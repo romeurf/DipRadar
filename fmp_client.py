@@ -1,20 +1,19 @@
 """
-Cliente para Financial Modeling Prep (FMP) API.
-Free tier: 250 calls/day — https://financialmodelingprep.com/developer/docs
-Regista em https://site.financialmodelingprep.com/register para API key gratuita.
+Cliente para Financial Modeling Prep (FMP) API — endpoints actuais (2026).
+Free tier: 250 calls/day
 """
 import os
 import time
 import logging
 import requests
-from functools import lru_cache
 
 FMP_API_KEY = os.environ.get("FMP_API_KEY", "demo")
-BASE = "https://financialmodelingprep.com/api"
+BASE_V3 = "https://financialmodelingprep.com/api/v3"
+BASE_V4 = "https://financialmodelingprep.com/api/v4"
+BASE_STABLE = "https://financialmodelingprep.com/stable"
 
 
-def _get(endpoint: str, params: dict = None, version: int = 3) -> dict | list | None:
-    url = f"{BASE}/v{version}/{endpoint}"
+def _get(url: str, params: dict = None) -> dict | list | None:
     p = {"apikey": FMP_API_KEY}
     if params:
         p.update(params)
@@ -22,136 +21,150 @@ def _get(endpoint: str, params: dict = None, version: int = 3) -> dict | list | 
         r = requests.get(url, params=p, timeout=15)
         r.raise_for_status()
         data = r.json()
-        # FMP devolve {"Error Message": "..."} quando há problema
-        if isinstance(data, dict) and "Error Message" in data:
-            logging.warning(f"FMP erro em {endpoint}: {data['Error Message']}")
+        if isinstance(data, dict) and ("Error Message" in data or "message" in data):
+            logging.warning(f"FMP erro: {data.get('Error Message') or data.get('message')}")
             return None
         return data
+    except requests.exceptions.HTTPError as e:
+        logging.error(f"HTTP {e.response.status_code} em {url}")
+        return None
     except Exception as e:
-        logging.error(f"FMP request falhou ({endpoint}): {e}")
+        logging.error(f"Request falhou: {e}")
         return None
 
 
-def screen_big_drops(min_drop_pct: float = 10.0, min_market_cap: int = 500_000_000) -> list[dict]:
+def screen_big_drops(min_drop_pct: float = 10.0,
+                     min_market_cap: int = 500_000_000) -> list[dict]:
     """
-    Usa o screener da FMP para encontrar acções que caíram X% hoje.
-    min_market_cap: filtra penny stocks (default 500M)
-    Devolve lista de {symbol, name, price, changesPercentage, sector, marketCap}
+    Tenta 3 endpoints por ordem:
+      1. /stable/biggest-losers  (endpoint actual)
+      2. /v3/biggest-losers      (alias)
+      3. /v3/stock-screener      (fallback)
     """
-    data = _get("stock_market/losers")
-    if not data:
-        return []
+    def _parse(data):
+        results = []
+        for item in (data or []):
+            symbol = item.get("symbol") or item.get("ticker")
+            change = item.get("changesPercentage") or item.get("changePercentage") or item.get("change")
+            if not symbol or change is None:
+                continue
+            if isinstance(change, str):
+                change = change.replace("(","").replace(")","").replace("%","").strip()
+                try: change = float(change)
+                except: continue
+            if change > -min_drop_pct:
+                continue
+            mc = item.get("marketCap") or item.get("market_cap") or 0
+            if mc and mc < min_market_cap:
+                continue
+            results.append({
+                "symbol": symbol,
+                "name": item.get("name") or item.get("companyName") or symbol,
+                "price": item.get("price"),
+                "change_pct": change,
+                "market_cap": mc,
+            })
+        return results
 
-    results = []
-    for item in data:
-        change = item.get("changesPercentage", 0)
-        # changesPercentage pode ser string "(-12.5%)" ou float
-        if isinstance(change, str):
-            change = float(change.strip("()%").replace(",", "."))
+    for url in [f"{BASE_STABLE}/biggest-losers", f"{BASE_V3}/biggest-losers"]:
+        data = _get(url)
+        if data:
+            r = _parse(data)
+            if r:
+                logging.info(f"{len(r)} losers via {url.split('/')[-1]}")
+                return r
+        time.sleep(0.3)
 
-        if change <= -min_drop_pct:
-            mc = item.get("marketCap", 0) or 0
-            if mc >= min_market_cap:
-                results.append({
-                    "symbol": item.get("ticker") or item.get("symbol"),
-                    "name": item.get("companyName") or item.get("name"),
-                    "price": item.get("price"),
-                    "change_pct": change,
-                    "market_cap": mc,
-                })
+    # Fallback: screener
+    data = _get(f"{BASE_V3}/stock-screener", {
+        "marketCapMoreThan": min_market_cap,
+        "isEtf": "false",
+        "isActivelyTrading": "true",
+        "limit": 500,
+    })
+    if data:
+        r = _parse(data)
+        logging.info(f"{len(r)} losers via screener")
+        return r
 
-    return results
+    logging.warning("Todos os endpoints de losers falharam.")
+    return []
 
 
 def get_fundamentals(symbol: str) -> dict:
-    """
-    Agrega métricas fundamentais de várias endpoints da FMP.
-    Usa lru_cache implícito no dict para não repetir calls.
-    """
     result = {"symbol": symbol}
 
-    # 1. Profile (sector, P/E, target price, etc.)
-    profile_data = _get(f"profile/{symbol}")
-    if profile_data and len(profile_data) > 0:
-        p = profile_data[0]
-        result["sector"] = p.get("sector", "")
-        result["industry"] = p.get("industry", "")
-        result["name"] = p.get("companyName", symbol)
-        result["pe"] = p.get("pe")
-        result["market_cap"] = p.get("mktCap")
-        result["price"] = p.get("price")
-        result["description"] = p.get("description", "")[:200]
+    data = _get(f"{BASE_V3}/profile/{symbol}")
+    if data and len(data) > 0:
+        p = data[0]
+        result.update({
+            "sector": p.get("sector",""), "industry": p.get("industry",""),
+            "name": p.get("companyName", symbol), "pe": p.get("pe"),
+            "market_cap": p.get("mktCap"), "price": p.get("price"),
+            "beta": p.get("beta"),
+        })
+    time.sleep(0.25)
 
-    # 2. Key metrics TTM
-    time.sleep(0.2)
-    km = _get(f"key-metrics-ttm/{symbol}")
-    if km and len(km) > 0:
-        k = km[0]
-        result["fcf_yield"] = k.get("freeCashFlowYieldTTM")
-        result["ev_ebitda"] = k.get("enterpriseValueOverEBITDATTM")
-        result["revenue_per_share"] = k.get("revenuePerShareTTM")
-        result["roe"] = k.get("roeTTM")
-        result["debt_equity"] = k.get("debtToEquityTTM")
-        result["dividend_yield"] = k.get("dividendYieldTTM") or k.get("dividendYieldPercentageTTM")
-        result["payout_ratio"] = k.get("payoutRatioTTM")
-        result["pb"] = k.get("pbRatioTTM")
-        result["fcf_per_share"] = k.get("freeCashFlowPerShareTTM")
+    data = _get(f"{BASE_V3}/key-metrics-ttm/{symbol}")
+    if data and len(data) > 0:
+        k = data[0]
+        result.update({
+            "fcf_yield": k.get("freeCashFlowYieldTTM"),
+            "ev_ebitda": k.get("enterpriseValueOverEBITDATTM"),
+            "roe": k.get("roeTTM"), "debt_equity": k.get("debtToEquityTTM"),
+            "dividend_yield": k.get("dividendYieldPercentageTTM") or k.get("dividendYieldTTM"),
+            "payout_ratio": k.get("payoutRatioTTM"), "pb": k.get("pbRatioTTM"),
+            "fcf_per_share": k.get("freeCashFlowPerShareTTM"),
+        })
+    time.sleep(0.25)
 
-    # 3. Financial growth (revenue growth YoY)
-    time.sleep(0.2)
-    growth = _get(f"financial-growth/{symbol}", {"period": "annual", "limit": 1})
-    if growth and len(growth) > 0:
-        g = growth[0]
-        result["revenue_growth"] = g.get("revenueGrowth")
-        result["eps_growth"] = g.get("epsgrowth")
-        result["fcf_growth"] = g.get("freeCashFlowGrowth")
+    data = _get(f"{BASE_V3}/financial-growth/{symbol}", {"period":"annual","limit":1})
+    if data and len(data) > 0:
+        g = data[0]
+        result.update({
+            "revenue_growth": g.get("revenueGrowth"),
+            "eps_growth": g.get("epsgrowth"),
+        })
+    time.sleep(0.25)
 
-    # 4. Income statement para gross margin
-    time.sleep(0.2)
-    income = _get(f"income-statement/{symbol}", {"period": "annual", "limit": 1})
-    if income and len(income) > 0:
-        i = income[0]
-        revenue = i.get("revenue", 0)
-        gross = i.get("grossProfit", 0)
-        if revenue and revenue > 0:
-            result["gross_margin"] = gross / revenue
+    data = _get(f"{BASE_V3}/income-statement/{symbol}", {"period":"annual","limit":1})
+    if data and len(data) > 0:
+        i = data[0]
+        rev = i.get("revenue",0) or 0
+        gross = i.get("grossProfit",0) or 0
+        if rev > 0:
+            result["gross_margin"] = gross / rev
+    time.sleep(0.25)
 
-    # 5. Analyst estimates / price target
-    time.sleep(0.2)
-    target = _get(f"price-target/{symbol}")
-    if target and len(target) > 0:
-        t = target[0]
-        avg_target = t.get("targetConsensus") or t.get("targetMean")
-        price = result.get("price")
-        if avg_target and price and price > 0:
-            result["analyst_upside"] = (avg_target - price) / price * 100
-            result["analyst_target"] = avg_target
+    # Analyst target — tenta v4 depois v3
+    for url, params in [
+        (f"{BASE_V4}/price-target", {"symbol": symbol}),
+        (f"{BASE_V3}/price-target/{symbol}", {}),
+    ]:
+        data = _get(url, params or None)
+        if data and len(data) > 0:
+            t = data[0]
+            avg = t.get("targetConsensus") or t.get("priceTarget")
+            price = result.get("price")
+            if avg and price and price > 0:
+                result["analyst_upside"] = (avg - price) / price * 100
+                result["analyst_target"] = avg
+            break
 
     return result
 
 
 def get_news(symbol: str, limit: int = 3) -> list[dict]:
-    """Notícias recentes via FMP."""
-    data = _get("stock_news", {"tickers": symbol, "limit": limit})
+    data = _get(f"{BASE_V3}/stock_news", {"tickers": symbol, "limit": limit})
     if not data:
         return []
-    return [
-        {
-            "title": item.get("title", ""),
-            "url": item.get("url", ""),
-            "published": item.get("publishedDate", ""),
-            "source": item.get("site", ""),
-        }
-        for item in data[:limit]
-    ]
+    return [{"title": i.get("title",""), "url": i.get("url",""),
+             "source": i.get("site","")} for i in data[:limit]]
 
 
 def get_historical_pe(symbol: str, years: int = 5) -> float | None:
-    """P/E médio histórico usando key-metrics anuais."""
-    data = _get(f"key-metrics/{symbol}", {"period": "annual", "limit": years})
+    data = _get(f"{BASE_V3}/key-metrics/{symbol}", {"period":"annual","limit":years})
     if not data:
         return None
-    pe_values = [d["peRatio"] for d in data if d.get("peRatio") and d["peRatio"] > 0 and d["peRatio"] < 300]
-    if not pe_values:
-        return None
-    return sum(pe_values) / len(pe_values)
+    vals = [d["peRatio"] for d in data if d.get("peRatio") and 0 < d["peRatio"] < 300]
+    return round(sum(vals)/len(vals), 1) if vals else None
