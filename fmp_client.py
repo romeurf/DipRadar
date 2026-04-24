@@ -37,10 +37,6 @@ def _fmp_get(url: str, params: dict = None):
 
 
 def _batch_market_caps(symbols: list[str]) -> dict[str, float]:
-    """
-    Uma só chamada FMP para obter market cap de vários símbolos.
-    Devolve {symbol: market_cap}.
-    """
     if not symbols:
         return {}
 
@@ -50,17 +46,19 @@ def _batch_market_caps(symbols: list[str]) -> dict[str, float]:
     for i in range(0, len(symbols), chunk_size):
         chunk = symbols[i:i + chunk_size]
         joined = ",".join(chunk)
-        data = _fmp_get(f"{BASE_V3}/quote/{joined}")
+
+        data = _fmp_get(f"{BASE_STABLE}/batch-quote", {"symbols": joined})
+
         if data:
             for item in data:
                 sym = item.get("symbol")
                 mc = item.get("marketCap") or 0
                 if sym:
                     result[sym] = mc
+
         time.sleep(0.3)
 
     return result
-
 
 def screen_big_drops(min_drop_pct: float = 10.0,
                      min_market_cap: int = 2_000_000_000) -> list[dict]:
