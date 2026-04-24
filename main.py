@@ -132,6 +132,13 @@ def run_scan() -> None:
 
             fundamentals = get_fundamentals(symbol)
 
+            if fundamentals.get("skip"):
+                logging.info(f"  {symbol}: rejeitada por market cap/fundamentos mínimos")
+                _alerted_today.add(alert_key)
+                continue
+            
+            sector = fundamentals.get("sector", "")
+
             # Micro-cap detectado pelo yfinance — saltar
             if fundamentals.get("skip"):
                 _alerted_today.add(alert_key)
