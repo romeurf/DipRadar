@@ -14,8 +14,19 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 
 def run_scan():
     universe = load_universe()
+    
     if not universe:
-        logging.info('Universe vazio. Corre universe.py primeiro.')
+        logging.info("Universe vazio. A criar universe_us.csv...")
+        universe = build_universe()
+        save_universe(universe)
+    
+    elif universe_is_stale(days=7):
+        logging.info("Universe desatualizado. A refrescar universe_us.csv...")
+        universe = build_universe()
+        save_universe(universe)
+    
+    if not universe:
+        logging.info("Não foi possível carregar/criar o universo.")
         return
 
     checked = 0
