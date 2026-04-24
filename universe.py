@@ -63,6 +63,13 @@ def save_universe(rows: list[dict], path: Path = UNIVERSE_FILE) -> None:
         writer.writeheader()
         writer.writerows(rows)
 
+from datetime import datetime, timedelta
+def universe_is_stale(path: Path = UNIVERSE_FILE, days: int = 2) -> bool:
+    if not path.exists():
+        return True
+
+    modified = datetime.fromtimestamp(path.stat().st_mtime)
+    return datetime.now() - modified > timedelta(days=days)
 
 def load_universe(path: Path = UNIVERSE_FILE) -> list[dict]:
     if not path.exists():
