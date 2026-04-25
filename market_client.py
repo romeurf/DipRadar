@@ -1,195 +1,168 @@
-import os
+"""
+Trigger: Yahoo Finance day_losers (gratuito, sem API key)
+Fundamentais: yfinance (gratuito, sem API key)
+Sem dependências pagas.
+"""
 import time
-import json
 import logging
 import requests
+import yfinance as yf
 
-EODHD_API_KEY = os.environ.get("EODHD_API_KEY", "")
-FMP_API_KEY = os.environ.get("FMP_API_KEY", "demo")
-FMP_BASE = "https://financialmodelingprep.com/api"
-EODHD_BASE = "https://eodhd.com/api"
+# ── Headers para simular browser — evita bloqueio por bot detection ───────────
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
-
-class APIRequestError(Exception):
-    pass
-
-
-def _eodhd_get(path: str, params: dict | None = None):
-    if not EODHD_API_KEY:
-        raise APIRequestError("Falta EODHD_API_KEY nas variáveis de ambiente.")
-
-    query = {"api_token": EODHD_API_KEY}
-    if params:
-        query.update(params)
-
-    url = f"{EODHD_BASE}/{path}"
-    r = requests.get(url, params=query, timeout=20)
-    r.raise_for_status()
-    return r.json()
+# Segundos entre chamadas yfinance
+_YF_SLEEP = 4.0
 
 
-def _fmp_get(endpoint: str, params: dict = None, version: int = 3):
-    url = f"{FMP_BASE}/v{version}/{endpoint}"
-    p = {"apikey": FMP_API_KEY}
-    if params:
-        p.update(params)
-    r = requests.get(url, params=p, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    if isinstance(data, dict) and "Error Message" in data:
-        raise APIRequestError(data["Error Message"])
-    return data
+# ── 1. LOSERS (Yahoo Finance) ─────────────────────────────────────────────────
 
-
-def screen_big_drops(min_drop_pct: float = 10.0, min_market_cap: int = 500_000_000) -> list[dict]:
-    filters = [
-        ["exchange", "=", "us"],
-        ["market_capitalization", ">=", min_market_cap],
-        ["refund_1d_p", "<=", -float(min_drop_pct)],
-        ["avgvol_1d", ">", 500000],
-    ]
-
+def screen_big_drops(min_drop_pct: float = 10.0,
+                     min_market_cap: int = 2_000_000_000) -> list[dict]:
+    """
+    Usa o screener predefinido do Yahoo Finance (day_losers).
+    Gratuito, sem API key, funciona no Railway.
+    """
+    url = (
+        "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+        "?formatted=false&scrIds=day_losers&count=100&start=0"
+    )
     try:
-        data = _eodhd_get(
-            "screener",
-            {
-                "sort": "refund_1d_p.asc",
-                "filters": json.dumps(filters),
-                "limit": 50,
-                "offset": 0,
-            },
+        r = requests.get(url, headers=_HEADERS, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+
+        quotes = (
+            data.get("finance", {})
+                .get("result", [{}])[0]
+                .get("quotes", [])
         )
     except Exception as e:
-        logging.error(f"EODHD screener falhou: {e}")
-        return []
-
-    if not isinstance(data, list):
-        logging.warning("EODHD screener devolveu formato inesperado.")
+        logging.error(f"Yahoo losers: {e}")
         return []
 
     results = []
-    for item in data:
-        symbol = item.get("code") or item.get("symbol")
-        if not symbol:
+    for q in quotes:
+        chg = q.get("regularMarketChangePercent", 0) or 0
+        if chg > -min_drop_pct:
             continue
 
-        results.append(
-            {
-                "symbol": symbol,
-                "name": item.get("name") or symbol,
-                "price": item.get("adjusted_close") or item.get("close") or 0,
-                "change_pct": float(item.get("refund_1d_p") or 0),
-                "market_cap": float(item.get("market_capitalization") or 0),
-                "sector": item.get("sector") or "",
-                "exchange": item.get("exchange") or "",
-                "source": "EODHD",
-            }
-        )
+        mc = q.get("marketCap") or 0
+        if mc and mc < min_market_cap:
+            continue
 
+        # Saltar ETFs alavancados e warrants
+        sym = q.get("symbol", "")
+        qtype = q.get("quoteType", "")
+        if qtype in ("ETF", "MUTUALFUND"):
+            continue
+        if len(sym) > 5:
+            continue
+
+        results.append({
+            "symbol":      sym,
+            "name":        q.get("longName") or q.get("shortName") or sym,
+            "price":       q.get("regularMarketPrice"),
+            "change_pct":  round(chg, 2),
+            "market_cap":  mc,
+        })
+
+    logging.info(f"Yahoo day_losers: {len(results)} candidatos (queda >= {min_drop_pct}%, cap >= ${min_market_cap/1e9:.0f}B)")
     return results
 
 
+# ── 2. FUNDAMENTAIS (yfinance) ────────────────────────────────────────────────
+
 def get_fundamentals(symbol: str) -> dict:
+    """Fundamentais via yfinance com backoff em caso de rate limit."""
     result = {"symbol": symbol}
 
-    try:
-        profile_data = _fmp_get(f"profile/{symbol}")
-        if profile_data and len(profile_data) > 0:
-            p = profile_data[0]
-            result["sector"] = p.get("sector", "")
-            result["industry"] = p.get("industry", "")
-            result["name"] = p.get("companyName", symbol)
-            result["pe"] = p.get("pe")
-            result["market_cap"] = p.get("mktCap")
-            result["price"] = p.get("price")
-            result["description"] = p.get("description", "")[:200]
-    except Exception as e:
-        logging.warning(f"Profile falhou para {symbol}: {e}")
+    for attempt in range(3):
+        try:
+            wait = _YF_SLEEP if attempt == 0 else 20 * attempt
+            time.sleep(wait)
 
-    try:
-        time.sleep(0.2)
-        km = _fmp_get(f"key-metrics-ttm/{symbol}")
-        if km and len(km) > 0:
-            k = km[0]
-            result["fcf_yield"] = k.get("freeCashFlowYieldTTM")
-            result["ev_ebitda"] = k.get("enterpriseValueOverEBITDATTM")
-            result["revenue_per_share"] = k.get("revenuePerShareTTM")
-            result["roe"] = k.get("roeTTM")
-            result["debt_equity"] = k.get("debtToEquityTTM")
-            result["dividend_yield"] = k.get("dividendYieldTTM") or k.get("dividendYieldPercentageTTM")
-            result["payout_ratio"] = k.get("payoutRatioTTM")
-            result["pb"] = k.get("pbRatioTTM")
-            result["fcf_per_share"] = k.get("freeCashFlowPerShareTTM")
-    except Exception as e:
-        logging.warning(f"Key metrics falhou para {symbol}: {e}")
+            inf = yf.Ticker(symbol).info or {}
 
-    try:
-        time.sleep(0.2)
-        growth = _fmp_get(f"financial-growth/{symbol}", {"period": "annual", "limit": 1})
-        if growth and len(growth) > 0:
-            g = growth[0]
-            result["revenue_growth"] = g.get("revenueGrowth")
-            result["eps_growth"] = g.get("epsgrowth")
-            result["fcf_growth"] = g.get("freeCashFlowGrowth")
-    except Exception as e:
-        logging.warning(f"Growth falhou para {symbol}: {e}")
+            mc = inf.get("marketCap") or 0
+            # Verificar cap real — rejeitar micro-caps que escaparam ao filtro
+            if mc > 0 and mc < 1_000_000_000:
+                result["skip"] = True
+                logging.info(f"  {symbol}: micro-cap ${mc/1e6:.0f}M — a saltar")
+                return result
 
-    try:
-        time.sleep(0.2)
-        income = _fmp_get(f"income-statement/{symbol}", {"period": "annual", "limit": 1})
-        if income and len(income) > 0:
-            i = income[0]
-            revenue = i.get("revenue", 0)
-            gross = i.get("grossProfit", 0)
-            if revenue and revenue > 0:
-                result["gross_margin"] = gross / revenue
-    except Exception as e:
-        logging.warning(f"Income statement falhou para {symbol}: {e}")
+            result.update({
+                "name":           inf.get("longName") or inf.get("shortName") or symbol,
+                "sector":         inf.get("sector", ""),
+                "industry":       inf.get("industry", ""),
+                "price":          inf.get("currentPrice") or inf.get("regularMarketPrice"),
+                "beta":           inf.get("beta"),
+                "market_cap":     mc,
+                "pe":             inf.get("trailingPE") or inf.get("forwardPE"),
+                "revenue_growth": inf.get("revenueGrowth"),
+                "gross_margin":   inf.get("grossMargins"),
+                "ev_ebitda":      inf.get("enterpriseToEbitda"),
+                "roe":            inf.get("returnOnEquity"),
+                "debt_equity":    inf.get("debtToEquity"),
+                "dividend_yield": inf.get("dividendYield"),
+                "payout_ratio":   inf.get("payoutRatio"),
+            })
 
-    try:
-        time.sleep(0.2)
-        target = _fmp_get(f"price-target/{symbol}")
-        if target and len(target) > 0:
-            t = target[0]
-            avg_target = t.get("targetConsensus") or t.get("targetMean")
-            price = result.get("price")
-            if avg_target and price and price > 0:
-                result["analyst_upside"] = (avg_target - price) / price * 100
-                result["analyst_target"] = avg_target
-    except Exception as e:
-        logging.warning(f"Price target falhou para {symbol}: {e}")
+            fcf    = inf.get("freeCashflow")
+            shares = inf.get("sharesOutstanding")
+            if fcf and mc > 0:
+                result["fcf_yield"] = fcf / mc
+            if fcf and shares and shares > 0:
+                result["fcf_per_share"] = fcf / shares
+
+            target = inf.get("targetMeanPrice")
+            price  = result.get("price")
+            if target and price and price > 0:
+                result["analyst_upside"] = (target - price) / price * 100
+                result["analyst_target"] = target
+
+            return result
+
+        except Exception as e:
+            if "Too Many Requests" in str(e) or "429" in str(e):
+                logging.warning(f"  {symbol}: rate limit (tentativa {attempt+1}/3)")
+                continue
+            logging.error(f"  {symbol}: {e}")
+            break
 
     return result
 
 
 def get_news(symbol: str, limit: int = 3) -> list[dict]:
     try:
-        data = _fmp_get("stock_news", {"tickers": symbol, "limit": limit})
-        if not data:
-            return []
-        return [
-            {
-                "title": item.get("title", ""),
-                "url": item.get("url", ""),
-                "published": item.get("publishedDate", ""),
-                "source": item.get("site", ""),
-            }
-            for item in data[:limit]
-        ]
+        time.sleep(2)
+        news = yf.Ticker(symbol).news or []
+        out = []
+        for item in news[:limit]:
+            content = item.get("content") or {}
+            out.append({
+                "title":  content.get("title") or item.get("title", ""),
+                "url":    (content.get("canonicalUrl") or {}).get("url") or item.get("link", ""),
+                "source": (content.get("provider") or {}).get("displayName") or "",
+            })
+        return out
     except Exception as e:
-        logging.warning(f"News falhou para {symbol}: {e}")
+        logging.error(f"News {symbol}: {e}")
         return []
 
 
 def get_historical_pe(symbol: str, years: int = 5) -> float | None:
     try:
-        data = _fmp_get(f"key-metrics/{symbol}", {"period": "annual", "limit": years})
-        if not data:
-            return None
-        pe_values = [d["peRatio"] for d in data if d.get("peRatio") and 0 < d["peRatio"] < 300]
-        if not pe_values:
-            return None
-        return sum(pe_values) / len(pe_values)
-    except Exception as e:
-        logging.warning(f"Historical PE falhou para {symbol}: {e}")
+        time.sleep(2)
+        pe = (yf.Ticker(symbol).info or {}).get("trailingPE")
+        return round(pe, 1) if pe and 0 < pe < 300 else None
+    except:
         return None
