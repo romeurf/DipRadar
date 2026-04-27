@@ -32,7 +32,7 @@ graph LR
 ---
 
 ### 📊 Sector-Specific Intelligence
-We don\\'t force one rule on every business. `sectors.py` applies custom logic to differentiate market sectors.
+We don\'t force one rule on every business. `sectors.py` applies custom logic to differentiate market sectors.
 
 | Sector | Key Focus |
 | :--- | :--- |
