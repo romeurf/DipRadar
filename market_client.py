@@ -187,6 +187,122 @@ def screen_structural_dips(
     return unique[:max_results]
 
 
+def screen_period_dips(
+    min_market_cap: int = 2_000_000_000,
+    week_threshold: float = 10.0,
+    month_threshold: float = 15.0,
+    max_results: int = 20,
+) -> dict[str, list[dict]]:
+    """
+    Detecta dips acumulados na última semana (7d) e último mês (30d)
+    usando yfinance.history() — 100% gratuito.
+
+    Estratégia:
+      1. Recolhe tickers candidatos dos feeds Yahoo gratuitos
+         (undervalued_large_caps + day_losers + most_actives).
+      2. Para cada ticker calcula % de queda vs 5 dias úteis atrás (semana)
+         e vs 22 dias úteis atrás (mês).
+      3. Devolve dict com chaves 'weekly' e 'monthly', cada uma lista ordenada
+         pela queda mais profunda primeiro.
+
+    Não requer API key. Corre automaticamente no Saturday Report (sábado 10h).
+    """
+    # ── 1. Recolhe tickers candidatos dos feeds gratuitos ─────────────────
+    screener_ids = ["undervalued_large_caps", "day_losers", "most_actives"]
+    candidates: dict[str, dict] = {}  # symbol -> {name, market_cap}
+
+    for scrId in screener_ids:
+        url = (
+            "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+            f"?formatted=false&scrIds={scrId}&count=100&start=0"
+        )
+        try:
+            r = requests.get(url, headers=_HEADERS, timeout=15)
+            r.raise_for_status()
+            quotes = (
+                r.json()
+                .get("finance", {})
+                .get("result", [{}])[0]
+                .get("quotes", [])
+            )
+            for q in quotes:
+                sym   = q.get("symbol", "")
+                qtype = q.get("quoteType", "")
+                mc    = q.get("marketCap") or 0
+                if not sym or qtype in ("ETF", "MUTUALFUND") or len(sym) > 5:
+                    continue
+                if mc and mc < min_market_cap:
+                    continue
+                if sym not in candidates:
+                    candidates[sym] = {
+                        "name":       q.get("longName") or q.get("shortName") or sym,
+                        "market_cap": mc,
+                    }
+        except Exception as e:
+            logging.warning(f"Period dip screener {scrId}: {e}")
+
+    logging.info(f"Period dip screener: {len(candidates)} tickers candidatos")
+
+    # ── 2. Calcula % de queda semanal e mensal via history() ─────────────
+    weekly_dips:  list[dict] = []
+    monthly_dips: list[dict] = []
+
+    for sym, meta in candidates.items():
+        try:
+            time.sleep(1)  # throttle suave
+            hist = yf.Ticker(sym).history(period="35d", interval="1d")["Close"].dropna()
+            if len(hist) < 6:
+                continue
+
+            price_now = float(hist.iloc[-1])
+
+            # Semana: ~5 dias úteis atrás
+            if len(hist) >= 6:
+                price_5d  = float(hist.iloc[-6])
+                chg_week  = (price_now - price_5d) / price_5d * 100
+                if chg_week <= -week_threshold:
+                    weekly_dips.append({
+                        "symbol":     sym,
+                        "name":       meta["name"],
+                        "price":      round(price_now, 2),
+                        "change_pct": round(chg_week, 2),
+                        "market_cap": meta["market_cap"],
+                        "period":     "7d",
+                    })
+
+            # Mês: ~22 dias úteis atrás
+            if len(hist) >= 23:
+                price_22d = float(hist.iloc[-23])
+                chg_month = (price_now - price_22d) / price_22d * 100
+                if chg_month <= -month_threshold:
+                    monthly_dips.append({
+                        "symbol":     sym,
+                        "name":       meta["name"],
+                        "price":      round(price_now, 2),
+                        "change_pct": round(chg_month, 2),
+                        "market_cap": meta["market_cap"],
+                        "period":     "30d",
+                    })
+        except Exception as e:
+            logging.warning(f"Period dip {sym}: {e}")
+
+    # Ordena por queda mais profunda e deduplica mensal (remove se já em semanal)
+    weekly_dips.sort(key=lambda x: x["change_pct"])
+    monthly_dips.sort(key=lambda x: x["change_pct"])
+
+    weekly_syms = {s["symbol"] for s in weekly_dips}
+    monthly_dips = [s for s in monthly_dips if s["symbol"] not in weekly_syms]
+
+    logging.info(
+        f"Period dips: {len(weekly_dips)} weekly (≥{week_threshold}%) | "
+        f"{len(monthly_dips)} monthly (≥{month_threshold}%)"
+    )
+    return {
+        "weekly":  weekly_dips[:max_results],
+        "monthly": monthly_dips[:max_results],
+    }
+
+
 def get_spy_change() -> float | None:
     try:
         time.sleep(2)
@@ -413,7 +529,6 @@ def get_portfolio_snapshot(holdings, cashback_eur, ppr_shares, ppr_avg_cost, usd
         if not prices:
             continue
 
-        # EUNL é cotado em EUR (LSE) — não converte
         fx = usd_eur if symbol in USD_TICKERS else 1.0
         price_now = prices["now"] * fx
         value_eur = shares * price_now

@@ -25,7 +25,7 @@ import requests
 from datetime import datetime, timedelta
 from pathlib import Path
 from market_client import (
-    screen_global_dips, screen_structural_dips,
+    screen_global_dips, screen_structural_dips, screen_period_dips,
     get_fundamentals, get_news, get_historical_pe,
     get_52w_drawdown, get_earnings_date, get_earnings_days,
     get_catalyst, get_spy_change, is_market_open,
@@ -313,12 +313,12 @@ def send_weekly_dip_scan() -> None:
 # ── Saturday Weekly Report (sábado 10h) ────────────────────────────────────
 
 def send_saturday_report() -> None:
-    if datetime.now().weekday() != 5:  # só ao sábado
+    if datetime.now().weekday() != 5:
         return
     logging.info("A gerar Saturday Weekly Report...")
 
     entries = _load_weekly_log()
-    now     = datetime.now()
+    now       = datetime.now()
     week_start = (now - timedelta(days=now.weekday() + 1)).strftime("%d/%m")
     week_end   = (now - timedelta(days=1)).strftime("%d/%m")
 
@@ -327,10 +327,10 @@ def send_saturday_report() -> None:
         "",
     ]
 
+    # ── Bloco 1: Resumo dos alertas diários da semana ──────────────────────
     if not entries:
-        lines.append("_Sem alertas esta semana._")
+        lines.append("_Sem alertas diários esta semana._")
     else:
-        # Agrupa por dia
         by_date: dict[str, list] = {}
         for e in entries:
             by_date.setdefault(e["date"], []).append(e)
@@ -341,36 +341,82 @@ def send_saturday_report() -> None:
         best          = max(entries, key=lambda x: x["score"])
 
         lines += [
-            f"*📊 Resumo da semana:*",
-            f"  Alertas totais: *{total_alerts}*",
-            f"  COMPRAR: *{comprar_count}* | MONITORIZAR: *{total_alerts - comprar_count}*",
-            f"  Score médio: *{avg_score:.1f}/20*",
-            f"  Melhor alerta: *{best['symbol']}* (score {best['score']:.0f}, {best['date']} {best['time']})",
+            "*📋 Alertas da semana:*",
+            f"  Total: *{total_alerts}* | COMPRAR: *{comprar_count}* | MONITORIZAR: *{total_alerts - comprar_count}*",
+            f"  Score médio: *{avg_score:.1f}/20* | Melhor: *{best['symbol']}* (score {best['score']:.0f}, {best['date']})",
             "",
         ]
 
-        # Detalhe por dia
-        lines.append("*🗓️ Alertas por dia:*")
+        lines.append("*🗓️ Por dia:*")
         for date_str in sorted(by_date.keys()):
             day_entries = by_date[date_str]
             lines.append(f"  *{date_str}* — {len(day_entries)} alerta(s)")
             for e in sorted(day_entries, key=lambda x: x["score"], reverse=True):
                 verdict_badge = "🟢" if e["verdict"] == "COMPRAR" else "🟡"
                 lines.append(
-                    f"    {verdict_badge} *{e['symbol']}* — Score {e['score']:.0f}/20 | "
+                    f"    {verdict_badge} *{e['symbol']}* Score {e['score']:.0f}/20 | "
                     f"{e['change']:+.1f}% | _{e['sector']}_"
                 )
         lines.append("")
 
-        # Top 3 da semana
         top3 = sorted(entries, key=lambda x: x["score"], reverse=True)[:3]
         lines.append("*🏆 Top 3 da semana:*")
         for i, e in enumerate(top3, 1):
-            lines.append(
-                f"  {i}. *{e['symbol']}* — Score {e['score']:.0f}/20 | {e['verdict']} | {e['date']}"
-            )
+            lines.append(f"  {i}. *{e['symbol']}* — Score {e['score']:.0f}/20 | {e['verdict']} | {e['date']}")
+        lines.append("")
 
-    # Limpa o log semanal após o report
+    # ── Bloco 2: Weekly dips (quedas ≥10% nos últimos 7 dias) ─────────────
+    lines += [
+        "─" * 30,
+        "",
+        "*📉 Weekly Dips — quedas ≥10% nos últimos 7 dias:*",
+        "_Stocks dos feeds Yahoo com maior queda acumulada semanal_",
+        "",
+    ]
+    try:
+        logging.info("Saturday: a calcular period dips...")
+        period_dips = screen_period_dips(
+            min_market_cap=MIN_MARKET_CAP,
+            week_threshold=10.0,
+            month_threshold=15.0,
+        )
+        weekly  = period_dips.get("weekly", [])
+        monthly = period_dips.get("monthly", [])
+
+        if weekly:
+            for s in weekly[:10]:
+                mc_b         = (s.get("market_cap") or 0) / 1e9
+                in_portfolio = " 💼" if s["symbol"] in DIRECT_TICKERS else ""
+                lines.append(
+                    f"  📉 *{s['symbol']}*{in_portfolio}: *{s['change_pct']:.1f}%* (7d) "
+                    f"| ${s['price']} | ${mc_b:.1f}B"
+                )
+        else:
+            lines.append("  _Nenhum stock com queda ≥10% na semana._")
+
+        # ── Bloco 3: Monthly dips (quedas ≥15% no último mês) ─────────────
+        lines += [
+            "",
+            "*📉 Monthly Dips — quedas ≥15% no último mês:*",
+            "_Excluídos stocks já listados no weekly dip_",
+            "",
+        ]
+        if monthly:
+            for s in monthly[:10]:
+                mc_b         = (s.get("market_cap") or 0) / 1e9
+                in_portfolio = " 💼" if s["symbol"] in DIRECT_TICKERS else ""
+                lines.append(
+                    f"  📉 *{s['symbol']}*{in_portfolio}: *{s['change_pct']:.1f}%* (30d) "
+                    f"| ${s['price']} | ${mc_b:.1f}B"
+                )
+        else:
+            lines.append("  _Nenhum stock com queda ≥15% no mês._")
+
+    except Exception as e:
+        logging.error(f"Saturday period dips: {e}")
+        lines.append(f"  _Erro ao calcular period dips: {e}_")
+
+    # ── Limpa log semanal e fecha mensagem ────────────────────────────────
     _save_weekly_log([])
     lines += ["", f"_⏰ Próximo report: sábado às 10h_"]
     send_telegram("\n".join(lines))
@@ -428,7 +474,6 @@ def calculate_flip_target(
     weighted_upside = (weighted_price / price) - 1
 
     sector_cap = _SECTOR_FLIP_CAP.get(sector, 0.30)
-    # Ajuste do cap pelo score (escala 0-20)
     if dip_score >= 18:   sector_cap *= 1.20
     elif dip_score >= 15: sector_cap *= 1.10
 
@@ -743,6 +788,7 @@ if __name__ == "__main__":
         f"Tier 1: ≥{DROP_THRESHOLD}% | Tier 2: 7–{DROP_THRESHOLD:.0f}% | Tier 3: 3–8% (score≥11)\n"
         f"Score: 0–20 | Min alerta: {MIN_DIP_SCORE}/20\n"
         f"Weekly scan: ✅ Segunda 8h45 | Saturday report: ✅ Sábado 10h\n"
+        f"Weekly dips (7d ≥10%) + Monthly dips (30d ≥15%): ✅ No Saturday report\n"
         f"Catalisadores Tavily: {'✅' if os.environ.get('TAVILY_API_KEY') else '⚠️ não configurado'}\n"
         f"_Scan a cada {SCAN_MINUTES} minutos (só horas de mercado)_"
     )
