@@ -34,7 +34,7 @@ def screen_global_dips(
     """
     regions = {
         "US": "day_losers",
-        "Europe": "day_losers_eu", 
+        "Europe": "day_losers_europe", 
         "UK": "day_losers_gb",
         "Asia": "day_losers_asia"
     }
