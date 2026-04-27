@@ -42,4 +42,4 @@ USD_TICKERS = {
     "NVO", "ADBE", "UBER", "MSFT", "PINS", "ADP", "CRM", "VICI",
     "CRWD", "PLTR", "NOW", "DUOL", "ACWI",
 }
-EUR_TICKERS = {"EUNL"}
+EUR_TICKERS = {"EUNL.DE"}
