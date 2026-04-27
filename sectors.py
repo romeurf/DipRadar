@@ -43,10 +43,10 @@ SECTOR_CONFIG = {
         "pe_max": 20,
         "pe_fair": 13,
         "fcf_yield_min": 0.04,
-        "ev_ebitda_max": None,   # não se aplica a bancos
-        "debt_equity_max": None, # alavancagem é estrutural em bancos
+        "ev_ebitda_max": None,
+        "debt_equity_max": None,
         "revenue_growth_min": 0.03,
-        "gross_margin_min": 0.0, # não se aplica
+        "gross_margin_min": 0.0,
         "key_metrics": ["P/B ratio", "ROE", "Net interest margin", "Dividend yield"],
         "red_flags": ["NIM compression", "Credit losses a subir", "Capital ratio em queda"],
     },
@@ -88,11 +88,11 @@ SECTOR_CONFIG = {
     },
     "Real Estate": {
         "label": "🏢 Real Estate (REIT)",
-        "pe_max": 60,   # REITs têm P/E alto por estrutura
+        "pe_max": 60,
         "pe_fair": 40,
         "fcf_yield_min": 0.04,
         "ev_ebitda_max": 25,
-        "debt_equity_max": 3.0, # alavancagem é normal em REITs
+        "debt_equity_max": 3.0,
         "revenue_growth_min": 0.02,
         "gross_margin_min": 0.50,
         "key_metrics": ["FFO yield", "Occupancy rate", "Dividend yield", "Lease escalations"],
@@ -241,8 +241,8 @@ def score_fundamentals(metrics: dict, sector: str) -> tuple[str, str, list[str]]
         verdict = "MONITORIZAR"
         emoji = "🟡"
     else:
-        verdict = "EVITAR"
-        emoji = "🔴"
+        verdict = "MONITORIZAR"  # fix: dados insuficientes → MONITORIZAR, não EVITAR
+        emoji = "🟡"
 
     reasons = bull_signals[:2] + bear_signals[:2]
     return verdict, emoji, reasons

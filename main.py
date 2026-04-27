@@ -6,11 +6,12 @@ Deploy: Railway.app
 
 Variáveis Railway obrigatórias:
   TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-  TZ=Europe/Lisbon          ← NOVO: resolve o problema do resumo chegar 1h tarde
+  TZ=Europe/Lisbon
 Variáveis opcionais:
   DROP_THRESHOLD=10         (% queda mínima para Tier 1)
   MIN_MARKET_CAP=2000000000
   SCAN_EVERY_MINUTES=30
+  MIN_DIP_SCORE=4           (score mínimo quantitativo para enviar alerta)
 """
 
 import os
@@ -25,6 +26,7 @@ from market_client import (
 )
 from sectors import get_sector_config, score_fundamentals
 from valuation import format_valuation_block
+from score import calculate_dip_score
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,6 +38,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 DROP_THRESHOLD   = float(os.environ.get("DROP_THRESHOLD", "10"))
 MIN_MARKET_CAP   = int(os.environ.get("MIN_MARKET_CAP", "2000000000"))
 SCAN_MINUTES     = int(os.environ.get("SCAN_EVERY_MINUTES", "30"))
+MIN_DIP_SCORE    = int(os.environ.get("MIN_DIP_SCORE", "4"))
 
 _alerted_today: set = set()
 
@@ -64,38 +67,50 @@ def send_telegram(message: str) -> bool:
 # ── Alerta individual (scan contínuo) ─────────────────────────────────────────
 
 def buildalertstock(stock: dict, fundamentals: dict, historical_pe: float | None,
-                   news: list, verdict: str, emoji: str, reasons: list) -> str:
-    
+                   news: list, verdict: str, emoji: str, reasons: list,
+                   dip_score: int, rsi_str: str | None) -> str:
+
     sector = fundamentals.get("sector", "")
     sector_cfg = get_sector_config(sector)
     name = fundamentals.get("name", stock.get("name", stock.get("symbol", "N/A")))
-    
+
     symbol = stock["symbol"]
     change = stock["change_pct"]
     price = fundamentals.get("price") or stock.get("price", "N/D")
     mc_b = (fundamentals.get("market_cap") or 0) / 1e9
-    
+
     drawdown = fundamentals.get("drawdown_from_high")
     drawdown_str = f" | 52w: {drawdown:.0f}%" if drawdown is not None else ""
-    
+
     region = stock.get("region")
     region_part = f" ({region})" if region else ""
-    
+
+    # Score badge
+    if dip_score >= 8:
+        score_badge = f"🔥 Score: {dip_score}/10"
+    elif dip_score >= 6:
+        score_badge = f"⭐ Score: {dip_score}/10"
+    else:
+        score_badge = f"📊 Score: {dip_score}/10"
+
+    rsi_part = f" | RSI: {rsi_str}" if rsi_str else ""
+
     lines = [
         f"📉 *{symbol} — {name}{region_part}*",
         f"Queda: *{change:.1f}%*{drawdown_str}",
         f"💰 Preço: ${price} | 🏦 Cap: ${mc_b:.1f}B",
         f"🏢 Sector: {sector_cfg.get('label', sector) or sector}",
+        f"{score_badge}{rsi_part}",
         "",
-        f"*🟢 Veredito: {emoji} {verdict}*",
+        f"*{emoji} Veredito: {verdict}*",
     ]
-    
+
     for reason in reasons:
         lines.append(f"  _{reason}_")
-    
+
     lines += ["", "*📊 Fundamentos:*"]
     lines.append(format_valuation_block(fundamentals, historical_pe, sector))
-    
+
     if news:
         lines += ["", "*📰 Notícias:*"]
         for item in news[:3]:
@@ -103,7 +118,7 @@ def buildalertstock(stock: dict, fundamentals: dict, historical_pe: float | None
             url = item["url"]
             source = item.get("source", "")
             lines.append(f"  [{title}]({url}){' _' + source + '_ ' if source else ''}")
-    
+
     lines.append(f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_")
     return "\n".join(lines)
 
@@ -141,23 +156,29 @@ def run_scan() -> None:
                 _alerted_today.add(alert_key)
                 continue
 
+            # Score quantitativo — filtro adicional
+            dip_score, rsi_str = calculate_dip_score(fundamentals, symbol)
+            if dip_score < MIN_DIP_SCORE:
+                logging.info(f"  {symbol}: score {dip_score} < {MIN_DIP_SCORE} — a saltar")
+                _alerted_today.add(alert_key)
+                continue
+
             historical_pe = get_historical_pe(symbol)
             news          = get_news(symbol)
             message       = buildalertstock(stock, fundamentals, historical_pe,
-                                        news, verdict, emoji, reasons)
+                                            news, verdict, emoji, reasons,
+                                            dip_score, rsi_str)
 
             if send_telegram(message):
                 _alerted_today.add(alert_key)
-                logging.info(f"  ✅ Alerta enviado: {symbol} ({verdict})")
-            time.sleep(5)  # increased from 2s to reduce 429s
+                logging.info(f"  ✅ Alerta enviado: {symbol} ({verdict}, score {dip_score})")
+            time.sleep(5)
 
         except Exception as e:
             logging.error(f"Erro {symbol}: {e}")
 
 
 # ── Resumo abertura + 1h (15h30 Lisboa) ───────────────────────────────────────
-# NYSE abre 9h30 ET = 14h30 Lisboa. Às 15h30 a poeira do open já assentou.
-# Mostra só Tier 1 (≥10%) — candidatos para investigares durante o dia.
 
 def send_open_summary() -> None:
     tier1 = screen_global_dips(
@@ -174,7 +195,9 @@ def send_open_summary() -> None:
     ]
     for s in tier1[:8]:
         mc_b = (s.get("market_cap") or 0) / 1e9
-        lines.append(f"  📉 *{s['symbol']}*: {s['change_pct']:.1f}% (${mc_b:.1f}B)")
+        region = s.get("region", "")
+        region_str = f" ({region})" if region else ""
+        lines.append(f"  📉 *{s['symbol']}*{region_str}: {s['change_pct']:.1f}% (${mc_b:.1f}B)")
 
     lines += [
         "",
@@ -184,8 +207,6 @@ def send_open_summary() -> None:
 
 
 # ── Resumo fecho (21h15 Lisboa) ───────────────────────────────────────────────
-# NYSE fecha 16h00 ET = 21h00 Lisboa. 15 minutos depois os números são definitivos.
-# Dois tiers + drawdown desde o máximo de 52 semanas para cada Tier 1.
 
 def send_close_summary() -> None:
     all_losers = screen_global_dips(
@@ -203,19 +224,17 @@ def send_close_summary() -> None:
         "",
     ]
 
-    # ── Tier 1 ──
     if tier1:
         lines.append(f"*🔴 TIER 1 — Análise completa (≥{DROP_THRESHOLD:.0f}%):*")
         for s in tier1[:6]:
             mc_b = (s.get("market_cap") or 0) / 1e9
             sym  = s["symbol"]
-
-            # Drawdown desde máximo 52 semanas (só para Tier 1 — máx 6 stocks)
+            region = s.get("region", "")
+            region_str = f" ({region})" if region else ""
             drawdown = get_52w_drawdown(sym)
             d_str = f" | 52w: *{drawdown:.0f}%*" if drawdown is not None else ""
-
             lines.append(
-                f"  📉 *{sym}*: {s['change_pct']:.1f}% hoje{d_str} — ${mc_b:.1f}B"
+                f"  📉 *{sym}*{region_str}: {s['change_pct']:.1f}% hoje{d_str} — ${mc_b:.1f}B"
             )
         lines += [
             "",
@@ -225,12 +244,13 @@ def send_close_summary() -> None:
     else:
         lines += [f"_Sem quedas ≥{DROP_THRESHOLD:.0f}% hoje_", ""]
 
-    # ── Tier 2 ──
     if tier2:
         lines.append("*🟡 TIER 2 — Watchlist (7–10%):*")
         for s in tier2[:6]:
             mc_b = (s.get("market_cap") or 0) / 1e9
-            lines.append(f"  👀 *{s['symbol']}*: {s['change_pct']:.1f}% (${mc_b:.1f}B)")
+            region = s.get("region", "")
+            region_str = f" ({region})" if region else ""
+            lines.append(f"  👀 *{s['symbol']}*{region_str}: {s['change_pct']:.1f}% (${mc_b:.1f}B)")
         lines += [
             "",
             "_→ Tier 2: monitorizar apenas, sem acção imediata_",
@@ -245,31 +265,23 @@ if __name__ == "__main__":
     logging.info("=" * 60)
     logging.info("Stock Alert Bot iniciado")
     logging.info(f"Threshold: {DROP_THRESHOLD}% | Min cap: ${MIN_MARKET_CAP/1e9:.0f}B")
-    logging.info(f"Scan a cada {SCAN_MINUTES} minutos")
+    logging.info(f"Scan a cada {SCAN_MINUTES} minutos | Min score: {MIN_DIP_SCORE}")
     logging.info(f"Timezone activo: {datetime.now().strftime('%Z %z')}")
     logging.info("=" * 60)
 
     send_telegram(
         f"🤖 *Bot iniciado*\n"
         f"Threshold Tier 1: ≥{DROP_THRESHOLD}% | Tier 2: 7–{DROP_THRESHOLD:.0f}%\n"
-        f"Cap mínimo: ${MIN_MARKET_CAP/1e9:.0f}B\n"
+        f"Cap mínimo: ${MIN_MARKET_CAP/1e9:.0f}B | Score mínimo: {MIN_DIP_SCORE}/10\n"
         f"Resumos: 15h30 (abertura) e 21h15 (fecho) Lisboa\n"
         f"_Scan a cada {SCAN_MINUTES} minutos_"
     )
 
-    # Scan contínuo
     schedule.every(SCAN_MINUTES).minutes.do(run_scan)
-
-    # Resumo abertura +1h — 15h30 Lisboa (NYSE open + 1h)
     schedule.every().day.at("15:30").do(send_open_summary)
-
-    # Resumo fecho definitivo — 21h15 Lisboa (NYSE close + 15min)
     schedule.every().day.at("21:15").do(send_close_summary)
-
-    # Reset diário de alertas
     schedule.every().day.at("00:01").do(_alerted_today.clear)
 
-    # Scan imediato ao arrancar
     run_scan()
 
     while True:

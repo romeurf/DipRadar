@@ -120,8 +120,8 @@ def format_valuation_block(fundamentals: dict, historical_pe: float | None, sect
         lines.append(f"  • ROE: {roe*100:.1f}%")
 
     if dy and dy > 0:
-        # yfinance pode devolver decimal (0.047) ou percentagem (4.7) — normalizar
-        dy_pct = dy if dy > 1 else dy * 100
+        # yfinance devolve sempre decimal (0.047 = 4.7%) — normalizar defensivamente
+        dy_pct = dy * 100 if dy < 1 else dy  # fix: evitar 470% se já vier em %
         payout_str = f" (payout {payout*100:.0f}%)" if payout else ""
         lines.append(f"  • Dividendo: {dy_pct:.2f}%{payout_str}")
 
