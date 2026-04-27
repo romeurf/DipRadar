@@ -63,39 +63,43 @@ def send_telegram(message: str) -> bool:
 
 # ── Alerta individual (scan contínuo) ─────────────────────────────────────────
 
-def build_alert(stock: dict, fundamentals: dict, historical_pe: float | None,
-                news: list, verdict: str, emoji: str, reasons: list) -> str:
-    sector     = fundamentals.get("sector", "")
+def buildalertstock(stock, fundamentals, historical_pe=None, news=None, verdict=None, emoji=None, reasons=None):
+    region = stock.get("region", "US")  # ← NOVO
+    sector = fundamentals.get("sector", "")
     sector_cfg = get_sector_config(sector)
-    name       = fundamentals.get("name", stock["symbol"])
-    change     = stock["change_pct"]
-    price      = fundamentals.get("price") or stock.get("price", "N/D")
-    mc_b       = (fundamentals.get("market_cap") or 0) / 1e9
-
+    name = fundamentals.get("name", "")
+    
+    symbol = stock["symbol"]
+    change = stock["change_pct"]
+    price = fundamentals.get("price") or stock.get("price", "N/D")
+    mcb = fundamentals.get("market_cap", 0) / 1e9
     drawdown = fundamentals.get("drawdown_from_high")
-    drawdown_str = f" | 52w: {drawdown:.0f}%" if drawdown is not None else ""
-
+    drawdown_str = f" | 52w drawdown {drawdown:.0f}%" if drawdown is not None else ""
+    
     lines = [
-        f"📉 *{stock['symbol']} — {name}*",
-        f"Queda: *{change:.1f}%* hoje{drawdown_str} | Preço: ${price} | Cap: ${mc_b:.1f}B",
-        f"Sector: {sector_cfg.get('label', sector)}",
-        "",
-        f"*Veredito: {emoji} {verdict}*",
+        f"📉 {symbol} — {name} **({region})**",  # ← REGIÃO VISÍVEL
+        f"Queda **{change:.1f}%** hoje{drawdown_str}",
+        f"💰 Preço: {price} | 🏦 Cap: {mcb:.1f}B",
+        f"🏢 Sector: {sector_cfg.get('label', sector) or sector}",
+        f"🟢 Veredito: **{emoji} {verdict}**",
     ]
+    
     for r in reasons:
-        lines.append(f"  _{r}_")
-
-    lines += ["", "*📊 Fundamentos:*",
-              format_valuation_block(fundamentals, historical_pe, sector)]
-    lines += ["", "*📰 Notícias:*"]
-    for item in news[:3]:
-        t = item["title"][:70]
-        u = item["url"]
-        s = item.get("source", "")
-        lines.append(f"  • [{t}]({u})" + (f" _{s}_" if s else ""))
-
-    lines.append(f"\n_⏰ {datetime.now().strftime('%d/%m/%Y %H:%M')}_")
-    return "\n".join(lines)
+        lines.append(f"  • {r}")
+    
+    lines.append("")  # Espaço
+    lines.append("**📊 Fundamentos:**")
+    lines.append(format_valuation_block(fundamentals, historical_pe, sector))
+    
+    if news:
+        lines.append("**📰 Notícias:**")
+        for item in news[:3]:
+            title = item["title"][:70]
+            url = item["url"]
+            source = item.get("source", "")
+            lines.append(f"  • {title} {'(' + source + ')' if source else ''}")
+    
+    return "\\n".join(lines)
 
 
 def run_scan() -> None:
