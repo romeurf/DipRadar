@@ -14,97 +14,52 @@ Variáveis opcionais:
   SCAN_EVERY_MINUTES=30
   MIN_DIP_SCORE=5
   TAVILY_API_KEY
+  PORTFOLIO_STRESS_PCT=5   (alerta se posição cair >X% em 1 dia; default 5)
 """
 
 import os
 import time
-import json
 import logging
 import schedule
 import requests
 from datetime import datetime, timedelta
-from pathlib import Path
 from market_client import (
     screen_global_dips, screen_structural_dips, screen_period_dips,
     get_fundamentals, get_news, get_historical_pe,
     get_52w_drawdown, get_earnings_date, get_earnings_days,
     get_catalyst, get_spy_change, is_market_open,
     get_usdeur, get_portfolio_snapshot,
+    calculate_dip_score as _calc_score_raw,
 )
 from portfolio import HOLDINGS, CASHBACK_EUR_VALUES, PPR_SHARES, PPR_AVG_COST, DIRECT_TICKERS
 from sectors import get_sector_config, score_fundamentals
 from valuation import format_valuation_block
 from score import calculate_dip_score
+from state import (
+    load_alerts, save_alerts, clear_alerts,
+    load_weekly_log, save_weekly_log, append_weekly_log,
+    load_rejected_log, append_rejected_log,
+)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
 
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-DROP_THRESHOLD   = float(os.environ.get("DROP_THRESHOLD", "8"))
-MIN_MARKET_CAP   = int(os.environ.get("MIN_MARKET_CAP", "2000000000"))
-SCAN_MINUTES     = int(os.environ.get("SCAN_EVERY_MINUTES", "30"))
-MIN_DIP_SCORE    = int(os.environ.get("MIN_DIP_SCORE", "5"))
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
+DROP_THRESHOLD    = float(os.environ.get("DROP_THRESHOLD", "8"))
+MIN_MARKET_CAP    = int(os.environ.get("MIN_MARKET_CAP", "2000000000"))
+SCAN_MINUTES      = int(os.environ.get("SCAN_EVERY_MINUTES", "30"))
+MIN_DIP_SCORE     = int(os.environ.get("MIN_DIP_SCORE", "5"))
+STRESS_PCT        = float(os.environ.get("PORTFOLIO_STRESS_PCT", "5"))
 
-_ALERTS_FILE  = Path("/tmp/dipadar_alerts.json")
-_WEEKLY_FILE  = Path("/tmp/dipadar_weekly.json")
-
-
-# ── Cache de alertas ─────────────────────────────────────────────────────────────
-
-def _load_alerts() -> set:
-    try:
-        if _ALERTS_FILE.exists():
-            data  = json.loads(_ALERTS_FILE.read_text())
-            today = datetime.now().date().isoformat()
-            return {k for k in data.get("keys", []) if k.endswith(today)}
-    except Exception:
-        pass
-    return set()
-
-def _save_alerts(alert_set: set) -> None:
-    try:
-        _ALERTS_FILE.write_text(json.dumps({"keys": list(alert_set)}))
-    except Exception as e:
-        logging.warning(f"Alert cache save: {e}")
-
-_alerted_today: set = _load_alerts()
+_alerted_today: set  = load_alerts()
 _scan_running:  bool = False
+_stress_alerted: set = set()   # symbols já alertados neste dia (stress)
 
 
-# ── Weekly log (acumula alertas da semana) ───────────────────────────────────
-
-def _load_weekly_log() -> list:
-    try:
-        if _WEEKLY_FILE.exists():
-            return json.loads(_WEEKLY_FILE.read_text()).get("alerts", [])
-    except Exception:
-        pass
-    return []
-
-def _save_weekly_log(entries: list) -> None:
-    try:
-        _WEEKLY_FILE.write_text(json.dumps({"alerts": entries}))
-    except Exception as e:
-        logging.warning(f"Weekly log save: {e}")
-
-def _log_alert(symbol: str, verdict: str, score: float, change_pct: float, sector: str) -> None:
-    entries = _load_weekly_log()
-    entries.append({
-        "symbol":  symbol,
-        "verdict": verdict,
-        "score":   score,
-        "change":  change_pct,
-        "sector":  sector,
-        "date":    datetime.now().strftime("%d/%m"),
-        "time":    datetime.now().strftime("%H:%M"),
-    })
-    _save_weekly_log(entries)
-
-
-# ── Blue chip detection (por fundamentais, não por sector) ───────────────────
+# ── Blue chip detection ───────────────────────────────────────────────
 
 _BLUECHIP_MARGIN_THRESHOLD = {
     "Technology":             0.40,
@@ -132,7 +87,7 @@ def is_bluechip(fundamentals: dict) -> bool:
     return (dividend_yield >= 0.015) or (rev_growth > 0.05 and gross_margin > margin_threshold)
 
 
-# ── Telegram ─────────────────────────────────────────────────────────────────
+# ── Telegram ─────────────────────────────────────────────────────────────
 
 def send_telegram(message: str, retries: int = 2) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -166,7 +121,7 @@ def send_telegram(message: str, retries: int = 2) -> bool:
     return all_ok
 
 
-# ── Heartbeat das 9h ─────────────────────────────────────────────────────────
+# ── Heartbeat das 9h ────────────────────────────────────────────────────────
 
 def _pnl_emoji(v: float) -> str:
     return "🟢" if v > 0 else ("🔴" if v < 0 else "⚪")
@@ -249,7 +204,75 @@ def send_heartbeat() -> None:
     logging.info("Heartbeat enviado.")
 
 
-# ── Weekly structural dip scan (segunda-feira 8h45) ─────────────────────────
+# ── Portfolio Stress Alert ────────────────────────────────────────────────
+
+def check_portfolio_stress() -> None:
+    """
+    Corre a cada scan (quando mercado aberto).
+    Envia alerta imediato se alguma posição da carteira cair >STRESS_PCT% no dia.
+    Cada symbol só dispara 1 vez por dia.
+    Também verifica se a carteira total caiu >3% no dia (stress macro).
+    """
+    global _stress_alerted
+    try:
+        usd_eur  = get_usdeur()
+        snapshot = get_portfolio_snapshot(
+            HOLDINGS, CASHBACK_EUR_VALUES, PPR_SHARES, PPR_AVG_COST, usd_eur
+        )
+    except Exception as e:
+        logging.warning(f"Portfolio stress snapshot: {e}")
+        return
+
+    positions = snapshot.get("positions", [])
+    total_eur = snapshot.get("total_eur", 0)
+    pnl_day   = snapshot.get("pnl_day", 0)
+
+    alerts = []
+    for p in positions:
+        sym      = p["symbol"]
+        pnl_d    = p.get("pnl_day")
+        val      = p.get("value_eur", 0)
+        if pnl_d is None or val == 0 or sym in _stress_alerted:
+            continue
+        base = val - pnl_d
+        if base <= 0:
+            continue
+        pct_d = pnl_d / base * 100
+        if pct_d <= -STRESS_PCT:
+            alerts.append((sym, pct_d, pnl_d, val))
+            _stress_alerted.add(sym)
+
+    for sym, pct_d, pnl_d, val in alerts:
+        in_portfolio = " 💼" if sym in DIRECT_TICKERS else ""
+        msg = (
+            f"🚨 *Alerta de stress: {sym}*{in_portfolio}\n"
+            f"Queda de *{pct_d:.1f}%* no dia de hoje\n"
+            f"P&L dia: €{pnl_d:+,.2f} | Valor actual: €{val:,.2f}\n"
+            f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_"
+        )
+        send_telegram(msg)
+        logging.warning(f"Portfolio stress: {sym} {pct_d:.1f}%")
+
+    # Stress macro: carteira total caiu >3% no dia
+    if total_eur > 0 and pnl_day is not None:
+        base_total = total_eur - pnl_day
+        if base_total > 0:
+            pct_total = pnl_day / base_total * 100
+            if pct_total <= -3.0 and "_TOTAL_" not in _stress_alerted:
+                _stress_alerted.add("_TOTAL_")
+                spy_change = get_spy_change()
+                spy_str    = f" | SPY: {spy_change:+.1f}%" if spy_change is not None else ""
+                msg = (
+                    f"🚨 *Carteira em stress macro*\n"
+                    f"Queda de *{pct_total:.1f}%* no dia de hoje{spy_str}\n"
+                    f"P&L dia: €{pnl_day:+,.2f} | Total: €{total_eur:,.2f}\n"
+                    f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_"
+                )
+                send_telegram(msg)
+                logging.warning(f"Portfolio stress MACRO: {pct_total:.1f}%")
+
+
+# ── Weekly structural dip scan (segunda-feira 8h45) ───────────────────────
 
 def send_weekly_dip_scan() -> None:
     if datetime.now().weekday() != 0:
@@ -310,67 +333,76 @@ def send_weekly_dip_scan() -> None:
     logging.info(f"Weekly scan enviado: {len(scored)} candidatos")
 
 
-# ── Saturday Weekly Report (sábado 10h) ────────────────────────────────────
+# ── Saturday Weekly Report ───────────────────────────────────────────────
 
 def send_saturday_report() -> None:
     if datetime.now().weekday() != 5:
         return
     logging.info("A gerar Saturday Weekly Report...")
 
-    entries = _load_weekly_log()
-    now       = datetime.now()
+    entries    = load_weekly_log()
+    now        = datetime.now()
     week_start = (now - timedelta(days=now.weekday() + 1)).strftime("%d/%m")
     week_end   = (now - timedelta(days=1)).strftime("%d/%m")
 
-    lines = [
-        f"*📊 Weekly Report — {week_start} a {week_end}*",
-        "",
-    ]
+    lines = [f"*📊 Weekly Report — {week_start} a {week_end}*", ""]
 
-    # ── Bloco 1: Resumo dos alertas diários da semana ──────────────────────
+    # ── Bloco 1: alertas da semana ───────────────────────────────────────
     if not entries:
         lines.append("_Sem alertas diários esta semana._")
     else:
         by_date: dict[str, list] = {}
         for e in entries:
             by_date.setdefault(e["date"], []).append(e)
-
         total_alerts  = len(entries)
         comprar_count = sum(1 for e in entries if e["verdict"] == "COMPRAR")
         avg_score     = sum(e["score"] for e in entries) / total_alerts
         best          = max(entries, key=lambda x: x["score"])
-
         lines += [
             "*📋 Alertas da semana:*",
             f"  Total: *{total_alerts}* | COMPRAR: *{comprar_count}* | MONITORIZAR: *{total_alerts - comprar_count}*",
             f"  Score médio: *{avg_score:.1f}/20* | Melhor: *{best['symbol']}* (score {best['score']:.0f}, {best['date']})",
             "",
+            "*🗓️ Por dia:*",
         ]
-
-        lines.append("*🗓️ Por dia:*")
         for date_str in sorted(by_date.keys()):
             day_entries = by_date[date_str]
             lines.append(f"  *{date_str}* — {len(day_entries)} alerta(s)")
             for e in sorted(day_entries, key=lambda x: x["score"], reverse=True):
-                verdict_badge = "🟢" if e["verdict"] == "COMPRAR" else "🟡"
+                badge = "🟢" if e["verdict"] == "COMPRAR" else "🟡"
                 lines.append(
-                    f"    {verdict_badge} *{e['symbol']}* Score {e['score']:.0f}/20 | "
-                    f"{e['change']:+.1f}% | _{e['sector']}_"
+                    f"    {badge} *{e['symbol']}* Score {e['score']:.0f}/20 | "
+                    f"{e['change']:+.1f}% | _{e['sector']}_ | {e.get('time','')}"
                 )
         lines.append("")
-
         top3 = sorted(entries, key=lambda x: x["score"], reverse=True)[:3]
         lines.append("*🏆 Top 3 da semana:*")
         for i, e in enumerate(top3, 1):
             lines.append(f"  {i}. *{e['symbol']}* — Score {e['score']:.0f}/20 | {e['verdict']} | {e['date']}")
         lines.append("")
 
-    # ── Bloco 2: Weekly dips (quedas ≥10% nos últimos 7 dias) ─────────────
+    # ── Bloco 2: rejected log do dia (hoje = sábado) ──────────────────
+    rejected = load_rejected_log()
+    if rejected:
+        lines += [
+            "*🗑️ Rejeitados hoje (sem alerta):*",
+            "_Stocks analisados que não cumpriram os critérios_",
+            "",
+        ]
+        for r in sorted(rejected, key=lambda x: x.get("score") or 0, reverse=True)[:10]:
+            score_str = f" | Score {r['score']:.0f}/20" if r.get("score") is not None else ""
+            verdict_str = f" | {r['verdict']}" if r.get("verdict") else ""
+            lines.append(
+                f"  ⛔ *{r['symbol']}* {r['change']:+.1f}% | "
+                f"Motivo: _{r['reason']}{score_str}{verdict_str}_"
+            )
+        lines.append("")
+
+    # ── Bloco 3 & 4: period dips (weekly + monthly) com score top 5 ──────
     lines += [
-        "─" * 30,
-        "",
+        "─" * 30, "",
         "*📉 Weekly Dips — quedas ≥10% nos últimos 7 dias:*",
-        "_Stocks dos feeds Yahoo com maior queda acumulada semanal_",
+        "_Top 5 com score calculado; restantes só listados_",
         "",
     ]
     try:
@@ -383,18 +415,43 @@ def send_saturday_report() -> None:
         weekly  = period_dips.get("weekly", [])
         monthly = period_dips.get("monthly", [])
 
-        if weekly:
-            for s in weekly[:10]:
+        def _score_period_list(stocks: list, label: str) -> None:
+            """Calcula score para top 5; restantes só lista."""
+            for i, s in enumerate(stocks[:10]):
+                sym          = s["symbol"]
                 mc_b         = (s.get("market_cap") or 0) / 1e9
-                in_portfolio = " 💼" if s["symbol"] in DIRECT_TICKERS else ""
-                lines.append(
-                    f"  📉 *{s['symbol']}*{in_portfolio}: *{s['change_pct']:.1f}%* (7d) "
-                    f"| ${s['price']} | ${mc_b:.1f}B"
-                )
+                in_portfolio = " 💼" if sym in DIRECT_TICKERS else ""
+                if i < 5:
+                    try:
+                        fund = get_fundamentals(sym, min_market_cap=MIN_MARKET_CAP)
+                        if not fund.get("skip"):
+                            ed = get_earnings_days(sym)
+                            score, rsi_str = calculate_dip_score(fund, sym, ed)
+                            badge = "🔥" if score >= 16 else ("⭐" if score >= 11 else "📊")
+                            lines.append(
+                                f"  {badge} *{sym}*{in_portfolio}: *{s['change_pct']:.1f}%* ({label}) "
+                                f"| Score {score:.0f}/20 | ${s['price']} | ${mc_b:.1f}B"
+                            )
+                        else:
+                            lines.append(
+                                f"  📉 *{sym}*{in_portfolio}: *{s['change_pct']:.1f}%* ({label}) | ${s['price']} | ${mc_b:.1f}B"
+                            )
+                        time.sleep(4)
+                    except Exception as e:
+                        logging.warning(f"Period dip score {sym}: {e}")
+                        lines.append(
+                            f"  📉 *{sym}*{in_portfolio}: *{s['change_pct']:.1f}%* ({label}) | ${s['price']} | ${mc_b:.1f}B"
+                        )
+                else:
+                    lines.append(
+                        f"  • *{sym}*{in_portfolio}: {s['change_pct']:.1f}% | ${s['price']} | ${mc_b:.1f}B"
+                    )
+
+        if weekly:
+            _score_period_list(weekly, "7d")
         else:
             lines.append("  _Nenhum stock com queda ≥10% na semana._")
 
-        # ── Bloco 3: Monthly dips (quedas ≥15% no último mês) ─────────────
         lines += [
             "",
             "*📉 Monthly Dips — quedas ≥15% no último mês:*",
@@ -402,13 +459,7 @@ def send_saturday_report() -> None:
             "",
         ]
         if monthly:
-            for s in monthly[:10]:
-                mc_b         = (s.get("market_cap") or 0) / 1e9
-                in_portfolio = " 💼" if s["symbol"] in DIRECT_TICKERS else ""
-                lines.append(
-                    f"  📉 *{s['symbol']}*{in_portfolio}: *{s['change_pct']:.1f}%* (30d) "
-                    f"| ${s['price']} | ${mc_b:.1f}B"
-                )
+            _score_period_list(monthly, "30d")
         else:
             lines.append("  _Nenhum stock com queda ≥15% no mês._")
 
@@ -416,14 +467,14 @@ def send_saturday_report() -> None:
         logging.error(f"Saturday period dips: {e}")
         lines.append(f"  _Erro ao calcular period dips: {e}_")
 
-    # ── Limpa log semanal e fecha mensagem ────────────────────────────────
-    _save_weekly_log([])
-    lines += ["", f"_⏰ Próximo report: sábado às 10h_"]
+    # ── Fecha ─────────────────────────────────────────────────────────────
+    save_weekly_log([])
+    lines += ["", "_⏰ Próximo report: sábado às 10h_"]
     send_telegram("\n".join(lines))
     logging.info("Saturday report enviado e log semanal limpo.")
 
 
-# ── Target Sell ─────────────────────────────────────────────────────────────
+# ── Target Sell / Flip ─────────────────────────────────────────────────
 
 _SECTOR_FLIP_CAP = {
     "Technology":             0.55,
@@ -449,10 +500,8 @@ def calculate_flip_target(
     price = fundamentals.get("price") or 0
     if not price or price <= 0:
         return "N/D", "SEM DADOS"
-
     if is_bluechip(fundamentals) and dip_score >= 12:
         return "HOLD ETERNO", "💎 Blue chip — Adicionar em dips, nunca vender"
-
     sector         = fundamentals.get("sector", "")
     sector_cfg     = get_sector_config(sector)
     pe_current     = fundamentals.get("pe") or 0
@@ -460,28 +509,22 @@ def calculate_flip_target(
     analyst_target = fundamentals.get("analyst_target")
     analyst_upside = fundamentals.get("analyst_upside") or 0
     beta           = fundamentals.get("beta") or 1.0
-
     anchors = []
     if pe_current and pe_current > 0 and pe_fair and pe_current < pe_fair:
         anchors.append(("PE rerating", price * (pe_fair / pe_current)))
     if analyst_target and analyst_target > price:
         anchors.append(("Analistas", float(analyst_target)))
     anchors.append(("Beta recovery", price * (1 + (beta or 1.0) * 0.12)))
-
-    weights         = {"PE rerating": 2, "Analistas": 2, "Beta recovery": 1}
-    total_w         = sum(weights[n] for n, _ in anchors)
-    weighted_price  = sum(weights[n] * t for n, t in anchors) / total_w
+    weights        = {"PE rerating": 2, "Analistas": 2, "Beta recovery": 1}
+    total_w        = sum(weights[n] for n, _ in anchors)
+    weighted_price = sum(weights[n] * t for n, t in anchors) / total_w
     weighted_upside = (weighted_price / price) - 1
-
     sector_cap = _SECTOR_FLIP_CAP.get(sector, 0.30)
     if dip_score >= 18:   sector_cap *= 1.20
     elif dip_score >= 15: sector_cap *= 1.10
-
     final_upside = min(weighted_upside, sector_cap)
     final_target = price * (1 + final_upside)
-
     macro_flag = f" | 🌍 Queda macro SPY {spy_change:.1f}% — timeline incerta" if spy_change and spy_change <= -2.0 else ""
-
     if catalyst and catalyst.get("found"):
         snippet  = f": _{catalyst['snippet']}_" if catalyst.get("snippet") else ""
         cat_flag = f" | {catalyst['label']}{snippet}"
@@ -491,12 +534,11 @@ def calculate_flip_target(
         cat_flag = " | 📡 Analistas veem upside forte"
     else:
         cat_flag = " | ⚠️ Sem catalisador identificado"
-
     strategy = f"🎯 Flip: ${final_target:.1f} (+{final_upside*100:.0f}%){cat_flag}{macro_flag}"
     return f"${final_target:.1f} (+{final_upside*100:.0f}%)", strategy
 
 
-# ── Ranking Flip ──────────────────────────────────────────────────────────────
+# ── Ranking Flip ───────────────────────────────────────────────────────────
 
 def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None) -> str:
     if not ranked_entries:
@@ -527,7 +569,7 @@ def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None) -> 
     return "\n".join(lines)
 
 
-# ── Alerta individual ─────────────────────────────────────────────────────────
+# ── Alerta individual ────────────────────────────────────────────────────────
 
 def build_alert(
     stock, fundamentals, historical_pe, news,
@@ -575,7 +617,7 @@ def build_alert(
     return "\n".join(lines)
 
 
-# ── Scan contínuo ─────────────────────────────────────────────────────────────
+# ── Scan contínuo ───────────────────────────────────────────────────────────
 
 def run_scan() -> None:
     global _scan_running
@@ -589,6 +631,9 @@ def run_scan() -> None:
     today = datetime.now().date().isoformat()
     logging.info(f"A correr scan — {datetime.now().strftime('%H:%M')}")
     try:
+        # Portfolio stress em paralelo com o scan
+        check_portfolio_stress()
+
         losers = screen_global_dips(min_drop_pct=DROP_THRESHOLD, min_market_cap=MIN_MARKET_CAP)
         if not losers:
             logging.info("Sem candidatos hoje.")
@@ -602,19 +647,23 @@ def run_scan() -> None:
                 logging.info(f"A analisar {symbol} ({stock['change_pct']:.1f}%)...")
                 fundamentals = get_fundamentals(symbol, stock.get("region", ""), MIN_MARKET_CAP)
                 if fundamentals.get("skip"):
-                    _alerted_today.add(alert_key); _save_alerts(_alerted_today)
+                    append_rejected_log(symbol, stock["change_pct"], "cap_insuficiente")
+                    _alerted_today.add(alert_key); save_alerts(_alerted_today)
                     continue
                 sector = fundamentals.get("sector", "")
                 verdict, emoji, reasons = score_fundamentals(fundamentals, sector)
                 if verdict == "EVITAR":
                     logging.info(f"  {symbol}: EVITAR — a saltar")
-                    _alerted_today.add(alert_key); _save_alerts(_alerted_today)
+                    append_rejected_log(symbol, stock["change_pct"], "EVITAR", verdict=verdict, sector=sector)
+                    _alerted_today.add(alert_key); save_alerts(_alerted_today)
                     continue
                 earnings_days      = get_earnings_days(symbol)
                 dip_score, rsi_str = calculate_dip_score(fundamentals, symbol, earnings_days)
                 if dip_score < MIN_DIP_SCORE:
                     logging.info(f"  {symbol}: score {dip_score} < {MIN_DIP_SCORE} — a saltar")
-                    _alerted_today.add(alert_key); _save_alerts(_alerted_today)
+                    append_rejected_log(symbol, stock["change_pct"], "score_baixo",
+                                        score=dip_score, verdict=verdict, sector=sector)
+                    _alerted_today.add(alert_key); save_alerts(_alerted_today)
                     continue
                 historical_pe = get_historical_pe(symbol)
                 news          = get_news(symbol)
@@ -624,8 +673,8 @@ def run_scan() -> None:
                 )
                 if send_telegram(message):
                     _alerted_today.add(alert_key)
-                    _save_alerts(_alerted_today)
-                    _log_alert(symbol, verdict, dip_score, stock["change_pct"], sector)
+                    save_alerts(_alerted_today)
+                    append_weekly_log(symbol, verdict, dip_score, stock["change_pct"], sector)
                     logging.info(f"  ✅ Alerta: {symbol} ({verdict}, score {dip_score}/20)")
                 time.sleep(5)
             except Exception as e:
@@ -634,7 +683,7 @@ def run_scan() -> None:
         _scan_running = False
 
 
-# ── Resumo abertura (15h30) ───────────────────────────────────────────────────
+# ── Resumo abertura (15h30) ───────────────────────────────────────────────
 
 def send_open_summary() -> None:
     tier1 = screen_global_dips(min_drop_pct=DROP_THRESHOLD, min_market_cap=MIN_MARKET_CAP)
@@ -655,7 +704,7 @@ def send_open_summary() -> None:
     send_telegram("\n".join(lines))
 
 
-# ── Resumo fecho (21h15) ──────────────────────────────────────────────────────
+# ── Resumo fecho (21h15) ─────────────────────────────────────────────────
 
 def send_close_summary() -> None:
     start_time = time.time()
@@ -774,22 +823,26 @@ def send_close_summary() -> None:
     send_telegram("\n".join(lines))
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     logging.info("=" * 60)
     logging.info("DipRadar iniciado")
     logging.info(f"Threshold: {DROP_THRESHOLD}% | Min cap: ${MIN_MARKET_CAP/1e9:.0f}B")
     logging.info(f"Scan a cada {SCAN_MINUTES} minutos | Min score: {MIN_DIP_SCORE}/20")
+    logging.info(f"Portfolio stress alert: >{STRESS_PCT:.0f}% por posição | >3% total")
     logging.info("=" * 60)
 
     send_telegram(
         f"🤖 *DipRadar iniciado*\n"
         f"Tier 1: ≥{DROP_THRESHOLD}% | Tier 2: 7–{DROP_THRESHOLD:.0f}% | Tier 3: 3–8% (score≥11)\n"
         f"Score: 0–20 | Min alerta: {MIN_DIP_SCORE}/20\n"
+        f"Portfolio stress: >{STRESS_PCT:.0f}% por posição | >3% total \n"
         f"Weekly scan: ✅ Segunda 8h45 | Saturday report: ✅ Sábado 10h\n"
-        f"Weekly dips (7d ≥10%) + Monthly dips (30d ≥15%): ✅ No Saturday report\n"
-        f"Catalisadores Tavily: {'✅' if os.environ.get('TAVILY_API_KEY') else '⚠️ não configurado'}\n"
+        f"Weekly dips (7d ≥10%) + Monthly dips (30d ≥15%): ✅ Com score\n"
+        f"Rejeitados: ✅ Auditoria diária no Saturday report\n"
+        f"Persistência: {'Volume /data/' if __import__('pathlib').Path('/data').exists() else '/tmp/ (sem volume)'} \n"
+        f"Catalisadores Tavily: {'✅' if __import__('os').environ.get('TAVILY_API_KEY') else '⚠️ não configurado'}\n"
         f"_Scan a cada {SCAN_MINUTES} minutos (só horas de mercado)_"
     )
 
@@ -800,7 +853,10 @@ if __name__ == "__main__":
     schedule.every().day.at("15:30").do(send_open_summary)
     schedule.every().day.at("21:15").do(send_close_summary)
     schedule.every().day.at("00:01").do(
-        lambda: (_alerted_today.clear(), _save_alerts(_alerted_today))
+        lambda: (
+            _alerted_today.clear(), save_alerts(_alerted_today),
+            _stress_alerted.clear(),
+        )
     )
 
     run_scan()
