@@ -20,7 +20,7 @@ import schedule
 import requests
 from datetime import datetime
 from market_client import (
-    screen_big_drops, get_fundamentals, get_news,
+    screen_global_dips, get_fundamentals, get_news,
     get_historical_pe, get_52w_drawdown,
 )
 from sectors import get_sector_config, score_fundamentals
@@ -102,7 +102,7 @@ def run_scan() -> None:
     today = datetime.now().date().isoformat()
     logging.info(f"A correr scan — {datetime.now().strftime('%H:%M')}")
 
-    losers = screen_big_drops(
+    losers = screen_global_dips(
         min_drop_pct=DROP_THRESHOLD,
         min_market_cap=MIN_MARKET_CAP,
     )
@@ -118,7 +118,7 @@ def run_scan() -> None:
 
         try:
             logging.info(f"A analisar {symbol} ({stock['change_pct']:.1f}%)...")
-            fundamentals = get_fundamentals(symbol)
+            fundamentals = get_fundamentals(symbol, stock.get("region", ""))
             if fundamentals.get("skip"):
                 _alerted_today.add(alert_key)
                 continue
@@ -150,7 +150,7 @@ def run_scan() -> None:
 # Mostra só Tier 1 (≥10%) — candidatos para investigares durante o dia.
 
 def send_open_summary() -> None:
-    tier1 = screen_big_drops(
+    tier1 = screen_global_dips(
         min_drop_pct=DROP_THRESHOLD,
         min_market_cap=MIN_MARKET_CAP,
     )
@@ -178,7 +178,7 @@ def send_open_summary() -> None:
 # Dois tiers + drawdown desde o máximo de 52 semanas para cada Tier 1.
 
 def send_close_summary() -> None:
-    all_losers = screen_big_drops(
+    all_losers = screen_global_dips(
         min_drop_pct=7.0,
         min_market_cap=MIN_MARKET_CAP,
     )
