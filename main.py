@@ -22,7 +22,7 @@ import json
 import logging
 import schedule
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from market_client import (
     screen_global_dips, get_fundamentals, get_news,
@@ -47,15 +47,14 @@ MIN_MARKET_CAP   = int(os.environ.get("MIN_MARKET_CAP", "2000000000"))
 SCAN_MINUTES     = int(os.environ.get("SCAN_EVERY_MINUTES", "30"))
 MIN_DIP_SCORE    = int(os.environ.get("MIN_DIP_SCORE", "5"))
 
-# ── Cache de alertas persistido em ficheiro ───────────────────────────────────────
+# ── Cache de alertas persistido em ficheiro ──────────────────────────────────
 _ALERTS_FILE = Path("/tmp/dipadar_alerts.json")
 
 def _load_alerts() -> set:
     try:
         if _ALERTS_FILE.exists():
-            data = json.loads(_ALERTS_FILE.read_text())
+            data  = json.loads(_ALERTS_FILE.read_text())
             today = datetime.now().date().isoformat()
-            # Limpa entradas de outros dias
             return {k for k in data.get("keys", []) if k.endswith(today)}
     except Exception:
         pass
@@ -69,16 +68,18 @@ def _save_alerts(alert_set: set) -> None:
 
 _alerted_today: set = _load_alerts()
 
-# ── Lock para evitar scans sobrepostos ──────────────────────────────────────────
+# ── Lock para evitar scans sobrepostos ──────────────────────────────────────
 _scan_running: bool = False
 
 
-# ── Telegram ───────────────────────────────────────────────────────────────────
+# ── Telegram ─────────────────────────────────────────────────────────────────
 
-def send_telegram(message: str) -> bool:
+def send_telegram(message: str, retries: int = 2) -> bool:
+    """Envia mensagem Telegram com retry automático e divisão em chunks >4000 chars."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print(message)
         return True
+
     chunks = []
     while len(message) > 4000:
         split_at = message.rfind("\n", 0, 4000)
@@ -87,30 +88,36 @@ def send_telegram(message: str) -> bool:
         chunks.append(message[:split_at])
         message = message[split_at:].lstrip("\n")
     chunks.append(message)
+
     url    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     all_ok = True
+
     for chunk in chunks:
-        try:
-            r = requests.post(url, json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": chunk,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": True,
-            }, timeout=10)
-            r.raise_for_status()
-            if len(chunks) > 1:
-                time.sleep(1)
-        except Exception as e:
-            logging.error(f"Telegram: {e}")
+        sent = False
+        for attempt in range(retries + 1):
+            try:
+                r = requests.post(url, json={
+                    "chat_id":                  TELEGRAM_CHAT_ID,
+                    "text":                     chunk,
+                    "parse_mode":               "Markdown",
+                    "disable_web_page_preview": True,
+                }, timeout=10)
+                r.raise_for_status()
+                sent = True
+                break
+            except Exception as e:
+                logging.error(f"Telegram (tentativa {attempt+1}/{retries+1}): {e}")
+                if attempt < retries:
+                    time.sleep(3)
+        if not sent:
             all_ok = False
+        elif len(chunks) > 1:
+            time.sleep(1)
+
     return all_ok
 
 
-# ── Heartbeat das 9h — carteira pessoal ──────────────────────────────────────
-
-def _fmt_eur(v: float, show_sign: bool = False) -> str:
-    sign = "+" if v >= 0 else ""
-    return f"{sign if show_sign else ''}€{v:,.2f}"
+# ── Heartbeat das 9h — carteira pessoal ─────────────────────────────────────
 
 def _pnl_emoji(v: float) -> str:
     if v > 0:  return "🟢"
@@ -127,23 +134,28 @@ def send_heartbeat() -> None:
         )
     except Exception as e:
         logging.error(f"Heartbeat snapshot: {e}")
-        send_telegram(f"🤖 *DipRadar* ativo — {datetime.now().strftime('%d/%m %H:%M')}\n_Erro ao calcular carteira: {e}_")
+        send_telegram(
+            f"🤖 *DipRadar* ativo — {datetime.now().strftime('%d/%m %H:%M')}\n"
+            f"_Erro ao calcular carteira: {e}_"
+        )
         return
 
-    total   = snapshot["total_eur"]
-    pnl_d   = snapshot["pnl_day"]
-    pnl_w   = snapshot["pnl_week"]
-    pnl_m   = snapshot["pnl_month"]
-    pnl_tot = snapshot["pnl_total"]
-    fx      = snapshot["usd_eur"]
+    total    = snapshot["total_eur"]
+    # Às 9h o mercado ainda está fechado — o P&L "hoje" seria sempre 0.
+    # Mostramos o P&L do dia anterior (ontem), semanal e mensal confirmados.
+    pnl_d    = snapshot["pnl_day"]    # = variação do dia anterior (fecho-1 vs fecho-2)
+    pnl_w    = snapshot["pnl_week"]
+    pnl_m    = snapshot["pnl_month"]
+    pnl_tot  = snapshot["pnl_total"]
+    fx       = snapshot["usd_eur"]
+    total_cost = snapshot.get("total_cost", 0)
 
     def _pct(pnl, base):
         if base and base != 0:
-            return f" ({'+' if pnl>=0 else ''}{pnl/base*100:.2f}%)"
+            return f" ({'+' if pnl >= 0 else ''}{pnl / base * 100:.2f}%)"
         return ""
 
-    # Total investido estimado (posições com custo conhecido)
-    total_cost = snapshot.get("total_cost", 0)
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%d/%m")
 
     lines = [
         f"🤖 *DipRadar — Bom dia!* {datetime.now().strftime('%d/%m/%Y')}",
@@ -151,15 +163,17 @@ def send_heartbeat() -> None:
         "",
         f"*💼 Carteira total: €{total:,.2f}*",
         "",
-        f"  {_pnl_emoji(pnl_d)}  *Hoje:*    €{pnl_d:+,.2f}{_pct(pnl_d, total - pnl_d)}",
-        f"  {_pnl_emoji(pnl_w)}  *Semana:*  €{pnl_w:+,.2f}{_pct(pnl_w, total - pnl_w)}",
-        f"  {_pnl_emoji(pnl_m)}  *Mês:*     €{pnl_m:+,.2f}{_pct(pnl_m, total - pnl_m)}",
+        f"  {_pnl_emoji(pnl_d)}  *Ontem ({yesterday}):*  €{pnl_d:+,.2f}{_pct(pnl_d, total - pnl_d)}",
+        f"  {_pnl_emoji(pnl_w)}  *Semana:*            €{pnl_w:+,.2f}{_pct(pnl_w, total - pnl_w)}",
+        f"  {_pnl_emoji(pnl_m)}  *Mês:*               €{pnl_m:+,.2f}{_pct(pnl_m, total - pnl_m)}",
     ]
 
     if pnl_tot is not None:
-        lines.append(f"  {_pnl_emoji(pnl_tot)}  *Total:*   €{pnl_tot:+,.2f}{_pct(pnl_tot, total_cost)}")
+        lines.append(
+            f"  {_pnl_emoji(pnl_tot)}  *Total investido:*   €{pnl_tot:+,.2f}{_pct(pnl_tot, total_cost)}"
+        )
 
-    # Top 3 movers do dia
+    # Top 3 winners + pior do dia anterior
     movers = sorted(
         [p for p in snapshot["positions"] if p["pnl_day"] is not None],
         key=lambda x: x["pnl_day"],
@@ -167,29 +181,36 @@ def send_heartbeat() -> None:
     )
     if movers:
         lines.append("")
-        lines.append("*📈 Top movers hoje:*")
+        lines.append(f"*📈 Top movers {yesterday}:*")
         for p in movers[:3]:
-            pct = p["pnl_day"] / (p["value_eur"] - p["pnl_day"]) * 100 if (p["value_eur"] - p["pnl_day"]) != 0 else 0
-            lines.append(f"  {_pnl_emoji(p['pnl_day'])} *{p['symbol']}*: €{p['pnl_day']:+,.2f} ({pct:+.1f}%)")
-        # Pior mover
+            base = p["value_eur"] - p["pnl_day"]
+            pct  = p["pnl_day"] / base * 100 if base != 0 else 0
+            lines.append(
+                f"  {_pnl_emoji(p['pnl_day'])} *{p['symbol']}*: "
+                f"€{p['pnl_day']:+,.2f} ({pct:+.1f}%)"
+            )
         worst = movers[-1]
-        if worst["pnl_day"] < 0 and worst != movers[0]:
-            pct = worst["pnl_day"] / (worst["value_eur"] - worst["pnl_day"]) * 100 if (worst["value_eur"] - worst["pnl_day"]) != 0 else 0
-            lines.append(f"  {_pnl_emoji(worst['pnl_day'])} *{worst['symbol']}*: €{worst['pnl_day']:+,.2f} ({pct:+.1f}%) ← pior")
+        if worst["pnl_day"] < 0 and worst["symbol"] != movers[0]["symbol"]:
+            base = worst["value_eur"] - worst["pnl_day"]
+            pct  = worst["pnl_day"] / base * 100 if base != 0 else 0
+            lines.append(
+                f"  {_pnl_emoji(worst['pnl_day'])} *{worst['symbol']}*: "
+                f"€{worst['pnl_day']:+,.2f} ({pct:+.1f}%) ← pior"
+            )
 
     lines += [
         "",
-        f"  📊 PPR (proxy): €{snapshot['ppr_value']:,.2f}",
+        f"  📊 PPR (proxy ACWI): €{snapshot['ppr_value']:,.2f}",
         f"  💜 CashBack Pie: €{snapshot['cashback_eur']:,.2f}",
         "",
-        f"_Mercado abre às 14h30 Lisboa_",
+        "_Mercado abre às 14h30 Lisboa_",
     ]
 
     send_telegram("\n".join(lines))
     logging.info("Heartbeat enviado.")
 
 
-# ── Target Sell ─────────────────────────────────────────────────────────────────
+# ── Target Sell ───────────────────────────────────────────────────────────────
 
 _BLUECHIP_SECTORS = {"Consumer Defensive", "Utilities", "Financial Services"}
 _SECTOR_FLIP_CAP  = {
@@ -298,7 +319,7 @@ def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None) -> 
     return "\n".join(lines)
 
 
-# ── Alerta individual ──────────────────────────────────────────────────────────
+# ── Alerta individual ─────────────────────────────────────────────────────────
 
 def build_alert(
     stock, fundamentals, historical_pe, news,
@@ -342,17 +363,15 @@ def build_alert(
     return "\n".join(lines)
 
 
-# ── Scan contínuo ──────────────────────────────────────────────────────────────
+# ── Scan contínuo ─────────────────────────────────────────────────────────────
 
 def run_scan() -> None:
     global _scan_running
 
-    # ── Guard: mercado fechado ──────────────────────────────────────────
     if not is_market_open():
         logging.info("Mercado fechado — scan ignorado.")
         return
 
-    # ── Guard: scan já em curso ──────────────────────────────────────────
     if _scan_running:
         logging.warning("Scan anterior ainda em curso — a saltar.")
         return
@@ -406,7 +425,7 @@ def run_scan() -> None:
         _scan_running = False
 
 
-# ── Resumo abertura (15h30) ────────────────────────────────────────────────
+# ── Resumo abertura (15h30) ───────────────────────────────────────────────────
 
 def send_open_summary() -> None:
     tier1 = screen_global_dips(min_drop_pct=DROP_THRESHOLD, min_market_cap=MIN_MARKET_CAP)
@@ -426,7 +445,7 @@ def send_open_summary() -> None:
     send_telegram("\n".join(lines))
 
 
-# ── Resumo fecho (21h15) ─────────────────────────────────────────────────
+# ── Resumo fecho (21h15) ──────────────────────────────────────────────────────
 
 def send_close_summary() -> None:
     start_time = time.time()
@@ -544,7 +563,7 @@ def send_close_summary() -> None:
     send_telegram("\n".join(lines))
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     logging.info("=" * 60)
@@ -559,7 +578,7 @@ if __name__ == "__main__":
         f"Tier 1: ≥{DROP_THRESHOLD}% | Tier 2: 7–{DROP_THRESHOLD:.0f}% | Tier 3: 3–8% (score≥8)\n"
         f"Cap mínimo: ${MIN_MARKET_CAP/1e9:.0f}B | Score mínimo: {MIN_DIP_SCORE}/10\n"
         f"Catalisadores Tavily: {'✅' if os.environ.get('TAVILY_API_KEY') else '⚠️ não configurado'}\n"
-        f"Heartbeat carteira: ✅ 9h diário\n"
+        f"Heartbeat carteira: ✅ 9h diário (P&L de ontem + semana + mês)\n"
         f"_Scan a cada {SCAN_MINUTES} minutos (só horas de mercado)_"
     )
 
@@ -567,7 +586,9 @@ if __name__ == "__main__":
     schedule.every().day.at("09:00").do(send_heartbeat)
     schedule.every().day.at("15:30").do(send_open_summary)
     schedule.every().day.at("21:15").do(send_close_summary)
-    schedule.every().day.at("00:01").do(lambda: (_alerted_today.clear(), _save_alerts(_alerted_today)))
+    schedule.every().day.at("00:01").do(
+        lambda: (_alerted_today.clear(), _save_alerts(_alerted_today))
+    )
 
     run_scan()
 

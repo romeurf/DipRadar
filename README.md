@@ -9,124 +9,70 @@
 ---
 
 ### 💡 The Vision
-**DipRadar** monitors **US, Europe, UK and Asia** markets simultaneously for sharp daily selloffs in quality companies. It filters every dip through a two-layer system — qualitative sector analysis + quantitative score — and delivers actionable Telegram alerts with DCF valuation, news context and RSI signal.
+**DipRadar** monitors global markets for sharp daily selloffs in quality companies. It filters every dip through sector-aware qualitative analysis + a quantitative score, and delivers Telegram alerts with DCF valuation, RSI signal, historical P/E and news context. It also sends a daily 9h portfolio heartbeat with P&L by day, week and month.
 
 ### 🚀 At a Glance
 - 🌍 **Global Screening**: US + Europe + UK + Asia via Yahoo Finance (free, no API key)
 - 💰 **Market Cap Filter**: Only $2B+ companies (no penny stocks)
 - 🎯 **Sector Precision**: 11 sectors with custom thresholds (Tech vs. Utilities vs. REITs)
-- 📊 **Quantitative Score**: 0–10 score per dip (FCF, growth, margins, RSI, D/E)
-- 📈 **Valuation Layer**: Simplified DCF + WACC by sector + Margin of Safety
+- 📊 **Quantitative Score**: 0–10 per dip (FCF, growth, margins, RSI, D/E, PE, analyst upside)
+- 📈 **Valuation Layer**: DCF + WACC by sector + historical P/E (3y) + Margin of Safety
 - 🔔 **Three Verdicts**: COMPRAR 🟢 / MONITORIZAR 🟡 / EVITAR 🔴
-- 📰 **News Context**: Latest 3 headlines per alert
+- 💼 **Portfolio Heartbeat**: Daily 9h message with total value, P&L yesterday/week/month
 - ⏰ **Daily Summaries**: Opening (+1h at 15:30) and Close (+15min at 21:15) Lisbon time
+- 🔒 **Scan Safety**: Market-hours guard + overlap lock + persistent alert cache
 
 ---
 
 ### ⚙️ How It Works
 
 ```
-1. Every 30min → Yahoo Finance screener (US + Europe + UK + Asia)
+1. Every 30min (market hours only) → Yahoo Finance screener
 2. Filter: drop ≥8% + market cap ≥$2B + no ETFs
 3. score_fundamentals() → COMPRAR / MONITORIZAR / EVITAR (qualitative)
-4. calculate_dip_score() → 0–10 score (quantitative)
+4. calculate_dip_score() → 0–10 score (quantitative, 8 criteria)
 5. if score < MIN_DIP_SCORE → skip
-6. Telegram alert with: region, sector, score badge, RSI,
-   P/E vs historical, FCF yield, DCF intrinsic, analyst target, news
-7. 15:30 → opening summary (Tier 1 candidates)
-8. 21:15 → close summary (Tier 1 + Tier 2 with 52w drawdown)
-```
-
-```mermaid
-graph LR
-    A[Yahoo Finance\n4 Regions] --> B[Drop + Cap\nFilter]
-    B --> C[Sector\nScore]
-    C --> D[Dip\nScore 0-10]
-    D --> E[DCF +\nValuation]
-    E --> F[Telegram\nAlert]
+6. Telegram alert with: sector, score, RSI, P/E vs 3y historical,
+   FCF yield, DCF intrinsic, analyst target, news
+7. 09:00 → portfolio heartbeat (P&L ontem/semana/mês)
+8. 15:30 → opening summary (Tier 1 candidates)
+9. 21:15 → close summary (Tier 1 + Tier 2 + Tier 3 gems + Flip ranking)
 ```
 
 ---
 
-### 📊 Quantitative Score System
+### 📊 Quantitative Score (0–10)
 
-Each dip gets scored 0–10 based on objective criteria:
-
-| Criterion | Points | Logic |
+| Criterion | Points | Condition |
 | :--- | :---: | :--- |
-| FCF Yield > 5% | **+3** | Cash-generative business |
-| Revenue Growth > 10% | **+2** | Growing top line |
-| Gross Margin > 40% | **+2** | Premium economics |
-| RSI < 30 | **+2** | Technically oversold |
-| Debt/Equity < 1 | **+1** | Clean balance sheet |
+| FCF Yield | **+2** / +1 | >5% / >3% |
+| Revenue Growth | **+2** / +1 | >10% / >5% |
+| Gross Margin | **+1** | >40% |
+| RSI oversold | **+2** / +1 | <30 / <40 |
+| Debt/Equity | **+1** | <100 (yfinance format) |
+| PE vs fair | **+1** | <75% of sector fair PE |
+| 52w Drawdown | **+1** | <-20% from high |
+| Analyst Upside | **+1** | >25% consensus upside |
 
-**Score badges in alerts:**
-- 🔥 `Score: 8–10` → Top tier gem
-- ⭐ `Score: 6–7` → Strong candidate
-- 📊 `Score: 4–5` → Monitor closely
+**Score badges:** 🔥 8–10 · ⭐ 6–7 · 📊 <6
 
 ---
 
 ### 📊 Sector Intelligence
 
-| Sector | Key Metrics | Red Flags |
-| :--- | :--- | :--- |
-| 💻 **Technology** | FCF Yield, Growth, Gross Margin | FCF negativo, Revenue decline |
-| 🏥 **Healthcare** | R&D Pipeline, FCF Yield | FDA rejection, Patent cliff |
-| 🏦 **Financials** | P/B, ROE, NIM | Credit losses rising |
-| 🛍️ **Consumer Cyclical** | Same-store sales, Inventory | SSS negativo, Margin compression |
-| 🛒 **Consumer Defensive** | Dividend growth, Pricing power | Dividend cut |
-| 🏭 **Industrials** | Backlog, FCF Yield | Backlog decline |
-| 🏢 **Real Estate** | FFO Yield, Occupancy | Occupancy falling |
-| ⚡ **Energy** | FCF at $60 oil, Dividend | FCF negativo a $60 barril |
-| 📡 **Communication** | Subscriber growth, ARPU | Subscriber loss |
-| 💡 **Utilities** | Dividend yield, Rate base | Regulatory adverso |
-| 🪨 **Materials** | FCF Yield, Cost curve | Commodity collapse |
-
----
-
-### 📱 Sample Telegram Alert
-
-```
-📉 CHTR — Charter Communications (US)
-Queda: -25.5% | 52w: -42%
-💰 Preço: $250 | 🏦 Cap: $30.1B
-🏢 Sector: 📡 Comunicação
-🔥 Score: 8/10 | RSI: 28
-
-🟢 Veredito: COMPRAR
-  P/E 12.1x — 25%+ abaixo do justo (20x) para o sector
-  FCF yield 6.2% — muito atrativo
-
-📊 Fundamentos:
-  • P/E: 12.1x vs hist. 22.0x (-45%)
-  • FCF Yield: 6.2%
-  • DCF intrínseco: $320.4 (margem: +28%)
-  • EV/EBITDA: 7.2x
-  • Revenue growth: 4.1%
-  • Gross margin: 47.3%
-  • Target analistas: $310.0 (+24%)
-
-📰 Notícias:
-  [Charter beats Q1 earnings estimates...](url) Reuters
-  [Cable giant cuts capex guidance...](url) Bloomberg
-
-⏰ 27/04 15:42
-```
-
----
-
-### 📦 Project Structure
-
-| File | Role |
-| :--- | :--- |
-| `main.py` | Engine: scheduler, scan loop, Telegram delivery |
-| `market_client.py` | Data: global screener (4 regions), fundamentals, RSI |
-| `sectors.py` | Logic: 11-sector qualitative scoring (COMPRAR/MONITORIZAR/EVITAR) |
-| `score.py` | Score: quantitative 0–10 dip quality score |
-| `valuation.py` | Insight: DCF, WACC by sector, Margin of Safety |
-| `railway.toml` | Deploy: Railway production config |
-| `requirements.txt` | Dependencies |
+| Sector | P/E Fair | FCF Min | Key Metrics |
+| :--- | :---: | :---: | :--- |
+| 💻 Technology | 35x | 2% | FCF Yield, Growth, Gross Margin |
+| 🏥 Healthcare | 22x | 2.5% | R&D Pipeline, FCF Yield |
+| 🏦 Financials | 13x | 4% | P/B, ROE, NIM |
+| 🛍️ Consumer Cyclical | 20x | 3% | SSS, Inventory turns |
+| 🛒 Consumer Defensive | 22x | 3% | Dividend growth, Pricing power |
+| 🏭 Industrials | 20x | 3% | Backlog, FCF Yield |
+| 🏢 Real Estate | 40x | 4% | FFO Yield, Occupancy |
+| ⚡ Energy | 12x | 5% | FCF at $60 oil, Dividend |
+| 📡 Communication | 20x | 3% | Subscribers, ARPU |
+| 💡 Utilities | 18x | 3% | Dividend yield, Rate base |
+| 🪨 Materials | 14x | 4% | FCF Yield, Cost curve |
 
 ---
 
@@ -144,28 +90,59 @@ pip install -r requirements.txt
 - Vai a `https://api.telegram.org/bot<TOKEN>/getUpdates` → copia o `chat.id`
 
 **3. Deploy Railway**
-```bash
-# 1. railway.app → New Project → Deploy from GitHub repo
-# 2. Variables → adiciona:
 ```
+railway.app → New Project → Deploy from GitHub repo → Variables
+```
+
+### ⚙️ Environment Variables
 
 | Variable | Required | Default | Description |
 | :--- | :---: | :---: | :--- |
 | `TELEGRAM_TOKEN` | ✅ | — | Bot token do @BotFather |
 | `TELEGRAM_CHAT_ID` | ✅ | — | Chat ID do teu Telegram |
 | `TZ` | ✅ | — | `Europe/Lisbon` |
-| `DROP_THRESHOLD` | ☑️ | `8` | % queda mínima (Tier 1) |
-| `MIN_MARKET_CAP` | ☑️ | `2000000000` | Cap mínimo em $ |
-| `SCAN_EVERY_MINUTES` | ☑️ | `30` | Frequência dos scans |
+| `DROP_THRESHOLD` | ☑️ | `8` | % queda mínima para Tier 1 |
+| `MIN_MARKET_CAP` | ☑️ | `2000000000` | Market cap mínimo em $ |
+| `SCAN_EVERY_MINUTES` | ☑️ | `30` | Frequência dos scans (só horas de mercado) |
 | `MIN_DIP_SCORE` | ☑️ | `5` | Score mínimo 0–10 para alertas |
+| `TAVILY_API_KEY` | ☑️ | — | API key Tavily para catalisadores (opcional) |
 
 **Tuning do `MIN_DIP_SCORE`:**
-- `3–4` → Agressivo (mais alertas, menos filtrado)
+- `3–4` → Agressivo (mais alertas)
 - `5` → **Recomendado** (balanço qualidade/quantidade)
-- `6–7` → Conservador (só gems com múltiplos critérios)
-- `8+` → Muito seletivo (raros, mas top tier)
+- `6–7` → Conservador (só gems)
+- `8+` → Muito seletivo (raros, top tier)
+
+---
+
+### 📦 Project Structure
+
+| File | Role |
+| :--- | :--- |
+| `main.py` | Engine: scheduler, scan loop, heartbeat, Telegram delivery |
+| `market_client.py` | Data: screener, fundamentals, RSI, historical PE, portfolio snapshot |
+| `portfolio.py` | Config: carteira pessoal (holdings, CashBack Pie, PPR) |
+| `sectors.py` | Logic: 11-sector qualitative scoring |
+| `score.py` | Score: quantitative 0–10 (8 criteria) |
+| `valuation.py` | Insight: DCF, WACC by sector, Margin of Safety |
+| `railway.toml` | Deploy: Railway production config |
+| `requirements.txt` | Dependencies |
+
+---
+
+### 💼 Portfolio Heartbeat (9h diário)
+
+Mensagem automática todas as manhãs com:
+- Valor total da carteira em EUR
+- P&L de ontem, semana e mês (com %)
+- P&L total vs custo de aquisição
+- Top 3 movers + pior posição do dia anterior
+- Valor do PPR (proxy ACWI) e CashBack Pie
+- Taxa USD/EUR actual
+
+Para actualizar a carteira: edita `portfolio.py` → `HOLDINGS` e `CASHBACK_EUR_VALUES`.
 
 ---
 
 ### ⚠️ Disclaimer
-*DipRadar is a screening and research tool. It does not provide financial advice. DCF/WACC models are simplified for fast triage, not institutional-grade valuation. Always do your own research before investing.*
+*DipRadar is a screening and research tool. It does not provide financial advice. DCF/WACC models are simplified for fast triage. Always do your own research before investing.*
