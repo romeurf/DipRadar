@@ -25,7 +25,8 @@ HOLDINGS = [
 ]
 
 # CashBack Pie — valor total em EUR por ticker (sem shares exactas).
-# Actualiza após cada depósito mensal.
+# ⚠️  Actualiza após cada depósito mensal na Trading212.
+# 🗓️  Último update: 2026-04-27
 CASHBACK_EUR_VALUES = {
     "CRWD": 2.52,
     "PLTR": 2.20,
@@ -34,8 +35,8 @@ CASHBACK_EUR_VALUES = {
 }
 
 # PPR Invest Tendências Globais
-PPR_SHARES    = 917.2796
-PPR_AVG_COST  = 7.2432          # EUR por unidade NAV
+PPR_SHARES     = 917.2796
+PPR_AVG_COST   = 7.2432          # EUR por unidade NAV
 PPR_COST_TOTAL = PPR_SHARES * PPR_AVG_COST  # ~6 643 EUR
 
 # Tickers cotados em USD (necessitam conversão USD→EUR)
