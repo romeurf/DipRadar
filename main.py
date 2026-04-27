@@ -105,7 +105,7 @@ def buildalertstock(stock: dict, fundamentals: dict, historical_pe: float | None
             lines.append(f"  [{title}]({url}){' _' + source + '_ ' if source else ''}")
     
     lines.append(f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_")
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 
 def run_scan() -> None:
