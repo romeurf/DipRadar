@@ -1,17 +1,13 @@
 """
-DipRadar - Multi-region stock dip screener
-US + Europe + UK + Asia via Yahoo Finance (free & unlimited)
-Fundamentals via yfinance
+Trigger: Yahoo Finance day_losers (gratuito, sem API key)
+Fundamentais: yfinance — sem session customizada (deixar gerir crumb interno)
 """
+
 import time
 import logging
 import requests
-import numpy as np
 import yfinance as yf
-from typing import List, Dict, Optional
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from datetime import datetime, timezone
 
 _HEADERS = {
     "User-Agent": (
@@ -24,221 +20,100 @@ _HEADERS = {
 }
 
 
-def screen_global_dips(
-    min_drop_pct: float = 10.0,
-    min_market_cap: int = 2_000_000_000
-) -> List[Dict]:
-    """
-    Screen largest daily losers across US, Europe, UK, and Asia.
-    Returns deduplicated list with region tag.
-    """
-    regions = {
-        "US": "day_losers",
-        "Europe": "day_losers_europe",
-        "UK": "day_losers_gb",
-        "Asia": "day_losers_asia",
-    }
+def screen_global_dips(min_drop_pct: float = 10.0,
+                       min_market_cap: int = 2_000_000_000) -> list[dict]:
+    """Yahoo Finance day_losers — sem API key, gratuito."""
+    url = (
+        "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+        "?formatted=false&scrIds=day_losers&count=100&start=0"
+    )
+    try:
+        r = requests.get(url, headers=_HEADERS, timeout=15)
+        r.raise_for_status()
+        quotes = (
+            r.json()
+            .get("finance", {})
+            .get("result", [{}])[0]
+            .get("quotes", [])
+        )
+    except Exception as e:
+        logging.error(f"Yahoo losers: {e}")
+        return []
 
-    all_losers = []
-    seen_symbols = set()
-
-    for region_name, screener_id in regions.items():
-        try:
-            url = (
-                f"https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
-                f"?scrIds={screener_id}&count=100"
-            )
-            r = requests.get(url, headers=_HEADERS, timeout=15)
-            r.raise_for_status()
-
-            quotes = (
-                r.json()
-                .get("finance", {})
-                .get("result", [{}])[0]
-                .get("quotes", [])
-            )
-
-            region_count = 0
-            for q in quotes:
-                symbol = q.get("symbol", "")
-                if symbol in seen_symbols:
-                    continue
-
-                change_pct = q.get("regularMarketChangePercent", 0) or 0
-                if change_pct > -min_drop_pct:
-                    continue
-
-                market_cap = q.get("marketCap", 0) or 0
-                if market_cap < min_market_cap:
-                    continue
-
-                quote_type = q.get("quoteType", "")
-                if quote_type in ["ETF", "MUTUALFUND"] or len(symbol) > 5:
-                    continue
-
-                all_losers.append({
-                    "symbol": symbol,
-                    "name": q.get("longName") or q.get("shortName") or symbol,
-                    "price": q.get("regularMarketPrice"),
-                    "change_pct": round(change_pct, 2),
-                    "market_cap": market_cap,
-                    "region": region_name,
-                })
-                seen_symbols.add(symbol)
-                region_count += 1
-
-            logger.info(f"{region_name}: {region_count} candidates")
-
-        except Exception as e:
-            logging.warning(f"{region_name} failed: {e}")
+    results = []
+    for q in quotes:
+        chg = q.get("regularMarketChangePercent", 0) or 0
+        if chg > -min_drop_pct:
             continue
+        mc = q.get("marketCap") or 0
+        if mc and mc < min_market_cap:
+            continue
+        sym = q.get("symbol", "")
+        qtype = q.get("quoteType", "")
+        if qtype in ("ETF", "MUTUALFUND") or len(sym) > 5:
+            continue
+        results.append({
+            "symbol": sym,
+            "name": q.get("longName") or q.get("shortName") or sym,
+            "price": q.get("regularMarketPrice"),
+            "change_pct": round(chg, 2),
+            "market_cap": mc,
+        })
 
-    logger.info(f"Total global dips: {len(all_losers)}")
-    return all_losers
+    logging.info(
+        f"Yahoo day_losers: {len(results)} candidatos "
+        f"(>={min_drop_pct}%, cap>=${min_market_cap/1e9:.0f}B)"
+    )
+    return results
 
 
 def _yf_info(symbol: str) -> dict:
-    """Get yfinance info with retry and backoff."""
+    """
+    Obtém info do yfinance com retry e backoff.
+    NÃO injeta session customizada — deixa o yfinance gerir o crumb internamente.
+    """
     for attempt in range(4):
-        wait = 15 + (30 * attempt)  # 15s, 45s, 75s, 105s
+        wait = 10 + (20 * attempt)  # 10s, 30s, 50s, 70s
         time.sleep(wait)
         try:
             inf = yf.Ticker(symbol).info
             if inf and len(inf) > 5:
                 return inf
-            logging.warning(f"{symbol}: empty response (attempt {attempt+1}/4)")
+            logging.warning(f"  {symbol}: resposta vazia (tentativa {attempt+1}/4)")
         except Exception as e:
-            err_str = str(e)
-            if any(x in err_str for x in ("429", "Too Many Requests", "Rate limit")):
-                logging.warning(f"{symbol}: rate limit (wait {wait}s)")
+            err = str(e)
+            if any(x in err for x in ("429", "Too Many Requests", "Rate limit", "401", "406")):
+                logging.warning(
+                    f"  {symbol}: rate/auth error (tentativa {attempt+1}/4) — "
+                    f"a aguardar {wait}s"
+                )
             else:
-                logging.error(f"{symbol}: {e}")
+                logging.error(f"  {symbol}: {e}")
                 break
     return {}
 
 
-def _calc_rsi(symbol: str, period: int = 14) -> Optional[float]:
-    """
-    Calcula RSI(14) a partir do último mês de dados diários.
-    Robusto contra MultiIndex (yfinance moderno).
-    """
-    try:
-        data = yf.download(symbol, period="1mo", progress=False, auto_adjust=True)
-        if data.empty:
-            return None
-        close = data["Close"]
-        # Fix: MultiIndex — pega na primeira coluna se for DataFrame
-        if hasattr(close, "columns"):
-            close = close.iloc[:, 0]
-        close = close.squeeze()
-        delta = close.diff()
-        gain = delta.where(delta > 0, 0.0).rolling(period).mean()
-        loss = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        val = rsi.iloc[-1]
-        return float(val) if not np.isnan(val) else None
-    except Exception as e:
-        logging.warning(f"RSI {symbol}: {e}")
-        return None
-
-
-def get_historical_pe(symbol: str) -> Optional[dict]:
-    """
-    Calcula P/E histórico real dos últimos 3 anos.
-
-    Método:
-      1. Obtém EPS actual por trimestre via get_earnings_history()
-      2. Obtém preço mensal via history(period=3y)
-      3. Para cada mês: P/E = preço / EPS_TTM (soma dos 4 trimestres anteriores)
-
-    Devolve dict com:
-      pe_hist_avg  — média dos últimos 3 anos
-      pe_hist_min  — mínimo histórico
-      pe_hist_max  — máximo histórico
-      pe_hist_median — mediana (mais robusta que a média)
-    """
-    try:
-        time.sleep(3)
-        ticker = yf.Ticker(symbol)
-
-        # EPS por trimestre
-        earnings = ticker.get_earnings_history()
-        if earnings is None or earnings.empty:
-            return None
-
-        # Só EPS positivos e reais (epsActual)
-        eps_q = (
-            earnings["epsActual"]
-            .dropna()
-            .sort_index()
-        )
-        if len(eps_q) < 4:
-            return None
-
-        # Preço mensal histórico
-        prices = ticker.history(period="3y", interval="1mo")["Close"]
-        if prices.empty:
-            return None
-        # Fix MultiIndex
-        if hasattr(prices, "columns"):
-            prices = prices.iloc[:, 0]
-        prices = prices.squeeze()
-
-        # Calcula EPS TTM para cada mês
-        pe_series = []
-        for date, price in prices.items():
-            # EPS TTM = soma dos 4 trimestres até esta data
-            past_eps = eps_q[eps_q.index <= date].tail(4)
-            if len(past_eps) < 4:
-                continue
-            eps_ttm = past_eps.sum()
-            if eps_ttm <= 0:
-                continue
-            pe = price / eps_ttm
-            if 0 < pe < 500:  # filtra outliers absurdos
-                pe_series.append(pe)
-
-        if len(pe_series) < 6:  # mínimo 6 meses de dados
-            return None
-
-        pe_arr = np.array(pe_series)
-        return {
-            "pe_hist_avg": round(float(np.mean(pe_arr)), 1),
-            "pe_hist_median": round(float(np.median(pe_arr)), 1),
-            "pe_hist_min": round(float(np.min(pe_arr)), 1),
-            "pe_hist_max": round(float(np.max(pe_arr)), 1),
-        }
-
-    except Exception as e:
-        logging.warning(f"Historical P/E {symbol}: {e}")
-        return None
-
-
 def get_fundamentals(symbol: str, region: str = "") -> dict:
-    result = {"symbol": symbol, "region": region}
+    result = {"symbol": symbol}
     inf = _yf_info(symbol)
 
     if not inf:
-        logging.error(f"{symbol}: failed after all retries")
+        logging.error(f"  {symbol}: falhou após todas as tentativas")
         return result
 
-    mc = inf.get("marketCap", 0) or 0
-    if 0 < mc < 1_000_000_000:
+    mc = inf.get("marketCap") or 0
+    if mc > 0 and mc < 1_000_000_000:
         result["skip"] = True
-        logger.info(f"{symbol}: micro-cap ${mc/1e6:.0f}M — skip")
+        logging.info(f"  {symbol}: micro-cap ${mc/1e6:.0f}M — a saltar")
         return result
 
     price = inf.get("currentPrice") or inf.get("regularMarketPrice")
 
-    # 52-week drawdown
+    # Drawdown desde máximo de 52 semanas
     week52_high = inf.get("fiftyTwoWeekHigh")
-    drawdown = None
+    drawdown_from_high = None
     if week52_high and price and week52_high > 0:
-        drawdown = round((price - week52_high) / week52_high * 100, 1)
-
-    # RSI calculado aqui uma única vez — reutilizado em score.py
-    rsi = _calc_rsi(symbol)
+        drawdown_from_high = round((price - week52_high) / week52_high * 100, 1)
 
     result.update({
         "name": inf.get("longName") or inf.get("shortName") or symbol,
@@ -252,15 +127,13 @@ def get_fundamentals(symbol: str, region: str = "") -> dict:
         "gross_margin": inf.get("grossMargins"),
         "ev_ebitda": inf.get("enterpriseToEbitda"),
         "roe": inf.get("returnOnEquity"),
-        "debt_equity": inf.get("debtToEquity"),  # yfinance: 150 = 1.5x D/E
+        "debt_equity": inf.get("debtToEquity"),
         "dividend_yield": inf.get("dividendYield"),
         "payout_ratio": inf.get("payoutRatio"),
         "week52_high": week52_high,
-        "drawdown_from_high": drawdown,
-        "rsi": rsi,  # calculado uma única vez aqui
+        "drawdown_from_high": drawdown_from_high,
     })
 
-    # FCF metrics
     fcf = inf.get("freeCashflow")
     shares = inf.get("sharesOutstanding")
     if fcf and mc > 0:
@@ -268,7 +141,6 @@ def get_fundamentals(symbol: str, region: str = "") -> dict:
     if fcf and shares and shares > 0:
         result["fcf_per_share"] = fcf / shares
 
-    # Analyst targets
     target = inf.get("targetMeanPrice")
     if target and price and price > 0:
         result["analyst_upside"] = (target - price) / price * 100
@@ -277,25 +149,51 @@ def get_fundamentals(symbol: str, region: str = "") -> dict:
     return result
 
 
-def get_news(symbol: str, limit: int = 3) -> List[Dict]:
-    try:
-        time.sleep(5)
-        news = yf.Ticker(symbol).news or []
-        return [{
-            "title": (item.get("content") or {}).get("title") or item.get("title", ""),
-            "url": ((item.get("content") or {}).get("canonicalUrl") or {}).get("url") or item.get("link", ""),
-            "source": ((item.get("content") or {}).get("provider") or {}).get("displayName") or "",
-        } for item in news[:limit]]
-    except Exception as e:
-        logging.error(f"News {symbol}: {e}")
-        return []
-
-
-# Mantém interface pública para o summary de fecho (usa drawdown_from_high já calculado)
-def get_52w_drawdown(symbol: str) -> Optional[float]:
+def get_earnings_date(symbol: str) -> str | None:
     """
-    Apenas usado no send_close_summary para stocks que não passaram por get_fundamentals.
-    Internamente usa o cache de fundamentals se disponível.
+    Devolve data dos próximos earnings como string 'dd/mm/yyyy' se nos próximos 45 dias,
+    ou None se não disponível ou distante.
+    """
+    try:
+        time.sleep(3)
+        cal = yf.Ticker(symbol).calendar
+        if cal is None:
+            return None
+        # calendar pode ser dict ou DataFrame
+        if hasattr(cal, "to_dict"):
+            cal = cal.to_dict()
+        earnings_raw = None
+        for key in ("Earnings Date", "earningsDate", "Earnings High"):
+            val = cal.get(key)
+            if val is not None:
+                earnings_raw = val
+                break
+        if earnings_raw is None:
+            return None
+        # pode ser lista
+        if isinstance(earnings_raw, list):
+            earnings_raw = earnings_raw[0]
+        # normaliza para datetime
+        if isinstance(earnings_raw, (int, float)):
+            dt = datetime.fromtimestamp(earnings_raw, tz=timezone.utc)
+        elif hasattr(earnings_raw, "to_pydatetime"):
+            dt = earnings_raw.to_pydatetime()
+        else:
+            return None
+        now = datetime.now(tz=timezone.utc)
+        days_ahead = (dt - now).days
+        if 0 <= days_ahead <= 45:
+            return dt.strftime("%d/%m/%Y")
+        return None
+    except Exception as e:
+        logging.warning(f"Earnings date {symbol}: {e}")
+        return None
+
+
+def get_52w_drawdown(symbol: str) -> float | None:
+    """
+    Devolve a % de queda desde o máximo de 52 semanas.
+    Exemplo: -23.5 significa que está 23.5% abaixo do máximo anual.
     """
     try:
         time.sleep(3)
@@ -309,14 +207,28 @@ def get_52w_drawdown(symbol: str) -> Optional[float]:
     return None
 
 
-# Mantém para compatibilidade — mas não é chamado internamente
-def get_rsi(symbol: str) -> Optional[float]:
-    """Wrapper público do RSI — usa _calc_rsi internamente."""
-    return _calc_rsi(symbol)
+def get_news(symbol: str, limit: int = 3) -> list[dict]:
+    try:
+        time.sleep(5)
+        news = yf.Ticker(symbol).news or []
+        out = []
+        for item in news[:limit]:
+            content = item.get("content") or {}
+            out.append({
+                "title": content.get("title") or item.get("title", ""),
+                "url": (content.get("canonicalUrl") or {}).get("url") or item.get("link", ""),
+                "source": (content.get("provider") or {}).get("displayName") or "",
+            })
+        return out
+    except Exception as e:
+        logging.error(f"News {symbol}: {e}")
+        return []
 
 
-if __name__ == "__main__":
-    candidates = screen_global_dips()
-    print(f"Global dips found: {len(candidates)}")
-    for c in candidates[:3]:
-        print(f"{c['region']}: {c['symbol']} {c['change_pct']}%")
+def get_historical_pe(symbol: str, years: int = 5) -> float | None:
+    try:
+        time.sleep(5)
+        pe = (yf.Ticker(symbol).info or {}).get("trailingPE")
+        return round(pe, 1) if pe and 0 < pe < 300 else None
+    except:
+        return None
