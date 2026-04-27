@@ -15,7 +15,8 @@ Variáveis opcionais:
   MIN_DIP_SCORE=5
   TAVILY_API_KEY
   PORTFOLIO_STRESS_PCT=5
-  RECOVERY_TARGET_PCT=15   (% de recuperação para disparar recovery alert)
+  RECOVERY_TARGET_PCT=15
+  WATCHLIST_SCAN_ENABLED=true
 """
 
 import os
@@ -44,6 +45,7 @@ from state import (
     mark_recovery_alerted, remove_recovery_position,
 )
 from backtest import backtest_runner, build_backtest_summary
+from watchlist import run_watchlist_scan, build_watchlist_morning_summary, WATCHLIST
 import bot_commands
 
 logging.basicConfig(
@@ -51,21 +53,22 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s"
 )
 
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-DROP_THRESHOLD   = float(os.environ.get("DROP_THRESHOLD", "8"))
-MIN_MARKET_CAP   = int(os.environ.get("MIN_MARKET_CAP", "2000000000"))
-SCAN_MINUTES     = int(os.environ.get("SCAN_EVERY_MINUTES", "30"))
-MIN_DIP_SCORE    = int(os.environ.get("MIN_DIP_SCORE", "5"))
-STRESS_PCT       = float(os.environ.get("PORTFOLIO_STRESS_PCT", "5"))
-RECOVERY_PCT     = float(os.environ.get("RECOVERY_TARGET_PCT", "15"))
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
+DROP_THRESHOLD    = float(os.environ.get("DROP_THRESHOLD", "8"))
+MIN_MARKET_CAP    = int(os.environ.get("MIN_MARKET_CAP", "2000000000"))
+SCAN_MINUTES      = int(os.environ.get("SCAN_EVERY_MINUTES", "30"))
+MIN_DIP_SCORE     = int(os.environ.get("MIN_DIP_SCORE", "5"))
+STRESS_PCT        = float(os.environ.get("PORTFOLIO_STRESS_PCT", "5"))
+RECOVERY_PCT      = float(os.environ.get("RECOVERY_TARGET_PCT", "15"))
+WATCHLIST_ENABLED = os.environ.get("WATCHLIST_SCAN_ENABLED", "true").lower() == "true"
 
 _alerted_today:  set  = load_alerts()
 _scan_running:   bool = False
 _stress_alerted: set  = set()
 
 
-# ── Blue chip detection ──────────────────────────────────────────────────────
+# ── Blue chip detection ───────────────────────────────────────────────────
 
 _BLUECHIP_MARGIN_THRESHOLD = {
     "Technology":             0.40,
@@ -93,7 +96,7 @@ def is_bluechip(fundamentals: dict) -> bool:
     return (dividend_yield >= 0.015) or (rev_growth > 0.05 and gross_margin > threshold)
 
 
-# ── Telegram ─────────────────────────────────────────────────────────────────
+# ── Telegram ─────────────────────────────────────────────────────────────
 
 def send_telegram(message: str, retries: int = 2) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -127,7 +130,7 @@ def send_telegram(message: str, retries: int = 2) -> bool:
     return all_ok
 
 
-# ── Heartbeat das 9h ─────────────────────────────────────────────────────────
+# ── Heartbeat das 9h ──────────────────────────────────────────────────────
 
 def _pnl_emoji(v: float) -> str:
     return "🟢" if v > 0 else ("🔴" if v < 0 else "⚪")
@@ -176,7 +179,7 @@ def send_heartbeat() -> None:
         f"🤖 *DipRadar — Bom dia!* {datetime.now().strftime('%d/%m/%Y')}",
         f"_USD/EUR: {fx:.4f}_",
         "",
-        f"*💼 Carteira total: €{total:,.2f}*",
+        f"*📦 Carteira total: €{total:,.2f}*",
         "",
         f"  {_pnl_emoji(pnl_d)}  *Ontem ({yesterday}):*  €{pnl_d:+,.2f}{_pct(pnl_d, total - pnl_d)}",
         f"  {_pnl_emoji(pnl_w)}  *Semana:*            €{pnl_w:+,.2f}{_pct(pnl_w, total - pnl_w)}",
@@ -208,11 +211,20 @@ def send_heartbeat() -> None:
         "",
         "_Mercado abre às 14h30 Lisboa_",
     ]
+
+    # Bloco watchlist no heartbeat
+    if WATCHLIST_ENABLED and WATCHLIST:
+        try:
+            wl_block = build_watchlist_morning_summary(DIRECT_TICKERS)
+            lines += ["", "─" * 25, "", wl_block]
+        except Exception as e:
+            logging.warning(f"Watchlist morning summary: {e}")
+
     send_telegram("\n".join(lines))
     logging.info("Heartbeat enviado.")
 
 
-# ── Portfolio Stress Alert ────────────────────────────────────────────────────
+# ── Portfolio Stress Alert ────────────────────────────────────────────────
 
 def check_portfolio_stress() -> None:
     global _stress_alerted
@@ -237,7 +249,7 @@ def check_portfolio_stress() -> None:
             continue
         pct_d = pnl_d / base * 100
         if pct_d <= -STRESS_PCT:
-            in_portfolio = " 💼" if sym in DIRECT_TICKERS else ""
+            in_portfolio = " 📦" if sym in DIRECT_TICKERS else ""
             send_telegram(
                 f"🚨 *Alerta de stress: {sym}*{in_portfolio}\n"
                 f"Queda de *{pct_d:.1f}%* no dia de hoje\n"
@@ -264,13 +276,9 @@ def check_portfolio_stress() -> None:
                 logging.warning(f"Portfolio stress MACRO: {pct_total:.1f}%")
 
 
-# ── Recovery Alert ────────────────────────────────────────────────────────────
+# ── Recovery Alert ────────────────────────────────────────────────────────
 
 def check_recovery_alerts() -> None:
-    """
-    Corre a cada scan. Verifica se alguma posição em watch atingiu
-    o preço alvo de recovery e envia alerta.
-    """
     import yfinance as yf
     positions = load_recovery_watch()
     if not positions:
@@ -287,7 +295,7 @@ def check_recovery_alerts() -> None:
             current = yf.Ticker(sym).info.get("regularMarketPrice") or 0
             if current and current >= target_price:
                 pct_recovery = (current - price_alert) / price_alert * 100
-                in_portfolio = " 💼" if sym in DIRECT_TICKERS else ""
+                in_portfolio = " 📦" if sym in DIRECT_TICKERS else ""
                 send_telegram(
                     f"🔔 *Recovery Alert: {sym}*{in_portfolio}\n"
                     f"Preço actual: *${current:.2f}* | Alerta foi a *${price_alert:.2f}*\n"
@@ -301,7 +309,7 @@ def check_recovery_alerts() -> None:
             logging.warning(f"Recovery check {sym}: {e}")
 
 
-# ── Weekly structural dip scan (segunda-feira 8h45) ──────────────────────────
+# ── Weekly structural dip scan (segunda-feira 8h45) ───────────────────────
 
 def send_weekly_dip_scan() -> None:
     if datetime.now().weekday() != 0:
@@ -339,7 +347,7 @@ def send_weekly_dip_scan() -> None:
     scored.sort(key=lambda x: x["score"], reverse=True)
     lines = [
         f"*📶 Weekly Structural Dip Scan — {datetime.now().strftime('%d/%m/%Y')}*",
-        f"_Stocks ≥25% abaixo dos máximos de 52 semanas com score ≧7_",
+        f"_Stocks ≥25% abaixo dos máximos de 52 semanas com score ≥7_",
         "",
     ]
     for s in scored[:12]:
@@ -358,7 +366,7 @@ def send_weekly_dip_scan() -> None:
     logging.info(f"Weekly scan enviado: {len(scored)} candidatos")
 
 
-# ── Saturday Weekly Report ────────────────────────────────────────────────────
+# ── Saturday Weekly Report ────────────────────────────────────────────────
 
 def send_saturday_report() -> None:
     if datetime.now().weekday() != 5:
@@ -370,7 +378,6 @@ def send_saturday_report() -> None:
     week_end   = (now - timedelta(days=1)).strftime("%d/%m")
     lines      = [f"*📊 Weekly Report — {week_start} a {week_end}*", ""]
 
-    # Bloco 1: alertas
     if not entries:
         lines.append("_Sem alertas diários esta semana._")
     else:
@@ -403,14 +410,12 @@ def send_saturday_report() -> None:
             lines.append(f"  {i}. *{e['symbol']}* — Score {e['score']:.0f}/20 | {e['verdict']} | {e['date']}")
         lines.append("")
 
-    # Bloco 2: backtest
     try:
         bt_block = build_backtest_summary()
         lines += ["─" * 30, "", bt_block, ""]
     except Exception as e:
         logging.warning(f"Backtest block: {e}")
 
-    # Bloco 3: rejeitados
     rejected = load_rejected_log()
     if rejected:
         lines += [
@@ -427,7 +432,6 @@ def send_saturday_report() -> None:
             )
         lines.append("")
 
-    # Blocos 4 & 5: period dips com score
     lines += ["─" * 30, "",
               "*📉 Weekly Dips — quedas ≥10% nos últimos 7 dias:*",
               "_Top 5 com score; restantes só listados_", ""]
@@ -442,7 +446,7 @@ def send_saturday_report() -> None:
             for i, s in enumerate(stocks[:10]):
                 sym          = s["symbol"]
                 mc_b         = (s.get("market_cap") or 0) / 1e9
-                in_portfolio = " 💼" if sym in DIRECT_TICKERS else ""
+                in_portfolio = " 📦" if sym in DIRECT_TICKERS else ""
                 if i < 5:
                     try:
                         fund = get_fundamentals(sym, min_market_cap=MIN_MARKET_CAP)
@@ -481,7 +485,7 @@ def send_saturday_report() -> None:
     logging.info("Saturday report enviado.")
 
 
-# ── Target Sell / Flip ────────────────────────────────────────────────────────
+# ── Target Sell / Flip ────────────────────────────────────────────────────
 
 _SECTOR_FLIP_CAP = {
     "Technology":             0.55,
@@ -545,7 +549,7 @@ def calculate_flip_target(
     return f"${final_target:.1f} (+{final_upside*100:.0f}%)", strategy
 
 
-# ── Ranking Flip ──────────────────────────────────────────────────────────────
+# ── Ranking Flip ──────────────────────────────────────────────────────────
 
 def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None) -> str:
     if not ranked_entries:
@@ -565,7 +569,7 @@ def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None) -> 
         catalyst = entry.get("catalyst")
         price    = f.get("price", 0)
         mc_b     = (f.get("market_cap") or 0) / 1e9
-        in_portfolio = " 💼" if sym in DIRECT_TICKERS else ""
+        in_portfolio = " 📦" if sym in DIRECT_TICKERS else ""
         _, strategy  = calculate_flip_target(f, score, earnings, catalyst, spy_change)
         badge        = "🔥" if score >= 16 else ("⭐" if score >= 11 else "📊")
         tier_badge   = {1: "🔴T1", 2: "🟡T2", 3: "🔵T3"}.get(tier, "")
@@ -576,7 +580,7 @@ def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None) -> 
     return "\n".join(lines)
 
 
-# ── Alerta individual ─────────────────────────────────────────────────────────
+# ── Alerta individual ─────────────────────────────────────────────────────
 
 def build_alert(
     stock, fundamentals, historical_pe, news,
@@ -592,7 +596,7 @@ def build_alert(
     drawdown     = fundamentals.get("drawdown_from_high")
     drawdown_str = f" | 52w: {drawdown:.0f}%" if drawdown is not None else ""
     region_part  = f" ({stock['region']})" if stock.get("region") else ""
-    in_portfolio = " 💼 *Já em carteira*" if symbol in DIRECT_TICKERS else ""
+    in_portfolio = " 📦 *Já em carteira*" if symbol in DIRECT_TICKERS else ""
     if dip_score >= 16:   score_badge = f"🔥 Score: {dip_score:.0f}/20"
     elif dip_score >= 11: score_badge = f"⭐ Score: {dip_score:.0f}/20"
     else:                 score_badge = f"📊 Score: {dip_score:.0f}/20"
@@ -624,7 +628,7 @@ def build_alert(
     return "\n".join(lines)
 
 
-# ── Scan contínuo ─────────────────────────────────────────────────────────────
+# ── Scan contínuo ─────────────────────────────────────────────────────────
 
 def run_scan() -> None:
     global _scan_running
@@ -640,6 +644,15 @@ def run_scan() -> None:
     try:
         check_portfolio_stress()
         check_recovery_alerts()
+
+        # Watchlist scan (stocks pessoais com critérios de entrada)
+        if WATCHLIST_ENABLED:
+            try:
+                wl_hits = run_watchlist_scan(send_telegram, DIRECT_TICKERS)
+                if wl_hits:
+                    logging.info(f"Watchlist: {wl_hits} alertas enviados")
+            except Exception as e:
+                logging.warning(f"Watchlist scan: {e}")
 
         losers = screen_global_dips(min_drop_pct=DROP_THRESHOLD, min_market_cap=MIN_MARKET_CAP)
         if not losers:
@@ -680,11 +693,9 @@ def run_scan() -> None:
                     _alerted_today.add(alert_key)
                     save_alerts(_alerted_today)
                     append_weekly_log(symbol, verdict, dip_score, stock["change_pct"], sector)
-                    # Backtest: regista para avaliação futura
                     price_now = fundamentals.get("price") or 0
                     if price_now:
                         append_backtest_entry(symbol, verdict, dip_score, stock["change_pct"], price_now, sector)
-                    # Recovery: adiciona ao watch com target RECOVERY_PCT
                     _, strategy = calculate_flip_target(fundamentals, dip_score)
                     if price_now and "HOLD" not in strategy:
                         add_recovery_position(symbol, price_now, dip_score, RECOVERY_PCT, verdict)
@@ -696,7 +707,7 @@ def run_scan() -> None:
         _scan_running = False
 
 
-# ── Resumo abertura (15h30) ───────────────────────────────────────────────────
+# ── Resumo abertura (15h30) ───────────────────────────────────────────────
 
 def send_open_summary() -> None:
     tier1 = screen_global_dips(min_drop_pct=DROP_THRESHOLD, min_market_cap=MIN_MARKET_CAP)
@@ -711,13 +722,13 @@ def send_open_summary() -> None:
     ]
     for s in tier1[:8]:
         mc_b         = (s.get("market_cap") or 0) / 1e9
-        in_portfolio = " 💼" if s["symbol"] in DIRECT_TICKERS else ""
+        in_portfolio = " 📦" if s["symbol"] in DIRECT_TICKERS else ""
         lines.append(f"  📉 *{s['symbol']}*{in_portfolio}: {s['change_pct']:.1f}% (${mc_b:.1f}B)")
     lines += ["", "_Resumo completo às 21h15_"]
     send_telegram("\n".join(lines))
 
 
-# ── Resumo fecho (21h15) ──────────────────────────────────────────────────────
+# ── Resumo fecho (21h15) ──────────────────────────────────────────────────
 
 def send_close_summary() -> None:
     start_time = time.time()
@@ -774,7 +785,7 @@ def send_close_summary() -> None:
             mc_b         = (s.get("market_cap") or 0) / 1e9
             drawdown     = get_52w_drawdown(s["symbol"])
             d_str        = f" | 52w: *{drawdown:.0f}%*" if drawdown is not None else ""
-            in_portfolio = " 💼" if s["symbol"] in DIRECT_TICKERS else ""
+            in_portfolio = " 📦" if s["symbol"] in DIRECT_TICKERS else ""
             lines.append(f"  📉 *{s['symbol']}*{in_portfolio}: {s['change_pct']:.1f}% hoje{d_str} — ${mc_b:.1f}B")
         lines += ["", "_→ Verifica catalisador, FCF e 4 critérios Flip_", ""]
     else:
@@ -784,7 +795,7 @@ def send_close_summary() -> None:
         lines.append(f"*🟡 TIER 2 — Watchlist (7–{DROP_THRESHOLD:.0f}%):*")
         for s in tier2[:6]:
             mc_b         = (s.get("market_cap") or 0) / 1e9
-            in_portfolio = " 💼" if s["symbol"] in DIRECT_TICKERS else ""
+            in_portfolio = " 📦" if s["symbol"] in DIRECT_TICKERS else ""
             lines.append(f"  👀 *{s['symbol']}*{in_portfolio}: {s['change_pct']:.1f}% (${mc_b:.1f}B)")
         lines += ["", "_→ Monitorizar apenas_", ""]
 
@@ -802,7 +813,7 @@ def send_close_summary() -> None:
             catalyst     = get_catalyst(sym, fund.get("name", ""))
             _, strategy  = calculate_flip_target(fund, score, earnings, catalyst, spy_change)
             badge        = "🔥" if score >= 16 else "⭐"
-            in_portfolio = " 💼" if sym in DIRECT_TICKERS else ""
+            in_portfolio = " 📦" if sym in DIRECT_TICKERS else ""
             lines.append(f"  {badge} *{sym}*{in_portfolio} — Score {score:.0f}/20 | ${price} | ${mc_b:.1f}B | {sector_label}")
             lines.append(f"     {strategy}")
             lines.append("")
@@ -836,7 +847,7 @@ def send_close_summary() -> None:
     send_telegram("\n".join(lines))
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import pathlib
@@ -845,9 +856,9 @@ if __name__ == "__main__":
     logging.info(f"Threshold: {DROP_THRESHOLD}% | Min cap: ${MIN_MARKET_CAP/1e9:.0f}B")
     logging.info(f"Scan a cada {SCAN_MINUTES} minutos | Min score: {MIN_DIP_SCORE}/20")
     logging.info(f"Stress: >{STRESS_PCT:.0f}% | Recovery target: +{RECOVERY_PCT:.0f}%")
+    logging.info(f"Watchlist: {'ACTIVA' if WATCHLIST_ENABLED else 'INACTIVA'} ({len(WATCHLIST)} stocks)")
     logging.info("=" * 60)
 
-    # Registar callbacks no bot_commands
     bot_commands.register_callbacks(
         send_telegram=send_telegram,
         run_scan=run_scan,
@@ -867,9 +878,10 @@ if __name__ == "__main__":
         f"Portfolio stress: >{STRESS_PCT:.0f}% posição | >3% total\n"
         f"Recovery alert: +{RECOVERY_PCT:.0f}% do preço de alerta\n"
         f"Backtesting: ✅ automático às 21h30\n"
+        f"Watchlist pessoal: {'✅ ' + str(len(WATCHLIST)) + ' stocks monitorizadas' if WATCHLIST_ENABLED else '⚠️ inactiva'}\n"
         f"Comandos Telegram: ✅ /help /status /carteira /scan /backtest /rejeitados\n"
-        f"Persistência: {'✅ /data/ (Railway Volume)' if has_volume else '⚠️ /tmp/ — configura Railway Volume'}\n"
-        f"Catalisadores Tavily: {'✅' if tavily_ok else '⚠️ não configurado'}\n"
+        f"Persistência: {('✅ /data/ (Railway Volume)') if has_volume else '⚠️ /tmp/ — configura Railway Volume'}\n"
+        f"Catalisadores Tavily: {('✅') if tavily_ok else '⚠️ não configurado'}\n"
         f"_Scan a cada {SCAN_MINUTES} minutos (só horas de mercado)_"
     )
 
