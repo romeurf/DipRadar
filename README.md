@@ -21,6 +21,7 @@
 - 💼 **Portfolio Heartbeat**: Daily 9h message with total value, P&L yesterday/week/month
 - ⏰ **Daily Summaries**: Opening (+1h at 15:30) and Close (+15min at 21:15) Lisbon time
 - 🔒 **Scan Safety**: Market-hours guard + overlap lock + persistent alert cache
+- 🔐 **Privacy**: All personal portfolio data in Railway env vars — nothing sensitive in the repo
 
 ---
 
@@ -94,24 +95,61 @@ pip install -r requirements.txt
 railway.app → New Project → Deploy from GitHub repo → Variables
 ```
 
+---
+
 ### ⚙️ Environment Variables
+
+#### Bot (obrigatórias)
 
 | Variable | Required | Default | Description |
 | :--- | :---: | :---: | :--- |
 | `TELEGRAM_TOKEN` | ✅ | — | Bot token do @BotFather |
 | `TELEGRAM_CHAT_ID` | ✅ | — | Chat ID do teu Telegram |
 | `TZ` | ✅ | — | `Europe/Lisbon` |
-| `DROP_THRESHOLD` | ☑️ | `8` | % queda mínima para Tier 1 |
-| `MIN_MARKET_CAP` | ☑️ | `2000000000` | Market cap mínimo em $ |
-| `SCAN_EVERY_MINUTES` | ☑️ | `30` | Frequência dos scans (só horas de mercado) |
-| `MIN_DIP_SCORE` | ☑️ | `5` | Score mínimo 0–10 para alertas |
-| `TAVILY_API_KEY` | ☑️ | — | API key Tavily para catalisadores (opcional) |
 
-**Tuning do `MIN_DIP_SCORE`:**
-- `3–4` → Agressivo (mais alertas)
-- `5` → **Recomendado** (balanço qualidade/quantidade)
-- `6–7` → Conservador (só gems)
-- `8+` → Muito seletivo (raros, top tier)
+#### Bot (opcionais)
+
+| Variable | Default | Description |
+| :--- | :---: | :--- |
+| `DROP_THRESHOLD` | `8` | % queda mínima para Tier 1 |
+| `MIN_MARKET_CAP` | `2000000000` | Market cap mínimo em $ |
+| `SCAN_EVERY_MINUTES` | `30` | Frequência dos scans (só horas de mercado) |
+| `MIN_DIP_SCORE` | `5` | Score mínimo 0–10 para alertas |
+| `TAVILY_API_KEY` | — | API key Tavily para catalisadores |
+
+#### Portfolio Heartbeat (privado — nunca no repo)
+
+Todos os dados da carteira ficam **exclusivamente** nas env vars do Railway.
+O código público só contém os tickers.
+
+**Posições directas** — número de shares por ticker:
+```
+HOLDING_NVO=142.33678955
+HOLDING_ADBE=16.27745882
+HOLDING_UBER=42.73462592
+HOLDING_EUNL=19.88552887
+HOLDING_MSFT=5.81970441
+HOLDING_PINS=95.00488077
+HOLDING_ADP=6.85764136
+HOLDING_CRM=6.17179094
+HOLDING_VICI=20.36983514
+```
+
+**CashBack Pie** — valor EUR actual por ticker (actualizar após depósitos):
+```
+CASHBACK_CRWD=2.52
+CASHBACK_PLTR=2.20
+CASHBACK_NOW=6.45
+CASHBACK_DUOL=2.51
+```
+
+**PPR Invest Tendências Globais:**
+```
+PPR_SHARES=917.2796
+PPR_AVG_COST=7.2432
+```
+
+> ⚠️ Se não adicionares estas variáveis, o heartbeat das 9h ainda funciona mas mostra €0 em tudo. O resto do bot (scan, alertas, resumos) não é afectado.
 
 ---
 
@@ -121,7 +159,7 @@ railway.app → New Project → Deploy from GitHub repo → Variables
 | :--- | :--- |
 | `main.py` | Engine: scheduler, scan loop, heartbeat, Telegram delivery |
 | `market_client.py` | Data: screener, fundamentals, RSI, historical PE, portfolio snapshot |
-| `portfolio.py` | Config: carteira pessoal (holdings, CashBack Pie, PPR) |
+| `portfolio.py` | Config: tickers públicos + leitura de env vars (sem dados privados) |
 | `sectors.py` | Logic: 11-sector qualitative scoring |
 | `score.py` | Score: quantitative 0–10 (8 criteria) |
 | `valuation.py` | Insight: DCF, WACC by sector, Margin of Safety |
@@ -140,7 +178,7 @@ Mensagem automática todas as manhãs com:
 - Valor do PPR (proxy ACWI) e CashBack Pie
 - Taxa USD/EUR actual
 
-Para actualizar a carteira: edita `portfolio.py` → `HOLDINGS` e `CASHBACK_EUR_VALUES`.
+Para actualizar shares: edita as env vars no Railway — não é necessário tocar no código.
 
 ---
 
