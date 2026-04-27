@@ -1,105 +1,90 @@
-# 📈 Stock Alert Bot
+# 📡 DipRadar
+> **Sector-aware stock dip scanner & Telegram alert bot.**
 
-Monitoriza **todas as acções** para quedas ≥10% e filtra automaticamente
-por fundamentos intactos, com análise específica por sector.
-
-## Como funciona
-
-```
-1. A cada 30min → FMP API: lista de maiores quedas do dia
-2. Filtro: queda ≥10% + market cap ≥$1B (sem penny stocks)
-3. Para cada acção que passa: análise fundamental por sector
-4. Score: COMPRAR / MONITORIZAR / EVITAR
-5. Se COMPRAR ou MONITORIZAR → alerta Telegram com:
-   - P/E actual vs histórico 5 anos vs sector
-   - FCF yield
-   - DCF simplificado com WACC por sector
-   - Revenue growth
-   - EV/EBITDA
-   - Upside dos analistas
-   - 3 notícias recentes
-6. Às 18h: resumo diário das maiores quedas
-```
-
-## Setup
-
-### 1. FMP API (Financial Modeling Prep)
-- Regista em https://site.financialmodelingprep.com/register
-- Free tier: 250 calls/dia — chega para uso normal
-- Copia a tua API key
-
-### 2. Telegram Bot
-- Fala com @BotFather → `/newbot` → copia o **token**
-- Fala com o teu bot para activar
-- Vai a `https://api.telegram.org/bot<TOKEN>/getUpdates` → copia o `chat.id`
-
-### 3. Deploy Railway (gratuito)
-
-```bash
-# 1. Cria conta em railway.app com GitHub
-# 2. New Project → Deploy from GitHub
-# 3. Faz push deste código para um repo teu
-# 4. Em Variables adiciona:
-TELEGRAM_TOKEN=xxxxx
-TELEGRAM_CHAT_ID=xxxxx
-FMP_API_KEY=xxxxx
-
-# Opcional:
-DROP_THRESHOLD=10      # % de queda mínima (default 10)
-MIN_MARKET_CAP=1000000000  # cap mínima em $ (default 1B)
-```
-
-### 4. (Alternativa) Render.com
-- New Web Service → GitHub → Start Command: `python main.py`
-- Adiciona as mesmas env vars
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![Telegram](https://img.shields.io/badge/Telegram-Bot-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://core.telegram.org/bots)
+[![Railway](https://img.shields.io/badge/Deploy-Railway-000000?style=for-the-badge&logo=railway&logoColor=white)](https://railway.app/)
 
 ---
 
-## Ficheiros
+### 💡 The Vision
+**DipRadar** is designed to cut through market noise. Instead of blindly buying every dip, it acts as an intelligent funnel: it detects sharp selloffs, automatically filters them through fundamental sector rules, and provides actionable data (Valuation, DCF, Recent News) directly to your Telegram.
 
+### 🚀 At a Glance
+- 📉 **Automated Screening**: Tracks Yahoo Finance\\'s `day_losers` list.
+- 🎯 **Sector Precision**: Uses sector-specific rules (Tech vs. Utilities).
+- 📊 **Valuation Layer**: Includes simplified DCF & Margin of Safety.
+- 🔔 **Actionable Alerts**: Verdict-based (COMPRAR, MONITORIZAR, EVITAR).
+- 📰 **News Context**: Fetches latest headlines for each dip.
+
+---
+
+### ⚙️ How it works
+```mermaid
+graph LR
+    A[Yahoo Finance] --> B[Filters]
+    B --> C[Fundamentals]
+    C --> D[Sector Score]
+    D --> E[Valuation]
+    E --> F[Telegram Alert]
 ```
-stock_alert_bot/
-├── main.py         # Loop principal + Telegram
-├── fmp_client.py   # API client FMP (screening + fundamentals + news)
-├── sectors.py      # Thresholds por sector + scoring
-├── valuation.py    # DCF, WACC, margem de segurança
-├── requirements.txt
-└── railway.toml
+
+---
+
+### 📊 Sector-Specific Intelligence
+We don\\'t force one rule on every business. `sectors.py` applies custom logic to differentiate market sectors.
+
+| Sector | Key Focus |
+| :--- | :--- |
+| 💻 **Technology** | Growth, FCF Yield, Margins |
+| 🏥 **Healthcare** | R&D Pipeline, Patent Cliffs |
+| 🏦 **Financials** | P/B, ROE, NIM |
+| 🛒 **Consumer** | Brand Moat, Pricing Power |
+| 🏗️ **Industrials** | Backlog, Operating Leverage |
+| 🏢 **Real Estate** | FFO Yield, Occupancy |
+
+---
+
+### 📱 Sample Telegram Alert
+> 📉 **NVO — Novo Nordisk A/S**  
+> 🕒 **Queda:** -12.3% | 💰 **Preço:** $36.5 | 🏦 **Cap:** $160B  
+> 🏥 **Sector:** Saúde  
+> 🟢 **Veredito:** COMPRAR  
+> 💎 **FCF yield:** 5.2%  
+> 🎯 **DCF intrínseco:** $58.2  
+> 🚀 **Upside:** +29%
+
+---
+
+### 📦 Project Structure
+| File | Role |
+| :--- | :--- |
+| `main.py` | Engine: Scheduler & Delivery |
+| `market_client.py` | Data: Screener & Fundamentals |
+| `sectors.py` | Logic: Scoring Rules |
+| `valuation.py` | Insight: DCF & WACC |
+| `railway.toml` | Deploy: Production Config |
+
+---
+
+### 🛠️ Quick Setup
+
+**1. Install**
+```bash
+git clone https://github.com/romeurf/DipRadar.git
+cd DipRadar
+pip install -r requirements.txt
 ```
 
-## Personalizar
+**2. Environment Variables**
+Configure these in your deployment environment:
+- `TELEGRAMTOKEN`: Your Bot Token
+- `TELEGRAMCHATID`: Target Chat ID
+- `TZ`: `Europe/Lisbon`
 
-**Threshold de queda:**
-```python
-# Em main.py ou via env var DROP_THRESHOLD
-DROP_THRESHOLD = 10  # alerta com queda ≥10%
-```
+*(Optional)*: `DROPTHRESHOLD`, `MINMARKETCAP`, `SCANEVERYMINUTES`
 
-**Sectores e thresholds** (em `sectors.py`):
-Cada sector tem: pe_max, pe_fair, fcf_yield_min, ev_ebitda_max, etc.
-Podes ajustar os valores para o teu critério de "fundamentos intactos".
+---
 
-**Formato da mensagem Telegram (exemplo):**
-```
-📉 NVO — Novo Nordisk A/S
-Queda: -12.3% hoje | Preço: $36.5 | Cap: $160B
-Sector: 🏥 Saúde
-
-Veredito: 🟢 COMPRAR
-  P/E 18x — 18% abaixo do justo (22x) para o sector
-  FCF yield 5.2% — muito atrativo
-
-📊 Fundamentos:
-  • P/E: 18.2x vs hist. 35.0x (-48%)
-  • FCF Yield: 5.2%
-  • DCF intrínseco: $58.2 (margem: +59%)
-  • EV/EBITDA: 12.1x
-  • Revenue growth: 22.1%
-  • Gross margin: 84.0%
-  • Dividendo: 7.10% (payout 52%)
-  • Target analistas: $47.0 (+29%)
-
-📰 Notícias:
-  • Novo Nordisk beats Q1 earnings... (reuters.com)
-  • FDA approves new GLP-1 indication... (bloomberg.com)
-```
+### ⚠️ Disclaimer
+*This is a tool for screening and research. It does not provide financial advice. The models used (DCF/WACC) are simplified for fast triaging, not institutional-grade valuation.*
