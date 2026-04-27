@@ -143,7 +143,7 @@ def run_scan() -> None:
 
             historical_pe = get_historical_pe(symbol)
             news          = get_news(symbol)
-            message       = build_alert(stock, fundamentals, historical_pe,
+            message       = buildalertstock(stock, fundamentals, historical_pe,
                                         news, verdict, emoji, reasons)
 
             if send_telegram(message):
