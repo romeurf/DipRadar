@@ -764,7 +764,7 @@ def send_close_summary() -> None:
         fund = _get_fund(sym, s.get("region", ""))
         if fund.get("skip"): continue
         score = _get_score(sym, fund)
-        if score >= 11:
+        if score >= 16:  # Rare Gem: queda pequena mas fundamentais excepcionais
             s["_score"] = score
             tier3.append(s)
     tier3.sort(key=lambda x: x.get("_score", 0), reverse=True)
@@ -800,7 +800,7 @@ def send_close_summary() -> None:
         lines += ["", "_→ Monitorizar apenas_", ""]
 
     if tier3:
-        lines.append("*🔵 TIER 3 — Gems Raras (-3/-8%, score ≥11):*")
+        lines.append("*🔵 TIER 3 — Gems Raras (-3/-8%, score ≥16):*")
         lines.append("")
         for s in tier3[:5]:
             sym          = s["symbol"]
@@ -812,9 +812,8 @@ def send_close_summary() -> None:
             earnings     = get_earnings_date(sym)
             catalyst     = get_catalyst(sym, fund.get("name", ""))
             _, strategy  = calculate_flip_target(fund, score, earnings, catalyst, spy_change)
-            badge        = "🔥" if score >= 16 else "⭐"
             in_portfolio = " 📦" if sym in DIRECT_TICKERS else ""
-            lines.append(f"  {badge} *{sym}*{in_portfolio} — Score {score:.0f}/20 | ${price} | ${mc_b:.1f}B | {sector_label}")
+            lines.append(f"  🔥 *{sym}*{in_portfolio} — Score {score:.0f}/20 | ${price} | ${mc_b:.1f}B | {sector_label}")
             lines.append(f"     {strategy}")
             lines.append("")
         rest_high = [s for s in tier3[5:] if s.get("_score", 0) >= 16]
@@ -873,7 +872,7 @@ if __name__ == "__main__":
     tavily_ok  = bool(os.environ.get("TAVILY_API_KEY"))
     send_telegram(
         f"🤖 *DipRadar iniciado*\n"
-        f"Tier 1: ≥{DROP_THRESHOLD}% | Tier 2: 7–{DROP_THRESHOLD:.0f}% | Tier 3: 3–8% (score≥11)\n"
+        f"Tier 1: ≥{DROP_THRESHOLD}% | Tier 2: 7–{DROP_THRESHOLD:.0f}% | Tier 3: 3–8% (score≥16 🔥)\n"
         f"Score: 0–20 | Min alerta: {MIN_DIP_SCORE}/20\n"
         f"Portfolio stress: >{STRESS_PCT:.0f}% posição | >3% total\n"
         f"Recovery alert: +{RECOVERY_PCT:.0f}% do preço de alerta\n"
