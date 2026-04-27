@@ -1,15 +1,12 @@
 """
 state.py — Persistência de estado entre restarts do Railway.
 
-Estratégia:
-  - Tenta Railway Volume (/data/) se existir.
-  - Fallback para /tmp/ (perde-se em restart, mas é melhor do que nada).
-  - Todos os ficheiros de estado passam por cá — nunca por Path("/tmp/") directo.
-
-Ficheiros geridos:
-  alerts   → _dipr_alerts.json   (cache de alertas do dia)
-  weekly   → _dipr_weekly.json   (log semanal de alertas)
-  rejected → _dipr_rejected.json (log diário de rejeitados)
+Estrutura de ficheiros:
+  _dipr_alerts.json    → cache de alertas do dia
+  _dipr_weekly.json    → log semanal de alertas
+  _dipr_rejected.json  → log diário de rejeitados
+  _dipr_backtest.json  → histórico de alertas para backtesting
+  _dipr_recovery.json  → posições em aberto aguardando recovery alert
 """
 
 import json
@@ -17,16 +14,17 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-# Preferir volume persistente do Railway; fallback /tmp
 _DATA_DIR = Path("/data") if Path("/data").exists() else Path("/tmp")
 logging.info(f"[state] Directoria de estado: {_DATA_DIR}")
 
-_ALERTS_FILE   = _DATA_DIR / "_dipr_alerts.json"
-_WEEKLY_FILE   = _DATA_DIR / "_dipr_weekly.json"
-_REJECTED_FILE = _DATA_DIR / "_dipr_rejected.json"
+_ALERTS_FILE    = _DATA_DIR / "_dipr_alerts.json"
+_WEEKLY_FILE    = _DATA_DIR / "_dipr_weekly.json"
+_REJECTED_FILE  = _DATA_DIR / "_dipr_rejected.json"
+_BACKTEST_FILE  = _DATA_DIR / "_dipr_backtest.json"
+_RECOVERY_FILE  = _DATA_DIR / "_dipr_recovery.json"
 
 
-# ── helpers genéricos ─────────────────────────────────────────────────────
+# ── helpers genéricos ────────────────────────────────────────────────────────
 
 def _read(path: Path) -> dict:
     try:
@@ -43,7 +41,7 @@ def _write(path: Path, data: dict) -> None:
         logging.warning(f"[state] write {path.name}: {e}")
 
 
-# ── Alerts cache (diário) ────────────────────────────────────────────────
+# ── Alerts cache (diário) ────────────────────────────────────────────────────
 
 def load_alerts() -> set:
     data  = _read(_ALERTS_FILE)
@@ -57,7 +55,7 @@ def clear_alerts() -> None:
     _write(_ALERTS_FILE, {"keys": []})
 
 
-# ── Weekly log ────────────────────────────────────────────────────────────
+# ── Weekly log ───────────────────────────────────────────────────────────────
 
 def load_weekly_log() -> list:
     return _read(_WEEKLY_FILE).get("alerts", [])
@@ -79,7 +77,7 @@ def append_weekly_log(symbol: str, verdict: str, score: float, change_pct: float
     save_weekly_log(entries)
 
 
-# ── Rejected log (diário) ─────────────────────────────────────────────────
+# ── Rejected log (diário) ────────────────────────────────────────────────────
 
 def load_rejected_log() -> list:
     data  = _read(_REJECTED_FILE)
@@ -94,14 +92,9 @@ def append_rejected_log(
     verdict: str | None = None,
     sector: str = "",
 ) -> None:
-    """
-    Regista um stock que foi analisado mas não gerou alerta, com o motivo.
-    Motivos possíveis: 'EVITAR', 'score_baixo', 'cap_insuficiente', 'sem_dados'
-    """
     data    = _read(_REJECTED_FILE)
     entries = data.get("entries", [])
     today   = datetime.now().date().isoformat()
-    # Limpa entradas de dias anteriores
     entries = [e for e in entries if e.get("date_iso") == today]
     entries.append({
         "symbol":   symbol,
@@ -114,3 +107,94 @@ def append_rejected_log(
         "date_iso": today,
     })
     _write(_REJECTED_FILE, {"entries": entries})
+
+
+# ── Backtest log (persistente, acumula todos os alertas) ─────────────────────
+
+def load_backtest_log() -> list:
+    """Devolve lista de todos os alertas históricos com campos de resultado."""
+    return _read(_BACKTEST_FILE).get("entries", [])
+
+def save_backtest_log(entries: list) -> None:
+    _write(_BACKTEST_FILE, {"entries": entries})
+
+def append_backtest_entry(
+    symbol: str,
+    verdict: str,
+    score: float,
+    change_pct: float,
+    price_alert: float,
+    sector: str = "",
+) -> None:
+    """
+    Regista um alerta para futura avaliação de resultado.
+    Os campos price_5d, price_10d, price_20d e pnl_* são preenchidos
+    pelo backtest_runner quando os dados estiverem disponíveis.
+    """
+    entries = load_backtest_log()
+    entries.append({
+        "symbol":      symbol,
+        "verdict":     verdict,
+        "score":       score,
+        "change":      change_pct,
+        "price_alert": price_alert,
+        "sector":      sector,
+        "date":        datetime.now().strftime("%d/%m/%Y"),
+        "date_iso":    datetime.now().date().isoformat(),
+        "price_5d":    None,
+        "price_10d":   None,
+        "price_20d":   None,
+        "pnl_5d":      None,
+        "pnl_10d":     None,
+        "pnl_20d":     None,
+        "resolved":    False,
+    })
+    save_backtest_log(entries)
+
+
+# ── Recovery watch (posições em aberto) ──────────────────────────────────────
+
+def load_recovery_watch() -> list:
+    return _read(_RECOVERY_FILE).get("positions", [])
+
+def save_recovery_watch(positions: list) -> None:
+    _write(_RECOVERY_FILE, {"positions": positions})
+
+def add_recovery_position(
+    symbol: str,
+    price_alert: float,
+    score: float,
+    target_pct: float,
+    verdict: str,
+) -> None:
+    """
+    Adiciona posição ao watch de recovery.
+    target_pct: % de recuperação a partir do preço de alerta (ex: 15.0)
+    Dispara alerta quando preço >= price_alert * (1 + target_pct/100).
+    """
+    positions = load_recovery_watch()
+    # Evita duplicados
+    if any(p["symbol"] == symbol for p in positions):
+        return
+    positions.append({
+        "symbol":      symbol,
+        "price_alert": price_alert,
+        "score":       score,
+        "target_pct":  target_pct,
+        "target_price": round(price_alert * (1 + target_pct / 100), 2),
+        "verdict":     verdict,
+        "date":        datetime.now().strftime("%d/%m/%Y"),
+        "alerted":     False,
+    })
+    save_recovery_watch(positions)
+
+def mark_recovery_alerted(symbol: str) -> None:
+    positions = load_recovery_watch()
+    for p in positions:
+        if p["symbol"] == symbol:
+            p["alerted"] = True
+    save_recovery_watch(positions)
+
+def remove_recovery_position(symbol: str) -> None:
+    positions = [p for p in load_recovery_watch() if p["symbol"] != symbol]
+    save_recovery_watch(positions)
