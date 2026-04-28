@@ -17,6 +17,9 @@ Para o PPR:
 
 CashBack Pie (valor EUR actual por ticker):
   CASHBACK_{SYM}         — ex: CASHBACK_CRWD=13.68
+
+Flip Fund (capital separado para flips táticos):
+  FLIP_FUND_EUR          — actualiza no Railway após cada depósito ou flip
 """
 
 import os
@@ -63,3 +66,8 @@ USD_TICKERS = {
     "CRWD", "PLTR", "NOW", "DUOL", "ACWI",
 }
 EUR_TICKERS = {"EUNL.DE", "IS3N.AS", "ALV.DE"}
+
+# ── Flip Fund (capital separado para flips táticos) ──────────────────────────
+# Actualiza FLIP_FUND_EUR no Railway após cada depósito ou execução de flip.
+# Não entra no total da carteira — é capital separado para operações rápidas.
+FLIP_FUND_EUR = _float_env("FLIP_FUND_EUR")
