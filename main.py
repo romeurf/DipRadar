@@ -41,7 +41,11 @@ from portfolio import (
 )
 from sectors import get_sector_config, score_fundamentals
 from valuation import format_valuation_block
-from score import calculate_dip_score, build_score_breakdown, classify_dip_category
+from score import (
+    calculate_dip_score, build_score_breakdown, classify_dip_category,
+    is_bluechip,
+    CATEGORY_HOLD_FOREVER, CATEGORY_APARTAMENTO, CATEGORY_ROTACAO,
+)
 from state import (
     load_alerts, save_alerts, clear_alerts,
     load_weekly_log, save_weekly_log, append_weekly_log,
@@ -66,7 +70,7 @@ TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
 DROP_THRESHOLD    = float(os.environ.get("DROP_THRESHOLD", "8"))
 MIN_MARKET_CAP    = int(os.environ.get("MIN_MARKET_CAP", "2000000000"))
 SCAN_MINUTES      = int(os.environ.get("SCAN_EVERY_MINUTES", "30"))
-MIN_DIP_SCORE     = int(os.environ.get("MIN_DIP_SCORE", "50"))  # escala 0-100
+MIN_DIP_SCORE     = int(os.environ.get("MIN_DIP_SCORE", "50"))
 STRESS_PCT        = float(os.environ.get("PORTFOLIO_STRESS_PCT", "5"))
 RECOVERY_PCT      = float(os.environ.get("RECOVERY_TARGET_PCT", "15"))
 WATCHLIST_ENABLED = os.environ.get("WATCHLIST_SCAN_ENABLED", "true").lower() == "true"
@@ -74,10 +78,10 @@ WATCHLIST_ENABLED = os.environ.get("WATCHLIST_SCAN_ENABLED", "true").lower() == 
 _alerted_today:  set  = load_alerts()
 _scan_running:   bool = False
 _stress_alerted: set  = set()
-_last_tier3:     list = []  # cache para comando /tier3
+_last_tier3:     list = []
 
 
-# ── Sector ETF map (para sector rotation signal) ──────────────────────────────────────
+# ── Sector ETF map ────────────────────────────────────────────────────────────
 
 _SECTOR_ETF = {
     "Technology":             "XLK",
@@ -116,7 +120,7 @@ def get_sector_change(sector: str) -> float | None:
     return None
 
 
-# ── Helpers de badge (escala 0-100) ───────────────────────────────────
+# ── Helpers de badge ──────────────────────────────────────────────────────────
 
 def score_badge(score: float) -> str:
     if score >= 80:  return "🔥"
@@ -124,35 +128,7 @@ def score_badge(score: float) -> str:
     return "📊"
 
 
-# ── Blue chip detection ──────────────────────────────────────────────────
-
-_BLUECHIP_MARGIN_THRESHOLD = {
-    "Technology":             0.40,
-    "Healthcare":             0.35,
-    "Communication Services": 0.35,
-    "Real Estate":            0.20,
-    "Industrials":            0.30,
-    "Consumer Defensive":     0.30,
-    "Consumer Cyclical":      0.30,
-    "Financial Services":     0.25,
-    "Energy":                 0.25,
-    "Utilities":              0.20,
-    "Basic Materials":        0.25,
-}
-
-def is_bluechip(fundamentals: dict) -> bool:
-    mc             = fundamentals.get("market_cap") or 0
-    dividend_yield = fundamentals.get("dividend_yield") or 0
-    rev_growth     = fundamentals.get("revenue_growth") or 0
-    gross_margin   = fundamentals.get("gross_margin") or 0
-    sector         = fundamentals.get("sector", "")
-    if mc < 50_000_000_000:
-        return False
-    threshold = _BLUECHIP_MARGIN_THRESHOLD.get(sector, 0.40)
-    return (dividend_yield >= 0.015) or (rev_growth > 0.05 and gross_margin > threshold)
-
-
-# ── Insider buying & short interest flags ────────────────────────────
+# ── Insider buying & short interest flags ────────────────────────────────────
 
 def get_insider_buy_flag(symbol: str) -> str:
     try:
@@ -181,7 +157,7 @@ def get_short_interest_flag(fundamentals: dict) -> str:
     return ""
 
 
-# ── Telegram ───────────────────────────────────────────────────────────────
+# ── Telegram ──────────────────────────────────────────────────────────────────
 
 def send_telegram(message: str, retries: int = 2) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -295,11 +271,9 @@ def send_heartbeat() -> None:
         f"  💜 CashBack Pie: €{snapshot['cashback_eur']:,.2f}",
     ]
 
-    # ── Flip Fund ───────────────────────────────────────────────────────────────
     if FLIP_FUND_EUR:
         lines.append(f"  🎯 *Flip Fund:* €{FLIP_FUND_EUR:,.2f} disponíveis")
 
-    # ── Alertas de concentração ─────────────────────────────────────────────────────
     if total > 0:
         concentration_warnings = []
         for pos in snapshot["positions"]:
@@ -317,24 +291,20 @@ def send_heartbeat() -> None:
                 concentration_warnings.append(
                     f"  ⚠️ *{sym}*: {weight:.1f}% — posição pesada, monitorizar"
                 )
-
-        # Core check: EUNL + PPR >= 35%
         eunl_val = next((p["value_eur"] for p in snapshot["positions"] if "EUNL" in p["symbol"]), 0)
         core_pct = (eunl_val + snapshot["ppr_value"]) / total * 100
         if core_pct < 35:
             concentration_warnings.append(
                 f"  ⚠️ *Core (EUNL+PPR)*: {core_pct:.1f}% — abaixo do mínimo de 35%"
             )
-
         if concentration_warnings:
             lines += ["", "*🚨 Alertas de concentração:*"] + concentration_warnings
 
-    # ── Earnings próximos das posições actuais ───────────────────────────────────────
     earnings_alerts = []
     for sym, shares, _ in HOLDINGS:
         if not shares:
             continue
-        clean_sym = sym.split(".")[0]  # EUNL.DE → EUNL
+        clean_sym = sym.split(".")[0]
         try:
             days = get_earnings_days(clean_sym)
             if days is not None:
@@ -363,7 +333,7 @@ def send_heartbeat() -> None:
     logging.info("Heartbeat enviado.")
 
 
-# ── Portfolio Stress Alert ───────────────────────────────────────────────────────
+# ── Portfolio Stress Alert ────────────────────────────────────────────────────
 
 def check_portfolio_stress() -> None:
     global _stress_alerted
@@ -415,7 +385,7 @@ def check_portfolio_stress() -> None:
                 logging.warning(f"Portfolio stress MACRO: {pct_total:.1f}%")
 
 
-# ── Recovery Alert ─────────────────────────────────────────────────────────────
+# ── Recovery Alert ────────────────────────────────────────────────────────────
 
 def check_recovery_alerts() -> None:
     import yfinance as yf
@@ -423,7 +393,6 @@ def check_recovery_alerts() -> None:
     if not positions:
         return
 
-    # ── Stop temporal: aviso para posições sem recovery há >60 dias ─────────
     try:
         stale = get_stale_recovery_positions(days=60)
         for p in stale:
@@ -444,7 +413,6 @@ def check_recovery_alerts() -> None:
     except Exception as e:
         logging.warning(f"[recovery] Stale check: {e}")
 
-    # ── Check de recovery normal (target atingido) ─────────────────────────
     for pos in positions:
         if pos.get("alerted"):
             continue
@@ -470,7 +438,7 @@ def check_recovery_alerts() -> None:
             logging.warning(f"Recovery check {sym}: {e}")
 
 
-# ── Weekly structural dip scan (segunda-feira 8h45) ─────────────────────────
+# ── Weekly structural dip scan ────────────────────────────────────────────────
 
 def send_weekly_dip_scan() -> None:
     if datetime.now().weekday() != 0:
@@ -531,7 +499,7 @@ def send_weekly_dip_scan() -> None:
     logging.info(f"Weekly scan enviado: {len(scored)} candidatos")
 
 
-# ── Saturday Weekly Report ────────────────────────────────────────────────────────
+# ── Saturday Weekly Report ────────────────────────────────────────────────────
 
 def send_saturday_report() -> None:
     if datetime.now().weekday() != 5:
@@ -651,7 +619,7 @@ def send_saturday_report() -> None:
     logging.info("Saturday report enviado.")
 
 
-# ── Target Sell / Flip ──────────────────────────────────────────────────────────
+# ── Target Sell / Flip ────────────────────────────────────────────────────────
 
 _SECTOR_FLIP_CAP = {
     "Technology":             0.55,
@@ -679,8 +647,9 @@ def calculate_flip_target(
     if not price or price <= 0:
         return "N/D", "SEM DADOS"
 
-    # Hold Forever — nunca vender
-    if category == "🏗️ Hold Forever" or (is_bluechip(fundamentals) and dip_score >= 60):
+    # ── Hold Forever: nunca calcular target de saída ──────────────────────
+    # Usar constante importada — à prova de divergência de emojis.
+    if category == CATEGORY_HOLD_FOREVER or (is_bluechip(fundamentals) and dip_score >= 60):
         return "HOLD ETERNO", "💎 Hold Forever — Acumular em dips, nunca vender"
 
     sector         = fundamentals.get("sector", "")
@@ -717,7 +686,7 @@ def calculate_flip_target(
         cat_flag = " | ⚠️ Sem catalisador identificado"
 
     # Adaptar prefixo da estratégia conforme categoria
-    if category == "🏠 Apartamento":
+    if category == CATEGORY_APARTAMENTO:
         dividend_yield = fundamentals.get("dividend_yield") or 0
         dy_str = f" | 💰 Yield {dividend_yield*100:.1f}%/ano" if dividend_yield > 0 else ""
         strategy = f"🏠 Apartamento: ${final_target:.1f} (+{final_upside*100:.0f}%){dy_str}{cat_flag}{macro_flag}"
@@ -749,7 +718,7 @@ def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None, exc
         earnings      = entry.get("earnings_date")
         earnings_days = entry.get("earnings_days")
         catalyst      = entry.get("catalyst")
-        category      = entry.get("category", "🔄 Rotação")
+        category      = entry.get("category", CATEGORY_ROTACAO)
         price         = f.get("price", 0)
         mc_b          = (f.get("market_cap") or 0) / 1e9
         beta          = f.get("beta")
@@ -758,7 +727,6 @@ def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None, exc
         badge         = score_badge(s)
         tier_badge    = {1: "🔴T1", 2: "🟡T2", 3: "🔵T3"}.get(tier, "")
 
-        # ── Position sizing ─────────────────────────────────────────────────
         _, sizing_str = suggest_position_size(
             score=s,
             beta=beta,
@@ -775,12 +743,12 @@ def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None, exc
     return "\n".join(lines)
 
 
-# ── Alerta individual ─────────────────────────────────────────────────────────────
+# ── Alerta individual ─────────────────────────────────────────────────────────
 
 def build_alert(
     stock, fundamentals, historical_pe, news,
     verdict, emoji, reasons, dip_score, rsi_str,
-    category: str = "🔄 Rotação",
+    category: str = CATEGORY_ROTACAO,
 ) -> str:
     sector       = fundamentals.get("sector", "")
     sector_cfg   = get_sector_config(sector)
@@ -843,7 +811,6 @@ def build_alert(
         spy_change=spy_change,
     )
 
-    # ── FIX: construir a mensagem de forma explícita, sem ternário partido ──
     body = (
         f"{emoji} *{name} ({symbol})*{region_part}{in_portfolio}\n"
         f"Sector: {sector_cfg.get('label', sector)} | ≈{mc_b:.1f}B\n"
@@ -861,7 +828,7 @@ def build_alert(
     return body
 
 
-# ── Scan principal ─────────────────────────────────────────────────────────────────
+# ── Scan principal ────────────────────────────────────────────────────────────
 
 def run_scan() -> None:
     global _scan_running, _alerted_today
@@ -910,7 +877,6 @@ def run_scan() -> None:
                 bc_flag  = is_bluechip(fund)
                 category = classify_dip_category(fund, score, bc_flag)
 
-                # Extrair valor numérico do RSI do rsi_str (ex: "35.2 🟡")
                 rsi_val = None
                 try:
                     rsi_val = float(str(rsi_str).split()[0])
@@ -925,7 +891,6 @@ def run_scan() -> None:
                     })
                     continue
 
-                # Determinar verdict e tier
                 if score >= 75:
                     verdict, emoji_str, tier = "COMPRAR", "🟢", 1
                 elif score >= 60:
@@ -935,7 +900,6 @@ def run_scan() -> None:
 
                 reasons = []
 
-                # ── Gravar snapshot ML ──────────────────────────────────
                 log_alert_snapshot(
                     symbol=sym,
                     fundamentals=fund,
@@ -998,7 +962,6 @@ def run_scan() -> None:
             except Exception as e:
                 logging.error(f"Erro no scan de {sym}: {e}", exc_info=True)
 
-        # Ranking flip no final do scan
         if ranked_entries:
             ranking_text = build_flip_ranking(ranked_entries, spy_change, exclude_syms=comprar_syms)
             if ranking_text:
@@ -1009,7 +972,7 @@ def run_scan() -> None:
         logging.info("Scan concluído.")
 
 
-# ── Watchlist Scan ─────────────────────────────────────────────────────────────────
+# ── Watchlist Scan ────────────────────────────────────────────────────────────
 
 def run_watchlist_job() -> None:
     if not WATCHLIST_ENABLED:
@@ -1023,14 +986,9 @@ def run_watchlist_job() -> None:
         logging.error(f"Watchlist scan: {e}")
 
 
-# ── ML Outcomes Job (domingo 08:00) ───────────────────────────────────────────────
+# ── ML Outcomes Job (domingo 08:00) ───────────────────────────────────────────
 
 def run_ml_outcomes_job() -> None:
-    """
-    Corre domingo de manhã (08:00) — preenche MFE/MAE/returns
-    para todos os alertas com 30+ dias de histórico.
-    Envia resumo por Telegram.
-    """
     logging.info("[ml_outcomes] A actualizar outcomes da alert_db...")
     try:
         stats = fill_db_outcomes()
@@ -1043,7 +1001,6 @@ def run_ml_outcomes_job() -> None:
         logging.info("[ml_outcomes] Base de dados vazia, nada a fazer.")
         return
 
-    # Montar resumo para Telegram
     db_stats = get_db_stats()
     outcomes = db_stats.get("outcomes", {})
     labeled  = db_stats.get("labeled", 0)
@@ -1080,7 +1037,7 @@ def run_ml_outcomes_job() -> None:
     logging.info(f"[ml_outcomes] Done: {stats}")
 
 
-# ── Bot commands handler ───────────────────────────────────────────────────────────
+# ── Bot commands handler ──────────────────────────────────────────────────────
 
 def poll_bot_commands() -> None:
     try:
@@ -1110,33 +1067,18 @@ def poll_bot_commands() -> None:
         logging.warning(f"poll_bot_commands: {e}")
 
 
-# ── Scheduler ──────────────────────────────────────────────────────────────────────
+# ── Scheduler ─────────────────────────────────────────────────────────────────
 
 def setup_schedule() -> None:
-    # Heartbeat diário às 9h
     schedule.every().day.at("09:00").do(send_heartbeat)
-
-    # Scan principal
     schedule.every(SCAN_MINUTES).minutes.do(run_scan)
-
-    # Stress check (durante horas de mercado)
     schedule.every(15).minutes.do(check_portfolio_stress)
-
-    # Watchlist
     schedule.every(45).minutes.do(run_watchlist_job)
-
-    # Recovery check
     schedule.every().day.at("15:00").do(check_recovery_alerts)
     schedule.every().day.at("17:30").do(check_recovery_alerts)
-
-    # Weekly scans
     schedule.every().monday.at("08:45").do(send_weekly_dip_scan)
     schedule.every().saturday.at("10:00").do(send_saturday_report)
-
-    # ── ML Outcomes: domingo às 08:00 ─────────────────────────────────
     schedule.every().sunday.at("08:00").do(run_ml_outcomes_job)
-
-    # Reset diário de alertas e stress à meia-noite
     schedule.every().day.at("00:01").do(lambda: (
         clear_alerts(),
         _alerted_today.clear(),
@@ -1144,20 +1086,17 @@ def setup_schedule() -> None:
         _sector_etf_cache.clear(),
         logging.info("Reset diário efectuado.")
     ))
-
-    # Poll de comandos Telegram a cada 10s
     schedule.every(10).seconds.do(poll_bot_commands)
-
     logging.info("Scheduler configurado.")
 
 
-# ── Entry point ──────────────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     logging.info("🚀 DipRadar a iniciar...")
     setup_schedule()
-    send_heartbeat()  # Heartbeat imediato no boot
-    run_scan()        # Scan imediato no boot
+    send_heartbeat()
+    run_scan()
     logging.info("Loop principal iniciado.")
     while True:
         schedule.run_pending()

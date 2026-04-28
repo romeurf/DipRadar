@@ -79,21 +79,44 @@ _MARGIN_THRESHOLD = {
 }
 
 # Thresholds de dividend_yield mínimo por sector para categoria Apartamento.
-# Sectores de crescimento (Tech, Comm) exigem yield mais alto porque
-# o dividendo não é o driver principal — tem de ser realmente excepcional.
 _APARTAMENTO_YIELD_THRESHOLD = {
-    "Technology":             0.025,  # 2.5% — raro em tech, mas válido (ex: MSFT, INTC)
-    "Communication Services": 0.030,  # 3.0%
-    "Healthcare":             0.020,  # 2.0% — pharma com pipeline + yield é Apartamento clássico
-    "Consumer Defensive":     0.025,  # 2.5%
-    "Consumer Cyclical":      0.025,  # 2.5%
-    "Industrials":            0.020,  # 2.0%
-    "Financial Services":     0.030,  # 3.0% — bancos e seguradoras têm yields altos por padrão
-    "Energy":                 0.035,  # 3.5% — energia paga bem, exige mais para diferenciar
-    "Utilities":              0.030,  # 3.0% — utilities são quasi-obrigações, yield alto é normal
-    "Real Estate":            0.035,  # 3.5% — REITs: yield abaixo de 3.5% não justifica o risco
-    "Basic Materials":        0.025,  # 2.5%
+    "Technology":             0.025,
+    "Communication Services": 0.030,
+    "Healthcare":             0.020,
+    "Consumer Defensive":     0.025,
+    "Consumer Cyclical":      0.025,
+    "Industrials":            0.020,
+    "Financial Services":     0.030,
+    "Energy":                 0.035,
+    "Utilities":              0.030,
+    "Real Estate":            0.035,
+    "Basic Materials":        0.025,
 }
+
+# Strings canónicas das categorias — fonte da verdade única.
+# Usar sempre estas constantes em vez de strings literais com emojis.
+CATEGORY_HOLD_FOREVER = "🏛️ Hold Forever"
+CATEGORY_APARTAMENTO  = "🏠 Apartamento"
+CATEGORY_ROTACAO      = "🔄 Rotação"
+
+
+def is_bluechip(fundamentals: dict) -> bool:
+    """
+    Determina se um stock qualifica como blue chip.
+    Critérios:
+      - Market cap >= $50B
+      - Dividend yield >= 1.5% OU (revenue growth > 5% E gross margin > threshold sectorial)
+    Fonte da verdade única — importar daqui em vez de duplicar no main.py.
+    """
+    mc           = fundamentals.get("market_cap") or 0
+    div_yield    = fundamentals.get("dividend_yield") or 0
+    rev_growth   = fundamentals.get("revenue_growth") or 0
+    gross_margin = fundamentals.get("gross_margin") or 0
+    sector       = fundamentals.get("sector", "")
+    if mc < 50_000_000_000:
+        return False
+    threshold = _MARGIN_THRESHOLD.get(sector, 0.40)
+    return (div_yield >= 0.015) or (rev_growth > 0.05 and gross_margin > threshold)
 
 
 def _get_insider_bought(symbol: str) -> bool:
@@ -130,7 +153,6 @@ def get_relative_strength(symbol: str, sector_change: float | None) -> float | N
     """
     Devolve a variação do stock no dia (%).
     A comparação com sector_change é feita externamente no calculate_dip_score.
-    Retorna None se não disponível.
     """
     return None
 
@@ -139,51 +161,41 @@ def get_relative_strength(symbol: str, sector_change: float | None) -> float | N
 
 def classify_dip_category(fundamentals: dict, dip_score: float, is_bluechip_flag: bool) -> str:
     """
-    Classifica o dip em uma de 3 categorias estratégicas:
+    Classifica o dip em uma de 3 categorias estratégicas.
+    Devolve sempre uma das constantes CATEGORY_* definidas neste módulo.
 
     🏛️ Hold Forever — Blue chip de qualidade máxima. Compounder inabalável.
-        Critérios DRACIONANOS (todos obrigatórios):
+        Critérios DRACONIANOS (todos obrigatórios):
           - is_bluechip=True AND score >= 70
           - gross_margin acima do threshold do sector
           - FCF não profundamente negativo (fcf_yield > -0.01)
           - D/E < 150 (balanço controlado)
-        Estratégia: nunca vender, acumular em dips.
-        Exemplo: MSFT, AAPL, GOOGL
 
     🏠 Apartamento — Drawdown estrutural + dividendo sectorial acima do threshold.
-        "Cobras a renda enquanto o imóvel valoriza."
         Critérios:
-          - dividend_yield >= threshold do sector (ver _APARTAMENTO_YIELD_THRESHOLD)
-          - drawdown_52w <= -20% (queda estrutural — há reprecificação a fazer)
+          - dividend_yield >= threshold do sector
+          - drawdown_52w <= -20%
           - FCF não profundamente negativo (fcf_yield > -0.03)
-          - score >= 45 (empresa não pode ser uma value trap pura)
-        Estratégia: YIELD + REPRECIFICAÇÃO — entrada faseada, stop em corte de dividendo.
-        Exemplo: NVO em queda acentuada, pharma com pipeline strong + yield
+          - score >= 45
 
-    🔄 Rotação — Oportunidade táctica. Ineficiência de curto/médio prazo.
-        Fallback: tudo o que não é Hold Forever nem Apartamento.
-        Estratégia: FLIP — entrada, target +X%, stop -15%.
-        Exemplo: PINS, stock de crescimento em correção sem dividendo.
-
-    Devolve string com emoji para usar directamente nas mensagens.
+    🔄 Rotação — Fallback táctico. Tudo o resto.
     """
-    dividend_yield = fundamentals.get("dividend_yield") or 0
-    drawdown       = fundamentals.get("drawdown_from_high") or 0
-    fcf_yield      = fundamentals.get("fcf_yield")   # pode ser None
-    gross_margin   = fundamentals.get("gross_margin") or 0
-    debt_equity    = fundamentals.get("debt_equity")  # pode ser None
-    sector         = fundamentals.get("sector", "")
+    dividend_yield   = fundamentals.get("dividend_yield") or 0
+    drawdown         = fundamentals.get("drawdown_from_high") or 0
+    fcf_yield        = fundamentals.get("fcf_yield")
+    gross_margin     = fundamentals.get("gross_margin") or 0
+    debt_equity      = fundamentals.get("debt_equity")
+    sector           = fundamentals.get("sector", "")
     margin_threshold = _MARGIN_THRESHOLD.get(sector, 0.40)
 
-    # ── Hold Forever: critérios draconianos ───────────────────────────────
-    # Não basta ser bluechip — tem de ter qualidade de balanço e margens.
+    # ── Hold Forever ──────────────────────────────────────────────────────
     hf_fcf_ok    = (fcf_yield is None) or (fcf_yield > -0.01)
     hf_margin_ok = gross_margin >= margin_threshold
     hf_de_ok     = (debt_equity is None) or (debt_equity < 150)
     if is_bluechip_flag and dip_score >= 70 and hf_fcf_ok and hf_margin_ok and hf_de_ok:
-        return "🏛️ Hold Forever"
+        return CATEGORY_HOLD_FOREVER
 
-    # ── Apartamento: yield sectorial + queda estrutural + FCF aceitável ───
+    # ── Apartamento ───────────────────────────────────────────────────────
     apt_yield_min = _APARTAMENTO_YIELD_THRESHOLD.get(sector, 0.020)
     apt_fcf_ok    = (fcf_yield is None) or (fcf_yield > -0.03)
     if (
@@ -192,24 +204,24 @@ def classify_dip_category(fundamentals: dict, dip_score: float, is_bluechip_flag
         and apt_fcf_ok
         and dip_score >= 45
     ):
-        return "🏠 Apartamento"
+        return CATEGORY_APARTAMENTO
 
-    # ── Rotação: fallback táctico ─────────────────────────────────────────
-    return "🔄 Rotação"
+    # ── Rotação: fallback ─────────────────────────────────────────────────
+    return CATEGORY_ROTACAO
 
 
 def calculate_dip_score(
     fundamentals: dict,
     symbol: str,
-    earnings_days: int | None = None,  # mantido na assinatura para retrocompatibilidade, mas NÃO pontua
+    earnings_days: int | None = None,
     sector_change: float | None = None,
-    stock_change_pct: float | None = None,  # variação % do stock no dia
+    stock_change_pct: float | None = None,
 ) -> tuple[float, str | None]:
     """
     Devolve (score, rsi_str). Escala 0-100.
     earnings_days    : mantido para compatibilidade — NÃO afecta o score.
-    sector_change    : variação % do ETF sectorial (para relative strength e penalização).
-    stock_change_pct : variação % do stock no dia (para relative strength).
+    sector_change    : variação % do ETF sectorial.
+    stock_change_pct : variação % do stock no dia.
     """
     score = 0
 
@@ -251,15 +263,12 @@ def calculate_dip_score(
         elif rsi_val < 40:
             score += 5
 
-    # ── Earnings: REMOVIDO do score ──────────────────────────────────────
-    # earnings_days não pontua — é mostrado como aviso independente no output.
-
     # Relative Strength vs sector
     if stock_change_pct is not None and sector_change is not None and sector_change != 0:
-        ratio = stock_change_pct / sector_change  # ambos negativos → ratio positivo se semelhantes
-        if ratio >= 0.5:  # stock caiu ≤50% do que o sector → sobre-reacção relativa
+        ratio = stock_change_pct / sector_change
+        if ratio >= 0.5:
             score += 10
-        elif ratio > 3.0:  # stock caiu >3x o sector → fuga estrutural
+        elif ratio > 3.0:
             score -= 5
 
     # Dip within uptrend — SMA50
@@ -340,11 +349,11 @@ def build_score_breakdown(
             lines.append(f"✅ FCF yield {fcf_yield*100:.1f}% › 3% (+10)")
         elif fcf_yield < 0:
             if rev_growth < 0.05:
-                lines.append(f"❌ FCF negativo + crescimento fraco (-15)")
+                lines.append("❌ FCF negativo + crescimento fraco (-15)")
             elif rev_growth > 0.10:
-                lines.append(f"⚠️ FCF negativo mas crescimento forte (-5)")
+                lines.append("⚠️ FCF negativo mas crescimento forte (-5)")
             else:
-                lines.append(f"⚠️ FCF negativo zona cinzenta (-10)")
+                lines.append("⚠️ FCF negativo zona cinzenta (-10)")
     else:
         lines.append("⬜ FCF yield — sem dados")
 
@@ -398,7 +407,7 @@ def build_score_breakdown(
     else:
         lines.append("⬜ Relative strength — sector change indisponível")
 
-    # SMA50 — dip within uptrend
+    # SMA50
     price = fundamentals.get("price") or 0
     if price > 0:
         sma50 = get_sma50(symbol)
