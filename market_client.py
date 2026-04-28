@@ -416,6 +416,43 @@ def _yf_info(symbol: str) -> dict:
     return {}
 
 
+def _normalize_dividend_yield(raw: float | None) -> float | None:
+    """
+    Normaliza o dividendYield devolvido pelo yfinance para decimal consistente.
+
+    O yfinance devolve tipicamente valores decimais (0.0263 = 2.63%), mas
+    alguns tickers devolvem o valor já em percentagem (2.63 em vez de 0.0263).
+    Esta função garante que o resultado é SEMPRE decimal.
+
+    Exemplos:
+      0.0263  →  0.0263  (2.63% — já decimal)
+      2.63    →  0.0263  (2.63% — convertido)
+      0.0     →  None
+      None    →  None
+
+    Nota: valores > 0.50 (50%) são impossíveis como yield real num stock
+    saudável, portanto são tratados como já estando em percentagem e
+    divididos por 100. Limite superior de segurança: 50% (0.50 decimal).
+    Tickers com yield genuinamente >50% são raros e geralmente sinais de
+    distress que o score já penaliza de outras formas.
+    """
+    if raw is None or raw <= 0:
+        return None
+    # yfinance devolve > 0.50 → assume que já está em percentagem
+    return float(raw) / 100 if raw > 0.50 else float(raw)
+
+
+def _normalize_ratio(raw: float | None) -> float | None:
+    """
+    Normaliza ratios como payout_ratio, gross_margin, roe, revenue_growth
+    que o yfinance devolve consistentemente como decimais.
+    Não requer ajuste — apenas garante que None é devolvido para valores None.
+    """
+    if raw is None:
+        return None
+    return float(raw)
+
+
 def get_fundamentals(symbol: str, region: str = "", min_market_cap: int = 2_000_000_000) -> dict:
     result = {"symbol": symbol}
     inf    = _yf_info(symbol)
@@ -443,13 +480,14 @@ def get_fundamentals(symbol: str, region: str = "", min_market_cap: int = 2_000_
         "beta":             inf.get("beta"),
         "market_cap":       mc,
         "pe":               inf.get("trailingPE") or inf.get("forwardPE"),
-        "revenue_growth":   inf.get("revenueGrowth"),
-        "gross_margin":     inf.get("grossMargins"),
+        "revenue_growth":   _normalize_ratio(inf.get("revenueGrowth")),
+        "gross_margin":     _normalize_ratio(inf.get("grossMargins")),
         "ev_ebitda":        inf.get("enterpriseToEbitda"),
-        "roe":              inf.get("returnOnEquity"),
+        "roe":              _normalize_ratio(inf.get("returnOnEquity")),
         "debt_equity":      inf.get("debtToEquity"),
-        "dividend_yield":   inf.get("dividendYield"),
-        "payout_ratio":     inf.get("payoutRatio"),
+        # dividend_yield normalizado para SEMPRE decimal (ex: 0.0263 = 2.63%)
+        "dividend_yield":   _normalize_dividend_yield(inf.get("dividendYield")),
+        "payout_ratio":     _normalize_ratio(inf.get("payoutRatio")),
         "week52_high":      week52_high,
         "drawdown_from_high": drawdown_from_high,
         "volume":           inf.get("volume") or inf.get("regularMarketVolume"),
@@ -515,27 +553,6 @@ def get_earnings_date(symbol: str) -> str | None:
         return None
     dt = datetime.now(tz=timezone.utc) + timedelta(days=days)
     return dt.strftime("%d/%m/%Y")
-
-
-def _normalize_dividend_yield(raw: float | None) -> float:
-    """
-    Normaliza o dividendYield devolvido pelo yfinance para percentagem real.
-
-    O yfinance devolve tipicamente valores decimais (0.035 = 3.5%), mas
-    alguns tickers europeus ou ETFs devolvem o valor já em percentagem
-    (3.5 em vez de 0.035). Qualquer valor > 1 é tratado como já estando
-    em percentagem e é devolvido directamente; valores <= 1 são
-    multiplicados por 100.
-
-    Exemplos:
-      0.0351  →  3.51%
-      3.51    →  3.51%   (já em %)
-      0.0     →  0.0%
-    """
-    if raw is None or raw <= 0:
-        return 0.0
-    # Se o valor for > 1 assume-se que já está em percentagem
-    return float(raw) if raw > 1 else float(raw) * 100
 
 
 def get_portfolio_snapshot(holdings, cashback_eur, ppr_shares, ppr_avg_cost, usd_eur):
