@@ -263,13 +263,15 @@ def fill_db_outcomes() -> dict:
         changed = False
 
         def _get_price_at(target_date):
-            """Preço de fecho mais próximo de target_date (±5 dias úteis)."""
-            for delta in range(0, 6):
-                for direction in [0, 1, -1, 2, -2]:
-                    check = target_date + timedelta(days=delta * direction if direction != 0 else 0)
-                    matches = hist_after[hist_after.index.date == check]
-                    if not matches.empty:
-                        return float(matches["Close"].iloc[0])
+            """
+            Preço de fecho mais próximo de target_date.
+            Tenta de -3 a +5 dias úteis para cobrir feriados e fins-de-semana.
+            """
+            for delta in range(-3, 6):
+                check = target_date + timedelta(days=delta)
+                matches = hist_after[hist_after.index.date == check]
+                if not matches.empty:
+                    return float(matches["Close"].iloc[0])
             return None
 
         # ── T+1m ──────────────────────────────────────────────────────────
