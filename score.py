@@ -115,9 +115,48 @@ def get_relative_strength(symbol: str, sector_change: float | None) -> float | N
     A comparação com sector_change é feita externamente no calculate_dip_score.
     Retorna None se não disponível.
     """
-    # O change_pct do stock vem dos fundamentals — não precisamos de nova chamada.
-    # Esta função fica disponível para uso futuro.
     return None
+
+
+# ── Classificação de categoria ────────────────────────────────────────────
+
+def classify_dip_category(fundamentals: dict, dip_score: float, is_bluechip_flag: bool) -> str:
+    """
+    Classifica o dip em uma de 3 categorias estratégicas:
+
+    🏛️ Hold Forever — Blue chip de qualidade máxima. Compounder inabalável.
+        Critérios: is_bluechip=True AND score >= 70
+        Estratégia: nunca vender, acumular em dips.
+        Exemplo: MSFT, AAPL, GOOGL
+
+    🏠 Apartamento — Ativo com drawdown estrutural + dividendo que paga
+        para esperar a reprecificação. "Cobras a renda enquanto o imóvel valoriza."
+        Critérios: dividend_yield >= 2% AND drawdown_52w <= -20% AND FCF não profundamente negativo
+        Estratégia: YIELD + REPRECIFICAÇÃO — entrada faseada, stop em corte de dividendo.
+        Exemplo: NVO em queda acentuada, pharma com pipeline strong + yield
+
+    🔄 Rotação — Oportunidade táctica. Ineficiência de curto/médio prazo.
+        Tudo o resto. Flip clássico com target e stop definidos.
+        Estratégia: FLIP — entrada, target +X%, stop -15%.
+        Exemplo: PINS, stock de crescimento em correção sem dividendo.
+
+    Devolve string com emoji para usar directamente nas mensagens.
+    """
+    dividend_yield = fundamentals.get("dividend_yield") or 0
+    drawdown       = fundamentals.get("drawdown_from_high") or 0
+    fcf_yield      = fundamentals.get("fcf_yield")  # pode ser None
+
+    # Hold Forever: blue chip confirmado com score alto
+    if is_bluechip_flag and dip_score >= 70:
+        return "🏛️ Hold Forever"
+
+    # Apartamento: dividendo decente + queda estrutural + FCF não catastrófico
+    fcf_ok = (fcf_yield is None) or (fcf_yield > -0.02)  # FCF ligeiramente negativo ainda ok
+    if dividend_yield >= 0.02 and drawdown <= -20 and fcf_ok:
+        return "🏠 Apartamento"
+
+    # Rotação: tudo o resto
+    return "🔄 Rotação"
 
 
 def calculate_dip_score(
