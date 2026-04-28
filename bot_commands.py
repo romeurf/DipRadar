@@ -19,13 +19,8 @@ Comandos disponíveis:
   /flip add TICK ENTRY SHARES [NOTA]   → Registar entrada num trade
   /flip close ID EXIT                  → Fechar trade pelo ID com preço de saída
   /flip del ID                         → Apagar trade pelo ID
+  /mldata                  → Estatísticas da base de dados ML + forçar update de outcomes
   /help                    → Lista de comandos
-
-Funções chamadas pelo scheduler (main.py):
-  send_earnings_alerts()   → Notificação automática de earnings a <7 dias
-
-Uso em main.py:
-  Corre start_bot_listener() numa thread separada no arranque.
 """
 
 import os
@@ -57,7 +52,7 @@ _EARNINGS_ALERT_DAYS: int = int(os.environ.get("EARNINGS_ALERT_DAYS", 7))
 _last_update_id: int = 0
 _bot_start_time: datetime = datetime.now()
 
-# Callbacks injectados pelo main.py
+# Callbacks injectados pelo main.py via register_callbacks() ou poll()
 _cb_send_telegram    = None
 _cb_run_scan         = None
 _cb_get_snapshot     = None
@@ -68,6 +63,8 @@ _cb_tier3_handler    = None
 _cb_analyze_ticker   = None
 _cb_get_fundamentals = None
 _cb_earnings_days    = None
+_cb_get_db_stats     = None
+_cb_fill_db_outcomes = None
 
 
 def register_callbacks(
@@ -81,11 +78,14 @@ def register_callbacks(
     analyze_ticker=None,
     get_fundamentals=None,
     earnings_days=None,
+    get_db_stats=None,
+    fill_db_outcomes=None,
 ) -> None:
     global _cb_send_telegram, _cb_run_scan, _cb_get_snapshot
     global _cb_backtest_summary, _cb_rejected_log, _cb_is_market_open
     global _cb_tier3_handler, _cb_analyze_ticker
     global _cb_get_fundamentals, _cb_earnings_days
+    global _cb_get_db_stats, _cb_fill_db_outcomes
     _cb_send_telegram    = send_telegram
     _cb_run_scan         = run_scan
     _cb_get_snapshot     = get_snapshot
@@ -96,11 +96,74 @@ def register_callbacks(
     _cb_analyze_ticker   = analyze_ticker
     _cb_get_fundamentals = get_fundamentals
     _cb_earnings_days    = earnings_days
+    _cb_get_db_stats     = get_db_stats
+    _cb_fill_db_outcomes = fill_db_outcomes
+
+
+# ── poll() bridge ────────────────────────────────────────────────────────────────────
+# O main.py chama poll() periodicamente via schedule (a cada 10s).
+# Este bridge lê os updates pendentes do Telegram e despacha comandos.
+# A função também re-injeta os callbacks do contexto antes de processar.
+
+def poll(
+    token: str,
+    chat_id: str,
+    send_fn,
+    context: dict,
+) -> None:
+    """
+    Chamado pelo scheduler do main.py a cada 10 segundos.
+    Lê até 20 updates pendentes do Telegram e despacha para _handle_command.
+    
+    context: dict com callbacks e utilitários injectados pelo main.py:
+      get_snapshot, DIRECT_TICKERS, MIN_MARKET_CAP, ..., get_db_stats, fill_db_outcomes
+    """
+    global _last_update_id
+    if not token:
+        return
+
+    # Re-injectar callbacks do contexto
+    global _cb_send_telegram, _cb_get_snapshot, _cb_get_db_stats, _cb_fill_db_outcomes
+    _cb_send_telegram    = send_fn
+    _cb_get_snapshot     = context.get("get_snapshot")
+    _cb_backtest_summary_fn = context.get("build_backtest_summary")
+    _cb_get_db_stats     = context.get("get_db_stats")
+    _cb_fill_db_outcomes = context.get("fill_db_outcomes")
+
+    # Guardar contexto completo para handlers que precisam
+    _poll_context.update(context)
+    _poll_context["send_fn"] = send_fn
+
+    url = f"https://api.telegram.org/bot{token}/getUpdates"
+    try:
+        r = requests.get(
+            url,
+            params={"offset": _last_update_id + 1, "timeout": 0, "limit": 20},
+            timeout=5,
+        )
+        if not r.ok:
+            return
+        for update in r.json().get("result", []):
+            uid             = update["update_id"]
+            _last_update_id = max(_last_update_id, uid)
+            msg  = update.get("message", {})
+            cid  = str(msg.get("chat", {}).get("id", ""))
+            text = msg.get("text", "")
+            if cid == chat_id and text:
+                logging.info(f"[bot_commands] Comando: {text!r}")
+                _handle_command(text)
+    except Exception as e:
+        logging.debug(f"[bot_commands] poll error: {e}")
+
+
+# Context partilhado entre poll() e handlers
+_poll_context: dict = {}
 
 
 def _reply(text: str) -> None:
-    if _cb_send_telegram:
-        _cb_send_telegram(text)
+    fn = _poll_context.get("send_fn") or _cb_send_telegram
+    if fn:
+        fn(text)
 
 
 def _check_rate(cmd: str) -> bool:
@@ -114,7 +177,7 @@ def _check_rate(cmd: str) -> bool:
     return allowed
 
 
-# ── /comparar ───────────────────────────────────────────────────────────────────
+# ── /comparar ───────────────────────────────────────────────────────────────────────────
 
 def _handle_comparar(symbols: list[str]) -> None:
     if len(symbols) < 2:
@@ -128,7 +191,10 @@ def _handle_comparar(symbols: list[str]) -> None:
         _reply("⚠️ Máximo 5 tickers por comparação.")
         return
 
-    if not _cb_get_fundamentals:
+    get_fundamentals = _poll_context.get("get_fundamentals") or _cb_get_fundamentals
+    get_earnings_days = _poll_context.get("get_earnings_days") or _cb_earnings_days
+
+    if not get_fundamentals:
         _reply("_Comparação não disponível — callback get_fundamentals não registado._")
         return
 
@@ -139,8 +205,8 @@ def _handle_comparar(symbols: list[str]) -> None:
         rows = []
         for sym in symbols:
             try:
-                fund  = _cb_get_fundamentals(sym)
-                edays = _cb_earnings_days(sym) if _cb_earnings_days else None
+                fund  = get_fundamentals(sym)
+                edays = get_earnings_days(sym) if get_earnings_days else None
                 score, rsi_str = calculate_dip_score(fund, sym, edays)
                 badge = "🔥" if score >= 80 else ("⭐" if score >= 55 else "📊")
                 rows.append({
@@ -165,7 +231,6 @@ def _handle_comparar(symbols: list[str]) -> None:
             return
 
         rows.sort(key=lambda r: r.get("score", 0), reverse=True)
-
         lines = [f"*🔄 Comparação — {datetime.now().strftime('%d/%m %H:%M')}*", ""]
         for r in rows:
             if r.get("error"):
@@ -186,7 +251,7 @@ def _handle_comparar(symbols: list[str]) -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
-# ── /historico ──────────────────────────────────────────────────────────────────
+# ── /historico ──────────────────────────────────────────────────────────────────────────
 
 def _handle_historico(symbol: str) -> None:
     history = get_ticker_score_history(symbol)
@@ -232,10 +297,127 @@ def _handle_historico(symbol: str) -> None:
     _reply("\n".join(lines))
 
 
-# ── Earnings alerts (chamado pelo scheduler do main.py) ──────────────────────
+# ── /mldata ──────────────────────────────────────────────────────────────────────────
+
+def _handle_mldata(force_update: bool = False) -> None:
+    """
+    /mldata          → Mostra estatísticas da base de dados ML
+    /mldata update   → Força fill_db_outcomes() e mostra resultado
+    """
+    get_db_stats     = _poll_context.get("get_db_stats") or _cb_get_db_stats
+    fill_db_outcomes = _poll_context.get("fill_db_outcomes") or _cb_fill_db_outcomes
+
+    if not get_db_stats:
+        _reply("_Base de dados ML não disponível. Reinicia o bot._")
+        return
+
+    def _run():
+        # Forçar update se pedido
+        update_stats = None
+        if force_update and fill_db_outcomes:
+            _reply("🔄 _A actualizar outcomes da alert_db... (pode demorar 1-2 min)_")
+            try:
+                update_stats = fill_db_outcomes()
+            except Exception as e:
+                _reply(f"⚠️ Erro no update: `{e}`")
+                return
+
+        try:
+            stats    = get_db_stats()
+            total    = stats.get("total", 0)
+            labeled  = stats.get("labeled", 0)
+            outcomes = stats.get("outcomes", {})
+            by_cat   = stats.get("by_category", {})
+            by_vrd   = stats.get("by_verdict", {})
+            db_path  = stats.get("db_path", "N/D")
+        except Exception as e:
+            _reply(f"_Erro ao ler stats: {e}_")
+            return
+
+        lines = [
+            f"🤖 *ML Alert Database*",
+            f"_{datetime.now().strftime('%d/%m/%Y %H:%M')}_",
+            "",
+            f"*🗓️ Total de alertas:* {total}",
+            f"*📊 Classificados:* {labeled} ({labeled/total*100:.0f}% do total)" if total > 0 else "*📊 Classificados:* 0",
+            f"*🗂️ Ficheiro:* `{db_path}`",
+            "",
+        ]
+
+        if by_cat:
+            lines.append("*🏠 Por categoria:*")
+            cat_emojis = {
+                "🏗️ Hold Forever": "🏗️",
+                "🏠 Apartamento":   "🏠",
+                "🔄 Rotação":       "🔄",
+            }
+            for cat, count in sorted(by_cat.items(), key=lambda x: x[1], reverse=True):
+                pct = count / total * 100 if total > 0 else 0
+                lines.append(f"  {cat}: *{count}* ({pct:.0f}%)")
+            lines.append("")
+
+        if by_vrd:
+            lines.append("*📊 Por verdict:*")
+            vrd_em = {"COMPRAR": "🟢", "MONITORIZAR": "🟡", "EVITAR": "🔴"}
+            for vrd, count in sorted(by_vrd.items(), key=lambda x: x[1], reverse=True):
+                em  = vrd_em.get(vrd, "📊")
+                pct = count / total * 100 if total > 0 else 0
+                lines.append(f"  {em} {vrd}: *{count}* ({pct:.0f}%)")
+            lines.append("")
+
+        if outcomes:
+            lines.append("*🎯 Outcomes (alertas com histórico suficiente):*")
+            emoji_map = {"WIN_40": "🟢", "WIN_20": "✅", "NEUTRAL": "🟡", "LOSS_15": "🔴"}
+            for label, count in sorted(outcomes.items(), key=lambda x: x[1], reverse=True):
+                em  = emoji_map.get(label, "📊")
+                pct = count / labeled * 100 if labeled > 0 else 0
+                lines.append(f"  {em} {label}: *{count}* ({pct:.0f}%)")
+            lines.append("")
+
+            # Win rate calculado
+            wins   = outcomes.get("WIN_40", 0) + outcomes.get("WIN_20", 0)
+            losses = outcomes.get("LOSS_15", 0)
+            if labeled > 0:
+                win_rate = wins / labeled * 100
+                lines.append(f"  📈 *Win rate total:* {win_rate:.0f}% ({wins}/{labeled})")
+                if losses > 0:
+                    lines.append(f"  ⚠️ *Value Traps detectadas:* {losses} ({losses/labeled*100:.0f}%)")
+            lines.append("")
+
+        # Se houve update, mostrar stats do update
+        if update_stats:
+            lines.append(f"*✅ Update concluído:* {update_stats.get('updated', 0)} novas classificações")
+            if update_stats.get('errors', 0) > 0:
+                lines.append(f"  ⚠️ Erros: {update_stats['errors']}")
+            lines.append("")
+
+        # Progresso para treino do modelo
+        if total == 0:
+            lines.append("🕐 _Base de dados vazia — aguarda os primeiros alertas._")
+        elif labeled < 50:
+            lines.append(f"🕐 _Precisa de mais *{50 - labeled}* alertas classificados para treinar o modelo ML._")
+            lines.append("_Update automático todos os domingos às 08:00._")
+        elif labeled < 100:
+            lines.append(f"🟡 *{labeled} alertas classificados* — podes começar a explorar o modelo!")
+            lines.append("_Para resultados sólidos, aguarda 100+._")
+        else:
+            lines.append(f"🟢 *{labeled} alertas classificados* — *pronto para treinar o modelo!*")
+            lines.append("_Usa `train_model.py` com XGBoost/sklearn._")
+
+        if not force_update and fill_db_outcomes:
+            lines.append("")
+            lines.append("_Força update agora com `/mldata update`_")
+
+        _reply("\n".join(lines))
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# ── Earnings alerts (chamado pelo scheduler do main.py) ────────────────────────
 
 def send_earnings_alerts(watchlist: list[str] | None = None) -> int:
-    if not _cb_earnings_days or not _cb_send_telegram:
+    earnings_days_fn = _poll_context.get("get_earnings_days") or _cb_earnings_days
+    if not earnings_days_fn or not (_poll_context.get("send_fn") or _cb_send_telegram):
         return 0
 
     dynamic     = load_dynamic_watchlist()
@@ -250,7 +432,7 @@ def send_earnings_alerts(watchlist: list[str] | None = None) -> int:
 
     for sym in all_tickers:
         try:
-            edays = _cb_earnings_days(sym)
+            edays = earnings_days_fn(sym)
             if edays is None:
                 continue
             if 0 <= edays <= _EARNINGS_ALERT_DAYS:
@@ -280,7 +462,7 @@ def send_earnings_alerts(watchlist: list[str] | None = None) -> int:
     return sent
 
 
-# ── /watchlist handler ────────────────────────────────────────────────────────
+# ── /watchlist handler ────────────────────────────────────────────────────────────────
 
 def _handle_watchlist(parts: list[str]) -> None:
     sub = parts[1].lower() if len(parts) > 1 else "list"
@@ -346,29 +528,18 @@ def _handle_watchlist(parts: list[str]) -> None:
         )
 
 
-# ── /flip handler ─────────────────────────────────────────────────────────────
+# ── /flip handler ───────────────────────────────────────────────────────────────────
 
 def _handle_flip(parts: list[str]) -> None:
-    """
-    Comandos do Flip Fund:
-
-      /flip                              → Resumo P&L + trades abertos
-      /flip list                         → Lista todos os trades (abertos + fechados)
-      /flip add TICK ENTRY SHARES [NOTA] → Registar nova entrada
-      /flip close ID EXIT                → Fechar trade com preço de saída
-      /flip del ID                       → Apagar trade
-    """
     sub = parts[1].lower() if len(parts) > 1 else "summary"
 
-    # ── Resumo / lista de abertos ───────────────────────────────────────────
+    # ── Resumo / lista ───────────────────────────────────────────────────────────
     if sub in ("summary", "list", "ls", "ver", "show") or len(parts) == 1:
         summary = get_flip_summary()
         lines = [
             f"*🎯 Flip Fund — {datetime.now().strftime('%d/%m/%Y')}*",
             "",
         ]
-
-        # P&L realizado
         pnl      = summary["total_pnl"]
         pnl_sign = "+" if pnl >= 0 else ""
         pnl_em   = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
@@ -382,7 +553,6 @@ def _handle_flip(parts: list[str]) -> None:
             w = summary["worst_trade"]
             lines.append(f"  ⚠️ Pior: *{w['symbol']}* ${w['pnl_eur']:+.2f} ({w['date_entry']} → {w['date_exit'] or '?'})")
 
-        # Posições abertas
         opened = summary["trades_open"]
         if opened:
             lines += ["", f"*📂 Posições abertas ({len(opened)}):*"]
@@ -395,7 +565,6 @@ def _handle_flip(parts: list[str]) -> None:
         else:
             lines += ["", "_Sem posições abertas._"]
 
-        # Se /flip list → mostra também fechados
         if sub in ("list", "ls"):
             closed = summary["trades_closed"]
             if closed:
@@ -419,14 +588,12 @@ def _handle_flip(parts: list[str]) -> None:
         _reply("\n".join(lines))
         return
 
-    # ── /flip add TICK ENTRY SHARES [NOTA] ─────────────────────────────────
+    # ── /flip add ──────────────────────────────────────────────────────────────
     if sub in ("add", "entrada", "open"):
-        # Mínimo: /flip add TICK ENTRY SHARES
         if len(parts) < 5:
             _reply(
                 "⚠️ Uso: `/flip add <TICKER> <PREÇO_ENTRADA> <SHARES> [nota]`\n"
-                "_Exemplo: `/flip add NVDA 105.50 10`_\n"
-                "_Exemplo com nota: `/flip add NVDA 105.50 10 queda macro`_"
+                "_Exemplo: `/flip add NVDA 105.50 10`_"
             )
             return
         ticker = parts[2].upper().strip()
@@ -434,7 +601,7 @@ def _handle_flip(parts: list[str]) -> None:
             entry  = float(parts[3])
             shares = float(parts[4])
         except ValueError:
-            _reply("⚠️ Preço e shares têm de ser números. Ex: `/flip add NVDA 105.50 10`")
+            _reply("⚠️ Preço e shares têm de ser números.")
             return
         if entry <= 0 or shares <= 0:
             _reply("⚠️ Preço de entrada e shares têm de ser positivos.")
@@ -452,19 +619,16 @@ def _handle_flip(parts: list[str]) -> None:
         )
         return
 
-    # ── /flip close ID EXIT ─────────────────────────────────────────────────
+    # ── /flip close ────────────────────────────────────────────────────────────
     if sub in ("close", "fechar", "sell"):
         if len(parts) < 4:
-            _reply(
-                "⚠️ Uso: `/flip close <ID> <PREÇO_SAÍDA>`\n"
-                "_Exemplo: `/flip close 3 121.80`_"
-            )
+            _reply("⚠️ Uso: `/flip close <ID> <PREÇO_SAÍDA>`\n_Exemplo: `/flip close 3 121.80`_")
             return
         try:
             trade_id = int(parts[2])
             exit_px  = float(parts[3])
         except ValueError:
-            _reply("⚠️ ID tem de ser inteiro e preço um número. Ex: `/flip close 3 121.80`")
+            _reply("⚠️ ID tem de ser inteiro e preço um número.")
             return
         if exit_px <= 0:
             _reply("⚠️ Preço de saída tem de ser positivo.")
@@ -486,7 +650,7 @@ def _handle_flip(parts: list[str]) -> None:
         )
         return
 
-    # ── /flip del ID ────────────────────────────────────────────────────────
+    # ── /flip del ───────────────────────────────────────────────────────────────
     if sub in ("del", "delete", "rm", "apagar", "remover"):
         if len(parts) < 3:
             _reply("⚠️ Uso: `/flip del <ID>`\n_Exemplo: `/flip del 2`_")
@@ -503,7 +667,6 @@ def _handle_flip(parts: list[str]) -> None:
             _reply(f"⚠️ Trade `#{trade_id}` não encontrado.")
         return
 
-    # Sub-comando desconhecido
     _reply(
         f"⚠️ Sub-comando desconhecido: `{sub}`\n\n"
         "*Uso do /flip:*\n"
@@ -515,7 +678,7 @@ def _handle_flip(parts: list[str]) -> None:
     )
 
 
-# ── Command router ───────────────────────────────────────────────────────────
+# ── Command router ─────────────────────────────────────────────────────────────────────
 
 def _handle_command(text: str) -> None:
     parts   = text.strip().split()
@@ -539,11 +702,13 @@ def _handle_command(text: str) -> None:
             "`/watchlist add TICK`      → Adicionar ticker\n"
             "`/watchlist rm TICK`       → Remover ticker\n"
             "`/watchlist clear`         → Limpar watchlist\n"
-            "`/flip`                    → P&L e trades abertos do Flip Fund\n"
-            "`/flip list`               → Todos os trades (abertos + fechados)\n"
+            "`/flip`                    → P&L e trades abertos\n"
+            "`/flip list`               → Todos os trades\n"
             "`/flip add TICK ENTRY SHR` → Registar entrada\n"
             "`/flip close ID EXIT`      → Fechar trade\n"
             "`/flip del ID`             → Apagar trade\n"
+            "`/mldata`                  → Stats da base de dados ML\n"
+            "`/mldata update`           → Forçar update de outcomes\n"
             "`/help`                    → Esta mensagem"
         )
 
@@ -552,26 +717,36 @@ def _handle_command(text: str) -> None:
         uptime     = datetime.now() - _bot_start_time
         hours, rem = divmod(int(uptime.total_seconds()), 3600)
         mins       = rem // 60
-        market     = "🟢 Aberto" if (_cb_is_market_open and _cb_is_market_open()) else "🔴 Fechado"
+        is_open_fn = _poll_context.get("is_market_open")
+        market     = "🟢 Aberto" if (is_open_fn and is_open_fn()) else "🔴 Fechado"
         wl         = load_dynamic_watchlist()
         summary    = get_flip_summary()
         flip_str   = f" | Flip: {summary['n_open']} abertos / P&L ${summary['total_pnl']:+.0f}"
+        db_fn      = _poll_context.get("get_db_stats") or _cb_get_db_stats
+        db_str     = ""
+        if db_fn:
+            try:
+                ds     = db_fn()
+                db_str = f" | ML DB: {ds.get('total', 0)} alertas"
+            except Exception:
+                pass
         _reply(
             f"*🤖 DipRadar Status*\n"
             f"Uptime: *{hours}h {mins}m*\n"
             f"Mercado: *{market}*\n"
-            f"Watchlist dinâmica: *{len(wl)} tickers*{flip_str}\n"
+            f"Watchlist dinâmica: *{len(wl)} tickers*{flip_str}{db_str}\n"
             f"_⏰ {datetime.now().strftime('%d/%m/%Y %H:%M')}_\n"
             f"_{rate_status()}_"
         )
 
     elif cmd == "/carteira":
         if not _check_rate(cmd_key): return
-        if not _cb_get_snapshot:
+        get_snap = _poll_context.get("get_snapshot") or _cb_get_snapshot
+        if not get_snap:
             _reply("_Snapshot não disponível._")
             return
         try:
-            snap  = _cb_get_snapshot()
+            snap  = get_snap()
             total = snap.get("total_eur", 0)
             pnl_d = snap.get("pnl_day", 0)
             pnl_w = snap.get("pnl_week", 0)
@@ -592,13 +767,15 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/scan":
         if not _check_rate(cmd_key): return
-        if _cb_is_market_open and not _cb_is_market_open():
+        is_open_fn = _poll_context.get("is_market_open")
+        if is_open_fn and not is_open_fn():
             _reply("⚠️ Mercado fechado — scan não disponível fora do horário.")
             return
         _reply("_🔍 A iniciar scan manual..._")
+        run_scan_fn = _poll_context.get("run_scan") or _cb_run_scan
         try:
-            if _cb_run_scan:
-                threading.Thread(target=_cb_run_scan, daemon=True).start()
+            if run_scan_fn:
+                threading.Thread(target=run_scan_fn, daemon=True).start()
         except Exception as e:
             _reply(f"_Erro no scan: {e}_")
 
@@ -607,14 +784,15 @@ def _handle_command(text: str) -> None:
         if len(parts) < 2:
             _reply("⚠️ Usa: `/analisar <TICKER>`\n_Exemplo: `/analisar AAPL`_")
             return
-        symbol = parts[1].upper().strip()
-        if not _cb_analyze_ticker:
+        symbol         = parts[1].upper().strip()
+        analyze_fn     = _poll_context.get("analyze_ticker") or _cb_analyze_ticker
+        if not analyze_fn:
             _reply("_Análise não disponível._")
             return
         _reply(f"_🔍 A analisar *{symbol}*... (pode demorar 10–20s)_")
         try:
             threading.Thread(
-                target=lambda: _reply(_cb_analyze_ticker(symbol)),
+                target=lambda: _reply(analyze_fn(symbol)),
                 daemon=True,
             ).start()
         except Exception as e:
@@ -627,36 +805,36 @@ def _handle_command(text: str) -> None:
             _handle_comparar(symbols)
         except Exception as e:
             _reply(f"_Erro na comparação: {e}_")
-            logging.exception("[bot_commands] /comparar error")
 
     elif cmd == "/historico":
         if not _check_rate(cmd_key): return
         if len(parts) < 2:
             _reply("⚠️ Usa: `/historico <TICKER>`\n_Exemplo: `/historico NVDA`_")
             return
-        symbol = parts[1].upper().strip()
         try:
-            _handle_historico(symbol)
+            _handle_historico(parts[1].upper().strip())
         except Exception as e:
             _reply(f"_Erro no histórico: {e}_")
 
     elif cmd == "/backtest":
         if not _check_rate(cmd_key): return
-        if not _cb_backtest_summary:
+        bt_fn = _poll_context.get("build_backtest_summary") or _cb_backtest_summary
+        if not bt_fn:
             _reply("_Backtest não disponível._")
             return
         try:
-            _reply(_cb_backtest_summary())
+            _reply(bt_fn())
         except Exception as e:
             _reply(f"_Erro no backtest: {e}_")
 
     elif cmd == "/rejeitados":
         if not _check_rate(cmd_key): return
-        if not _cb_rejected_log:
+        rej_fn = _poll_context.get("load_rejected_log") or _cb_rejected_log
+        if not rej_fn:
             _reply("_Log não disponível._")
             return
         try:
-            rejected = _cb_rejected_log()
+            rejected = rej_fn()
             if not rejected:
                 _reply("_Nenhum stock rejeitado hoje._")
                 return
@@ -674,8 +852,9 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/tier3":
         if not _check_rate(cmd_key): return
+        tier3_fn = _poll_context.get("tier3_handler") or _cb_tier3_handler
         try:
-            _reply(_cb_tier3_handler() if _cb_tier3_handler else "🔵 *Tier 3* — _Handler não registado._")
+            _reply(tier3_fn() if tier3_fn else "🔵 *Tier 3* — _Handler não registado._")
         except Exception as e:
             _reply(f"_Erro ao obter Tier 3: {e}_")
 
@@ -685,7 +864,6 @@ def _handle_command(text: str) -> None:
             _handle_watchlist(parts)
         except Exception as e:
             _reply(f"_Erro na watchlist: {e}_")
-            logging.exception("[bot_commands] /watchlist error")
 
     elif cmd == "/flip":
         if not _check_rate(cmd_key): return
@@ -693,14 +871,21 @@ def _handle_command(text: str) -> None:
             _handle_flip(parts)
         except Exception as e:
             _reply(f"_Erro no flip: {e}_")
-            logging.exception("[bot_commands] /flip error")
+
+    elif cmd == "/mldata":
+        if not _check_rate(cmd_key): return
+        force = len(parts) > 1 and parts[1].lower() in ("update", "atualizar", "force")
+        try:
+            _handle_mldata(force_update=force)
+        except Exception as e:
+            _reply(f"_Erro no mldata: {e}_")
 
     else:
         if text.startswith("/"):
             _reply(f"_Comando desconhecido: `{cmd}` — usa /help_")
 
 
-# ── Poll loop ──────────────────────────────────────────────────────────────────────
+# ── Poll loop (legacy — usado se main.py usar start_bot_listener) ────────────────────
 
 def _poll_loop() -> None:
     global _last_update_id
@@ -732,7 +917,7 @@ def _poll_loop() -> None:
 
 
 def start_bot_listener() -> threading.Thread:
-    """Inicia o listener de comandos numa daemon thread."""
+    """Inicia o listener de comandos numa daemon thread (legacy)."""
     t = threading.Thread(target=_poll_loop, daemon=True, name="bot-commands")
     t.start()
     return t
