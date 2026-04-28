@@ -92,6 +92,25 @@ def _safe_volume_ratio(vol: float | None, avg_vol: float | None) -> float | str:
     return round(vol / avg_vol, 2)
 
 
+def _resolve_outcome_label(ref_return: float) -> str:
+    """
+    Converte um retorno percentual num label de outcome para treino ML.
+    Thresholds:
+      WIN_40  : >= +40%
+      WIN_20  : >= +20%
+      NEUTRAL : >= -15%
+      LOSS_15 : < -15%
+    """
+    if ref_return >= 40:
+        return "WIN_40"
+    elif ref_return >= 20:
+        return "WIN_20"
+    elif ref_return >= -15:
+        return "NEUTRAL"
+    else:
+        return "LOSS_15"
+
+
 def log_alert_snapshot(
     symbol: str,
     fundamentals: dict,
@@ -172,12 +191,18 @@ def fill_db_outcomes() -> dict:
         MFE = retorno máximo intraday em qualquer dia dos 90 dias
         MAE = drawdown máximo intraday em qualquer dia dos 90 dias
       - outcome_label: WIN_40 | WIN_20 | NEUTRAL | LOSS_15
-        (baseado em return_3m, ou return_6m se disponível)
+        Referência por categoria:
+          Apartamento  → prioridade return_6m > return_3m > return_1m
+                         (tese de reprecificação a médio/longo prazo)
+          Hold Forever → nunca classifica (posição sem target de saída)
+          Rotação      → prioridade return_3m > return_6m > return_1m
+                         (tese de flip de curto/médio prazo)
 
     Só actualiza linhas onde os campos ainda estão vazios.
     Retorna dict com stats do run para logging/Telegram.
     """
     import yfinance as yf
+    from score import CATEGORY_APARTAMENTO, CATEGORY_HOLD_FOREVER
 
     if not _DB_PATH.exists():
         logging.info("[fill_db] Ficheiro não existe ainda.")
@@ -210,6 +235,7 @@ def fill_db_outcomes() -> dict:
         date_iso = row.get("date_iso", "")
         symbol   = row.get("symbol", "")
         price_at_alert = row.get("price", "")
+        category = row.get("category", "")
 
         if not date_iso or not symbol or not price_at_alert:
             skipped += 1
@@ -314,25 +340,30 @@ def fill_db_outcomes() -> dict:
 
         # ── outcome_label ─────────────────────────────────────────────────
         if changed and row.get("outcome_label") == "":
-            ref_return = None
-            for field in ("return_6m", "return_3m", "return_1m"):
-                val = row.get(field)
-                if val not in ("", None):
-                    try:
-                        ref_return = float(val)
-                        break
-                    except ValueError:
-                        pass
-
-            if ref_return is not None:
-                if ref_return >= 40:
-                    row["outcome_label"] = "WIN_40"
-                elif ref_return >= 20:
-                    row["outcome_label"] = "WIN_20"
-                elif ref_return >= -15:
-                    row["outcome_label"] = "NEUTRAL"
+            # Hold Forever nunca recebe label — não há target de saída
+            if CATEGORY_HOLD_FOREVER in category:
+                pass
+            else:
+                # Ordem de prioridade dos campos de referência por categoria:
+                #   Apartamento → 6m > 3m > 1m  (reprecificação a médio/longo prazo)
+                #   Rotação     → 3m > 6m > 1m  (flip de curto/médio prazo)
+                if CATEGORY_APARTAMENTO in category:
+                    priority = ("return_6m", "return_3m", "return_1m")
                 else:
-                    row["outcome_label"] = "LOSS_15"
+                    priority = ("return_3m", "return_6m", "return_1m")
+
+                ref_return = None
+                for field in priority:
+                    val = row.get(field)
+                    if val not in ("", None):
+                        try:
+                            ref_return = float(val)
+                            break
+                        except ValueError:
+                            pass
+
+                if ref_return is not None:
+                    row["outcome_label"] = _resolve_outcome_label(ref_return)
 
         if changed:
             rows[i] = row
