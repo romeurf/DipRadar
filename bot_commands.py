@@ -2,13 +2,14 @@
 bot_commands.py — Comandos Telegram para o DipRadar.
 
 Comandos disponíveis:
-  /status     → Estado do bot (uptime, próximo scan, mercado aberto/fechado)
-  /carteira   → Snapshot instantâneo da carteira
-  /scan       → Força scan imediato (só horas de mercado)
-  /backtest   → Resumo do backtest de alertas
-  /rejeitados → Log de rejeitados de hoje
-  /tier3      → Gems Raras do último resumo de fecho (score ≥16)
-  /help       → Lista de comandos
+  /status           → Estado do bot (uptime, próximo scan, mercado aberto/fechado)
+  /carteira         → Snapshot instantâneo da carteira
+  /scan             → Força scan imediato (só horas de mercado)
+  /analisar <TICK>  → Análise completa de qualquer ticker a pedido
+  /backtest         → Resumo do backtest de alertas
+  /rejeitados       → Log de rejeitados de hoje
+  /tier3            → Gems Raras do último resumo de fecho (score ≥80)
+  /help             → Lista de comandos
 
 Uso em main.py:
   Corre start_bot_listener() numa thread separada no arranque.
@@ -35,6 +36,7 @@ _cb_backtest_summary = None  # fn() -> str
 _cb_rejected_log     = None  # fn() -> list
 _cb_is_market_open   = None  # fn() -> bool
 _cb_tier3_handler    = None  # fn() -> str
+_cb_analyze_ticker   = None  # fn(symbol) -> str
 
 
 def register_callbacks(
@@ -45,9 +47,11 @@ def register_callbacks(
     rejected_log,
     is_market_open,
     tier3_handler=None,
+    analyze_ticker=None,
 ) -> None:
     global _cb_send_telegram, _cb_run_scan, _cb_get_snapshot
-    global _cb_backtest_summary, _cb_rejected_log, _cb_is_market_open, _cb_tier3_handler
+    global _cb_backtest_summary, _cb_rejected_log, _cb_is_market_open
+    global _cb_tier3_handler, _cb_analyze_ticker
     _cb_send_telegram    = send_telegram
     _cb_run_scan         = run_scan
     _cb_get_snapshot     = get_snapshot
@@ -55,6 +59,7 @@ def register_callbacks(
     _cb_rejected_log     = rejected_log
     _cb_is_market_open   = is_market_open
     _cb_tier3_handler    = tier3_handler
+    _cb_analyze_ticker   = analyze_ticker
 
 
 def _reply(text: str) -> None:
@@ -63,18 +68,20 @@ def _reply(text: str) -> None:
 
 
 def _handle_command(text: str) -> None:
-    cmd = text.strip().lower().split()[0] if text.strip() else ""
+    parts = text.strip().split()
+    cmd   = parts[0].lower() if parts else ""
 
     if cmd in ("/help", "/start"):
         _reply(
             "*🤖 DipRadar — Comandos disponíveis:*\n\n"
-            "`/status`     → Estado do bot\n"
-            "`/carteira`   → Snapshot da carteira agora\n"
-            "`/scan`       → Forçar scan imediato\n"
-            "`/backtest`   → Resumo backtesting\n"
-            "`/rejeitados` → Rejeitados de hoje\n"
-            "`/tier3`      → Gems Raras do último fecho (score ≥16)\n"
-            "`/help`       → Esta mensagem"
+            "`/status`           → Estado do bot\n"
+            "`/carteira`         → Snapshot da carteira agora\n"
+            "`/scan`             → Forçar scan imediato\n"
+            "`/analisar <TICK>`  → Análise completa de qualquer ticker\n"
+            "`/backtest`         → Resumo backtesting\n"
+            "`/rejeitados`       → Rejeitados de hoje\n"
+            "`/tier3`            → Gems Raras do último fecho (score ≥80)\n"
+            "`/help`             → Esta mensagem"
         )
 
     elif cmd == "/status":
@@ -123,6 +130,26 @@ def _handle_command(text: str) -> None:
                 threading.Thread(target=_cb_run_scan, daemon=True).start()
         except Exception as e:
             _reply(f"_Erro no scan: {e}_")
+
+    elif cmd == "/analisar":
+        if len(parts) < 2:
+            _reply(
+                "⚠️ Usa: `/analisar <TICKER>`\n"
+                "_Exemplo: `/analisar AAPL` ou `/analisar NVDA`_"
+            )
+            return
+        symbol = parts[1].upper().strip()
+        if not _cb_analyze_ticker:
+            _reply("_Análise não disponível._")
+            return
+        _reply(f"_🔍 A analisar *{symbol}*... (pode demorar 10–20s)_")
+        try:
+            threading.Thread(
+                target=lambda: _reply(_cb_analyze_ticker(symbol)),
+                daemon=True,
+            ).start()
+        except Exception as e:
+            _reply(f"_Erro ao analisar {symbol}: {e}_")
 
     elif cmd == "/backtest":
         if not _cb_backtest_summary:
