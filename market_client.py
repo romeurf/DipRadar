@@ -23,6 +23,10 @@ _HEADERS = {
 
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 
+# ISIN do PPR Invest Tendências Globais (usado só para logging/referência)
+# O proxy de preço usado é o ETF ACWI (iShares MSCI ACWI) via yfinance
+PPR_ISIN = "PTARMJHM0003"
+
 _CATALYST_KEYWORDS = {
     "earnings":    "📅 Earnings próximo",
     "results":     "📅 Resultados próximos",
@@ -196,20 +200,9 @@ def screen_period_dips(
     """
     Detecta dips acumulados na última semana (7d) e último mês (30d)
     usando yfinance.history() — 100% gratuito.
-
-    Estratégia:
-      1. Recolhe tickers candidatos dos feeds Yahoo gratuitos
-         (undervalued_large_caps + day_losers + most_actives).
-      2. Para cada ticker calcula % de queda vs 5 dias úteis atrás (semana)
-         e vs 22 dias úteis atrás (mês).
-      3. Devolve dict com chaves 'weekly' e 'monthly', cada uma lista ordenada
-         pela queda mais profunda primeiro.
-
-    Não requer API key. Corre automaticamente no Saturday Report (sábado 10h).
     """
-    # ── 1. Recolhe tickers candidatos dos feeds gratuitos ─────────────────
     screener_ids = ["undervalued_large_caps", "day_losers", "most_actives"]
-    candidates: dict[str, dict] = {}  # symbol -> {name, market_cap}
+    candidates: dict[str, dict] = {}
 
     for scrId in screener_ids:
         url = (
@@ -243,20 +236,18 @@ def screen_period_dips(
 
     logging.info(f"Period dip screener: {len(candidates)} tickers candidatos")
 
-    # ── 2. Calcula % de queda semanal e mensal via history() ─────────────
     weekly_dips:  list[dict] = []
     monthly_dips: list[dict] = []
 
     for sym, meta in candidates.items():
         try:
-            time.sleep(1)  # throttle suave
+            time.sleep(1)
             hist = yf.Ticker(sym).history(period="35d", interval="1d")["Close"].dropna()
             if len(hist) < 6:
                 continue
 
             price_now = float(hist.iloc[-1])
 
-            # Semana: ~5 dias úteis atrás
             if len(hist) >= 6:
                 price_5d  = float(hist.iloc[-6])
                 chg_week  = (price_now - price_5d) / price_5d * 100
@@ -270,7 +261,6 @@ def screen_period_dips(
                         "period":     "7d",
                     })
 
-            # Mês: ~22 dias úteis atrás
             if len(hist) >= 23:
                 price_22d = float(hist.iloc[-23])
                 chg_month = (price_now - price_22d) / price_22d * 100
@@ -286,11 +276,10 @@ def screen_period_dips(
         except Exception as e:
             logging.warning(f"Period dip {sym}: {e}")
 
-    # Ordena por queda mais profunda e deduplica mensal (remove se já em semanal)
     weekly_dips.sort(key=lambda x: x["change_pct"])
     monthly_dips.sort(key=lambda x: x["change_pct"])
 
-    weekly_syms = {s["symbol"] for s in weekly_dips}
+    weekly_syms  = {s["symbol"] for s in weekly_dips}
     monthly_dips = [s for s in monthly_dips if s["symbol"] not in weekly_syms]
 
     logging.info(
@@ -506,7 +495,37 @@ def get_earnings_date(symbol: str) -> str | None:
     return dt.strftime("%d/%m/%Y")
 
 
+def _normalize_dividend_yield(raw: float | None) -> float:
+    """
+    Normaliza o dividendYield devolvido pelo yfinance para percentagem real.
+
+    O yfinance devolve tipicamente valores decimais (0.035 = 3.5%), mas
+    alguns tickers europeus ou ETFs devolvem o valor já em percentagem
+    (3.5 em vez de 0.035). Qualquer valor > 1 é tratado como já estando
+    em percentagem e é devolvido directamente; valores <= 1 são
+    multiplicados por 100.
+
+    Exemplos:
+      0.0351  →  3.51%
+      3.51    →  3.51%   (já em %)
+      0.0     →  0.0%
+    """
+    if raw is None or raw <= 0:
+        return 0.0
+    # Se o valor for > 1 assume-se que já está em percentagem
+    return float(raw) if raw > 1 else float(raw) * 100
+
+
 def get_portfolio_snapshot(holdings, cashback_eur, ppr_shares, ppr_avg_cost, usd_eur):
+    """
+    Calcula o snapshot actual da carteira.
+
+    PPR (ISIN {PPR_ISIN}):
+      O fundo não tem ticker directo no Yahoo Finance.
+      Usamos o ACWI (iShares MSCI ACWI ETF) como proxy de preço.
+      O valor real do PPR = ppr_shares * acwi_price * usd_eur.
+      O custo histórico = ppr_shares * ppr_avg_cost.
+    """
     from portfolio import USD_TICKERS, EUR_TICKERS
 
     positions  = []
@@ -541,7 +560,7 @@ def get_portfolio_snapshot(holdings, cashback_eur, ppr_shares, ppr_avg_cost, usd
         if not prices:
             continue
 
-        fx = usd_eur if symbol in USD_TICKERS else 1.0
+        fx        = usd_eur if symbol in USD_TICKERS else 1.0
         price_now = prices["now"] * fx
         value_eur = shares * price_now
 
@@ -570,7 +589,7 @@ def get_portfolio_snapshot(holdings, cashback_eur, ppr_shares, ppr_avg_cost, usd
         })
         total_eur += value_eur
 
-    # CashBack Pie
+    # ── CashBack Pie ─────────────────────────────────────────────────
     cashback_total = sum(cashback_eur.values())
     total_eur     += cashback_total
     pie_pnl_day    = 0.0
@@ -579,21 +598,39 @@ def get_portfolio_snapshot(holdings, cashback_eur, ppr_shares, ppr_avg_cost, usd
         if p and p.get("yesterday") and p["yesterday"] > 0:
             pie_pnl_day += val_eur * (p["now"] - p["yesterday"]) / p["yesterday"]
 
-    # PPR proxy ACWI
-    ppr_value_eur = ppr_cost = ppr_shares * ppr_avg_cost
+    # ── PPR (ISIN PTARMJHM0003, proxy ACWI) ─────────────────────────────
+    # Valor real = shares * preço_actual_ACWI * usd_eur
+    # Custo histórico = shares * avg_cost (em EUR, já convertido na compra)
+    ppr_cost      = ppr_shares * ppr_avg_cost   # custo total histórico em EUR
+    ppr_value_eur = ppr_cost                     # fallback se ACWI falhar
+
     ppr_pnl_day = ppr_pnl_week = ppr_pnl_month = None
     pp = _get_prices("ACWI")
-    if pp:
-        acwi_now = pp["now"] * usd_eur
+    if pp and pp.get("now"):
+        acwi_now       = pp["now"] * usd_eur
+        ppr_value_eur  = ppr_shares * acwi_now   # ← valor real de mercado
+
         if pp.get("yesterday") and pp["yesterday"] > 0:
-            ppr_pnl_day   = ppr_cost * (acwi_now - pp["yesterday"] * usd_eur) / (pp["yesterday"] * usd_eur)
+            acwi_yest     = pp["yesterday"] * usd_eur
+            ppr_pnl_day   = ppr_shares * (acwi_now - acwi_yest)
         if pp.get("week_ago") and pp["week_ago"] > 0:
-            ppr_pnl_week  = ppr_cost * (acwi_now - pp["week_ago"]  * usd_eur) / (pp["week_ago"]  * usd_eur)
+            acwi_w        = pp["week_ago"] * usd_eur
+            ppr_pnl_week  = ppr_shares * (acwi_now - acwi_w)
         if pp.get("month_ago") and pp["month_ago"] > 0:
-            ppr_pnl_month = ppr_cost * (acwi_now - pp["month_ago"] * usd_eur) / (pp["month_ago"] * usd_eur)
+            acwi_m        = pp["month_ago"] * usd_eur
+            ppr_pnl_month = ppr_shares * (acwi_now - acwi_m)
+
+        logging.info(
+            f"PPR ({PPR_ISIN}): {ppr_shares} UP × €{acwi_now:.4f}/UP "
+            f"= €{ppr_value_eur:.2f} (custo €{ppr_cost:.2f})"
+        )
+    else:
+        logging.warning(f"PPR ({PPR_ISIN}): ACWI sem dados, a usar custo histórico como fallback")
+
     total_eur  += ppr_value_eur
     total_cost += ppr_cost
 
+    # ── Agregação P&L ─────────────────────────────────────────────────
     agg_day   = sum(p["pnl_day"]   for p in positions if p["pnl_day"]   is not None) + pie_pnl_day
     agg_week  = sum(p["pnl_week"]  for p in positions if p["pnl_week"]  is not None)
     agg_month = sum(p["pnl_month"] for p in positions if p["pnl_month"] is not None)
