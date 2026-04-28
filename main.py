@@ -648,7 +648,6 @@ def calculate_flip_target(
         return "N/D", "SEM DADOS"
 
     # ── Hold Forever: nunca calcular target de saída ──────────────────────
-    # Usar constante importada — à prova de divergência de emojis.
     if category == CATEGORY_HOLD_FOREVER or (is_bluechip(fundamentals) and dip_score >= 60):
         return "HOLD ETERNO", "💎 Hold Forever — Acumular em dips, nunca vender"
 
@@ -685,7 +684,6 @@ def calculate_flip_target(
     else:
         cat_flag = " | ⚠️ Sem catalisador identificado"
 
-    # Adaptar prefixo da estratégia conforme categoria
     if category == CATEGORY_APARTAMENTO:
         dividend_yield = fundamentals.get("dividend_yield") or 0
         dy_str = f" | 💰 Yield {dividend_yield*100:.1f}%/ano" if dividend_yield > 0 else ""
@@ -826,6 +824,74 @@ def build_alert(
     if sizing_str:
         body += f"\n💶 *Sizing:* {sizing_str}"
     return body
+
+
+# ── On-demand ticker analysis (usado pelo /analisar command) ──────────────────
+
+def analyze_ticker(symbol: str) -> str:
+    """
+    Análise completa a pedido para qualquer ticker.
+    Retorna string formatada pronta para enviar via Telegram.
+    Chamado pelo /analisar command através do poll() context.
+    """
+    symbol = symbol.upper().strip()
+    try:
+        fund = get_fundamentals(symbol, min_market_cap=0)
+        if fund.get("skip"):
+            return (
+                f"⚠️ *{symbol}* — dados insuficientes\n"
+                f"_{fund.get('skip_reason', 'Ticker sem dados disponíveis')}_"
+            )
+
+        hist_pe       = get_historical_pe(symbol)
+        news          = get_news(symbol)
+        earnings_days = get_earnings_days(symbol)
+        sector_chg    = get_sector_change(fund.get("sector", ""))
+        spy_change    = get_spy_change()
+        score, rsi_str = calculate_dip_score(fund, symbol, earnings_days, sector_change=sector_chg)
+
+        bc_flag  = is_bluechip(fund)
+        category = classify_dip_category(fund, score, bc_flag)
+
+        price      = fund.get("price") or 0
+        change_pct = 0.0
+        try:
+            import yfinance as yf
+            fi = yf.Ticker(symbol).fast_info
+            prev = getattr(fi, "previous_close", None)
+            last = getattr(fi, "last_price", None)
+            if prev and last and prev > 0:
+                change_pct = (last - prev) / prev * 100
+        except Exception:
+            pass
+
+        stock_dict = {
+            "symbol":     symbol,
+            "change_pct": change_pct,
+            "region":     "",
+        }
+
+        if score >= 75:
+            verdict, emoji_str = "COMPRAR", "🟢"
+        elif score >= 60:
+            verdict, emoji_str = "MONITORIZAR", "🟡"
+        elif score >= MIN_DIP_SCORE:
+            verdict, emoji_str = "MONITORIZAR", "🔵"
+        else:
+            verdict, emoji_str = "EVITAR", "🔴"
+
+        alert_text = build_alert(
+            stock_dict, fund, hist_pe, news,
+            verdict, emoji_str, [], score, rsi_str,
+            category=category,
+        )
+
+        header = f"🔍 *Análise on-demand — {symbol}*\n_Pedido via /analisar — {datetime.now().strftime('%d/%m %H:%M')}_\n\n"
+        return header + alert_text
+
+    except Exception as e:
+        logging.error(f"analyze_ticker({symbol}): {e}", exc_info=True)
+        return f"❌ *Erro ao analisar {symbol}*\n_`{e}`_"
 
 
 # ── Scan principal ────────────────────────────────────────────────────────────
@@ -1046,21 +1112,25 @@ def poll_bot_commands() -> None:
             chat_id=TELEGRAM_CHAT_ID,
             send_fn=send_telegram,
             context={
-                "get_snapshot":        _get_snapshot,
-                "DIRECT_TICKERS":      DIRECT_TICKERS,
-                "MIN_MARKET_CAP":      MIN_MARKET_CAP,
-                "MIN_DIP_SCORE":       MIN_DIP_SCORE,
-                "DROP_THRESHOLD":      DROP_THRESHOLD,
-                "get_sector_change":   get_sector_change,
-                "is_bluechip":         is_bluechip,
-                "score_badge":         score_badge,
+                "get_snapshot":          _get_snapshot,
+                "DIRECT_TICKERS":        DIRECT_TICKERS,
+                "MIN_MARKET_CAP":        MIN_MARKET_CAP,
+                "MIN_DIP_SCORE":         MIN_DIP_SCORE,
+                "DROP_THRESHOLD":        DROP_THRESHOLD,
+                "get_sector_change":     get_sector_change,
+                "is_bluechip":           is_bluechip,
+                "score_badge":           score_badge,
                 "calculate_flip_target": calculate_flip_target,
-                "build_flip_ranking":  build_flip_ranking,
-                "last_tier3":          _last_tier3,
-                "FLIP_FUND_EUR":       FLIP_FUND_EUR,
+                "build_flip_ranking":    build_flip_ranking,
+                "last_tier3":            _last_tier3,
+                "FLIP_FUND_EUR":         FLIP_FUND_EUR,
                 "build_backtest_summary": build_backtest_summary,
-                "get_db_stats":        get_db_stats,
-                "fill_db_outcomes":    fill_db_outcomes,
+                "get_db_stats":          get_db_stats,
+                "fill_db_outcomes":      fill_db_outcomes,
+                # ── gap corrigido: /analisar e /comparar agora funcionam ──
+                "analyze_ticker":        analyze_ticker,
+                "get_fundamentals":      get_fundamentals,
+                "get_earnings_days":     get_earnings_days,
             },
         )
     except Exception as e:
