@@ -32,7 +32,7 @@ from market_client import (
     get_catalyst, get_spy_change, is_market_open,
     get_usdeur, get_portfolio_snapshot,
 )
-from portfolio import HOLDINGS, CASHBACK_EUR_VALUES, PPR_SHARES, PPR_AVG_COST, DIRECT_TICKERS
+from portfolio import HOLDINGS, CASHBACK_EUR_VALUES, PPR_SHARES, PPR_AVG_COST, DIRECT_TICKERS, FLIP_FUND_EUR
 from sectors import get_sector_config, score_fundamentals
 from valuation import format_valuation_block
 from score import calculate_dip_score, build_score_breakdown
@@ -285,6 +285,13 @@ def send_heartbeat() -> None:
         "",
         f"  📊 PPR (proxy ACWI): €{snapshot['ppr_value']:,.2f}",
         f"  💜 CashBack Pie: €{snapshot['cashback_eur']:,.2f}",
+    ]
+
+    # ── Flip Fund ────────────────────────────────────────────────────────
+    if FLIP_FUND_EUR:
+        lines.append(f"  🎯 *Flip Fund:* €{FLIP_FUND_EUR:,.2f} disponíveis")
+
+    lines += [
         "",
         "_Mercado abre às 14h30 Lisboa_",
     ]
