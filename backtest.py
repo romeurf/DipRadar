@@ -8,6 +8,8 @@ Lógica:
     price_5d / price_10d / price_20d para entradas com 5/10/20 dias úteis
     já decorridos, calculando o P&L %.
   - O Saturday report chama build_backtest_summary() para mostrar o resumo.
+  - Auto-calibração: suggest_min_score() calcula o score mínimo óptimo
+    com base nos winners históricos e sugere ajuste ao MIN_DIP_SCORE.
 
 Nenhuma API key necessária — usa yfinance.history().
 """
@@ -45,7 +47,6 @@ def _get_price_n_days_ago(symbol: str, n_business_days: int) -> float | None:
         hist = yf.Ticker(symbol).history(period="60d", interval="1d")["Close"].dropna()
         if len(hist) < n_business_days + 1:
             return None
-        # hist.iloc[-1] = hoje; hist.iloc[-(n+1)] = n dias atrás
         return float(hist.iloc[-(n_business_days + 1)])
     except Exception as e:
         logging.warning(f"Backtest price {symbol} -{n_business_days}d: {e}")
@@ -84,7 +85,6 @@ def backtest_runner() -> int:
                     entry[key_pnl] = round((p - price_alert) / price_alert * 100, 2)
                     changed = True
 
-        # Marca como resolved quando os 3 campos estiverem preenchidos
         if all(entry.get(k) is not None for k in ("price_5d", "price_10d", "price_20d")):
             entry["resolved"] = True
 
@@ -98,24 +98,97 @@ def backtest_runner() -> int:
     return updated
 
 
+def suggest_min_score(entries: list[dict] | None = None, horizon: str = "pnl_5d") -> dict:
+    """
+    Analisa os resultados históricos e sugere o score mínimo óptimo.
+
+    Algoritmo:
+      - Para cada threshold candidato (45, 50, 55, 60, 65, 70, 75, 80),
+        calcula a win rate e o P&L médio dos alertas com score >= threshold.
+      - O threshold óptimo é o mais baixo que mantém win rate >= 55%.
+      - Se nenhum atingir 55%, usa o de maior win rate.
+
+    Devolve dict com:
+      suggested_min : int  — threshold sugerido
+      current_best  : dict — stats do threshold sugerido
+      all_thresholds: list — stats de todos os candidatos
+      reason        : str  — explicação humana
+    """
+    if entries is None:
+        entries = load_backtest_log()
+
+    resolved = [e for e in entries if e.get(horizon) is not None]
+    if len(resolved) < 5:
+        return {
+            "suggested_min": None,
+            "reason": f"Insuficiente (só {len(resolved)} entradas resolvidas em {horizon})",
+            "all_thresholds": [],
+        }
+
+    candidates = [45, 50, 55, 60, 65, 70, 75, 80]
+    results = []
+    for thresh in candidates:
+        subset = [e for e in resolved if (e.get("score") or 0) >= thresh]
+        if len(subset) < 3:
+            results.append({"threshold": thresh, "n": len(subset), "win_rate": None, "avg_pnl": None})
+            continue
+        pnls    = [e[horizon] for e in subset]
+        win_n   = sum(1 for x in pnls if x > 0)
+        win_r   = win_n / len(pnls)
+        avg_pnl = sum(pnls) / len(pnls)
+        results.append({
+            "threshold": thresh,
+            "n":         len(subset),
+            "win_rate":  round(win_r, 3),
+            "avg_pnl":   round(avg_pnl, 2),
+        })
+
+    # Melhor threshold: o mais baixo com win rate >= 55%
+    viable = [r for r in results if r["win_rate"] is not None and r["win_rate"] >= 0.55]
+    if viable:
+        best = min(viable, key=lambda x: x["threshold"])
+        reason = (
+            f"Score ≥{best['threshold']} tem win rate {best['win_rate']*100:.0f}% "
+            f"({best['n']} alertas, avg P&L {best['avg_pnl']:+.1f}%)"
+        )
+    else:
+        # Nenhum atinge 55% — usa o de maior win rate
+        valid = [r for r in results if r["win_rate"] is not None]
+        if not valid:
+            return {"suggested_min": None, "reason": "Sem dados suficientes", "all_thresholds": results}
+        best   = max(valid, key=lambda x: x["win_rate"])
+        reason = (
+            f"Nenhum threshold atinge 55% win rate. "
+            f"Melhor disponível: ≥{best['threshold']} com {best['win_rate']*100:.0f}% "
+            f"({best['n']} alertas)"
+        )
+
+    return {
+        "suggested_min":  best["threshold"],
+        "current_best":   best,
+        "all_thresholds": results,
+        "reason":         reason,
+    }
+
+
 def build_backtest_summary(min_entries: int = 3) -> str:
     """
     Gera bloco Markdown para o Saturday report.
     Só mostra resultados para entradas com pelo menos price_5d preenchido.
+    Inclui sugestão de auto-calibração do MIN_DIP_SCORE.
     """
-    entries = load_backtest_log()
+    entries  = load_backtest_log()
     resolved = [e for e in entries if e.get("pnl_5d") is not None]
 
     if len(resolved) < min_entries:
-        total = len(entries)
+        total   = len(entries)
         pending = total - len(resolved)
         if total == 0:
             return "_Backtest: sem alertas registados ainda._"
         return f"_Backtest: {total} alertas registados, {pending} ainda sem dados suficientes (aguarda 5 dias úteis)._"
 
-    # Métricas globais
-    comprar   = [e for e in resolved if e["verdict"] == "COMPRAR"]
-    monitor   = [e for e in resolved if e["verdict"] != "COMPRAR"]
+    comprar = [e for e in resolved if e["verdict"] == "COMPRAR"]
+    monitor = [e for e in resolved if e["verdict"] != "COMPRAR"]
 
     def _stats(lst: list, label: str) -> list[str]:
         if not lst:
@@ -123,7 +196,7 @@ def build_backtest_summary(min_entries: int = 3) -> str:
         pnl5  = [e["pnl_5d"]  for e in lst if e.get("pnl_5d")  is not None]
         pnl10 = [e["pnl_10d"] for e in lst if e.get("pnl_10d") is not None]
         pnl20 = [e["pnl_20d"] for e in lst if e.get("pnl_20d") is not None]
-        win5  = sum(1 for x in pnl5  if x > 0)
+        win5  = sum(1 for x in pnl5 if x > 0)
         lines = [f"  *{label}* ({len(lst)} alertas):"]
         if pnl5:  lines.append(f"    5d:  avg {sum(pnl5)/len(pnl5):+.1f}% | win {win5}/{len(pnl5)} ({win5/len(pnl5)*100:.0f}%)")
         if pnl10:
@@ -144,7 +217,6 @@ def build_backtest_summary(min_entries: int = 3) -> str:
         lines.append("")
     lines += _stats(monitor, "MONITORIZAR")
 
-    # Top 3 melhores e piores a 5d
     all_with_5d = sorted(resolved, key=lambda x: x["pnl_5d"], reverse=True)
     if all_with_5d:
         lines += ["", "  *🏆 Melhores (5d):*"]
@@ -154,7 +226,6 @@ def build_backtest_summary(min_entries: int = 3) -> str:
         for e in all_with_5d[-3:][::-1]:
             lines.append(f"    ❌ *{e['symbol']}* {e['pnl_5d']:+.1f}% | score {e['score']:.0f} | {e['date']}")
 
-    # Calibração: score médio dos winners vs losers
     winners = [e for e in resolved if e.get("pnl_5d", 0) > 0]
     losers  = [e for e in resolved if e.get("pnl_5d", 0) <= 0]
     if winners and losers:
@@ -169,5 +240,33 @@ def build_backtest_summary(min_entries: int = 3) -> str:
             lines.append("    _Score discrimina bem winners/losers ✅_")
         else:
             lines.append("    _Score tem pouco poder discriminativo — considera ajustar thresholds ⚠️_")
+
+    # ── Auto-calibração: sugestão de MIN_DIP_SCORE ────────────────────
+    try:
+        cal = suggest_min_score(entries)
+        if cal.get("suggested_min") is not None:
+            lines += [
+                "",
+                "  *🤖 Auto-calibração MIN_DIP_SCORE:*",
+                f"    Sugestão baseada em histórico: *score ≥{cal['suggested_min']}*",
+                f"    _{cal['reason']}_",
+            ]
+            # Tabela compacta de todos os thresholds
+            valid_rows = [r for r in cal["all_thresholds"] if r["win_rate"] is not None]
+            if valid_rows:
+                lines.append("    _Thresholds:_")
+                for r in valid_rows:
+                    marker = " ←" if r["threshold"] == cal["suggested_min"] else ""
+                    lines.append(
+                        f"      ≥{r['threshold']}: win {r['win_rate']*100:.0f}% | "
+                        f"avg {r['avg_pnl']:+.1f}% | n={r['n']}{marker}"
+                    )
+            lines.append(
+                f"    _→ Actualiza MIN\_DIP\_SCORE no Railway para {cal['suggested_min']} se concordas_"
+            )
+        else:
+            lines += ["", f"  _Auto-calibração: {cal.get('reason', 'sem dados')}_"]
+    except Exception as e:
+        logging.warning(f"Auto-calibração: {e}")
 
     return "\n".join(lines)
