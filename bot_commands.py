@@ -7,6 +7,7 @@ Comandos disponíveis:
   /scan       → Força scan imediato (só horas de mercado)
   /backtest   → Resumo do backtest de alertas
   /rejeitados → Log de rejeitados de hoje
+  /tier3      → Gems Raras do último resumo de fecho (score ≥16)
   /help       → Lista de comandos
 
 Uso em main.py:
@@ -27,12 +28,13 @@ _last_update_id: int = 0
 _bot_start_time: datetime = datetime.now()
 
 # Callbacks injectados pelo main.py
-_cb_send_telegram   = None  # fn(msg) -> bool
-_cb_run_scan        = None  # fn() -> None
-_cb_get_snapshot    = None  # fn() -> dict
-_cb_backtest_summary = None # fn() -> str
-_cb_rejected_log    = None  # fn() -> list
-_cb_is_market_open  = None  # fn() -> bool
+_cb_send_telegram    = None  # fn(msg) -> bool
+_cb_run_scan         = None  # fn() -> None
+_cb_get_snapshot     = None  # fn() -> dict
+_cb_backtest_summary = None  # fn() -> str
+_cb_rejected_log     = None  # fn() -> list
+_cb_is_market_open   = None  # fn() -> bool
+_cb_tier3_handler    = None  # fn() -> str
 
 
 def register_callbacks(
@@ -42,15 +44,17 @@ def register_callbacks(
     backtest_summary,
     rejected_log,
     is_market_open,
+    tier3_handler=None,
 ) -> None:
     global _cb_send_telegram, _cb_run_scan, _cb_get_snapshot
-    global _cb_backtest_summary, _cb_rejected_log, _cb_is_market_open
+    global _cb_backtest_summary, _cb_rejected_log, _cb_is_market_open, _cb_tier3_handler
     _cb_send_telegram    = send_telegram
     _cb_run_scan         = run_scan
     _cb_get_snapshot     = get_snapshot
     _cb_backtest_summary = backtest_summary
     _cb_rejected_log     = rejected_log
     _cb_is_market_open   = is_market_open
+    _cb_tier3_handler    = tier3_handler
 
 
 def _reply(text: str) -> None:
@@ -69,6 +73,7 @@ def _handle_command(text: str) -> None:
             "`/scan`       → Forçar scan imediato\n"
             "`/backtest`   → Resumo backtesting\n"
             "`/rejeitados` → Rejeitados de hoje\n"
+            "`/tier3`      → Gems Raras do último fecho (score ≥16)\n"
             "`/help`       → Esta mensagem"
         )
 
@@ -89,7 +94,7 @@ def _handle_command(text: str) -> None:
             _reply("_Snapshot não disponível._")
             return
         try:
-            snap = _cb_get_snapshot()
+            snap  = _cb_get_snapshot()
             total = snap.get("total_eur", 0)
             pnl_d = snap.get("pnl_day", 0)
             pnl_w = snap.get("pnl_week", 0)
@@ -150,6 +155,15 @@ def _handle_command(text: str) -> None:
         except Exception as e:
             _reply(f"_Erro: {e}_")
 
+    elif cmd == "/tier3":
+        try:
+            if _cb_tier3_handler:
+                _reply(_cb_tier3_handler())
+            else:
+                _reply("🔵 *Tier 3* — _Handler não registado._")
+        except Exception as e:
+            _reply(f"_Erro ao obter Tier 3: {e}_")
+
     else:
         if text.startswith("/"):
             _reply(f"_Comando desconhecido: `{cmd}` — usa /help_")
@@ -176,7 +190,6 @@ def _poll_loop() -> None:
                     msg  = update.get("message", {})
                     chat = str(msg.get("chat", {}).get("id", ""))
                     text = msg.get("text", "")
-                    # Só aceita mensagens do chat configurado
                     if chat == TELEGRAM_CHAT_ID and text:
                         logging.info(f"[bot_commands] Comando recebido: {text!r}")
                         _handle_command(text)
