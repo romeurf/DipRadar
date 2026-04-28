@@ -75,6 +75,9 @@ def format_valuation_block(
     """
     Formata bloco de avaliação para mensagem Telegram.
     historical_pe: dict com pe_hist_avg, pe_hist_median, pe_hist_min, pe_hist_max
+
+    Nota: dividend_yield está SEMPRE em decimal após normalização em market_client.py
+    (ex: 0.0263 = 2.63%). Não é necessário qualquer heurística aqui.
     """
     lines = []
 
@@ -86,10 +89,10 @@ def format_valuation_block(
     analyst_upside = fundamentals.get("analyst_upside")
     analyst_target = fundamentals.get("analyst_target")
     ev_ebitda = fundamentals.get("ev_ebitda")
-    dy = fundamentals.get("dividend_yield")
-    payout = fundamentals.get("payout_ratio")
-    gross_margin = fundamentals.get("gross_margin")
-    roe = fundamentals.get("roe")
+    dy = fundamentals.get("dividend_yield")   # sempre decimal: 0.0263 = 2.63%
+    payout = fundamentals.get("payout_ratio")  # sempre decimal: 0.45 = 45%
+    gross_margin = fundamentals.get("gross_margin")  # decimal
+    roe = fundamentals.get("roe")              # decimal
 
     # P/E actual vs histórico real
     if pe:
@@ -103,12 +106,12 @@ def format_valuation_block(
                 lo = historical_pe.get("pe_hist_min")
                 hi = historical_pe.get("pe_hist_max")
                 if lo and hi:
-                    pe_str += f" \u2014 range 3a: {lo:.0f}–{hi:.0f}x"
-        lines.append(f"  • P/E: {pe_str}")
+                    pe_str += f" \u2014 range 3a: {lo:.0f}\u2013{hi:.0f}x"
+        lines.append(f"  \u2022 P/E: {pe_str}")
 
     # FCF
     if fcf_yield is not None:
-        lines.append(f"  • FCF Yield: {fcf_yield*100:.1f}%")
+        lines.append(f"  \u2022 FCF Yield: {fcf_yield*100:.1f}%")
 
     # DCF
     if fcf_ps and fcf_ps > 0 and rev_growth is not None and price:
@@ -116,26 +119,26 @@ def format_valuation_block(
         growth = min(max(rev_growth, 0), 0.30)
         intrinsic = dcf_intrinsic_value(fcf_ps, growth, wacc)
         mos = margin_of_safety(intrinsic, price)
-        lines.append(f"  • DCF intrínseco: ${intrinsic:.1f} (margem: {mos:+.0f}%)")
+        lines.append(f"  \u2022 DCF intr\u00ednseco: ${intrinsic:.1f} (margem: {mos:+.0f}%)")
 
     if ev_ebitda:
-        lines.append(f"  • EV/EBITDA: {ev_ebitda:.1f}x")
+        lines.append(f"  \u2022 EV/EBITDA: {ev_ebitda:.1f}x")
 
     if rev_growth is not None:
-        lines.append(f"  • Revenue growth: {rev_growth*100:.1f}%")
+        lines.append(f"  \u2022 Revenue growth: {rev_growth*100:.1f}%")
 
     if gross_margin is not None:
-        lines.append(f"  • Gross margin: {gross_margin*100:.1f}%")
+        lines.append(f"  \u2022 Gross margin: {gross_margin*100:.1f}%")
 
     if roe is not None:
-        lines.append(f"  • ROE: {roe*100:.1f}%")
+        lines.append(f"  \u2022 ROE: {roe*100:.1f}%")
 
+    # dividend_yield já é sempre decimal (normalizado na fonte)
     if dy and dy > 0:
-        dy_pct = dy * 100 if dy < 1 else dy
-        payout_str = f" (payout {payout*100:.0f}%)" if payout else ""
-        lines.append(f"  • Dividendo: {dy_pct:.2f}%{payout_str}")
+        payout_str = f" (payout {payout*100:.0f}%)" if payout and payout > 0 else ""
+        lines.append(f"  \u2022 Dividendo: {dy*100:.2f}%{payout_str}")
 
     if analyst_target:
-        lines.append(f"  • Target analistas: ${analyst_target:.1f} ({analyst_upside:+.0f}%)")
+        lines.append(f"  \u2022 Target analistas: ${analyst_target:.1f} ({analyst_upside:+.0f}%)")
 
-    return "\n".join(lines) if lines else "  • Dados insuficientes"
+    return "\n".join(lines) if lines else "  \u2022 Dados insuficientes"
