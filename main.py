@@ -73,6 +73,9 @@ from data_feed import get_eod_prices, get_latest_price, is_tiingo_available
 # Chunk 3 — universe
 from universe import get_full_universe, get_ml_universe, ETF_TICKERS, is_etf
 
+# Chunk 6 — ML predictor
+from ml_predictor import ml_score, ml_badge, is_model_ready, MLResult
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
@@ -331,11 +334,13 @@ def send_heartbeat() -> None:
     if earnings_alerts:
         lines += ["", "*📅 Earnings próximos (carteira):*"] + sorted(earnings_alerts)
 
-    # Indicador Tiingo
+    # Indicador Tiingo + ML
     tiingo_ok = is_tiingo_available()
+    ml_ok     = is_model_ready()
     lines += [
         "",
         f"_{'🟢 Tiingo EOD activo' if tiingo_ok else '🟡 yfinance (sem chave Tiingo)'}_",
+        f"_{'🤖 Modelo ML pronto' if ml_ok else '🤖 ML: modelo não treinado'}_",
         "_Mercado abre às 14h30 Lisboa_",
     ]
 
@@ -446,14 +451,13 @@ def check_thesis_degradation(region: str = "ALL") -> None:
         entry_score = pos["entry_score"]
         try:
             time.sleep(2)
-            # Usa preço EOD limpo via data_feed
             price = get_latest_price(sym) or 0
 
             fund = get_fundamentals(sym, min_market_cap=0)
             if fund.get("skip"):
                 continue
             if price:
-                fund["price"] = price  # sobrescreve com EOD
+                fund["price"] = price
 
             earnings_days = get_earnings_days(sym)
             sector_chg    = get_sector_change(fund.get("sector", ""))
@@ -863,6 +867,7 @@ def build_alert(
     stock, fundamentals, historical_pe, news,
     verdict, emoji, reasons, dip_score, rsi_str,
     category: str = CATEGORY_ROTACAO,
+    ml_result: MLResult | None = None,
 ) -> str:
     sector       = fundamentals.get("sector", "")
     sector_cfg   = get_sector_config(sector)
@@ -925,6 +930,11 @@ def build_alert(
         spy_change=spy_change,
     )
 
+    # ML badge (Chunk 6)
+    ml_line = ""
+    if ml_result is not None:
+        ml_line = f"\n{ml_badge(ml_result)}"
+
     body = (
         f"{emoji} *{name} ({symbol})*{region_part}{in_portfolio}\n"
         f"Sector: {sector_cfg.get('label', sector)} | ≈{mc_b:.1f}B\n"
@@ -932,7 +942,8 @@ def build_alert(
         f"{earn_warn}"
         f"{valuation_block}"
         f"\n*Categoria:* {category}\n"
-        f"{score_line}\n"
+        f"{score_line}"
+        f"{ml_line}\n"
         f"{score_breakdown}\n"
         f"\n*Estratégia:* {strategy}"
         f"{macro_ctx}"
@@ -976,6 +987,17 @@ def analyze_ticker(symbol: str) -> str:
         except Exception:
             pass
 
+        # ML score (Chunk 6)
+        ml_features = {
+            **fund,
+            "score":            score,
+            "spy_change":       spy_change,
+            "sector_etf_change": sector_chg,
+            "earnings_days":    earnings_days,
+            "change_day_pct":   change_pct,
+        }
+        ml_result = ml_score(ml_features)
+
         stock_dict = {"symbol": symbol, "change_pct": change_pct, "region": ""}
 
         if score >= 75:
@@ -991,6 +1013,7 @@ def analyze_ticker(symbol: str) -> str:
             stock_dict, fund, hist_pe, news,
             verdict, emoji_str, [], score, rsi_str,
             category=category,
+            ml_result=ml_result,
         )
 
         header = f"🔍 *Análise on-demand — {symbol}*\n_Pedido via /analisar — {datetime.now().strftime('%d/%m %H:%M')}_\n\n"
@@ -1071,6 +1094,22 @@ def run_scan() -> None:
                 else:
                     verdict, emoji_str, tier = "MONITORIZAR", "🔵", 3
 
+                # Chunk 6 — ML score em tempo real
+                ml_features = {
+                    **fund,
+                    "score":             score,
+                    "spy_change":        spy_change,
+                    "sector_etf_change": sector_chg,
+                    "earnings_days":     earnings_days,
+                    "change_day_pct":    stock["change_pct"],
+                }
+                ml_result = ml_score(ml_features)
+                if ml_result.model_ready:
+                    logging.info(
+                        f"[ml] {sym}: label={ml_result.label} "
+                        f"prob={ml_result.win_prob:.2f} conf={ml_result.confidence}"
+                    )
+
                 log_alert_snapshot(
                     symbol=sym, fundamentals=fund, score=score,
                     verdict=verdict, category=category,
@@ -1083,6 +1122,7 @@ def run_scan() -> None:
                     stock, fund, hist_pe, news,
                     verdict, emoji_str, [], score, rsi_str,
                     category=category,
+                    ml_result=ml_result,
                 )
 
                 ranked_entries.append({
@@ -1279,12 +1319,11 @@ def setup_schedule() -> BlockingScheduler:
     )
 
     # ── Scan intra-dia (durante horário de mercado) ────────────────────────────
-    # Mantido para alertas em tempo real durante a sessão
     scheduler.add_job(
         run_scan,
         CronTrigger(
             minute=f"*/{SCAN_MINUTES}",
-            hour="14-21",  # 14h30-21h00 WEST (US market hours)
+            hour="14-21",
             day_of_week="mon-fri",
             timezone=LISBON_TZ,
         ),
@@ -1376,6 +1415,7 @@ def setup_schedule() -> BlockingScheduler:
 if __name__ == "__main__":
     logging.info("🚀 DipRadar v2.0 a iniciar...")
     logging.info(f"  Tiingo: {'🟢 ACTIVO' if is_tiingo_available() else '🟡 sem chave — yfinance fallback'}")
+    logging.info(f"  ML Model: {'🟢 PRONTO' if is_model_ready() else '🟡 não treinado — só score de regras'}")
 
     scheduler = setup_schedule()
 
