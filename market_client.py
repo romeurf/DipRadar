@@ -45,7 +45,7 @@ _CATALYST_KEYWORDS = {
     "partnership": "🤝 Parceria estratégica",
 }
 
-# ── Feriados NYSE hardcoded (anos 2025-2027) ───────────────────────────────────
+# ── Feriados NYSE hardcoded (anos 2025-2027) ───────────────────────────────────────────────
 _NYSE_HOLIDAYS = {
     date(2025, 1, 1), date(2025, 1, 20), date(2025, 2, 17),
     date(2025, 4, 18), date(2025, 5, 26), date(2025, 6, 19),
@@ -429,25 +429,13 @@ def _normalize_dividend_yield(raw: float | None) -> float | None:
       2.63    →  0.0263  (2.63% — convertido)
       0.0     →  None
       None    →  None
-
-    Nota: valores > 0.50 (50%) são impossíveis como yield real num stock
-    saudável, portanto são tratados como já estando em percentagem e
-    divididos por 100. Limite superior de segurança: 50% (0.50 decimal).
-    Tickers com yield genuinamente >50% são raros e geralmente sinais de
-    distress que o score já penaliza de outras formas.
     """
     if raw is None or raw <= 0:
         return None
-    # yfinance devolve > 0.50 → assume que já está em percentagem
     return float(raw) / 100 if raw > 0.50 else float(raw)
 
 
 def _normalize_ratio(raw: float | None) -> float | None:
-    """
-    Normaliza ratios como payout_ratio, gross_margin, roe, revenue_growth
-    que o yfinance devolve consistentemente como decimais.
-    Não requer ajuste — apenas garante que None é devolvido para valores None.
-    """
     if raw is None:
         return None
     return float(raw)
@@ -485,7 +473,6 @@ def get_fundamentals(symbol: str, region: str = "", min_market_cap: int = 2_000_
         "ev_ebitda":        inf.get("enterpriseToEbitda"),
         "roe":              _normalize_ratio(inf.get("returnOnEquity")),
         "debt_equity":      inf.get("debtToEquity"),
-        # dividend_yield normalizado para SEMPRE decimal (ex: 0.0263 = 2.63%)
         "dividend_yield":   _normalize_dividend_yield(inf.get("dividendYield")),
         "payout_ratio":     _normalize_ratio(inf.get("payoutRatio")),
         "week52_high":      week52_high,
@@ -561,9 +548,26 @@ def get_portfolio_snapshot(holdings, cashback_eur, ppr_shares, ppr_avg_cost, usd
 
     PPR (ISIN {PPR_ISIN}):
       O fundo não tem ticker directo no Yahoo Finance.
-      Usamos o ACWI (iShares MSCI ACWI ETF) como proxy de preço.
-      O valor real do PPR = ppr_shares * acwi_price * usd_eur.
-      O custo histórico = ppr_shares * ppr_avg_cost.
+      Usamos o ACWI (iShares MSCI ACWI ETF) como proxy de retorno percentual.
+
+      ATENÇÃO: o ACWI não é usado como preço absoluto por UP (as unidades do PPR
+      têm preços completamente diferentes do ACWI). É usado APENAS como proxy
+      dos movimentos percentuais do mercado global para calcular o P&L diário,
+      semanal e mensal.
+
+      Valor actual do PPR:
+        - Se PPR_ACWI_REF_PRICE estiver definido (preço USD do ACWI na data de
+          compra média): valor = custo * (acwi_agora / acwi_ref)
+        - Caso contrário (fallback seguro): valor = custo histórico (sem inflação)
+
+      P&L periódico (dia/semana/mês):
+        Sempre calculado como: valor_ppr * retorno_percentual_ACWI_no_período
+        Nunca como: ppr_shares * (acwi_agora - acwi_ontem) [ERRADO — unidades incompatíveis]
+
+    Para configurar no Railway:
+      PPR_SHARES        = número de unidades de participação (UP)
+      PPR_AVG_COST      = custo médio por UP em EUR (ex: 14.50)
+      PPR_ACWI_REF_PRICE = preço USD do ACWI na data de compra média (opcional, mas recomendado)
     """
     from portfolio import USD_TICKERS, EUR_TICKERS
 
@@ -628,48 +632,79 @@ def get_portfolio_snapshot(holdings, cashback_eur, ppr_shares, ppr_avg_cost, usd
         })
         total_eur += value_eur
 
-    # ── CashBack Pie ────────────────────────────────────────────────────────
-    cashback_total = sum(cashback_eur.values())
+    # ── CashBack Pie ──────────────────────────────────────────────────────────────────────────
+    cashback_total = sum(cashback_eur.values()) if cashback_eur else 0.0
     total_eur     += cashback_total
     pie_pnl_day    = 0.0
-    for sym, val_eur in cashback_eur.items():
+    for sym, val_eur in (cashback_eur or {}).items():
         p = _get_prices(sym)
         if p and p.get("yesterday") and p["yesterday"] > 0:
             pie_pnl_day += val_eur * (p["now"] - p["yesterday"]) / p["yesterday"]
 
-    # ── PPR (ISIN PTARMJHM0003, proxy ACWI) ────────────────────────────────────
-    # Valor real = shares * preço_actual_ACWI * usd_eur
-    # Custo histórico = shares * avg_cost (em EUR, já convertido na compra)
-    ppr_cost      = ppr_shares * ppr_avg_cost   # custo total histórico em EUR
-    ppr_value_eur = ppr_cost                     # fallback se ACWI falhar
+    # ── PPR (ISIN PTARMJHM0003, proxy ACWI) ─────────────────────────────────────────────────────
+    #
+    # CORRECÇÃO DO BUG DE INFLAÇÃO:
+    #   ANTES (errado): ppr_value = ppr_shares * acwi_price_eur
+    #     Ex: 50 UP x €97 (ACWI) = €4.850 — COMPLETAMENTE ERRADO
+    #
+    #   DEPOIS (correcto): usar ACWI só como proxy de retorno %
+    #     Custo histórico = ppr_shares * ppr_avg_cost (em EUR, ex: 50 x €14.5 = €725)
+    #     Valor actual    = custo * (acwi_agora / acwi_ref_compra)  [se ref disponível]
+    #     P&L diário     = valor * (acwi_hoje - acwi_ontem) / acwi_ontem
+    #
+    # Env var opcional PPR_ACWI_REF_PRICE: preço USD do ACWI na data de compra média.
+    # Se não definido, o valor mostrado é o custo histórico (conservador e sem inflação).
+    # ─────────────────────────────────────────────────────────────────────────
+    ppr_cost      = ppr_shares * ppr_avg_cost  # custo total em EUR
+    ppr_value_eur = ppr_cost                   # fallback seguro
 
     ppr_pnl_day = ppr_pnl_week = ppr_pnl_month = None
+
+    # Ler preço de referência do ACWI na data de compra média (opcional)
+    try:
+        _acwi_ref_raw = os.environ.get("PPR_ACWI_REF_PRICE", "")
+        ppr_acwi_ref = float(_acwi_ref_raw) if _acwi_ref_raw else 0.0
+    except (ValueError, TypeError):
+        ppr_acwi_ref = 0.0
+
     pp = _get_prices("ACWI")
-    if pp and pp.get("now"):
-        acwi_now       = pp["now"] * usd_eur
-        ppr_value_eur  = ppr_shares * acwi_now   # ← valor real de mercado
+    if pp and pp.get("now") and pp["now"] > 0:
+        acwi_now = pp["now"]  # em USD
 
+        # Valor actual do PPR: aplicar retorno % do ACWI ao custo histórico
+        if ppr_acwi_ref > 0:
+            ppr_value_eur = ppr_cost * (acwi_now / ppr_acwi_ref)
+            logging.info(
+                f"PPR ({PPR_ISIN}): custo €{ppr_cost:.2f} x ACWI {acwi_now:.2f}/{ppr_acwi_ref:.2f}"
+                f" = €{ppr_value_eur:.2f}"
+            )
+        else:
+            # Sem referência: mostrar custo histórico (conservador)
+            ppr_value_eur = ppr_cost
+            logging.info(
+                f"PPR ({PPR_ISIN}): PPR_ACWI_REF_PRICE não definido — "
+                f"a usar custo histórico €{ppr_cost:.2f} como valor."
+                f" Para valor de mercado, define PPR_ACWI_REF_PRICE no Railway."
+            )
+
+        # P&L periódico: SEMPRE baseado em retorno % do ACWI aplicado ao valor actual
+        # NUNCA: ppr_shares * (acwi_agora - acwi_ontem) — unidades são incompatíveis
         if pp.get("yesterday") and pp["yesterday"] > 0:
-            acwi_yest     = pp["yesterday"] * usd_eur
-            ppr_pnl_day   = ppr_shares * (acwi_now - acwi_yest)
+            day_pct       = (acwi_now - pp["yesterday"]) / pp["yesterday"]
+            ppr_pnl_day   = ppr_value_eur * day_pct
         if pp.get("week_ago") and pp["week_ago"] > 0:
-            acwi_w        = pp["week_ago"] * usd_eur
-            ppr_pnl_week  = ppr_shares * (acwi_now - acwi_w)
+            week_pct      = (acwi_now - pp["week_ago"]) / pp["week_ago"]
+            ppr_pnl_week  = ppr_value_eur * week_pct
         if pp.get("month_ago") and pp["month_ago"] > 0:
-            acwi_m        = pp["month_ago"] * usd_eur
-            ppr_pnl_month = ppr_shares * (acwi_now - acwi_m)
-
-        logging.info(
-            f"PPR ({PPR_ISIN}): {ppr_shares} UP × €{acwi_now:.4f}/UP "
-            f"= €{ppr_value_eur:.2f} (custo €{ppr_cost:.2f})"
-        )
+            month_pct     = (acwi_now - pp["month_ago"]) / pp["month_ago"]
+            ppr_pnl_month = ppr_value_eur * month_pct
     else:
-        logging.warning(f"PPR ({PPR_ISIN}): ACWI sem dados, a usar custo histórico como fallback")
+        logging.warning(f"PPR ({PPR_ISIN}): ACWI sem dados, a usar custo histórico como valor")
 
     total_eur  += ppr_value_eur
     total_cost += ppr_cost
 
-    # ── Agregação P&L ─────────────────────────────────────────────────────
+    # ── Agregação P&L ────────────────────────────────────────────────────────────────────────
     agg_day   = sum(p["pnl_day"]   for p in positions if p["pnl_day"]   is not None) + pie_pnl_day
     agg_week  = sum(p["pnl_week"]  for p in positions if p["pnl_week"]  is not None)
     agg_month = sum(p["pnl_month"] for p in positions if p["pnl_month"] is not None)
