@@ -33,15 +33,15 @@ from state import load_alerts, save_alerts
 from score import CATEGORY_HOLD_FOREVER, CATEGORY_APARTAMENTO, CATEGORY_ROTACAO
 
 
-# ══════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 # WATCHLIST — edita aqui para adicionar/remover stocks
-# ══════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
 WATCHLIST: list[dict[str, Any]] = [
 
-    # ── CORE EUROPEU ────────────────────────────────────────────────────
+    # ── CORE EUROPEU ───────────────────────────────────────────────────────────
     {
-        "symbol":   "IS3N.AS",
+        "symbol":   "IS3N.L",
         "name":     "iShares Core MSCI EM IMI",
         "slot":     "P1",
         "category": CATEGORY_ROTACAO,
@@ -51,7 +51,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "notes": "Entrada imediata com excesso do fundo de emergência. Diversificação Emerging Markets.",
     },
 
-    # ── DIVIDENDO / REIT ────────────────────────────────────────────────
+    # ── DIVIDENDO / REIT ──────────────────────────────────────────────────────
     {
         "symbol":   "O",
         "name":     "Realty Income",
@@ -108,7 +108,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "notes": "Defesa. Dip adicional >10% no dia ou >20% do topo.",
     },
 
-    # ── TECH GROWTH ─────────────────────────────────────────────────────
+    # ── TECH GROWTH ───────────────────────────────────────────────────────────
     {
         "symbol":   "CRWD",
         "name":     "CrowdStrike",
@@ -151,7 +151,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "notes": "Semicondutores/AI infra. Slot P3. Entrar apenas com queda >30% dos máximos.",
     },
 
-    # ── EUROPA ──────────────────────────────────────────────────────────
+    # ── EUROPA ────────────────────────────────────────────────────────────────────
     {
         "symbol":   "ALV.DE",
         "name":     "Allianz",
@@ -166,9 +166,9 @@ WATCHLIST: list[dict[str, Any]] = [
 ]
 
 
-# ══════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 # ENGINE DE VERIFICAÇÃO
-# ══════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
 _SLOT_EMOJI = {"P1": "🔴", "P2": "🟡", "P3": "🔵"}
 
@@ -201,7 +201,6 @@ def _get_ticker_data(symbol: str) -> dict | None:
             "name":        name,
             "mc_b":        mc / 1e9,
             "sector":      sector,
-            # Campos extra para _check_category_divergence
             "market_cap":      mc,
             "free_cashflow":   info.get("freeCashflow"),
             "gross_margins":   info.get("grossMargins") or 0,
@@ -215,11 +214,6 @@ def _get_ticker_data(symbol: str) -> dict | None:
 
 
 def _check_criteria(data: dict, criteria: list[dict]) -> list[str]:
-    """
-    Verifica a lista de critérios contra os dados reais.
-    Devolve lista de critérios satisfeitos (strings descritivas).
-    Qualquer critério satisfeito = alerta.
-    """
     triggered = []
     for c in criteria:
         ctype = c["type"]
@@ -242,20 +236,6 @@ def _check_category_divergence(
     symbol: str,
     data: dict,
 ) -> str | None:
-    """
-    Compara a categoria de intenção da watchlist com a categoria dinâmica
-    calculada pelo score.py em tempo real.
-
-    Devolve uma linha de aviso se divergirem, None se estiverem alinhadas
-    ou se não houver intenção definida.
-
-    Usa os dados já recolhidos por _get_ticker_data() — sem chamadas extra ao yfinance.
-
-    Filosofia:
-      - watchlist.category = INTENÇÃO (a gaveta estratégica que definiste)
-      - score.classify_dip_category() = REALIDADE (os fundamentos de hoje)
-      Divergência não bloqueia o alerta — apenas avisa.
-    """
     if not intention:
         return None
     try:
@@ -265,7 +245,7 @@ def _check_category_divergence(
         fcf = data.get("free_cashflow")
         fundamentals = {
             "dividend_yield":    data.get("dividend_yield_raw", 0),
-            "drawdown_from_high": -data["drawdown"],   # score.py usa negativo
+            "drawdown_from_high": -data["drawdown"],
             "fcf_yield":         (fcf / mc) if (fcf and mc > 0) else None,
             "gross_margin":      data.get("gross_margins", 0),
             "debt_equity":       data.get("debt_to_equity"),
@@ -274,7 +254,6 @@ def _check_category_divergence(
             "sector":            data.get("sector", ""),
         }
         bc_flag = is_bluechip(fundamentals)
-        # Score neutro (50) — o objectivo é só detectar divergência de categoria
         reality = classify_dip_category(fundamentals, dip_score=50, is_bluechip_flag=bc_flag)
         if intention != reality:
             return f"⚠️ *ALERTA DE TESE:* Intenção ({intention}) → Modelo ({reality})"
@@ -326,12 +305,6 @@ def run_watchlist_scan(
     send_telegram,
     direct_tickers: set | list,
 ) -> int:
-    """
-    Corre o scan completo da watchlist.
-    Envia alerta Telegram para cada stock que satisfaça pelo menos 1 critério.
-    Devolve o número de alertas enviados.
-    Usa o mesmo sistema de deduplicação diária que o scan principal.
-    """
     alerted  = load_alerts()
     today    = datetime.now().date().isoformat()
     sent     = 0
@@ -371,10 +344,6 @@ def run_watchlist_scan(
 
 
 def build_watchlist_morning_summary(direct_tickers: set | list) -> str:
-    """
-    Bloco de texto com o estado actual de TODA a watchlist.
-    Incluído no heartbeat das 9h para teres visibilidade diária.
-    """
     in_port = set(direct_tickers)
     lines   = ["*👀 Watchlist — Estado actual:*", ""]
     for entry in WATCHLIST:
@@ -392,7 +361,7 @@ def build_watchlist_morning_summary(direct_tickers: set | list) -> str:
         cat_tag    = f" | {intention}" if intention else ""
         lines.append(
             f"  {slot_e} *{symbol}*{port_tag}{hit_tag}{cat_tag} — "
-            f"${data['price']:.2f} | 52w ↓{data['drawdown']:.0f}% | "
+            f"${data['price']:.2f} | 52w \u2193{data['drawdown']:.0f}% | "
             f"Yield {data['div_yield']:.1f}%"
         )
     lines.append(f"\n_⏰ {datetime.now().strftime('%d/%m %H:%M')}_")
