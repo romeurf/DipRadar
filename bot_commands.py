@@ -26,6 +26,8 @@ Comandos disponíveis:
   /mldata                  → Estatísticas da base de dados ML + forçar update de outcomes
   /admin_backfill_ml       → [ADMIN] Semear hist_backtest.csv com 5 anos de dips históricos
   /admin_train_ml          → [ADMIN] Treinar modelo ML e gerar dip_model.pkl
+  /health                  → Dashboard de observabilidade (RAM, CPU, latências, last scan)
+  /health errors           → Log dos últimos erros críticos
   /help                    → Lista de comandos
 """
 
@@ -48,6 +50,7 @@ from state import (
     delete_flip_trade,
     get_flip_summary,
 )
+import health_monitor
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -551,6 +554,45 @@ def _handle_admin_train_ml() -> None:
     threading.Thread(target=_run, daemon=True, name="admin-train").start()
 
 
+# ── /health handler ─────────────────────────────────────────────────────────────
+
+def _handle_health(parts: list[str]) -> None:
+    """
+    /health          → dashboard completo (RAM, CPU, scans, APIs, modelos, erros)
+    /health errors   → log detalhado dos últimos erros críticos
+    """
+    sub = parts[1].lower() if len(parts) > 1 else "dashboard"
+
+    if sub in ("errors", "erros", "log"):
+        with health_monitor._lock:
+            errors = list(health_monitor._error_log)
+        if not errors:
+            _reply("✅ *Sem erros registados* — sistema limpo.")
+            return
+        lines = [f"*🚨 Log de erros — últimos {len(errors)}*", ""]
+        for e in reversed(errors):
+            ts_str  = e["ts"].strftime("%d/%m %H:%M:%S")
+            tb_prev = e["tb"][-400:] if len(e["tb"]) > 400 else e["tb"]
+            lines.append(f"🔴 `{ts_str}` *[{e['context']}]*")
+            lines.append(f"   _{e['error'][:120]}_")
+            lines.append(f"```\n{tb_prev}\n```")
+            lines.append("")
+        _reply("\n".join(lines))
+        return
+
+    # Dashboard principal — corre em thread para não bloquear o poll
+    _reply("_🔄 A recolher métricas... (2-5s)_")
+
+    def _run():
+        try:
+            report = health_monitor.build_health_report(ping_apis=True)
+            _reply(report)
+        except Exception as e:
+            _reply(f"❌ Erro ao construir health report: `{e}`")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 # ── Earnings alerts ───────────────────────────────────────────────────────────────
 
 def send_earnings_alerts(watchlist: list[str] | None = None) -> int:
@@ -742,10 +784,6 @@ def _handle_flip(parts: list[str]) -> None:
 # ── /buy handler ──────────────────────────────────────────────────────────────────
 
 def _handle_buy(parts: list[str]) -> None:
-    """
-    /buy <TICKER> <PREÇO> <SHARES> [SCORE]
-    Exemplo: /buy CRWD 245.50 3 82
-    """
     if len(parts) < 4:
         _reply(
             "⚠️ Uso: `/buy <TICKER> <PREÇO> <SHARES> [SCORE]`\n"
@@ -803,11 +841,6 @@ def _handle_buy(parts: list[str]) -> None:
 # ── /sell handler ─────────────────────────────────────────────────────────────────
 
 def _handle_sell(parts: list[str]) -> None:
-    """
-    /sell <TICKER> <PREÇO> [SHARES]
-    SHARES omitido = venda total da posição.
-    Exemplo: /sell CRWD 280.00 2
-    """
     if len(parts) < 3:
         _reply(
             "⚠️ Uso: `/sell <TICKER> <PREÇO> [SHARES]`\n"
@@ -870,12 +903,6 @@ def _handle_sell(parts: list[str]) -> None:
 # ── /liquidez handler ─────────────────────────────────────────────────────────────
 
 def _handle_liquidez(parts: list[str]) -> None:
-    """
-    /liquidez          → ver saldo
-    /liquidez +500     → adicionar 500€
-    /liquidez -100     → retirar 100€ (ex: taxa)
-    /liquidez =1500    → definir saldo exacto
-    """
     try:
         from portfolio import get_liquidity, add_liquidity, set_liquidity
     except Exception as e:
@@ -922,7 +949,6 @@ def _handle_liquidez(parts: list[str]) -> None:
         )
         return
 
-    # Tentativa de valor sem sinal → tratar como definição directa
     try:
         amount  = float(raw)
         new_liq = set_liquidity(amount)
@@ -939,10 +965,6 @@ def _handle_liquidez(parts: list[str]) -> None:
 # ── /portfolio handler ────────────────────────────────────────────────────────────
 
 def _handle_portfolio(parts: list[str]) -> None:
-    """
-    /portfolio         → resumo de todas as posições activas
-    /portfolio <TICK>  → detalhe de uma posição específica
-    """
     try:
         from portfolio import get_positions, get_liquidity
     except Exception as e:
@@ -952,7 +974,6 @@ def _handle_portfolio(parts: list[str]) -> None:
     positions = get_positions()
     liquidity = get_liquidity()
 
-    # Detalhe de posição específica
     if len(parts) >= 2:
         symbol = parts[1].upper().strip()
         pos    = positions.get(symbol)
@@ -981,7 +1002,6 @@ def _handle_portfolio(parts: list[str]) -> None:
         )
         return
 
-    # Resumo geral
     if not positions:
         liq_em = "🟢" if liquidity >= 0 else "🔴"
         _reply(
@@ -995,7 +1015,6 @@ def _handle_portfolio(parts: list[str]) -> None:
     total_current = 0.0
     lines         = [f"*📊 Carteira Activa — {datetime.now().strftime('%d/%m %H:%M')}*", ""]
 
-    # Agrupa por categoria
     by_cat: dict[str, list] = {}
     for sym, pos in positions.items():
         cat = pos.get("category", "Outras")
@@ -1070,6 +1089,8 @@ def _handle_command(text: str) -> None:
             "`/portfolio`              → Posições activas\n"
             "`/mldata`                  → Stats da base de dados ML\n"
             "`/mldata update`           → Forçar update de outcomes\n"
+            "`/health`                  → Dashboard observabilidade\n"
+            "`/health errors`           → Log de erros críticos\n"
             "`/help`                    → Esta mensagem"
         )
 
@@ -1095,7 +1116,6 @@ def _handle_command(text: str) -> None:
         data_dir  = Path("/data") if Path("/data").exists() else Path("/tmp")
         ml_status = "🟢 PKL pronto" if (data_dir / "dip_model_stage1.pkl").exists() else "🔴 Não treinado"
 
-        # Liquidez da carteira activa
         try:
             from portfolio import get_liquidity, get_active_symbols
             liq      = get_liquidity()
@@ -1246,6 +1266,10 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_train_ml":
         _handle_admin_train_ml()
+
+    elif cmd == "/health":
+        if not _check_rate(cmd_key): return
+        _handle_health(parts)
 
     else:
         if text.startswith("/"):
