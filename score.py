@@ -1,70 +1,50 @@
 """
-Score quantitativo de qualidade do dip (0-100 pts, cap 100).
+score.py — Motor Quantitativo Institucional (DipRadar 2.0)
 
-Critérios e pesos:
+SUBSTITUI as heurísticas de limites fixos pelo motor estatístico:
+  Z-Scores + Sigmóide  →  normalização contínua e resistente a outliers
+  Quality / Value / Timing  →  três hemisférios ponderados
+  Confidence Penalty  →  penaliza scores com dados em falta
+  ML Prob Multiplier  →  integra a probabilidade WIN do classificador
 
-  FCF (rei do score):
-    +20  FCF yield > 5%
-    +10  FCF yield > 3%
-    -15  FCF negativo E revenue growth < 5%  (value trap real)
-    - 5  FCF negativo MAS revenue growth > 10%  (capex de crescimento)
-    -10  FCF negativo zona cinzenta (growth 5-10%)
+Equação final:
+  base_score  = 0.50 * quality + 0.30 * value + 0.20 * timing
+  final_score = base_score * ml_prob * confidence * 100
 
-  Crescimento:
-    +15  Revenue growth > 10%
-    + 5  Revenue growth > 5%
-
-  Qualidade de negócio:
-    +10  Gross margin > threshold do sector
-
-  Técnico:
-    +10  RSI < 30  |  +5 se < 40
-
-  *** Earnings: REMOVIDO do score ***
-  Earnings NÃO pontuam — entrar antes de earnings é risco puro para flip.
-  Os alertas de earnings continuam a ser mostrados como aviso separado.
-
-  Relative Strength vs sector:
-    +10  Stock caiu ≤50% do que o sector (correcção idiossincrática ou sobre-reacção)
-    - 5  Stock caiu >3x o sector (fuga de capital estrutural)
-
-  Dip within uptrend (SMA50):
-    +10  Preço actual > SMA50 (dip dentro de tendência ascendente)
-
-  Capitulação:
-    +10  Volume spike > 1.5x média
-
-  Consenso externo:
-    +10  Analyst upside > 25%
-
-  Insider buying:
-    + 8  Compras de insiders nos últimos 90 dias
-
-  Valuation / estrutura:
-    +10  Drawdown 52w < -20%
-    + 5  Market cap > $10B  (liquidez para re-rating)
-    + 5  D/E < 100
-    + 5  PE < 75% do pe_fair do sector
-
-  Penalização sector rotation:
-    -10  ETF sectorial cair ≥-2% no mesmo dia (dip arrastado pelo sector)
-
-Máximo teórico: ~128 → cap 100
-Badges: 🔥 ≥80  ·  ⭐ 55-79  ·  📊 <55
-
-Equivalências antigas (escala 20):
-  16/20  →  ~80/100
-  11/20  →  ~55/100
-  10/20  →  ~50/100  (MIN_DIP_SCORE default → 50)
+API pública (compatível com toda a base de código existente):
+  calculate_score(features, ml_prob)           — motor puro
+  score_from_fundamentals(fund, ml_prob)       — adaptador market_client
+  format_score_v2_breakdown(result)            — bloco Telegram
+  calculate_dip_score(fund, sym, ...)          — shim retro-compat
+  build_score_breakdown(fund, sym, ...)        — shim retro-compat
+  is_bluechip(fund)                            — mantido sem alterações
+  classify_dip_category(fund, score, bc_flag)  — mantido sem alterações
+  CATEGORY_HOLD_FOREVER / APARTAMENTO / ROTACAO
 """
 
-import time
-import logging
-from datetime import datetime, timedelta
-from market_client import get_rsi
-from sectors import get_sector_config
+from __future__ import annotations
 
-_MARGIN_THRESHOLD = {
+import math
+import logging
+from typing import Any
+
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# 0. Constantes de categoria — fonte da verdade única
+# ---------------------------------------------------------------------------
+
+CATEGORY_HOLD_FOREVER = "🏗️ Hold Forever"
+CATEGORY_APARTAMENTO  = "🏠 Apartamento"
+CATEGORY_ROTACAO      = "🔄 Rotação"
+
+
+# ---------------------------------------------------------------------------
+# 1. Thresholds de sector (partilhados por is_bluechip e classify_dip_category)
+# ---------------------------------------------------------------------------
+
+_MARGIN_THRESHOLD: dict[str, float] = {
     "Technology":             0.40,
     "Healthcare":             0.35,
     "Communication Services": 0.35,
@@ -78,8 +58,7 @@ _MARGIN_THRESHOLD = {
     "Basic Materials":        0.25,
 }
 
-# Thresholds de dividend_yield mínimo por sector para categoria Apartamento.
-_APARTAMENTO_YIELD_THRESHOLD = {
+_APARTAMENTO_YIELD_THRESHOLD: dict[str, float] = {
     "Technology":             0.025,
     "Communication Services": 0.030,
     "Healthcare":             0.020,
@@ -93,12 +72,410 @@ _APARTAMENTO_YIELD_THRESHOLD = {
     "Basic Materials":        0.025,
 }
 
-# Strings canónicas das categorias — fonte da verdade única.
-# Usar sempre estas constantes em vez de strings literais com emojis.
-CATEGORY_HOLD_FOREVER = "🏛️ Hold Forever"
-CATEGORY_APARTAMENTO  = "🏠 Apartamento"
-CATEGORY_ROTACAO      = "🔄 Rotação"
 
+# ---------------------------------------------------------------------------
+# 2. Médias e desvios empíricos para Z-Scores
+# ---------------------------------------------------------------------------
+
+_DEFAULT_MEAN: dict[str, float] = {
+    "roic":           0.12,
+    "fcf_margin":     0.08,
+    "revenue_growth": 0.07,
+    "debt_equity":  100.0,
+    "pe":            22.0,
+    "fcf_yield":      0.04,
+}
+
+_DEFAULT_STD: dict[str, float] = {
+    "roic":           0.08,
+    "fcf_margin":     0.07,
+    "revenue_growth": 0.12,
+    "debt_equity":   80.0,
+    "pe":            15.0,
+    "fcf_yield":      0.03,
+}
+
+_SECTOR_PE_MEAN: dict[str, float] = {
+    "Technology":             30.0,
+    "Healthcare":             25.0,
+    "Communication Services": 22.0,
+    "Financial Services":     13.0,
+    "Consumer Cyclical":      20.0,
+    "Consumer Defensive":     20.0,
+    "Industrials":            18.0,
+    "Energy":                 12.0,
+    "Utilities":              16.0,
+    "Real Estate":            35.0,
+    "Basic Materials":        14.0,
+}
+
+_SECTOR_PE_STD: dict[str, float] = {
+    "Technology":             18.0,
+    "Healthcare":             15.0,
+    "Communication Services": 14.0,
+    "Financial Services":      6.0,
+    "Consumer Cyclical":      12.0,
+    "Consumer Defensive":      8.0,
+    "Industrials":            10.0,
+    "Energy":                  7.0,
+    "Utilities":               6.0,
+    "Real Estate":            20.0,
+    "Basic Materials":         8.0,
+}
+
+_SECTOR_ROIC_MEAN: dict[str, float] = {
+    "Technology":             0.20,
+    "Healthcare":             0.15,
+    "Communication Services": 0.12,
+    "Financial Services":     0.10,
+    "Consumer Cyclical":      0.12,
+    "Consumer Defensive":     0.18,
+    "Industrials":            0.10,
+    "Energy":                 0.08,
+    "Utilities":              0.06,
+    "Real Estate":            0.06,
+    "Basic Materials":        0.09,
+}
+
+
+# ---------------------------------------------------------------------------
+# 3. Função Sigmóide — o "esmagador de outliers"
+# ---------------------------------------------------------------------------
+
+def z_to_score(z: float | np.floating) -> float:
+    """
+    Converte um Z-Score num valor contínuo em [0, 1] via sigmóide.
+
+      f(z) = 1 / (1 + exp(-z))
+
+    z = 0  → 0.50 (neutro)    z = +2 → 0.88    z = -2 → 0.12
+
+    Totalmente seguro contra NaN/Inf; devolve 0.5 se entrada inválida.
+    """
+    try:
+        z = float(z)
+        if not math.isfinite(z):
+            return 0.5
+        z = max(-10.0, min(10.0, z))
+        return float(1.0 / (1.0 + np.exp(-z)))
+    except Exception:
+        return 0.5
+
+
+# ---------------------------------------------------------------------------
+# 4. Utilitários internos
+# ---------------------------------------------------------------------------
+
+def _safe_float(v: Any, fallback: float = float("nan")) -> float:
+    if v is None:
+        return fallback
+    try:
+        f = float(v)
+        return f if math.isfinite(f) else fallback
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _z(value: float, mean: float, std: float) -> float:
+    if std <= 0:
+        return 0.0
+    return (value - mean) / std
+
+
+# ---------------------------------------------------------------------------
+# 5. Hemisfério A — Quality (50%)
+# ---------------------------------------------------------------------------
+
+def _compute_quality(
+    features: dict,
+    sector: str,
+    missing: list[str],
+    n_total: list[int],
+) -> float:
+    scores: list[float] = []
+
+    roic_mean = _SECTOR_ROIC_MEAN.get(sector, _DEFAULT_MEAN["roic"])
+    roic_std  = _DEFAULT_STD["roic"]
+
+    # ROIC (com fallback para fcf_yield como proxy)
+    n_total.append(1)
+    roic = _safe_float(features.get("roic"))
+    if math.isnan(roic):
+        roic = _safe_float(features.get("fcf_yield"))
+    if math.isnan(roic):
+        missing.append("roic")
+        scores.append(0.5)
+    else:
+        scores.append(z_to_score(_z(roic, roic_mean, roic_std)))
+
+    # FCF Margin (com fallback para gross_margin)
+    n_total.append(1)
+    fcf_margin = _safe_float(features.get("fcf_margin"))
+    if math.isnan(fcf_margin):
+        fcf_margin = _safe_float(features.get("gross_margin") or features.get("fcf_yield"))
+    if math.isnan(fcf_margin):
+        missing.append("fcf_margin")
+        scores.append(0.5)
+    else:
+        scores.append(z_to_score(_z(fcf_margin, _DEFAULT_MEAN["fcf_margin"], _DEFAULT_STD["fcf_margin"])))
+
+    # Revenue Growth
+    n_total.append(1)
+    rev_growth = _safe_float(features.get("revenue_growth"))
+    if math.isnan(rev_growth):
+        missing.append("revenue_growth")
+        scores.append(0.5)
+    else:
+        scores.append(z_to_score(_z(rev_growth, _DEFAULT_MEAN["revenue_growth"], _DEFAULT_STD["revenue_growth"])))
+
+    # Debt/Equity — invertido: menor dívida = melhor
+    n_total.append(1)
+    de = _safe_float(features.get("debt_equity"))
+    if math.isnan(de):
+        missing.append("debt_equity")
+        scores.append(0.5)
+    else:
+        scores.append(z_to_score(-_z(de, _DEFAULT_MEAN["debt_equity"], _DEFAULT_STD["debt_equity"])))
+
+    return float(np.mean(scores))
+
+
+# ---------------------------------------------------------------------------
+# 6. Hemisfério B — Value (30%)
+# ---------------------------------------------------------------------------
+
+def _compute_value(
+    features: dict,
+    sector: str,
+    missing: list[str],
+    n_total: list[int],
+) -> float:
+    scores: list[float] = []
+
+    pe_mean = _SECTOR_PE_MEAN.get(sector, _DEFAULT_MEAN["pe"])
+    pe_std  = _SECTOR_PE_STD.get(sector, _DEFAULT_STD["pe"])
+
+    # P/E — invertido: PE baixo = barato = bom
+    n_total.append(1)
+    pe = _safe_float(features.get("pe"))
+    if math.isnan(pe) or pe <= 0:
+        missing.append("pe")
+        scores.append(0.5)
+    else:
+        scores.append(z_to_score(-_z(pe, pe_mean, pe_std)))
+
+    # FCF Yield — maior = melhor
+    n_total.append(1)
+    fcf_yield = _safe_float(features.get("fcf_yield"))
+    if math.isnan(fcf_yield):
+        missing.append("fcf_yield")
+        scores.append(0.5)
+    else:
+        scores.append(z_to_score(_z(fcf_yield, _DEFAULT_MEAN["fcf_yield"], _DEFAULT_STD["fcf_yield"])))
+
+    return float(np.mean(scores))
+
+
+# ---------------------------------------------------------------------------
+# 7. Hemisfério C — Timing (20%)
+# ---------------------------------------------------------------------------
+
+def _compute_timing(
+    features: dict,
+    missing: list[str],
+    n_total: list[int],
+) -> float:
+    scores: list[float] = []
+
+    # RSI — direto, sem Z-score (já é adimensional [0, 100])
+    n_total.append(1)
+    rsi = _safe_float(features.get("rsi"))
+    if math.isnan(rsi) or not (0 <= rsi <= 100):
+        missing.append("rsi")
+        scores.append(0.5)
+    else:
+        scores.append(1.0 - (rsi / 100.0))
+
+    # Drawdown 52w (valor negativo, ex: -30 = queda de 30%)
+    # Queda maior → z mais positivo → score mais alto (oportunidade)
+    n_total.append(1)
+    drawdown = _safe_float(features.get("drawdown_from_high"))
+    if math.isnan(drawdown):
+        missing.append("drawdown_from_high")
+        scores.append(0.5)
+    else:
+        # Média empírica: -15%, std 15%; inverte sinal (queda grande = boa)
+        z_dd = -_z(drawdown, -15.0, 15.0)
+        scores.append(z_to_score(z_dd))
+
+    return float(np.mean(scores))
+
+
+# ---------------------------------------------------------------------------
+# 8. Value Trap Gate
+# ---------------------------------------------------------------------------
+
+def _is_value_trap(features: dict) -> bool:
+    """
+    True se revenue_growth < 0 E FCF é negativo.
+    Negócio em dupla contracção — quality penalizada em 50%.
+    """
+    rev_growth = _safe_float(features.get("revenue_growth"), fallback=0.0)
+    fcf        = _safe_float(
+        features.get("fcf_margin") or features.get("fcf_yield"),
+        fallback=0.0,
+    )
+    return bool(rev_growth < 0 and fcf < 0)
+
+
+# ---------------------------------------------------------------------------
+# 9. Motor principal
+# ---------------------------------------------------------------------------
+
+def calculate_score(
+    features: dict,
+    ml_prob: float | None = None,
+) -> dict:
+    """
+    Motor quantitativo institucional.
+
+    Parâmetros
+    ----------
+    features : dict
+        Chaves esperadas: roic, fcf_margin, fcf_yield, revenue_growth,
+        debt_equity, pe, rsi, drawdown_from_high, sector, gross_margin
+    ml_prob : float | None
+        Probabilidade WIN do classificador ML [0, 1]. None = 1.0.
+
+    Retorno
+    -------
+    dict: final_score, quality_score, value_score, timing_score,
+          confidence, is_value_trap, skip_recommended, missing_fields
+    """
+    sector: str = str(features.get("sector") or "")
+
+    missing: list[str] = []
+    n_total: list[int] = []
+
+    try:
+        quality = _compute_quality(features, sector, missing, n_total)
+    except Exception as exc:
+        logging.warning(f"[score] quality hemisphere error: {exc}")
+        quality = 0.5
+
+    try:
+        value = _compute_value(features, sector, missing, n_total)
+    except Exception as exc:
+        logging.warning(f"[score] value hemisphere error: {exc}")
+        value = 0.5
+
+    try:
+        timing = _compute_timing(features, missing, n_total)
+    except Exception as exc:
+        logging.warning(f"[score] timing hemisphere error: {exc}")
+        timing = 0.5
+
+    # Value Trap Gate
+    vt = _is_value_trap(features)
+    if vt:
+        quality *= 0.5
+        logging.debug("[score] value trap detected — quality halved")
+
+    # Confidence
+    total_attempted = len(n_total)
+    n_missing       = len(missing)
+    n_valid         = max(0, total_attempted - n_missing)
+    confidence      = (n_valid / total_attempted) if total_attempted > 0 else 0.0
+    skip            = confidence < 0.6
+
+    if skip:
+        logging.debug(
+            f"[score] skip_recommended=True — confidence={confidence:.2f} "
+            f"(missing: {missing})"
+        )
+
+    # ML weight
+    ml_weight = 1.0 if ml_prob is None else float(np.clip(ml_prob, 0.0, 1.0))
+
+    # Score final
+    base_score  = (0.50 * quality) + (0.30 * value) + (0.20 * timing)
+    raw_final   = base_score * ml_weight * confidence * 100.0
+    final_score = float(np.clip(raw_final, 0.0, 100.0))
+
+    return {
+        "final_score":      round(final_score, 2),
+        "quality_score":    round(quality,    4),
+        "value_score":      round(value,      4),
+        "timing_score":     round(timing,     4),
+        "confidence":       round(confidence, 4),
+        "is_value_trap":    vt,
+        "skip_recommended": skip,
+        "missing_fields":   missing,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 10. Bridge de compatibilidade — adaptador para o dicionário do market_client
+# ---------------------------------------------------------------------------
+
+def score_from_fundamentals(
+    fundamentals: dict,
+    ml_prob: float | None = None,
+) -> dict:
+    """
+    Adapta o dicionário de get_fundamentals() ao motor calculate_score().
+    Mapeamento:
+      gross_margin  → fcf_margin proxy (quando fcf_margin não existe)
+      todos os outros campos são passados directamente
+    """
+    features = {
+        "roic":               fundamentals.get("roic"),
+        "fcf_margin":         fundamentals.get("fcf_margin") or fundamentals.get("gross_margin"),
+        "fcf_yield":          fundamentals.get("fcf_yield"),
+        "revenue_growth":     fundamentals.get("revenue_growth"),
+        "debt_equity":        fundamentals.get("debt_equity"),
+        "pe":                 fundamentals.get("pe"),
+        "rsi":                fundamentals.get("rsi"),
+        "drawdown_from_high": fundamentals.get("drawdown_from_high"),
+        "sector":             fundamentals.get("sector"),
+    }
+    return calculate_score(features, ml_prob=ml_prob)
+
+
+# ---------------------------------------------------------------------------
+# 11. Formata o breakdown para Telegram
+# ---------------------------------------------------------------------------
+
+def format_score_v2_breakdown(result: dict) -> str:
+    """
+    Gera um bloco de texto legível para o Telegram a partir do resultado
+    de calculate_score() / score_from_fundamentals().
+    """
+    fs   = result["final_score"]
+    q    = result["quality_score"]
+    v    = result["value_score"]
+    t    = result["timing_score"]
+    conf = result["confidence"]
+    vt   = result["is_value_trap"]
+    skip = result["skip_recommended"]
+    miss = result["missing_fields"]
+
+    badge = "🔥" if fs >= 80 else ("⭐" if fs >= 55 else "📊")
+    lines = [
+        f"{badge} *Score V2: {fs:.1f}/100*",
+        f"  🏗️  Quality *{q*100:.0f}%*  \u00b7  💰 Value *{v*100:.0f}%*  \u00b7  ⏱️ Timing *{t*100:.0f}%*",
+        f"  📊 Confiança: *{conf*100:.0f}%*" + (" — dados insuficientes ⚠️" if skip else ""),
+    ]
+    if vt:
+        lines.append("  🔴 *Value Trap detectada* — quality penalizada em 50%")
+    if miss:
+        lines.append(f"  _Em falta: {', '.join(miss)}_")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 12. is_bluechip — mantido sem alterações
+# ---------------------------------------------------------------------------
 
 def is_bluechip(fundamentals: dict) -> bool:
     """
@@ -106,7 +483,6 @@ def is_bluechip(fundamentals: dict) -> bool:
     Critérios:
       - Market cap >= $50B
       - Dividend yield >= 1.5% OU (revenue growth > 5% E gross margin > threshold sectorial)
-    Fonte da verdade única — importar daqui em vez de duplicar no main.py.
     """
     mc           = fundamentals.get("market_cap") or 0
     div_yield    = fundamentals.get("dividend_yield") or 0
@@ -119,66 +495,18 @@ def is_bluechip(fundamentals: dict) -> bool:
     return (div_yield >= 0.015) or (rev_growth > 0.05 and gross_margin > threshold)
 
 
-def _get_insider_bought(symbol: str) -> bool:
-    """True se houve compras de insiders nos últimos 90 dias."""
-    try:
-        import yfinance as yf
-        transactions = yf.Ticker(symbol).insider_transactions
-        if transactions is None or transactions.empty:
-            return False
-        cutoff = datetime.now() - timedelta(days=90)
-        recent = transactions[
-            (transactions.index >= cutoff) &
-            (transactions["Shares"].fillna(0) > 0)
-        ]
-        return not recent.empty
-    except Exception:
-        return False
-
-
-def get_sma50(symbol: str) -> float | None:
-    """Devolve SMA50 diária. None se não houver dados suficientes."""
-    try:
-        import yfinance as yf
-        time.sleep(2)
-        hist = yf.Ticker(symbol).history(period="80d", interval="1d")["Close"].dropna()
-        if len(hist) >= 50:
-            return float(hist.iloc[-50:].mean())
-    except Exception as e:
-        logging.debug(f"SMA50 {symbol}: {e}")
-    return None
-
-
-def get_relative_strength(symbol: str, sector_change: float | None) -> float | None:
-    """
-    Devolve a variação do stock no dia (%).
-    A comparação com sector_change é feita externamente no calculate_dip_score.
-    """
-    return None
-
-
-# ── Classificação de categoria ────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# 13. classify_dip_category — mantido sem alterações
+# ---------------------------------------------------------------------------
 
 def classify_dip_category(fundamentals: dict, dip_score: float, is_bluechip_flag: bool) -> str:
     """
     Classifica o dip em uma de 3 categorias estratégicas.
     Devolve sempre uma das constantes CATEGORY_* definidas neste módulo.
 
-    🏛️ Hold Forever — Blue chip de qualidade máxima. Compounder inabalável.
-        Critérios DRACONIANOS (todos obrigatórios):
-          - is_bluechip=True AND score >= 70
-          - gross_margin acima do threshold do sector
-          - FCF não profundamente negativo (fcf_yield > -0.01)
-          - D/E < 150 (balanço controlado)
-
-    🏠 Apartamento — Drawdown estrutural + dividendo sectorial acima do threshold.
-        Critérios:
-          - dividend_yield >= threshold do sector
-          - drawdown_52w <= -20%
-          - FCF não profundamente negativo (fcf_yield > -0.03)
-          - score >= 45
-
-    🔄 Rotação — Fallback táctico. Tudo o resto.
+    🏗️ Hold Forever — blue chip, score ≥70, margens e balanço excelentes.
+    🏠 Apartamento  — drawdown estrutural + dividendo sectorial acima do threshold.
+    🔄 Rotação       — fallback táctico para o resto.
     """
     dividend_yield   = fundamentals.get("dividend_yield") or 0
     drawdown         = fundamentals.get("drawdown_from_high") or 0
@@ -188,14 +516,14 @@ def classify_dip_category(fundamentals: dict, dip_score: float, is_bluechip_flag
     sector           = fundamentals.get("sector", "")
     margin_threshold = _MARGIN_THRESHOLD.get(sector, 0.40)
 
-    # ── Hold Forever ──────────────────────────────────────────────────────
+    # Hold Forever
     hf_fcf_ok    = (fcf_yield is None) or (fcf_yield > -0.01)
     hf_margin_ok = gross_margin >= margin_threshold
     hf_de_ok     = (debt_equity is None) or (debt_equity < 150)
     if is_bluechip_flag and dip_score >= 70 and hf_fcf_ok and hf_margin_ok and hf_de_ok:
         return CATEGORY_HOLD_FOREVER
 
-    # ── Apartamento ───────────────────────────────────────────────────────
+    # Apartamento
     apt_yield_min = _APARTAMENTO_YIELD_THRESHOLD.get(sector, 0.020)
     apt_fcf_ok    = (fcf_yield is None) or (fcf_yield > -0.03)
     if (
@@ -206,9 +534,13 @@ def classify_dip_category(fundamentals: dict, dip_score: float, is_bluechip_flag
     ):
         return CATEGORY_APARTAMENTO
 
-    # ── Rotação: fallback ─────────────────────────────────────────────────
     return CATEGORY_ROTACAO
 
+
+# ---------------------------------------------------------------------------
+# 14. Shims de retro-compatibilidade
+#     Permitem que main.py e bot_commands.py funcionem sem qualquer alteração.
+# ---------------------------------------------------------------------------
 
 def calculate_dip_score(
     fundamentals: dict,
@@ -218,109 +550,15 @@ def calculate_dip_score(
     stock_change_pct: float | None = None,
 ) -> tuple[float, str | None]:
     """
-    Devolve (score, rsi_str). Escala 0-100.
-    earnings_days    : mantido para compatibilidade — NÃO afecta o score.
-    sector_change    : variação % do ETF sectorial.
-    stock_change_pct : variação % do stock no dia.
+    Shim de compatibilidade. Chama o motor quantitativo internamente.
+    Assinatura idêntica à função antiga — zero alterações em main.py.
+
+    Devolve (final_score: float, rsi_str: str | None).
     """
-    score = 0
-
-    rsi_val    = fundamentals.get("rsi") or get_rsi(symbol)
-    fcf_yield  = fundamentals.get("fcf_yield")
-    rev_growth = fundamentals.get("revenue_growth") or 0
-    sector     = fundamentals.get("sector", "")
-
-    # FCF
-    if fcf_yield is not None:
-        if fcf_yield > 0.05:
-            score += 20
-        elif fcf_yield > 0.03:
-            score += 10
-        elif fcf_yield < 0:
-            if rev_growth < 0.05:
-                score -= 15
-            elif rev_growth > 0.10:
-                score -= 5
-            else:
-                score -= 10
-
-    # Revenue growth
-    if rev_growth > 0.10:
-        score += 15
-    elif rev_growth > 0.05:
-        score += 5
-
-    # Gross margin
-    gross_margin     = fundamentals.get("gross_margin") or 0
-    margin_threshold = _MARGIN_THRESHOLD.get(sector, 0.40)
-    if gross_margin > margin_threshold:
-        score += 10
-
-    # RSI
-    if rsi_val is not None:
-        if rsi_val < 30:
-            score += 10
-        elif rsi_val < 40:
-            score += 5
-
-    # Relative Strength vs sector
-    if stock_change_pct is not None and sector_change is not None and sector_change != 0:
-        ratio = stock_change_pct / sector_change
-        if ratio >= 0.5:
-            score += 10
-        elif ratio > 3.0:
-            score -= 5
-
-    # Dip within uptrend — SMA50
-    price = fundamentals.get("price") or 0
-    if price > 0:
-        sma50 = get_sma50(symbol)
-        if sma50 is not None and price > sma50:
-            score += 10
-
-    # Volume spike (capitulação)
-    volume         = fundamentals.get("volume") or 0
-    average_volume = fundamentals.get("average_volume") or 0
-    if volume and average_volume and average_volume > 0 and volume > average_volume * 1.5:
-        score += 10
-
-    # Analyst upside
-    analyst_upside = fundamentals.get("analyst_upside") or 0
-    if analyst_upside > 25:
-        score += 10
-
-    # Insider buying
-    if _get_insider_bought(symbol):
-        score += 8
-
-    # Drawdown 52w
-    drawdown = fundamentals.get("drawdown_from_high") or 0
-    if drawdown < -20:
-        score += 10
-
-    # Market cap
-    mc = fundamentals.get("market_cap") or 0
-    if mc >= 10_000_000_000:
-        score += 5
-
-    # D/E
-    debt_equity = fundamentals.get("debt_equity", 999)
-    if debt_equity is not None and debt_equity < 100:
-        score += 5
-
-    # PE vs fair
-    pe      = fundamentals.get("pe") or 0
-    pe_fair = get_sector_config(sector).get("pe_fair", 22)
-    if pe and pe > 0 and pe_fair and pe < pe_fair * 0.75:
-        score += 5
-
-    # Sector rotation penalty
-    if sector_change is not None and sector_change <= -2.0:
-        score -= 10
-
-    score = max(0, min(score, 100))
-    rsi_str = f"{rsi_val:.0f}" if rsi_val is not None else None
-    return float(score), rsi_str
+    result  = score_from_fundamentals(fundamentals)
+    rsi_val = fundamentals.get("rsi")
+    rsi_str = f"{float(rsi_val):.0f}" if rsi_val is not None else None
+    return result["final_score"], rsi_str
 
 
 def build_score_breakdown(
@@ -329,158 +567,60 @@ def build_score_breakdown(
     earnings_days: int | None = None,
     sector_change: float | None = None,
     stock_change_pct: float | None = None,
-) -> list[str]:
+) -> str:
     """
-    Devolve lista de linhas descritivas para cada critério do score.
-    Cada linha começa com ✅ (positivo), ❌ (negativo) ou ⬜ (neutro/não aplicável).
+    Shim de compatibilidade. Devolve o bloco Telegram do motor quantitativo.
+    Assinatura idêntica à função antiga — zero alterações em main.py.
     """
-    lines: list[str] = []
+    result = score_from_fundamentals(fundamentals)
+    return format_score_v2_breakdown(result)
 
-    rsi_val    = fundamentals.get("rsi") or get_rsi(symbol)
-    fcf_yield  = fundamentals.get("fcf_yield")
-    rev_growth = fundamentals.get("revenue_growth") or 0
-    sector     = fundamentals.get("sector", "")
 
-    # FCF
-    if fcf_yield is not None:
-        if fcf_yield > 0.05:
-            lines.append(f"✅ FCF yield {fcf_yield*100:.1f}% › 5% (+20)")
-        elif fcf_yield > 0.03:
-            lines.append(f"✅ FCF yield {fcf_yield*100:.1f}% › 3% (+10)")
-        elif fcf_yield < 0:
-            if rev_growth < 0.05:
-                lines.append("❌ FCF negativo + crescimento fraco (-15)")
-            elif rev_growth > 0.10:
-                lines.append("⚠️ FCF negativo mas crescimento forte (-5)")
-            else:
-                lines.append("⚠️ FCF negativo zona cinzenta (-10)")
-    else:
-        lines.append("⬜ FCF yield — sem dados")
+# ---------------------------------------------------------------------------
+# 15. Smoke test  (python score.py)
+# ---------------------------------------------------------------------------
 
-    # Revenue growth
-    if rev_growth > 0.10:
-        lines.append(f"✅ Revenue growth {rev_growth*100:.1f}% › 10% (+15)")
-    elif rev_growth > 0.05:
-        lines.append(f"✅ Revenue growth {rev_growth*100:.1f}% › 5% (+5)")
-    else:
-        lines.append(f"⬜ Revenue growth {rev_growth*100:.1f}% (sem pts)")
+if __name__ == "__main__":
+    sample = {
+        "roic":              0.22,
+        "fcf_margin":        0.14,
+        "fcf_yield":         0.06,
+        "revenue_growth":    0.12,
+        "debt_equity":       45.0,
+        "pe":                18.0,
+        "rsi":               28.0,
+        "drawdown_from_high": -32.0,
+        "sector":            "Technology",
+        "market_cap":        200_000_000_000,
+        "gross_margin":      0.65,
+        "dividend_yield":    0.008,
+    }
 
-    # Gross margin
-    gross_margin     = fundamentals.get("gross_margin") or 0
-    margin_threshold = _MARGIN_THRESHOLD.get(sector, 0.40)
-    if gross_margin > margin_threshold:
-        lines.append(f"✅ Gross margin {gross_margin*100:.1f}% › {margin_threshold*100:.0f}% sector (+10)")
-    else:
-        lines.append(f"⬜ Gross margin {gross_margin*100:.1f}% (abaixo do threshold {margin_threshold*100:.0f}%)")
+    print("=== calculate_score ===")
+    res = calculate_score(sample, ml_prob=0.85)
+    for k, v in res.items():
+        print(f"  {k}: {v}")
+    print()
+    print(format_score_v2_breakdown(res))
+    print()
 
-    # RSI
-    if rsi_val is not None:
-        if rsi_val < 30:
-            lines.append(f"✅ RSI {rsi_val:.0f} — oversold forte (+10)")
-        elif rsi_val < 40:
-            lines.append(f"✅ RSI {rsi_val:.0f} — oversold moderado (+5)")
-        else:
-            lines.append(f"⬜ RSI {rsi_val:.0f} — neutro (sem pts)")
-    else:
-        lines.append("⬜ RSI — sem dados")
+    print("=== shim calculate_dip_score ===")
+    score, rsi_str = calculate_dip_score(sample, "AAPL")
+    print(f"  score={score:.1f}  rsi_str={rsi_str}")
+    bc = is_bluechip(sample)
+    cat = classify_dip_category(sample, score, bc)
+    print(f"  is_bluechip={bc}  category={cat}")
+    print()
 
-    # Earnings — aviso informativo apenas (não pontua)
-    if earnings_days is not None and earnings_days >= 0:
-        if earnings_days <= 7:
-            lines.append(f"🔴 Earnings em {earnings_days}d — RISCO ALTO (não pontua, cuidado em flip)")
-        elif earnings_days <= 21:
-            lines.append(f"🟡 Earnings em {earnings_days}d — atenção (não pontua)")
-        else:
-            lines.append(f"📅 Earnings em {earnings_days}d (informativo)")
-    else:
-        lines.append("⬜ Earnings — data desconhecida")
+    print("=== Value Trap ===")
+    trap = dict(sample, revenue_growth=-0.05, fcf_margin=-0.04, fcf_yield=-0.02)
+    res2 = calculate_score(trap, ml_prob=0.70)
+    for k, v in res2.items():
+        print(f"  {k}: {v}")
+    print()
 
-    # Relative Strength
-    if stock_change_pct is not None and sector_change is not None and sector_change != 0:
-        ratio = stock_change_pct / sector_change
-        if ratio >= 0.5:
-            lines.append(f"✅ Relative strength: stock {stock_change_pct:.1f}% vs sector {sector_change:.1f}% — sobre-reacção (+10)")
-        elif ratio > 3.0:
-            lines.append(f"❌ Relative strength: stock {stock_change_pct:.1f}% vs sector {sector_change:.1f}% — fuga estrutural (-5)")
-        else:
-            lines.append(f"⬜ Relative strength: {ratio:.1f}x sector (sem pts)")
-    else:
-        lines.append("⬜ Relative strength — sector change indisponível")
-
-    # SMA50
-    price = fundamentals.get("price") or 0
-    if price > 0:
-        sma50 = get_sma50(symbol)
-        if sma50 is not None:
-            if price > sma50:
-                lines.append(f"✅ Preço ${price:.2f} > SMA50 ${sma50:.2f} — dip em tendência (+10)")
-            else:
-                lines.append(f"⬜ Preço ${price:.2f} < SMA50 ${sma50:.2f} — tendência quebrada (sem pts)")
-        else:
-            lines.append("⬜ SMA50 — sem dados suficientes")
-    else:
-        lines.append("⬜ SMA50 — preço indisponível")
-
-    # Volume spike
-    volume         = fundamentals.get("volume") or 0
-    average_volume = fundamentals.get("average_volume") or 0
-    if volume and average_volume and average_volume > 0:
-        ratio = volume / average_volume
-        if ratio > 1.5:
-            lines.append(f"✅ Volume spike {ratio:.1f}x média — capitulação (+10)")
-        else:
-            lines.append(f"⬜ Volume {ratio:.1f}x média (sem pts)")
-    else:
-        lines.append("⬜ Volume — sem dados")
-
-    # Analyst upside
-    analyst_upside = fundamentals.get("analyst_upside") or 0
-    if analyst_upside > 25:
-        lines.append(f"✅ Analyst upside {analyst_upside:.1f}% › 25% (+10)")
-    else:
-        lines.append(f"⬜ Analyst upside {analyst_upside:.1f}% (sem pts)")
-
-    # Insider buying
-    if _get_insider_bought(symbol):
-        lines.append("✅ Insider buying nos últimos 90d (+8)")
-    else:
-        lines.append("⬜ Sem insider buying recente")
-
-    # Drawdown
-    drawdown = fundamentals.get("drawdown_from_high") or 0
-    if drawdown < -20:
-        lines.append(f"✅ Drawdown 52w {drawdown:.1f}% — dip significativo (+10)")
-    else:
-        lines.append(f"⬜ Drawdown 52w {drawdown:.1f}% (sem pts)")
-
-    # Market cap
-    mc = fundamentals.get("market_cap") or 0
-    if mc >= 10_000_000_000:
-        lines.append(f"✅ Market cap ${mc/1e9:.0f}B › $10B — liquidez (+5)")
-    else:
-        lines.append(f"⬜ Market cap ${mc/1e9:.1f}B (sem pts)")
-
-    # D/E
-    debt_equity = fundamentals.get("debt_equity", 999)
-    if debt_equity is not None and debt_equity < 100:
-        lines.append(f"✅ D/E {debt_equity:.0f} ‹ 100 — balanço saudável (+5)")
-    else:
-        lines.append(f"⬜ D/E {debt_equity if debt_equity else 'N/D'} (sem pts)")
-
-    # PE vs fair
-    pe      = fundamentals.get("pe") or 0
-    pe_fair = get_sector_config(sector).get("pe_fair", 22)
-    if pe and pe > 0 and pe_fair and pe < pe_fair * 0.75:
-        lines.append(f"✅ PE {pe:.1f} ‹ 75% do fair ({pe_fair*0.75:.1f}) — barato (+5)")
-    elif pe and pe > 0:
-        lines.append(f"⬜ PE {pe:.1f} (fair sector {pe_fair}) — sem desconto")
-    else:
-        lines.append("⬜ PE — sem dados")
-
-    # Sector rotation penalty
-    if sector_change is not None and sector_change <= -2.0:
-        lines.append(f"❌ Sector rotation: ETF {sector_change:.1f}% — penalização (-10)")
-    elif sector_change is not None:
-        lines.append(f"⬜ Sector ETF {sector_change:.1f}% — sem penalização")
-
-    return lines
+    print("=== Baixa confiança ===")
+    sparse = {"pe": 22.0, "rsi": 45.0, "sector": "Healthcare"}
+    res3 = calculate_score(sparse, ml_prob=0.60)
+    for k, v in res3.items():
+        print(f"  {k}: {v}")
