@@ -21,6 +21,7 @@ Comandos disponíveis:
   /flip del ID                         → Apagar trade pelo ID
   /mldata                  → Estatísticas da base de dados ML + forçar update de outcomes
   /admin_backfill_ml       → [ADMIN] Semear hist_backtest.csv com 5 anos de dips históricos
+  /admin_train_ml          → [ADMIN] Treinar modelo ML e gerar dip_model.pkl
   /help                    → Lista de comandos
 """
 
@@ -37,7 +38,6 @@ from state import (
     remove_from_dynamic_watchlist,
     save_dynamic_watchlist,
     get_ticker_score_history,
-    # Flip Fund
     load_flip_log,
     add_flip_trade,
     close_flip_trade,
@@ -53,8 +53,9 @@ _EARNINGS_ALERT_DAYS: int = int(os.environ.get("EARNINGS_ALERT_DAYS", 7))
 _last_update_id: int = 0
 _bot_start_time: datetime = datetime.now()
 
-# Flag de segurança: evita lançar dois backfills em simultâneo
+# Flags de segurança para operações longas
 _backfill_running: bool = False
+_train_running:    bool = False
 
 # Callbacks injectados pelo main.py via register_callbacks() ou poll()
 _cb_send_telegram    = None
@@ -104,10 +105,7 @@ def register_callbacks(
     _cb_fill_db_outcomes = fill_db_outcomes
 
 
-# ── poll() bridge ────────────────────────────────────────────────────────────────────
-# O main.py chama poll() periodicamente via schedule (a cada 10s).
-# Este bridge lê os updates pendentes do Telegram e despacha comandos.
-# A função também re-injeta os callbacks do contexto antes de processar.
+# ── poll() bridge ─────────────────────────────────────────────────────────────
 
 def poll(
     token: str,
@@ -115,26 +113,16 @@ def poll(
     send_fn,
     context: dict,
 ) -> None:
-    """
-    Chamado pelo scheduler do main.py a cada 10 segundos.
-    Lê até 20 updates pendentes do Telegram e despacha para _handle_command.
-    
-    context: dict com callbacks e utilitários injectados pelo main.py:
-      get_snapshot, DIRECT_TICKERS, MIN_MARKET_CAP, ..., get_db_stats, fill_db_outcomes
-    """
     global _last_update_id
     if not token:
         return
 
-    # Re-injectar callbacks do contexto
     global _cb_send_telegram, _cb_get_snapshot, _cb_get_db_stats, _cb_fill_db_outcomes
     _cb_send_telegram    = send_fn
     _cb_get_snapshot     = context.get("get_snapshot")
-    _cb_backtest_summary_fn = context.get("build_backtest_summary")
     _cb_get_db_stats     = context.get("get_db_stats")
     _cb_fill_db_outcomes = context.get("fill_db_outcomes")
 
-    # Guardar contexto completo para handlers que precisam
     _poll_context.update(context)
     _poll_context["send_fn"] = send_fn
 
@@ -160,7 +148,6 @@ def poll(
         logging.debug(f"[bot_commands] poll error: {e}")
 
 
-# Context partilhado entre poll() e handlers
 _poll_context: dict = {}
 
 
@@ -181,7 +168,7 @@ def _check_rate(cmd: str) -> bool:
     return allowed
 
 
-# ── /comparar ───────────────────────────────────────────────────────────────────────────
+# ── /comparar ─────────────────────────────────────────────────────────────────
 
 def _handle_comparar(symbols: list[str]) -> None:
     if len(symbols) < 2:
@@ -195,7 +182,7 @@ def _handle_comparar(symbols: list[str]) -> None:
         _reply("⚠️ Máximo 5 tickers por comparação.")
         return
 
-    get_fundamentals = _poll_context.get("get_fundamentals") or _cb_get_fundamentals
+    get_fundamentals  = _poll_context.get("get_fundamentals") or _cb_get_fundamentals
     get_earnings_days = _poll_context.get("get_earnings_days") or _cb_earnings_days
 
     if not get_fundamentals:
@@ -216,11 +203,8 @@ def _handle_comparar(symbols: list[str]) -> None:
                 bc_flag  = is_bluechip(fund)
                 category = classify_dip_category(fund, score, bc_flag)
                 rows.append({
-                    "sym":      sym,
-                    "score":    score,
-                    "badge":    badge,
-                    "category": category,
-                    "rsi":      rsi_str or "N/D",
+                    "sym": sym, "score": score, "badge": badge,
+                    "category": category, "rsi": rsi_str or "N/D",
                     "fcf":      f"{fund.get('fcf_yield',0)*100:.1f}%" if fund.get('fcf_yield') is not None else "N/D",
                     "growth":   f"{fund.get('revenue_growth',0)*100:.1f}%" if fund.get('revenue_growth') is not None else "N/D",
                     "margin":   f"{fund.get('gross_margin',0)*100:.0f}%" if fund.get('gross_margin') is not None else "N/D",
@@ -252,65 +236,49 @@ def _handle_comparar(symbols: list[str]) -> None:
         winner = rows[0]
         if not winner.get("error"):
             lines.append(f"_🏆 Melhor score: *{winner['sym']}* ({winner['score']:.0f} pts) — usa `/analisar {winner['sym']}` para detalhe._")
-
         _reply("\n".join(lines))
 
     threading.Thread(target=_run, daemon=True).start()
 
 
-# ── /historico ──────────────────────────────────────────────────────────────────────────
+# ── /historico ────────────────────────────────────────────────────────────────
 
 def _handle_historico(symbol: str) -> None:
     history = get_ticker_score_history(symbol)
     if not history:
         _reply(
-            f"_Sem histórico de scores para *{symbol}*._ \n"
+            f"_Sem histórico de scores para *{symbol}*._\n"
             "_O ticker ainda não foi analisado ou alertado pelo DipRadar._"
         )
         return
 
-    entries = history[-10:]
-    lines   = [f"*📈 Histórico — {symbol} ({len(history)} entradas totais):*", ""]
-
+    entries    = history[-10:]
+    lines      = [f"*📈 Histórico — {symbol} ({len(history)} entradas totais):*", ""]
     prev_score = None
     for e in entries:
-        score   = e.get("score", 0)
+        score  = e.get("score", 0)
+        change = e.get("change", 0)
+        price  = e.get("price")
+        date   = e.get("date", "")
+        t      = e.get("time", "")
         verdict = e.get("verdict") or ""
-        change  = e.get("change", 0)
-        price   = e.get("price")
-        date    = e.get("date", "")
-        t       = e.get("time", "")
-
-        if prev_score is None:
-            trend = ""
-        elif score > prev_score:
-            trend = f" ↑{score - prev_score:.0f}"
-        elif score < prev_score:
-            trend = f" ↓{prev_score - score:.0f}"
-        else:
-            trend = " ="
+        if prev_score is None: trend = ""
+        elif score > prev_score: trend = f" ↑{score - prev_score:.0f}"
+        elif score < prev_score: trend = f" ↓{prev_score - score:.0f}"
+        else: trend = " ="
         prev_score = score
-
-        badge = "🔥" if score >= 80 else ("⭐" if score >= 55 else "📊")
+        badge     = "🔥" if score >= 80 else ("⭐" if score >= 55 else "📊")
         price_str = f" @ ${price:.2f}" if price else ""
-        lines.append(
-            f"  {badge} `{date} {t}` — *{score:.0f}*{trend} | {change:+.1f}%{price_str} | _{verdict}_"
-        )
+        lines.append(f"  {badge} `{date} {t}` — *{score:.0f}*{trend} | {change:+.1f}%{price_str} | _{verdict}_")
 
     if len(history) > 10:
-        lines.append("")
-        lines.append(f"_... e mais {len(history) - 10} entradas anteriores._")
-
+        lines.append(f"\n_... e mais {len(history) - 10} entradas anteriores._")
     _reply("\n".join(lines))
 
 
-# ── /mldata ──────────────────────────────────────────────────────────────────────────
+# ── /mldata ───────────────────────────────────────────────────────────────────
 
 def _handle_mldata(force_update: bool = False) -> None:
-    """
-    /mldata          → Mostra estatísticas da base de dados ML
-    /mldata update   → Força fill_db_outcomes() e mostra resultado
-    """
     get_db_stats     = _poll_context.get("get_db_stats") or _cb_get_db_stats
     fill_db_outcomes = _poll_context.get("fill_db_outcomes") or _cb_fill_db_outcomes
 
@@ -319,7 +287,6 @@ def _handle_mldata(force_update: bool = False) -> None:
         return
 
     def _run():
-        # Forçar update se pedido
         update_stats = None
         if force_update and fill_db_outcomes:
             _reply("🔄 _A actualizar outcomes da alert_db... (pode demorar 1-2 min)_")
@@ -330,114 +297,65 @@ def _handle_mldata(force_update: bool = False) -> None:
                 return
 
         try:
-            stats    = get_db_stats()
-            total    = stats.get("total", 0)
-            labeled  = stats.get("labeled", 0)
+            stats   = get_db_stats()
+            total   = stats.get("total", 0)
+            labeled = stats.get("labeled", 0)
             outcomes = stats.get("outcomes", {})
-            by_cat   = stats.get("by_category", {})
-            by_vrd   = stats.get("by_verdict", {})
-            db_path  = stats.get("db_path", "N/D")
+            by_cat  = stats.get("by_category", {})
+            by_vrd  = stats.get("by_verdict", {})
+            db_path = stats.get("db_path", "N/D")
         except Exception as e:
             _reply(f"_Erro ao ler stats: {e}_")
             return
 
         lines = [
-            f"🤖 *ML Alert Database*",
-            f"_{datetime.now().strftime('%d/%m/%Y %H:%M')}_",
-            "",
+            "🤖 *ML Alert Database*",
+            f"_{datetime.now().strftime('%d/%m/%Y %H:%M')}_", "",
             f"*🗓️ Total de alertas:* {total}",
-            f"*📊 Classificados:* {labeled} ({labeled/total*100:.0f}% do total)" if total > 0 else "*📊 Classificados:* 0",
-            f"*🗂️ Ficheiro:* `{db_path}`",
-            "",
+            (f"*📊 Classificados:* {labeled} ({labeled/total*100:.0f}% do total)" if total > 0 else "*📊 Classificados:* 0"),
+            f"*🗂️ Ficheiro:* `{db_path}`", "",
         ]
-
         if by_cat:
             lines.append("*🏠 Por categoria:*")
             for cat, count in sorted(by_cat.items(), key=lambda x: x[1], reverse=True):
-                pct = count / total * 100 if total > 0 else 0
-                lines.append(f"  {cat}: *{count}* ({pct:.0f}%)")
+                lines.append(f"  {cat}: *{count}* ({count/total*100:.0f}%)")
             lines.append("")
-
-        if by_vrd:
-            lines.append("*📊 Por verdict:*")
-            vrd_em = {"COMPRAR": "🟢", "MONITORIZAR": "🟡", "EVITAR": "🔴"}
-            for vrd, count in sorted(by_vrd.items(), key=lambda x: x[1], reverse=True):
-                em  = vrd_em.get(vrd, "📊")
-                pct = count / total * 100 if total > 0 else 0
-                lines.append(f"  {em} {vrd}: *{count}* ({pct:.0f}%)")
-            lines.append("")
-
         if outcomes:
-            lines.append("*🎯 Outcomes (alertas com histórico suficiente):*")
-            emoji_map = {"WIN_40": "🟢", "WIN_20": "✅", "NEUTRAL": "🟡", "LOSS_15": "🔴"}
-            for label, count in sorted(outcomes.items(), key=lambda x: x[1], reverse=True):
-                em  = emoji_map.get(label, "📊")
-                pct = count / labeled * 100 if labeled > 0 else 0
-                lines.append(f"  {em} {label}: *{count}* ({pct:.0f}%)")
-            lines.append("")
-
-            wins   = outcomes.get("WIN_40", 0) + outcomes.get("WIN_20", 0)
-            losses = outcomes.get("LOSS_15", 0)
+            lines.append("*🎯 Outcomes:*")
+            em_map = {"WIN_40": "🟢", "WIN_20": "✅", "NEUTRAL": "🟡", "LOSS_15": "🔴"}
+            for lbl, cnt in sorted(outcomes.items(), key=lambda x: x[1], reverse=True):
+                lines.append(f"  {em_map.get(lbl,'📊')} {lbl}: *{cnt}* ({cnt/labeled*100:.0f}%)" if labeled else f"  {lbl}: {cnt}")
+            wins = outcomes.get("WIN_40", 0) + outcomes.get("WIN_20", 0)
             if labeled > 0:
-                win_rate = wins / labeled * 100
-                lines.append(f"  📈 *Win rate total:* {win_rate:.0f}% ({wins}/{labeled})")
-                if losses > 0:
-                    lines.append(f"  ⚠️ *Value Traps detectadas:* {losses} ({losses/labeled*100:.0f}%)")
+                lines.append(f"\n  📈 *Win rate:* {wins/labeled*100:.0f}% ({wins}/{labeled})")
             lines.append("")
-
         if update_stats:
-            lines.append(f"*✅ Update concluído:* {update_stats.get('updated', 0)} novas classificações")
-            if update_stats.get('errors', 0) > 0:
-                lines.append(f"  ⚠️ Erros: {update_stats['errors']}")
-            lines.append("")
+            lines.append(f"*✅ Update:* {update_stats.get('updated', 0)} novas classificações\n")
 
-        if total == 0:
-            lines.append("🕐 _Base de dados vazia — aguarda os primeiros alertas._")
-        elif labeled < 50:
-            lines.append(f"🕐 _Precisa de mais *{50 - labeled}* alertas classificados para treinar o modelo ML._")
-            lines.append("_Update automático todos os domingos às 08:00._")
-        elif labeled < 100:
-            lines.append(f"🟡 *{labeled} alertas classificados* — podes começar a explorar o modelo!")
-            lines.append("_Para resultados sólidos, aguarda 100+._")
+        if labeled >= 100:
+            lines.append("🟢 *Pronto para treinar!* Usa `/admin_train_ml`")
+        elif labeled >= 50:
+            lines.append(f"🟡 *{labeled} amostras* — quase prontos (mín. recomendado: 100)")
+            lines.append("_Já podes tentar `/admin_train_ml` com resultados parciais._")
         else:
-            lines.append(f"🟢 *{labeled} alertas classificados* — *pronto para treinar o modelo!*")
-            lines.append("_Usa `train_model.py` com XGBoost/sklearn._")
+            lines.append(f"🕐 *{labeled} amostras* — precisa de mais dados (mín: 30 para treinar).")
 
         if not force_update and fill_db_outcomes:
-            lines.append("")
-            lines.append("_Força update agora com `/mldata update`_")
-
+            lines.append("\n_Força update agora com `/mldata update`_")
         _reply("\n".join(lines))
 
     threading.Thread(target=_run, daemon=True).start()
 
 
-# ── /admin_backfill_ml ────────────────────────────────────────────────────────────────
+# ── /admin_backfill_ml ────────────────────────────────────────────────────────
 
 def _handle_admin_backfill_ml() -> None:
-    """
-    Comando de administrador (escondido do /help) para semear o hist_backtest.csv
-    com 5 anos de dips históricos.
-
-    Comportamento:
-      - Só pode correr uma instância de cada vez (_backfill_running flag).
-      - Responde imediatamente com mensagem de arranque para não bloquear o bot.
-      - Corre build_historical_training_set() numa daemon thread.
-      - Quando termina, formata e envia o relatório de stats para o Telegram.
-
-    Idempotência: pode ser chamado múltiplas vezes em segurança.
-    O _write_hist_csv() interno garante que nunca duplica linhas.
-    """
     global _backfill_running
 
     if _backfill_running:
-        _reply(
-            "⚠️ *Backfill já está a correr.*\n"
-            "_Aguarda a conclusão antes de lançar novamente._"
-        )
+        _reply("⚠️ *Backfill já está a correr.*\n_Aguarda a conclusão antes de lançar novamente._")
         return
 
-    # Resolver watchlist: dinâmica + estática (WATCHLIST do config)
     dynamic = load_dynamic_watchlist()
     static  = []
     try:
@@ -445,22 +363,18 @@ def _handle_admin_backfill_ml() -> None:
         static = list(_STATIC_WL)
     except Exception:
         pass
-    tickers = list(dict.fromkeys(dynamic + static))  # dedup, preserva ordem
+    tickers = list(dict.fromkeys(dynamic + static))
 
     if not tickers:
-        _reply(
-            "⚠️ *Watchlist vazia.*\n"
-            "_Adiciona tickers com `/watchlist add TICK` antes de fazer backfill._"
-        )
+        _reply("⚠️ *Watchlist vazia.*\n_Adiciona tickers com `/watchlist add TICK` antes de fazer backfill._")
         return
 
     n = len(tickers)
     _reply(
         f"⏳ *A iniciar a Máquina do Tempo* — {n} ticker(s) | lookback 5 anos\n"
-        f"_Isto pode demorar {n * 4 // 60 + 1}–{n * 6 // 60 + 2} minutos..._\n"
-        f"_O bot continua a responder durante o processo._"
+        f"_Estimativa: {n * 4 // 60 + 1}–{n * 6 // 60 + 2} minutos..._\n"
+        "_O bot continua a responder durante o processo._"
     )
-    logging.info(f"[admin_backfill] Iniciando para {n} tickers: {tickers}")
 
     def _run():
         global _backfill_running
@@ -468,11 +382,9 @@ def _handle_admin_backfill_ml() -> None:
         start_ts = time.time()
         try:
             from backtest import build_historical_training_set
-            stats = build_historical_training_set(tickers=tickers)
-            elapsed = int(time.time() - start_ts)
+            stats    = build_historical_training_set(tickers=tickers)
+            elapsed  = int(time.time() - start_ts)
             mins, secs = divmod(elapsed, 60)
-
-            # ── Formatar relatório de stats ─────────────────────────────────
             total    = stats.get("total_dips", 0)
             written  = stats.get("written", 0)
             skipped  = stats.get("skipped", 0)
@@ -480,28 +392,17 @@ def _handle_admin_backfill_ml() -> None:
             dupes    = stats.get("duplicates", 0)
             errors   = stats.get("errors", 0)
             csv_path = stats.get("csv_path") or "N/D"
-
-            # Calcular distribuição de outcome_labels
             dip_rows = stats.get("dip_rows", [])
             label_counts: dict = {}
             for row in dip_rows:
                 lbl = row.get("outcome_label") or "pending"
                 label_counts[lbl] = label_counts.get(lbl, 0) + 1
 
-            label_emoji = {
-                "WIN_40":  "🟢",
-                "WIN_20":  "✅",
-                "NEUTRAL": "🟡",
-                "LOSS_15": "🔴",
-                "pending": "⏳",
-            }
-
+            em_map = {"WIN_40": "🟢", "WIN_20": "✅", "NEUTRAL": "🟡", "LOSS_15": "🔴", "pending": "⏳"}
             lines = [
-                f"✅ *Backfill ML concluído!*",
-                f"_{datetime.now().strftime('%d/%m/%Y %H:%M')} — {mins}m{secs:02d}s_",
-                "",
-                f"*🗂️ Ficheiro:* `{csv_path}`",
-                "",
+                "✅ *Backfill ML concluído!*",
+                f"_{datetime.now().strftime('%d/%m/%Y %H:%M')} — {mins}m{secs:02d}s_", "",
+                f"*🗂️ Ficheiro:* `{csv_path}`", "",
                 "*📊 Pipeline stats:*",
                 f"  📡 Dips detectados:  *{total}*",
                 f"  ✍️  Escritos no CSV: *{written}*",
@@ -509,105 +410,199 @@ def _handle_admin_backfill_ml() -> None:
                 f"  ⏳ Censurados (edge): *{censored}*",
                 f"  🔁 Duplicados (skip): *{dupes}*",
             ]
-            if errors > 0:
-                lines.append(f"  ⚠️ Erros de ticker:  *{errors}*")
+            if errors: lines.append(f"  ⚠️ Erros de ticker: *{errors}*")
             lines.append("")
-
             if label_counts:
                 lines.append("*🎯 Distribuição de outcomes:*")
                 for lbl, cnt in sorted(label_counts.items(), key=lambda x: x[1], reverse=True):
-                    em  = label_emoji.get(lbl, "📊")
                     pct = cnt / len(dip_rows) * 100 if dip_rows else 0
-                    lines.append(f"  {em} {lbl}: *{cnt}* ({pct:.0f}%)")
+                    lines.append(f"  {em_map.get(lbl,'📊')} {lbl}: *{cnt}* ({pct:.0f}%)")
                 lines.append("")
 
-            # Conselho sobre próximo passo
-            total_labeled = sum(
-                cnt for lbl, cnt in label_counts.items() if lbl != "pending"
-            )
+            total_labeled = sum(cnt for lbl, cnt in label_counts.items() if lbl != "pending")
             if total_labeled >= 100:
-                lines.append("🟢 *Pronto para treinar o modelo ML!*")
-                lines.append("_Usa `/mldata` para ver o estado completo._")
-            elif total_labeled >= 50:
-                lines.append(f"🟡 *{total_labeled} outcomes classificados* — quase a chegar aos 100.")
-                lines.append("_Adiciona mais tickers à watchlist e volta a correr._")
+                lines.append("🟢 *Pronto para treinar!* Usa `/admin_train_ml`")
+            elif total_labeled >= 30:
+                lines.append(f"🟡 *{total_labeled} amostras* — podes já tentar `/admin_train_ml`")
             else:
-                lines.append(f"🕐 *{total_labeled} outcomes classificados* — precisa de mais dados.")
-                lines.append("_Aumenta a watchlist ou aguarda dados live._")
+                lines.append(f"🕐 *{total_labeled} amostras* — adiciona mais tickers à watchlist.")
 
             _reply("\n".join(lines))
-            logging.info(
-                f"[admin_backfill] Concluído em {mins}m{secs:02d}s — "
-                f"escrito={written} | ignorado={skipped} | censurado={censored} | erro={errors}"
-            )
-
         except Exception as e:
-            logging.error(f"[admin_backfill] Erro fatal: {e}")
-            _reply(
-                f"❌ *Backfill falhou com erro:*\n"
-                f"`{e}`\n"
-                "_Verifica os logs no Railway para mais detalhes._"
-            )
+            logging.error(f"[admin_backfill] Erro: {e}")
+            _reply(f"❌ *Backfill falhou:*\n`{e}`\n_Verifica os logs no Railway._")
         finally:
             _backfill_running = False
 
     threading.Thread(target=_run, daemon=True, name="admin-backfill").start()
 
 
-# ── Earnings alerts (chamado pelo scheduler do main.py) ────────────────────────
+# ── /admin_train_ml ───────────────────────────────────────────────────────────
+
+def _handle_admin_train_ml() -> None:
+    """
+    Comando de administrador (escondido do /help) para treinar o modelo ML
+    e gerar os ficheiros dip_model_stage1.pkl e dip_model_stage2.pkl.
+
+    Comportamento:
+      - Só pode correr uma instância de cada vez (_train_running flag).
+      - Responde imediatamente para não bloquear o bot.
+      - Corre train_all() numa daemon thread.
+      - Quando termina, envia o relatório completo para o Telegram:
+          algoritmo vencedor, AUC-PR, threshold, top-5 features.
+    """
+    global _train_running
+
+    if _train_running:
+        _reply("⚠️ *Treino já está a correr.*\n_Aguarda a conclusão._")
+        return
+
+    _reply(
+        "🧪 *A iniciar o Laboratório de ML...*\n"
+        "_A competição AutoSelect vai correr RF vs XGBoost vs LightGBM._\n"
+        "_Estimativa: 2–5 minutos dependendo do volume de dados._\n"
+        "_O bot continua a responder durante o treino._"
+    )
+    logging.info("[admin_train] Iniciando treino ML")
+
+    def _run():
+        global _train_running
+        _train_running = True
+        start_ts = time.time()
+        try:
+            from train_model import train_all
+            result = train_all(live_only=False, dry_run=False, min_precision=0.70)
+
+            elapsed    = int(time.time() - start_ts)
+            mins, secs = divmod(elapsed, 60)
+            s1         = result.get("stage1", {})
+            s2         = result.get("stage2")
+
+            # ── Relatório para o Telegram ─────────────────────────────────
+            lines = [
+                "🎓 *Treino ML concluído!*",
+                f"_{datetime.now().strftime('%d/%m/%Y %H:%M')} — {mins}m{secs:02d}s_",
+                "",
+                "*🥊 Competição AutoSelect:*",
+                f"  🏆 Vencedor Andar 1: *{s1.get('algorithm', 'N/D')}*",
+                f"  📊 AUC-PR:           *{s1.get('auc_pr', 0):.4f}*",
+                f"  🎯 Threshold:        *{s1.get('threshold', 0):.4f}*",
+                f"  📦 Amostras:         *{s1.get('n_samples', 0)}* "
+                    f"(WIN={s1.get('n_win', 0)} | NOT-WIN={s1.get('n_not_win', 0)})",
+                f"  🧬 SMOTE activado:   {'Sim' if s1.get('smote_used') else 'Não'}",
+                "",
+            ]
+
+            if s2:
+                lines += [
+                    "*🍷 Andar 2 (Sommelier WIN\_40 vs WIN\_20):*",
+                    f"  🏆 Algoritmo: *{s2.get('algorithm', 'N/D')}*",
+                    f"  📊 AUC-PR:    *{s2.get('auc_pr', 0):.4f}*",
+                    f"  📦 Amostras:  *{s2.get('n_samples', 0)}* "
+                        f"(WIN\_40={s2.get('n_win40', 0)} | WIN\_20={s2.get('n_win20', 0)})",
+                    "",
+                ]
+            else:
+                lines.append("_Andar 2: dados insuficientes (precisa ≥15 amostras WIN)._\n")
+
+            # Top-5 features
+            feat_imp = s1.get("feature_importance", [])
+            if feat_imp:
+                lines.append("*🔬 Top-5 features (Andar 1):*")
+                bars = ["▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"]
+                max_imp = feat_imp[0]["importance"] if feat_imp else 1
+                for fi in feat_imp[:5]:
+                    ratio    = fi["importance"] / max_imp if max_imp > 0 else 0
+                    bar_len  = int(ratio * 10)
+                    bar      = "█" * bar_len
+                    lines.append(f"  `{fi['feature']:<20}` {bar} *{fi['importance']:.4f}*")
+                lines.append("")
+
+            # Qualidade do modelo
+            auc = s1.get("auc_pr", 0)
+            if auc >= 0.80:
+                lines.append("🟢 *Modelo excelente!* AUC-PR ≥ 0.80 — pronto para produção.")
+                lines.append("_Chunk I vai integrar este cérebro no scanner ao vivo._")
+            elif auc >= 0.65:
+                lines.append("🟡 *Modelo bom.* AUC-PR ≥ 0.65 — funcional, vai melhorar com mais dados.")
+            else:
+                lines.append("🔴 *Modelo fraco.* AUC-PR < 0.65 — precisa de mais amostras.")
+                lines.append("_Corre `/admin_backfill_ml` com mais tickers na watchlist._")
+
+            _reply("\n".join(lines))
+            logging.info(
+                f"[admin_train] Concluído em {mins}m{secs:02d}s — "
+                f"alg={s1.get('algorithm')} auc={s1.get('auc_pr')} threshold={s1.get('threshold')}"
+            )
+
+        except ValueError as e:
+            # Erro de dados insuficientes
+            _reply(
+                f"⚠️ *Dados insuficientes para treinar:*\n`{e}`\n\n"
+                "*Solução:*\n"
+                "1. Corre `/admin_backfill_ml` para gerar mais dados históricos.\n"
+                "2. Aguarda alertas live durante algumas semanas.\n"
+                "3. Volta a tentar `/admin_train_ml`."
+            )
+        except FileNotFoundError as e:
+            _reply(
+                f"⚠️ *Ficheiro de dados não encontrado:*\n`{e}`\n\n"
+                "_Corre `/admin_backfill_ml` primeiro para gerar o hist\_backtest.csv._"
+            )
+        except Exception as e:
+            logging.error(f"[admin_train] Erro fatal: {e}")
+            _reply(
+                f"❌ *Treino falhou com erro inesperado:*\n`{e}`\n"
+                "_Verifica os logs no Railway para mais detalhes._"
+            )
+        finally:
+            _train_running = False
+
+    threading.Thread(target=_run, daemon=True, name="admin-train").start()
+
+
+# ── Earnings alerts ───────────────────────────────────────────────────────────
 
 def send_earnings_alerts(watchlist: list[str] | None = None) -> int:
     earnings_days_fn = _poll_context.get("get_earnings_days") or _cb_earnings_days
     if not earnings_days_fn or not (_poll_context.get("send_fn") or _cb_send_telegram):
         return 0
-
     dynamic     = load_dynamic_watchlist()
     static      = list(watchlist) if watchlist else []
     all_tickers = list(dict.fromkeys(dynamic + static))
-
     if not all_tickers:
         return 0
-
     today_str = datetime.now().date().isoformat()
-    sent      = 0
-
+    sent = 0
     for sym in all_tickers:
         try:
             edays = earnings_days_fn(sym)
-            if edays is None:
-                continue
+            if edays is None: continue
             if 0 <= edays <= _EARNINGS_ALERT_DAYS:
                 history = get_ticker_score_history(sym)
                 already = any(
                     e.get("date_iso") == today_str and e.get("verdict", "").startswith("earnings_alert")
                     for e in history
                 )
-                if already:
-                    continue
-
-                urgency    = "🚨 *HOJE*" if edays == 0 else (f"⏰ *{edays} dia(s)*" if edays <= 2 else f"📅 {edays} dia(s)")
+                if already: continue
+                urgency   = "🚨 *HOJE*" if edays == 0 else (f"⏰ *{edays} dia(s)*" if edays <= 2 else f"📅 {edays} dia(s)")
                 last_score = history[-1].get("score") if history else None
                 score_str  = f" — último score: *{last_score:.0f}/100*" if last_score is not None else ""
-
                 _reply(
                     f"📊 *Earnings Alert* — *{sym}*\n"
                     f"Resultados em: {urgency}{score_str}\n"
                     f"_Considera `/analisar {sym}` antes dos resultados._"
                 )
                 sent += 1
-                logging.info(f"[earnings_alert] enviado: {sym} ({edays}d)")
-
         except Exception as e:
             logging.warning(f"[earnings_alert] {sym}: {e}")
-
     return sent
 
 
-# ── /watchlist handler ────────────────────────────────────────────────────────────────
+# ── /watchlist handler ────────────────────────────────────────────────────────
 
 def _handle_watchlist(parts: list[str]) -> None:
     sub = parts[1].lower() if len(parts) > 1 else "list"
-
     if sub in ("list", "ls", "show", "ver"):
         tickers = load_dynamic_watchlist()
         if not tickers:
@@ -616,95 +611,70 @@ def _handle_watchlist(parts: list[str]) -> None:
         lines = [f"*👀 Watchlist dinâmica ({len(tickers)} tickers):*", ""]
         for i, t in enumerate(tickers, 1):
             lines.append(f"  {i}. `{t}`")
-        lines.append("")
-        lines.append("_Remove com `/watchlist rm TICKER` · Limpa com `/watchlist clear`_")
+        lines += ["", "_Remove com `/watchlist rm TICKER` · Limpa com `/watchlist clear`_"]
         _reply("\n".join(lines))
-
     elif sub in ("add", "adicionar", "+"):
         if len(parts) < 3:
-            _reply("⚠️ Uso: `/watchlist add <TICKER>`\n_Exemplo: `/watchlist add NVDA`_")
+            _reply("⚠️ Uso: `/watchlist add <TICKER>`")
             return
         ticker = parts[2].upper().strip().split(".")[0]
         if len(ticker) > 10 or not ticker.isalpha():
-            _reply(f"⚠️ Ticker inválido: `{ticker}` — usa letras apenas (ex: AAPL, NVDA).")
+            _reply(f"⚠️ Ticker inválido: `{ticker}`")
             return
         added = add_to_dynamic_watchlist(ticker)
         if added:
-            total = len(load_dynamic_watchlist())
-            _reply(f"✅ *`{ticker}`* adicionado à watchlist.\n_Total: {total} tickers._")
-            logging.info(f"[watchlist] adicionado: {ticker}")
+            _reply(f"✅ *`{ticker}`* adicionado. Total: {len(load_dynamic_watchlist())} tickers.")
         else:
             _reply(f"_`{ticker}` já está na watchlist._")
-
     elif sub in ("rm", "remove", "remover", "del", "delete", "-"):
         if len(parts) < 3:
-            _reply("⚠️ Uso: `/watchlist rm <TICKER>`\n_Exemplo: `/watchlist rm NVDA`_")
+            _reply("⚠️ Uso: `/watchlist rm <TICKER>`")
             return
-        ticker = parts[2].upper().strip()
+        ticker  = parts[2].upper().strip()
         removed = remove_from_dynamic_watchlist(ticker)
         if removed:
-            total = len(load_dynamic_watchlist())
-            _reply(f"🗑️ *`{ticker}`* removido da watchlist.\n_Restam {total} tickers._")
-            logging.info(f"[watchlist] removido: {ticker}")
+            _reply(f"🗑️ *`{ticker}`* removido. Restam {len(load_dynamic_watchlist())} tickers.")
         else:
             _reply(f"⚠️ `{ticker}` não está na watchlist.")
-
     elif sub in ("clear", "limpar", "reset"):
-        tickers = load_dynamic_watchlist()
-        count   = len(tickers)
+        count = len(load_dynamic_watchlist())
         if count == 0:
             _reply("_A watchlist já está vazia._")
             return
         save_dynamic_watchlist([])
-        _reply(f"🧹 Watchlist limpa. _{count} ticker(s) removido(s)._\n_Usa `/watchlist add TICKER` para recomeçar._")
-        logging.info(f"[watchlist] clear: {count} tickers removidos")
-
+        _reply(f"🧹 Watchlist limpa — {count} ticker(s) removido(s).")
     else:
         _reply(
-            f"⚠️ Sub-comando desconhecido: `{sub}`\n\n"
-            "*Uso:*\n`/watchlist`          → Ver lista\n"
-            "`/watchlist add TICK` → Adicionar\n"
-            "`/watchlist rm TICK`  → Remover\n"
-            "`/watchlist clear`    → Limpar tudo"
+            f"⚠️ Sub-comando desconhecido: `{sub}`\n"
+            "`/watchlist` · `/watchlist add TICK` · `/watchlist rm TICK` · `/watchlist clear`"
         )
 
 
-# ── /flip handler ───────────────────────────────────────────────────────────────────
+# ── /flip handler ─────────────────────────────────────────────────────────────
 
 def _handle_flip(parts: list[str]) -> None:
     sub = parts[1].lower() if len(parts) > 1 else "summary"
 
     if sub in ("summary", "list", "ls", "ver", "show") or len(parts) == 1:
-        summary = get_flip_summary()
-        lines = [
-            f"*🎯 Flip Fund — {datetime.now().strftime('%d/%m/%Y')}*",
-            "",
-        ]
+        summary  = get_flip_summary()
         pnl      = summary["total_pnl"]
-        pnl_sign = "+" if pnl >= 0 else ""
         pnl_em   = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
-        lines.append(f"  {pnl_em} *P&L realizado:* ${pnl_sign}{pnl:.2f}")
-        lines.append(f"  📊 Trades fechados: *{summary['n_closed']}* | Win rate: *{summary['win_rate']:.0f}%*")
-
+        lines = [
+            f"*🎯 Flip Fund — {datetime.now().strftime('%d/%m/%Y')}*", "",
+            f"  {pnl_em} *P&L realizado:* ${"+" if pnl >= 0 else ""}{pnl:.2f}",
+            f"  📊 Trades fechados: *{summary['n_closed']}* | Win rate: *{summary['win_rate']:.0f}%*",
+        ]
         if summary["best_trade"]:
             b = summary["best_trade"]
-            lines.append(f"  🏆 Melhor: *{b['symbol']}* ${b['pnl_eur']:+.2f} ({b['date_entry']} → {b['date_exit'] or '?'})")
-        if summary["worst_trade"] and summary["n_closed"] > 1:
-            w = summary["worst_trade"]
-            lines.append(f"  ⚠️ Pior: *{w['symbol']}* ${w['pnl_eur']:+.2f} ({w['date_entry']} → {w['date_exit'] or '?'})")
-
+            lines.append(f"  🏆 Melhor: *{b['symbol']}* ${b['pnl_eur']:+.2f}")
         opened = summary["trades_open"]
         if opened:
             lines += ["", f"*📂 Posições abertas ({len(opened)}):*"]
             for t in opened:
                 notes_str = f" — _{t['notes']}_" if t.get("notes") else ""
-                lines.append(
-                    f"  #{t['id']} *{t['symbol']}* x{t['shares']} @ ${t['price_entry']:.2f}"
-                    f" (desde {t['date_entry']}){notes_str}"
-                )
+                lines.append(f"  #{t['id']} *{t['symbol']}* x{t['shares']} @ ${t['price_entry']:.2f} (desde {t['date_entry']}){notes_str}")
         else:
-            lines += ["", "_Sem posições abertas._")
-
+            lines += ["", "_Sem posições abertas._"]
         if sub in ("list", "ls"):
             closed = summary["trades_closed"]
             if closed:
@@ -712,110 +682,74 @@ def _handle_flip(parts: list[str]) -> None:
                 for t in sorted(closed, key=lambda x: x["date_exit"] or "", reverse=True)[:10]:
                     pnl_s = f"${t['pnl_eur']:+.2f}" if t["pnl_eur"] is not None else "N/D"
                     em    = "🟢" if (t["pnl_eur"] or 0) > 0 else "🔴"
-                    lines.append(
-                        f"  {em} #{t['id']} *{t['symbol']}* x{t['shares']} "
-                        f"${t['price_entry']:.2f}→${t['price_exit']:.2f} | *{pnl_s}* "
-                        f"({t['date_entry']} → {t['date_exit']})"
-                    )
-                if len(closed) > 10:
-                    lines.append(f"  _... e mais {len(closed) - 10} trades anteriores._")
-
-        lines += [
-            "",
-            "_`/flip add TICK ENTRY SHARES` → Registar entrada_",
-            "_`/flip close ID EXIT` → Fechar trade_",
-        ]
+                    lines.append(f"  {em} #{t['id']} *{t['symbol']}* ${t['price_entry']:.2f}→${t['price_exit']:.2f} | *{pnl_s}*")
+        lines += ["", "_`/flip add TICK ENTRY SHARES` · `/flip close ID EXIT`_"]
         _reply("\n".join(lines))
         return
 
     if sub in ("add", "entrada", "open"):
         if len(parts) < 5:
-            _reply(
-                "⚠️ Uso: `/flip add <TICKER> <PREÇO_ENTRADA> <SHARES> [nota]`\n"
-                "_Exemplo: `/flip add NVDA 105.50 10`_"
-            )
+            _reply("⚠️ Uso: `/flip add <TICKER> <ENTRADA> <SHARES> [nota]`")
             return
         ticker = parts[2].upper().strip()
-        try:
-            entry  = float(parts[3])
-            shares = float(parts[4])
+        try: entry, shares = float(parts[3]), float(parts[4])
         except ValueError:
             _reply("⚠️ Preço e shares têm de ser números.")
             return
         if entry <= 0 or shares <= 0:
-            _reply("⚠️ Preço de entrada e shares têm de ser positivos.")
+            _reply("⚠️ Valores têm de ser positivos.")
             return
         notes = " ".join(parts[5:]) if len(parts) > 5 else ""
         trade = add_flip_trade(ticker, shares, entry, notes=notes)
-        cost  = round(entry * shares, 2)
         _reply(
-            f"✅ *Flip trade registado!*\n"
-            f"  #{trade['id']} *{ticker}* — {shares} shares @ ${entry:.2f}\n"
-            f"  💰 Custo total: *${cost:.2f}*\n"
-            f"  📅 Data: {trade['date_entry']}\n"
-            f"  _Fecha com `/flip close {trade['id']} <PREÇO_SAÍDA>`_"
-            + (f"\n  📝 Nota: _{notes}_" if notes else "")
+            f"✅ *Trade registado!*\n"
+            f"  #{trade['id']} *{ticker}* x{shares} @ ${entry:.2f}\n"
+            f"  💰 Custo: *${entry*shares:.2f}*\n"
+            f"  _Fecha com `/flip close {trade['id']} <PREÇO>`_"
+            + (f"\n  📝 _{notes}_" if notes else "")
         )
         return
 
     if sub in ("close", "fechar", "sell"):
         if len(parts) < 4:
-            _reply("⚠️ Uso: `/flip close <ID> <PREÇO_SAÍDA>`\n_Exemplo: `/flip close 3 121.80`_")
+            _reply("⚠️ Uso: `/flip close <ID> <PREÇO_SAÍDA>`")
             return
-        try:
-            trade_id = int(parts[2])
-            exit_px  = float(parts[3])
+        try: trade_id, exit_px = int(parts[2]), float(parts[3])
         except ValueError:
-            _reply("⚠️ ID tem de ser inteiro e preço um número.")
-            return
-        if exit_px <= 0:
-            _reply("⚠️ Preço de saída tem de ser positivo.")
+            _reply("⚠️ ID inteiro e preço numérico.")
             return
         trade = close_flip_trade(trade_id, exit_px)
         if trade is None:
-            _reply(f"⚠️ Trade `#{trade_id}` não encontrado ou já está fechado.")
+            _reply(f"⚠️ Trade `#{trade_id}` não encontrado ou já fechado.")
             return
-        pnl    = trade["pnl_eur"]
-        pct    = (exit_px - trade["price_entry"]) / trade["price_entry"] * 100
-        em     = "🟢" if pnl > 0 else "🔴"
-        result = "Lucro" if pnl > 0 else "Perda"
+        pnl = trade["pnl_eur"]
+        pct = (exit_px - trade["price_entry"]) / trade["price_entry"] * 100
+        em  = "🟢" if pnl > 0 else "🔴"
         _reply(
-            f"{em} *Flip trade fechado!*\n"
-            f"  #{trade_id} *{trade['symbol']}* x{trade['shares']}\n"
-            f"  Entrada: ${trade['price_entry']:.2f} → Saída: ${exit_px:.2f}\n"
-            f"  *{result}: ${pnl:+.2f}* ({pct:+.1f}%)\n"
-            f"  _Período: {trade['date_entry']} → {trade['date_exit']}_"
+            f"{em} *Trade fechado!*\n"
+            f"  #{trade_id} *{trade['symbol']}* — ${trade['price_entry']:.2f} → ${exit_px:.2f}\n"
+            f"  *{'Lucro' if pnl > 0 else 'Perda'}: ${pnl:+.2f}* ({pct:+.1f}%)"
         )
         return
 
-    if sub in ("del", "delete", "rm", "apagar", "remover"):
+    if sub in ("del", "delete", "rm", "apagar"):
         if len(parts) < 3:
-            _reply("⚠️ Uso: `/flip del <ID>`\n_Exemplo: `/flip del 2`_")
+            _reply("⚠️ Uso: `/flip del <ID>`")
             return
-        try:
-            trade_id = int(parts[2])
+        try: trade_id = int(parts[2])
         except ValueError:
-            _reply("⚠️ ID tem de ser um número inteiro.")
+            _reply("⚠️ ID tem de ser inteiro.")
             return
-        removed = delete_flip_trade(trade_id)
-        if removed:
+        if delete_flip_trade(trade_id):
             _reply(f"🗑️ Trade `#{trade_id}` removido.")
         else:
             _reply(f"⚠️ Trade `#{trade_id}` não encontrado.")
         return
 
-    _reply(
-        f"⚠️ Sub-comando desconhecido: `{sub}`\n\n"
-        "*Uso do /flip:*\n"
-        "`/flip`                           → Resumo P&L\n"
-        "`/flip list`                      → Todos os trades\n"
-        "`/flip add TICK ENTRY SHARES`     → Nova entrada\n"
-        "`/flip close ID EXIT`             → Fechar trade\n"
-        "`/flip del ID`                    → Apagar trade"
-    )
+    _reply("⚠️ Usa `/flip` · `/flip list` · `/flip add` · `/flip close` · `/flip del`")
 
 
-# ── Command router ─────────────────────────────────────────────────────────────────────
+# ── Command router ─────────────────────────────────────────────────────────────
 
 def _handle_command(text: str) -> None:
     parts   = text.strip().split()
@@ -867,11 +801,15 @@ def _handle_command(text: str) -> None:
                 db_str = f" | ML DB: {ds.get('total', 0)} alertas"
             except Exception:
                 pass
+        # Indicar se modelos ML estão prontos
+        from pathlib import Path
+        data_dir  = Path("/data") if Path("/data").exists() else Path("/tmp")
+        ml_status = "🟢 PKL pronto" if (data_dir / "dip_model_stage1.pkl").exists() else "🔴 Não treinado"
         _reply(
             f"*🤖 DipRadar Status*\n"
-            f"Uptime: *{hours}h {mins}m*\n"
-            f"Mercado: *{market}*\n"
-            f"Watchlist dinâmica: *{len(wl)} tickers*{flip_str}{db_str}\n"
+            f"Uptime: *{hours}h {mins}m* | Mercado: *{market}*\n"
+            f"Watchlist: *{len(wl)} tickers*{flip_str}{db_str}\n"
+            f"ML Model: *{ml_status}*\n"
             f"_⏰ {datetime.now().strftime('%d/%m/%Y %H:%M')}_\n"
             f"_{rate_status()}_"
         )
@@ -892,8 +830,7 @@ def _handle_command(text: str) -> None:
             def _e(v): return "🟢" if v > 0 else ("🔴" if v < 0 else "⚪")
             _reply(
                 f"*💼 Carteira — {datetime.now().strftime('%d/%m %H:%M')}*\n"
-                f"_USD/EUR: {fx:.4f}_\n\n"
-                f"*Total: €{total:,.2f}*\n\n"
+                f"_USD/EUR: {fx:.4f}_\n\n*Total: €{total:,.2f}*\n\n"
                 f"  {_e(pnl_d)} Hoje:   €{pnl_d:+,.2f}\n"
                 f"  {_e(pnl_w)} Semana: €{pnl_w:+,.2f}\n"
                 f"  {_e(pnl_m)} Mês:    €{pnl_m:+,.2f}\n"
@@ -910,59 +847,41 @@ def _handle_command(text: str) -> None:
             return
         _reply("_🔍 A iniciar scan manual..._")
         run_scan_fn = _poll_context.get("run_scan") or _cb_run_scan
-        try:
-            if run_scan_fn:
-                threading.Thread(target=run_scan_fn, daemon=True).start()
-        except Exception as e:
-            _reply(f"_Erro no scan: {e}_")
+        if run_scan_fn:
+            threading.Thread(target=run_scan_fn, daemon=True).start()
 
     elif cmd == "/analisar":
         if not _check_rate(cmd_key): return
         if len(parts) < 2:
             _reply("⚠️ Usa: `/analisar <TICKER>`\n_Exemplo: `/analisar AAPL`_")
             return
-        symbol         = parts[1].upper().strip()
-        analyze_fn     = _poll_context.get("analyze_ticker") or _cb_analyze_ticker
+        symbol     = parts[1].upper().strip()
+        analyze_fn = _poll_context.get("analyze_ticker") or _cb_analyze_ticker
         if not analyze_fn:
             _reply("_Análise não disponível._")
             return
-        _reply(f"_🔍 A analisar *{symbol}*... (pode demorar 10–20s)_")
-        try:
-            threading.Thread(
-                target=lambda: _reply(analyze_fn(symbol)),
-                daemon=True,
-            ).start()
-        except Exception as e:
-            _reply(f"_Erro ao analisar {symbol}: {e}_")
+        _reply(f"_🔍 A analisar *{symbol}*..._")
+        threading.Thread(target=lambda: _reply(analyze_fn(symbol)), daemon=True).start()
 
     elif cmd == "/comparar":
         if not _check_rate(cmd_key): return
-        symbols = [p.upper().strip() for p in parts[1:]]
-        try:
-            _handle_comparar(symbols)
-        except Exception as e:
-            _reply(f"_Erro na comparação: {e}_")
+        _handle_comparar([p.upper() for p in parts[1:]])
 
     elif cmd == "/historico":
         if not _check_rate(cmd_key): return
         if len(parts) < 2:
-            _reply("⚠️ Usa: `/historico <TICKER>`\n_Exemplo: `/historico NVDA`_")
+            _reply("⚠️ Usa: `/historico <TICKER>`")
             return
-        try:
-            _handle_historico(parts[1].upper().strip())
-        except Exception as e:
-            _reply(f"_Erro no histórico: {e}_")
+        _handle_historico(parts[1].upper().strip())
 
     elif cmd == "/backtest":
         if not _check_rate(cmd_key): return
         bt_fn = _poll_context.get("build_backtest_summary") or _cb_backtest_summary
-        if not bt_fn:
+        if bt_fn:
+            try: _reply(bt_fn())
+            except Exception as e: _reply(f"_Erro no backtest: {e}_")
+        else:
             _reply("_Backtest não disponível._")
-            return
-        try:
-            _reply(bt_fn())
-        except Exception as e:
-            _reply(f"_Erro no backtest: {e}_")
 
     elif cmd == "/rejeitados":
         if not _check_rate(cmd_key): return
@@ -977,11 +896,9 @@ def _handle_command(text: str) -> None:
                 return
             lines = [f"*🗑️ Rejeitados hoje ({len(rejected)}):*", ""]
             for r in sorted(rejected, key=lambda x: x.get("score") or 0, reverse=True)[:15]:
-                score_str   = f" | score {r['score']:.0f}" if r.get("score") is not None else ""
-                verdict_str = f" | {r['verdict']}" if r.get("verdict") else ""
                 lines.append(
                     f"  ⛔ *{r['symbol']}* {r['change']:+.1f}% | "
-                    f"_{r['reason']}{score_str}{verdict_str}_ | {r.get('time','')}"
+                    f"_{r['reason']}_ | {r.get('time','')}"
                 )
             _reply("\n".join(lines))
         except Exception as e:
@@ -993,48 +910,39 @@ def _handle_command(text: str) -> None:
         try:
             _reply(tier3_fn() if tier3_fn else "🔵 *Tier 3* — _Handler não registado._")
         except Exception as e:
-            _reply(f"_Erro ao obter Tier 3: {e}_")
+            _reply(f"_Erro: {e}_")
 
     elif cmd == "/watchlist":
         if not _check_rate(cmd_key): return
-        try:
-            _handle_watchlist(parts)
-        except Exception as e:
-            _reply(f"_Erro na watchlist: {e}_")
+        _handle_watchlist(parts)
 
     elif cmd == "/flip":
         if not _check_rate(cmd_key): return
-        try:
-            _handle_flip(parts)
-        except Exception as e:
-            _reply(f"_Erro no flip: {e}_")
+        _handle_flip(parts)
 
     elif cmd == "/mldata":
         if not _check_rate(cmd_key): return
         force = len(parts) > 1 and parts[1].lower() in ("update", "atualizar", "force")
-        try:
-            _handle_mldata(force_update=force)
-        except Exception as e:
-            _reply(f"_Erro no mldata: {e}_")
+        _handle_mldata(force_update=force)
 
-    # ── Comando de administrador (escondido do /help) ─────────────────────────
+    # ── Comandos de administrador (escondidos do /help) ───────────────────────
     elif cmd == "/admin_backfill_ml":
-        try:
-            _handle_admin_backfill_ml()
-        except Exception as e:
-            _reply(f"_Erro no backfill: {e}_")
+        _handle_admin_backfill_ml()
+
+    elif cmd == "/admin_train_ml":
+        _handle_admin_train_ml()
 
     else:
         if text.startswith("/"):
             _reply(f"_Comando desconhecido: `{cmd}` — usa /help_")
 
 
-# ── Poll loop (legacy — usado se main.py usar start_bot_listener) ────────────────────
+# ── Poll loop (legacy) ────────────────────────────────────────────────────────
 
 def _poll_loop() -> None:
     global _last_update_id
     if not TELEGRAM_TOKEN:
-        logging.warning("[bot_commands] TELEGRAM_TOKEN não configurado — listener inactivo.")
+        logging.warning("[bot_commands] TELEGRAM_TOKEN não configurado.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     logging.info("[bot_commands] Listener iniciado.")
@@ -1053,7 +961,6 @@ def _poll_loop() -> None:
                     chat            = str(msg.get("chat", {}).get("id", ""))
                     text            = msg.get("text", "")
                     if chat == TELEGRAM_CHAT_ID and text:
-                        logging.info(f"[bot_commands] Comando recebido: {text!r}")
                         _handle_command(text)
         except Exception as e:
             logging.warning(f"[bot_commands] poll error: {e}")
@@ -1061,7 +968,6 @@ def _poll_loop() -> None:
 
 
 def start_bot_listener() -> threading.Thread:
-    """Inicia o listener de comandos numa daemon thread (legacy)."""
     t = threading.Thread(target=_poll_loop, daemon=True, name="bot-commands")
     t.start()
     return t
