@@ -2,39 +2,65 @@
 universe.py — Universo global de tickers para o DipRadar 2.0.
 
 Fontes:
-  - S&P 500       : Wikipedia (scraped dinamicamente)
-  - Nasdaq 100    : Wikipedia (scraped dinamicamente)
+  - S&P 500       : Wikipedia (scraped dinamicamente, fallback completo 503)
+  - Nasdaq 100    : Wikipedia (scraped dinamicamente, fallback completo 101)
   - STOXX 600     : Lista estática curada (top 200 por liquidez)
   - FTSE 100      : Lista estática curada
-  - Carteira atual: Hardcoded (tickers do utilizador)
+  - Carteira atual: Inclui ETFs (EUNL, IEMA) — monitorização de preço apenas
 
-Uso:
-  from universe import get_full_universe
-  tickers = get_full_universe()   # list[str], ~1200 tickers únicos
+ETFs são excluídos do pipeline ML (sem fundamentais válidos).
+Usar ETF_TICKERS para esta exclusão nos outros módulos:
+
+  from universe import get_full_universe, ETF_TICKERS, get_ml_universe
+  all_tickers = get_full_universe()   # inclui ETFs
+  ml_tickers  = get_ml_universe()    # exclui ETFs
 """
 
 from __future__ import annotations
 
 import logging
-import time
 from functools import lru_cache
-from typing import Optional
 
-# ── Carteira actual do utilizador ────────────────────────────────────────────
-# Estes tickers entram sempre no universo independentemente dos índices.
-# Actualiza esta lista com /buy e /sell (gerido pelo portfolio.py).
+# ─────────────────────────────────────────────────────────────────────────
+# ETFs — monitorizar preço/drawdown MAS excluír do pipeline ML
+# Razão: yfinance não devolve FCF, gross margins, D/E, etc. para ETFs.
+#         Treinar o modelo com ETFs baralha completamente os features.
+# ─────────────────────────────────────────────────────────────────────────
+ETF_TICKERS: set[str] = {
+    "EUNL",    # iShares Core MSCI World UCITS ETF (carteira)
+    "IEMA",    # iShares MSCI EM ESG Leaders (watchlist)
+    "IS3N.L",  # alias antigo — manter por compatibilidade com alertas guardados
+    # Acrescenta outros ETFs aqui se necessaire
+    "IWDA.AS", "CSPX.L", "VUSA.L", "VWRL.L", "VWCE.DE",
+    "EMIM.L",  "IQQQ.DE", "XDWD.DE", "DBXD.DE", "EEM",
+    "SPY",     "QQQ",     "IVV",    "VTI",    "VOO",
+    "GLD",     "SLV",     "TLT",    "HYG",    "LQD",
+}
+
+# ─────────────────────────────────────────────────────────────────────────
+# Carteira actual do utilizador
+# ─────────────────────────────────────────────────────────────────────────
+# Inclui ETFs (para monitorização de preço/drawdown via watchlist.py)
+# O pipeline ML filtra-os automaticamente com get_ml_universe()
 USER_PORTFOLIO: list[str] = [
+    # Stocks
     "NVO", "ADBE", "UBER", "MSFT", "PINS",
     "ADP", "CRM", "VICI", "CRWD", "PLTR", "NOW", "DUOL",
+    # ETFs (monitorização apenas, sem ML)
+    "EUNL",
 ]
 
 # Watchlist pessoal (tickers de interesse, mesmo fora da carteira)
 USER_WATCHLIST: list[str] = [
     "O", "MDT", "ABBV", "LMT", "RTX",
-    "PANW", "TSM", "AVGO", "ALV.DE", "IEMA",
+    "PANW", "TSM", "AVGO", "ALV.DE",
+    "IEMA",  # ETF — monitorização apenas
 ]
 
-# ── STOXX Europe 600 — top 200 por liquidez/relevância ───────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────
+# STOXX Europe 600 — top 200 por liquidez/relevância
+# ─────────────────────────────────────────────────────────────────────────
 _STOXX200: list[str] = [
     # Alemanha
     "SAP.DE", "SIE.DE", "ALV.DE", "MRK.DE", "BMW.DE", "MBG.DE",
@@ -84,7 +110,9 @@ _STOXX200: list[str] = [
     "PKN.WA", "PKO.WA",
 ]
 
-# ── FTSE 100 ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
+# FTSE 100
+# ─────────────────────────────────────────────────────────────────────────
 _FTSE100: list[str] = [
     "AZN.L", "SHEL.L", "HSBA.L", "ULVR.L", "BP.L", "RIO.L",
     "GSK.L", "DGE.L", "REL.L", "BATS.L", "LLOY.L", "BARC.L",
@@ -94,65 +122,59 @@ _FTSE100: list[str] = [
     "AAL.L", "ANTO.L", "BHP.L", "GLEN.L", "EVR.L", "MNDI.L",
     "SMDS.L", "SMT.L", "III.L", "LAND.L", "SGRO.L", "HMSO.L",
     "BLND.L", "DLN.L", "PSN.L", "BWY.L", "TW.L", "BA.L",
-    "RR.L", "QQ.L", "AUTO.L", "OCDO.L", "MKS.L", "NEXT.L",
+    "RR.L", "AUTO.L", "OCDO.L", "MKS.L", "NEXT.L",
     "JD.L", "SPX.L", "RS1.L", "DCC.L", "SKG.L", "IMI.L",
-    "PHNX.L", "LGEN.L", "AV.L", "ADM.L", "HSBA.L", "STAN.L",
-    "INVP.L", "MNDI.L", "RTO.L", "SBRY.L", "MRO.L",
+    "PHNX.L", "LGEN.L", "AV.L", "ADM.L", "STAN.L",
+    "INVP.L", "RTO.L", "SBRY.L", "MRO.L",
 ]
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Funções públicas
+# ─────────────────────────────────────────────────────────────────────────
+
 def _fetch_sp500() -> list[str]:
-    """Scrape S&P 500 da Wikipedia. Fallback para lista estática se falhar."""
+    """Scrape S&P 500 da Wikipedia. Fallback completo (503) se falhar."""
     try:
         import pandas as pd
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
         tables = pd.read_html(url, attrs={"id": "constituents"})
         tickers = tables[0]["Symbol"].tolist()
-        # Yahoo Finance usa - em vez de . em alguns tickers (ex: BRK.B → BRK-B)
         tickers = [t.replace(".", "-") for t in tickers]
-        logging.info(f"[universe] S&P 500: {len(tickers)} tickers obtidos da Wikipedia")
+        logging.info(f"[universe] S&P 500: {len(tickers)} tickers da Wikipedia")
         return tickers
     except Exception as e:
-        logging.warning(f"[universe] Falha ao obter S&P 500 da Wikipedia: {e}. A usar fallback.")
+        logging.warning(f"[universe] S&P 500 Wikipedia falhou: {e}. Fallback completo.")
         return _SP500_FALLBACK
 
 
 def _fetch_nasdaq100() -> list[str]:
-    """Scrape Nasdaq 100 da Wikipedia. Fallback para lista estática se falhar."""
+    """Scrape Nasdaq 100 da Wikipedia. Fallback completo (101) se falhar."""
     try:
         import pandas as pd
         url = "https://en.wikipedia.org/wiki/Nasdaq-100"
         tables = pd.read_html(url)
-        # Encontra a tabela com coluna 'Ticker'
         for t in tables:
             if "Ticker" in t.columns:
-                tickers = t["Ticker"].tolist()
-                logging.info(f"[universe] Nasdaq 100: {len(tickers)} tickers obtidos da Wikipedia")
-                return [str(t) for t in tickers]
+                tickers = [str(x) for x in t["Ticker"].tolist()]
+                logging.info(f"[universe] Nasdaq 100: {len(tickers)} tickers da Wikipedia")
+                return tickers
         raise ValueError("Tabela Nasdaq 100 não encontrada")
     except Exception as e:
-        logging.warning(f"[universe] Falha ao obter Nasdaq 100 da Wikipedia: {e}. A usar fallback.")
+        logging.warning(f"[universe] Nasdaq 100 Wikipedia falhou: {e}. Fallback completo.")
         return _NASDAQ100_FALLBACK
 
 
 @lru_cache(maxsize=1)
-def get_full_universe(refresh: bool = False) -> list[str]:
+def get_full_universe() -> list[str]:
     """
-    Devolve lista única de tickers do universo completo.
-    Cache de sessão — chama get_full_universe.cache_clear() para forçar refresh.
-
-    Ordem de prioridade (deduplicação mantém primeira ocorrência):
-      1. Carteira do utilizador (sempre monitorizada)
-      2. Watchlist pessoal
-      3. S&P 500
-      4. Nasdaq 100
-      5. STOXX Europe 200
-      6. FTSE 100
+    Universo completo incluindo ETFs.
+    Para scan de watchlist/preço. NÃO usar directamente no pipeline ML.
     """
-    sp500    = _fetch_sp500()
-    ndx100   = _fetch_nasdaq100()
+    sp500  = _fetch_sp500()
+    ndx100 = _fetch_nasdaq100()
 
-    all_tickers = (
+    raw = (
         USER_PORTFOLIO
         + USER_WATCHLIST
         + sp500
@@ -161,56 +183,126 @@ def get_full_universe(refresh: bool = False) -> list[str]:
         + _FTSE100
     )
 
-    # Deduplica preservando ordem
-    seen:    set[str] = set()
-    unique:  list[str] = []
-    for t in all_tickers:
+    seen:   set[str]  = set()
+    unique: list[str] = []
+    for t in raw:
         t = t.strip().upper()
         if t and t not in seen:
             seen.add(t)
             unique.append(t)
 
-    logging.info(f"[universe] Universo total: {len(unique)} tickers únicos")
+    logging.info(f"[universe] Universo total: {len(unique)} tickers")
     return unique
 
 
+def get_ml_universe() -> list[str]:
+    """
+    Universo filtrado para o pipeline ML.
+    Remove ETFs — sem fundamentais válidos no yfinance.
+    Usar em backtest.py, train_model.py, scan diurno.
+    """
+    full    = get_full_universe()
+    filtered = [t for t in full if t not in ETF_TICKERS]
+    excluded = len(full) - len(filtered)
+    logging.info(f"[universe] ML universe: {len(filtered)} tickers ({excluded} ETFs excluídos)")
+    return filtered
+
+
+def is_etf(ticker: str) -> bool:
+    """Verifica se um ticker é ETF e deve ser excluído do ML."""
+    return ticker.upper() in ETF_TICKERS
+
+
 def get_universe_stats() -> dict:
-    """Estatísticas do universo para debug/logging."""
+    """Estatísticas do universo para /admin ou logging."""
     sp500  = _fetch_sp500()
     ndx100 = _fetch_nasdaq100()
     full   = get_full_universe()
+    ml     = get_ml_universe()
     return {
-        "total":       len(full),
-        "sp500":       len(sp500),
-        "nasdaq100":   len(ndx100),
-        "stoxx200":    len(_STOXX200),
-        "ftse100":     len(_FTSE100),
-        "portfolio":   len(USER_PORTFOLIO),
-        "watchlist":   len(USER_WATCHLIST),
+        "total":          len(full),
+        "ml_eligible":    len(ml),
+        "etfs_excluded":  len(full) - len(ml),
+        "sp500":          len(sp500),
+        "nasdaq100":      len(ndx100),
+        "stoxx200":       len(_STOXX200),
+        "ftse100":        len(_FTSE100),
+        "user_portfolio": len(USER_PORTFOLIO),
+        "user_watchlist": len(USER_WATCHLIST),
     }
 
 
-# ── Fallbacks estáticos (usados se Wikipedia falhar) ─────────────────────────
-# Top 50 de cada índice para garantir cobertura mínima
+# ─────────────────────────────────────────────────────────────────────────
+# FALLBACKS COMPLETOS — activados se Wikipedia estiver inacessível
+# S&P 500: 503 constituintes (Jan 2025)
+# Nasdaq 100: 101 constituintes (Jan 2025)
+# ─────────────────────────────────────────────────────────────────────────
 
 _SP500_FALLBACK: list[str] = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "BRK-B", "LLY",
-    "AVGO", "JPM", "TSLA", "UNH", "V", "XOM", "MA", "JNJ", "PG",
-    "HD", "COST", "ABBV", "MRK", "CVX", "WMT", "NFLX", "BAC",
-    "CRM", "AMD", "KO", "PEP", "TMO", "ACN", "LIN", "MCD", "CSCO",
-    "ABT", "TXN", "ORCL", "PM", "NKE", "ADBE", "DHR", "WFC", "GE",
-    "NEE", "RTX", "BMY", "UPS", "AMGN", "QCOM", "LOW", "SPGI",
-    "INTU", "HON", "CAT", "DE", "GS", "AXP", "SBUX", "PLD",
-    "ISRG", "GILD", "BKNG", "MDT", "VRTX", "ADI", "REGN", "NOW",
-    "PANW", "CRWD", "PLTR", "DUOL", "PINS", "ADP", "VICI", "O",
+    "MMM","AOS","ABT","ABBV","ACN","ADBE","AMD","AES","AFL","A",
+    "APD","ABNB","AKAM","ALB","ARE","ALGN","ALLE","LNT","ALL","GOOGL",
+    "GOOG","MO","AMZN","AMCR","AEE","AAL","AEP","AXP","AIG","AMT",
+    "AWK","AMP","AME","AMGN","APH","ADI","ANSS","AON","APA","AAPL",
+    "AMAT","APTV","ACGL","ADM","ANET","AJG","AIZ","T","ATO","ADSK",
+    "AZO","AVB","AVY","AXON","BKR","BALL","BAC","BK","BBWI","BAX",
+    "BDX","BRK-B","BBY","BIO","TECH","BIIB","BLK","BX","BA","BCR",
+    "BWA","BSX","BMY","AVGO","BR","BRO","BF-B","BLDR","BG","CDNS",
+    "CZR","CPT","CPB","COF","CAH","KMX","CCL","CARR","CTLT","CAT",
+    "CBOE","CBRE","CDW","CE","COR","CNC","CNP","CF","CHRW","CRL",
+    "SCHW","CHTR","CVX","CMG","CB","CHD","CI","CINF","CTAS","CSCO",
+    "C","CFG","CLX","CME","CMS","KO","CTSH","CL","CMCSA","CAG",
+    "COP","ED","STZ","CEG","COO","CPRT","GLW","CPAY","CTVA","CSGP",
+    "COST","CTRA","CRWD","CCI","CSX","CMI","CVS","DHR","DRI","DVA",
+    "DAY","DE","DAL","XRAY","DVN","DXCM","FANG","DLR","DFS","DG",
+    "DLTR","D","DPZ","DOV","DHI","DTE","DUK","DD","EMN","ETN",
+    "EBAY","ECL","EIX","EW","EA","ELV","EMR","ENPH","ETR","EOG",
+    "EPAM","EQT","EFX","EQIX","EQR","ESS","EL","ETSY","EG","EVRG",
+    "ES","EXC","EXPE","EXPD","EXR","XOM","FFIV","FDS","FICO","FAST",
+    "FRT","FDX","FIS","FITB","FSLR","FE","FI","FMC","F","FTNT",
+    "FTV","FOXA","FOX","BEN","FCX","GRMN","IT","GE","GEHC","GEV",
+    "GEN","GNRC","GD","GIS","GM","GPC","GILD","GPN","GL","GDDY",
+    "GS","HAL","HIG","HAS","HCA","DOC","HSIC","HSY","HES","HPE",
+    "HLT","HOLX","HD","HON","HRL","HST","HWM","HPQ","HUBB","HUM",
+    "HBAN","HII","IBM","IEX","IDXX","ITW","INCY","IR","PODD","INTC",
+    "ICE","IFF","IP","IPG","INTU","ISRG","IVZ","INVH","IQV","IRM",
+    "JBHT","JBL","JKHY","J","JNJ","JCI","JPM","JNPR","K","KVUE",
+    "KDP","KEY","KEYS","KMB","KIM","KMI","KKR","KLAC","KHC","KR",
+    "LHX","LH","LRCX","LW","LVS","LDOS","LEN","LLY","LIN","LYV",
+    "LKQ","LMT","L","LOW","LULU","LYB","MTB","MRO","MPC","MKTX",
+    "MAR","MMC","MLM","MAS","MA","MTCH","MKC","MCD","MCK","MDT",
+    "MRK","META","MET","MTD","MGM","MCHP","MU","MSFT","MAA","MRNA",
+    "MHK","MOH","TAP","MDLZ","MPWR","MNST","MCO","MS","MOS","MSI",
+    "MSCI","NDAQ","NTAP","NFLX","NEM","NWSA","NWS","NEE","NKE",
+    "NI","NDSN","NSC","NTRS","NOC","NCLH","NRG","NUE","NVDA","NVR",
+    "NXPI","ORLY","OXY","ODFL","OMC","ON","OKE","ORCL","OTIS",
+    "PCAR","PKG","PLTR","PANW","PARA","PH","PAYX","PAYC","PYPL",
+    "PNR","PEP","PFE","PCG","PM","PSX","PNW","PNC","POOL","PPG",
+    "PPL","PFG","PG","PGR","PLD","PRU","PEG","PTC","PSA","PHM",
+    "QRVO","PWR","QCOM","DGX","RL","RJF","RTX","O","REG","REGN",
+    "RF","RSG","RMD","RVTY","ROK","ROL","ROP","ROST","RCL","SPGI",
+    "CRM","SBAC","SLB","STX","SRE","NOW","SHW","SPG","SWKS","SJM",
+    "SW","SNA","SOLV","SO","LUV","SWK","SBUX","STT","STLD","STE",
+    "SYK","SMCI","SYF","SNPS","SYY","TMUS","TROW","TTWO","TPR",
+    "TRGP","TGT","TEL","TDY","TFX","TER","TSLA","TXN","TPL","TXT",
+    "TMO","TJX","TSCO","TT","TDG","TRV","TRMB","TFC","TYL","TSN",
+    "USB","UBER","UDR","ULTA","UNP","UAL","UPS","URI","UNH","UHS",
+    "VLO","VTR","VLTO","VRSN","VRSK","VZ","VRTX","VTRS","VICI",
+    "V","VST","VMC","WRB","GWW","WAB","WBA","WMT","DIS","WBD",
+    "WM","WAT","WEC","WFC","WELL","WST","WDC","WRK","WY","WHR",
+    "WMB","WTW","WYNN","XEL","XYL","YUM","ZBRA","ZBH","ZTS",
 ]
 
 _NASDAQ100_FALLBACK: list[str] = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO",
-    "COST", "NFLX", "ASML", "AMD", "ADBE", "QCOM", "INTU", "TXN",
-    "AMAT", "CMCSA", "CSCO", "PEP", "HON", "ISRG", "BKNG", "SBUX",
-    "REGN", "VRTX", "PANW", "CRWD", "MRVL", "GILD", "MDLZ", "MU",
-    "ADI", "LRCX", "KDP", "MAR", "KLAC", "SNPS", "CDNS", "ORLY",
-    "AZN", "CTAS", "PYPL", "MELI", "MNST", "FTNT", "NXPI", "PAYX",
-    "ABNB", "DXCM",
+    "ADBE","ADP","ABNB","ALGN","GOOGL","GOOG","AMZN","AMD","AEP",
+    "AMGN","ADI","ANSS","AAPL","AMAT","ASML","AZN","TEAM","ADSK",
+    "BIDU","BIIB","BKNG","AVGO","CDNS","CDW","CHTR","CTAS","CSCO",
+    "CCEP","CTSH","CMCSA","CEG","CPRT","CSGP","COST","CRWD","CSX",
+    "DDOG","DXCM","FANG","DLTR","EBAY","EA","EXC","FAST","FTNT",
+    "GILD","GFS","HON","IDXX","ILMN","INTC","INTU","ISRG","JD",
+    "KDP","KLAC","KHC","LRCX","LIN","LULU","MAR","MRVL","MELI",
+    "META","MCHP","MU","MSFT","MRNA","MDLZ","MDB","MNST","NFLX",
+    "NVDA","NXPI","ORLY","ODFL","ON","PCAR","PANW","PAYX","PYPL",
+    "PDD","PEP","QCOM","REGN","ROP","ROST","SBUX","SGEN","SIRI",
+    "SNPS","TSLA","TXN","TMUS","TTWO","VRSK","VRTX","WBA","WBD",
+    "WDAY","XEL","ZM","ZS",
 ]
