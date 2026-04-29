@@ -19,6 +19,10 @@ Comandos disponíveis:
   /flip add TICK ENTRY SHARES [NOTA]   → Registar entrada num trade
   /flip close ID EXIT                  → Fechar trade pelo ID com preço de saída
   /flip del ID                         → Apagar trade pelo ID
+  /buy <TICK> <PREÇO> <SHARES> [SCORE] → Registar compra na carteira activa
+  /sell <TICK> <PREÇO> [SHARES]        → Registar venda (parcial ou total)
+  /liquidez [+|-]<VALOR>               → Ver / ajustar saldo disponível
+  /portfolio                           → Resumo das posições activas
   /mldata                  → Estatísticas da base de dados ML + forçar update de outcomes
   /admin_backfill_ml       → [ADMIN] Semear hist_backtest.csv com 5 anos de dips históricos
   /admin_train_ml          → [ADMIN] Treinar modelo ML e gerar dip_model.pkl
@@ -477,7 +481,7 @@ def _handle_admin_train_ml() -> None:
                 f"  🎯 Threshold:        *{s1.get('threshold', 0):.4f}*",
                 f"  📦 Amostras:         *{s1.get('n_samples', 0)}* "
                     f"(WIN={s1.get('n_win', 0)} | NOT-WIN={s1.get('n_not_win', 0)})",
-                f"  🧬 SMOTE activado:   {'Sim' if s1.get('smote_used') else 'N\u00e3o'}",
+                f"  🧬 SMOTE activado:   {'Sim' if s1.get('smote_used') else 'Não'}",
                 "",
             ]
 
@@ -493,7 +497,7 @@ def _handle_admin_train_ml() -> None:
                     "",
                 ]
             else:
-                lines.append("_Andar 2: dados insuficientes (precisa \u226515 amostras WIN)._\n")
+                lines.append("_Andar 2: dados insuficientes (precisa ≥15 amostras WIN)._\n")
 
             feat_imp = s1.get("feature_importance", [])
             if feat_imp:
@@ -508,10 +512,10 @@ def _handle_admin_train_ml() -> None:
 
             auc = s1.get("auc_pr", 0)
             if auc >= 0.80:
-                lines.append("🟢 *Modelo excelente!* AUC-PR \u2265 0.80 — pronto para produção.")
+                lines.append("🟢 *Modelo excelente!* AUC-PR ≥ 0.80 — pronto para produção.")
                 lines.append("_Chunk I vai integrar este cérebro no scanner ao vivo._")
             elif auc >= 0.65:
-                lines.append("🟡 *Modelo bom.* AUC-PR \u2265 0.65 — funcional, vai melhorar com mais dados.")
+                lines.append("🟡 *Modelo bom.* AUC-PR ≥ 0.65 — funcional, vai melhorar com mais dados.")
             else:
                 lines.append("🔴 *Modelo fraco.* AUC-PR < 0.65 — precisa de mais amostras.")
                 lines.append("_Corre `/admin_backfill_ml` com mais tickers na watchlist._")
@@ -735,6 +739,302 @@ def _handle_flip(parts: list[str]) -> None:
     _reply("⚠️ Usa `/flip` · `/flip list` · `/flip add` · `/flip close` · `/flip del`")
 
 
+# ── /buy handler ──────────────────────────────────────────────────────────────────
+
+def _handle_buy(parts: list[str]) -> None:
+    """
+    /buy <TICKER> <PREÇO> <SHARES> [SCORE]
+    Exemplo: /buy CRWD 245.50 3 82
+    """
+    if len(parts) < 4:
+        _reply(
+            "⚠️ Uso: `/buy <TICKER> <PREÇO> <SHARES> [SCORE]`\n"
+            "_Exemplo: `/buy CRWD 245.50 3 82`_\n"
+            "_Score é opcional (0-100). ETFs não precisam de score._"
+        )
+        return
+
+    symbol = parts[1].upper().strip()
+    try:
+        price  = float(parts[2])
+        shares = float(parts[3])
+    except ValueError:
+        _reply("⚠️ Preço e shares têm de ser números.")
+        return
+
+    if price <= 0 or shares <= 0:
+        _reply("⚠️ Preço e shares têm de ser positivos.")
+        return
+
+    score = None
+    if len(parts) >= 5:
+        try:
+            score = int(float(parts[4]))
+            if not (0 <= score <= 100):
+                _reply("⚠️ Score tem de ser entre 0 e 100.")
+                return
+        except ValueError:
+            _reply("⚠️ Score tem de ser um número inteiro.")
+            return
+
+    try:
+        from portfolio import buy as portfolio_buy, get_liquidity
+        result = portfolio_buy(symbol, price, shares, entry_score=score)
+    except Exception as e:
+        _reply(f"❌ Erro ao registar compra: `{e}`")
+        return
+
+    action_str = "📈 *DCA efectuado*" if result["action"] == "avg_down" else "🆕 *Nova posição aberta*"
+    pos        = result["position"]
+    liq        = result["liquidity"]
+    liq_warn   = "\n⚠️ _Liquidez ficou negativa — faz `/liquidez +VALOR` para corrigir._" if result["liq_warning"] else ""
+
+    _reply(
+        f"✅ {action_str} — *{symbol}*\n\n"
+        f"  💰 Compra: *{shares}x* @ *${price:.2f}* = *${result['cost']:.2f}*\n"
+        f"  📊 Preço médio: *${pos['avg_price']:.2f}* | Total: *{pos['shares']}x*\n"
+        f"  🏷️ Categoria: _{pos.get('category', 'N/D')}_"
+        + (f"\n  🎯 Score entrada: *{score}/100*" if score is not None else "")
+        + f"\n\n  💵 Liquidez restante: *€{liq:.2f}*"
+        + liq_warn
+    )
+
+
+# ── /sell handler ─────────────────────────────────────────────────────────────────
+
+def _handle_sell(parts: list[str]) -> None:
+    """
+    /sell <TICKER> <PREÇO> [SHARES]
+    SHARES omitido = venda total da posição.
+    Exemplo: /sell CRWD 280.00 2
+    """
+    if len(parts) < 3:
+        _reply(
+            "⚠️ Uso: `/sell <TICKER> <PREÇO> [SHARES]`\n"
+            "_Omite SHARES para fechar toda a posição._\n"
+            "_Exemplo: `/sell CRWD 280.00 2`_"
+        )
+        return
+
+    symbol = parts[1].upper().strip()
+    try:
+        price = float(parts[2])
+    except ValueError:
+        _reply("⚠️ Preço tem de ser um número.")
+        return
+
+    if price <= 0:
+        _reply("⚠️ Preço tem de ser positivo.")
+        return
+
+    shares = None
+    if len(parts) >= 4:
+        try:
+            shares = float(parts[3])
+            if shares <= 0:
+                _reply("⚠️ Shares têm de ser positivas.")
+                return
+        except ValueError:
+            _reply("⚠️ Shares têm de ser um número.")
+            return
+
+    try:
+        from portfolio import sell as portfolio_sell
+        result = portfolio_sell(symbol, price, shares)
+    except Exception as e:
+        _reply(f"❌ Erro ao registar venda: `{e}`")
+        return
+
+    if result is None:
+        _reply(f"⚠️ Posição *{symbol}* não encontrada na carteira.\n_Usa `/portfolio` para ver as posições activas._")
+        return
+
+    pnl    = result["pnl"]
+    pct    = result["pnl_pct"]
+    em     = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
+    action = "🏁 *Posição fechada*" if result["action"] == "closed" else "✂️ *Venda parcial*"
+
+    remaining_str = ""
+    if result["action"] == "partial":
+        remaining_str = f"\n  📦 Restam: *{result['remaining']}x*"
+
+    _reply(
+        f"{em} {action} — *{symbol}*\n\n"
+        f"  💰 Vendido: *{result['shares_sold']}x* @ *${price:.2f}* = *${result['proceeds']:.2f}*\n"
+        f"  {'📈' if pnl >= 0 else '📉'} P&L: *${pnl:+.2f}* ({pct:+.1f}%)"
+        + remaining_str
+        + f"\n\n  💵 Liquidez: *€{result['liquidity']:.2f}*"
+    )
+
+
+# ── /liquidez handler ─────────────────────────────────────────────────────────────
+
+def _handle_liquidez(parts: list[str]) -> None:
+    """
+    /liquidez          → ver saldo
+    /liquidez +500     → adicionar 500€
+    /liquidez -100     → retirar 100€ (ex: taxa)
+    /liquidez =1500    → definir saldo exacto
+    """
+    try:
+        from portfolio import get_liquidity, add_liquidity, set_liquidity
+    except Exception as e:
+        _reply(f"❌ Módulo portfolio não disponível: `{e}`")
+        return
+
+    if len(parts) < 2:
+        liq = get_liquidity()
+        em  = "🟢" if liq >= 0 else "🔴"
+        _reply(
+            f"💵 *Liquidez disponível:* {em} *€{liq:.2f}*\n\n"
+            "_Comandos:_\n"
+            "  `/liquidez +500`  → adicionar €500\n"
+            "  `/liquidez -100`  → retirar €100\n"
+            "  `/liquidez =1500` → definir saldo exacto"
+        )
+        return
+
+    raw = parts[1].strip()
+
+    if raw.startswith("="):
+        try:
+            amount = float(raw[1:])
+        except ValueError:
+            _reply("⚠️ Valor inválido. Exemplo: `/liquidez =1500`")
+            return
+        new_liq = set_liquidity(amount)
+        _reply(f"✅ *Liquidez definida para €{new_liq:.2f}*")
+        return
+
+    if raw.startswith("+") or raw.startswith("-"):
+        try:
+            amount = float(raw)
+        except ValueError:
+            _reply("⚠️ Valor inválido. Exemplo: `/liquidez +500` ou `/liquidez -100`")
+            return
+        new_liq = add_liquidity(amount, note="ajuste manual Telegram")
+        old_liq = new_liq - amount
+        direction = "adicionado" if amount >= 0 else "retirado"
+        em = "🟢" if new_liq >= 0 else "🔴"
+        _reply(
+            f"✅ *€{abs(amount):.2f} {direction}*\n"
+            f"  €{old_liq:.2f} → {em} *€{new_liq:.2f}*"
+        )
+        return
+
+    # Tentativa de valor sem sinal → tratar como definição directa
+    try:
+        amount  = float(raw)
+        new_liq = set_liquidity(amount)
+        _reply(f"✅ *Liquidez definida para €{new_liq:.2f}*")
+    except ValueError:
+        _reply(
+            "⚠️ Formato inválido.\n"
+            "  `/liquidez`       → ver saldo\n"
+            "  `/liquidez +500`  → adicionar\n"
+            "  `/liquidez =1500` → definir"
+        )
+
+
+# ── /portfolio handler ────────────────────────────────────────────────────────────
+
+def _handle_portfolio(parts: list[str]) -> None:
+    """
+    /portfolio         → resumo de todas as posições activas
+    /portfolio <TICK>  → detalhe de uma posição específica
+    """
+    try:
+        from portfolio import get_positions, get_liquidity
+    except Exception as e:
+        _reply(f"❌ Módulo portfolio não disponível: `{e}`")
+        return
+
+    positions = get_positions()
+    liquidity = get_liquidity()
+
+    # Detalhe de posição específica
+    if len(parts) >= 2:
+        symbol = parts[1].upper().strip()
+        pos    = positions.get(symbol)
+        if not pos:
+            _reply(
+                f"⚠️ *{symbol}* não está na carteira activa.\n"
+                "_Usa `/portfolio` para ver todas as posições._"
+            )
+            return
+        last_price = pos.get("last_price") or pos["avg_price"]
+        pnl_u      = (last_price - pos["avg_price"]) * pos["shares"]
+        pnl_pct    = (last_price - pos["avg_price"]) / pos["avg_price"] * 100 if pos["avg_price"] else 0
+        em         = "🟢" if pnl_u >= 0 else "🔴"
+        score_str  = f"*{pos['last_score']}/100*" if pos.get("last_score") is not None else "_N/D_"
+        _reply(
+            f"📋 *{symbol}* — {pos.get('name', symbol)}\n\n"
+            f"  📦 Shares: *{pos['shares']}x*\n"
+            f"  💵 Preço médio: *${pos['avg_price']:.2f}*\n"
+            f"  📈 Preço actual: *${last_price:.2f}*\n"
+            f"  {em} P&L não realizado: *${pnl_u:+.2f}* ({pnl_pct:+.1f}%)\n"
+            f"  🏷️ Categoria: _{pos.get('category', 'N/D')}_\n"
+            f"  🎯 Score actual: {score_str}\n"
+            f"  📅 Entrada: {pos.get('entry_date', 'N/D')}\n"
+            f"  🔄 Última actualização: {pos.get('last_update', 'N/D')}"
+            + ("\n  ⚠️ _Tese degradada_" if pos.get("degradation_alerted") else "")
+        )
+        return
+
+    # Resumo geral
+    if not positions:
+        liq_em = "🟢" if liquidity >= 0 else "🔴"
+        _reply(
+            f"📭 *Carteira vazia*\n\n"
+            f"  💵 Liquidez: {liq_em} *€{liquidity:.2f}*\n\n"
+            "_Usa `/buy TICK PREÇO SHARES` para registar a primeira posição._"
+        )
+        return
+
+    total_cost    = 0.0
+    total_current = 0.0
+    lines         = [f"*📊 Carteira Activa — {datetime.now().strftime('%d/%m %H:%M')}*", ""]
+
+    # Agrupa por categoria
+    by_cat: dict[str, list] = {}
+    for sym, pos in positions.items():
+        cat = pos.get("category", "Outras")
+        by_cat.setdefault(cat, []).append((sym, pos))
+
+    for cat, items in sorted(by_cat.items()):
+        lines.append(f"*{cat}*")
+        for sym, pos in sorted(items, key=lambda x: x[0]):
+            last_price = pos.get("last_price") or pos["avg_price"]
+            cost       = pos["avg_price"] * pos["shares"]
+            current    = last_price * pos["shares"]
+            pnl_u      = current - cost
+            pnl_pct    = pnl_u / cost * 100 if cost else 0
+            em         = "🟢" if pnl_u >= 0 else "🔴"
+            score_str  = f" | 🎯{pos['last_score']}" if pos.get("last_score") is not None else ""
+            degrade    = " ⚠️" if pos.get("degradation_alerted") else ""
+            lines.append(
+                f"  {em} *{sym}*{degrade} — {pos['shares']}x @ ${pos['avg_price']:.2f}"
+                f" → ${last_price:.2f} | *{pnl_pct:+.1f}%*{score_str}"
+            )
+            total_cost    += cost
+            total_current += current
+        lines.append("")
+
+    total_pnl     = total_current - total_cost
+    total_pnl_pct = total_pnl / total_cost * 100 if total_cost else 0
+    em_total      = "🟢" if total_pnl >= 0 else "🔴"
+    liq_em        = "🟢" if liquidity >= 0 else "🔴"
+
+    lines += [
+        "─────────────────",
+        f"  {em_total} P&L não realizado: *${total_pnl:+.2f}* ({total_pnl_pct:+.1f}%)",
+        f"  💵 Liquidez disponível: {liq_em} *€{liquidity:.2f}*",
+        "",
+        "_`/portfolio TICK` para detalhe · `/buy` · `/sell`_",
+    ]
+    _reply("\n".join(lines))
+
+
 # ── Command router ────────────────────────────────────────────────────────────────
 
 def _handle_command(text: str) -> None:
@@ -764,6 +1064,10 @@ def _handle_command(text: str) -> None:
             "`/flip add TICK ENTRY SHR` → Registar entrada\n"
             "`/flip close ID EXIT`      → Fechar trade\n"
             "`/flip del ID`             → Apagar trade\n"
+            "`/buy TICK PREÇO SHARES`   → Registar compra\n"
+            "`/sell TICK PREÇO [SHR]`   → Registar venda\n"
+            "`/liquidez`               → Ver/ajustar saldo\n"
+            "`/portfolio`              → Posições activas\n"
             "`/mldata`                  → Stats da base de dados ML\n"
             "`/mldata update`           → Forçar update de outcomes\n"
             "`/help`                    → Esta mensagem"
@@ -790,12 +1094,23 @@ def _handle_command(text: str) -> None:
         from pathlib import Path
         data_dir  = Path("/data") if Path("/data").exists() else Path("/tmp")
         ml_status = "🟢 PKL pronto" if (data_dir / "dip_model_stage1.pkl").exists() else "🔴 Não treinado"
+
+        # Liquidez da carteira activa
+        try:
+            from portfolio import get_liquidity, get_active_symbols
+            liq      = get_liquidity()
+            n_pos    = len(get_active_symbols())
+            port_str = f"\nCarteira: *{n_pos} posições* | Liquidez: *€{liq:.2f}*"
+        except Exception:
+            port_str = ""
+
         _reply(
             f"*🤖 DipRadar Status*\n"
             f"Uptime: *{hours}h {mins}m* | Mercado: *{market}*\n"
             f"Watchlist: *{len(wl)} tickers*{flip_str}{db_str}\n"
-            f"ML Model: *{ml_status}*\n"
-            f"_⏰ {datetime.now().strftime('%d/%m/%Y %H:%M')}_\n"
+            f"ML Model: *{ml_status}*"
+            + port_str
+            + f"\n_⏰ {datetime.now().strftime('%d/%m/%Y %H:%M')}_\n"
             f"_{rate_status()}_"
         )
 
@@ -904,6 +1219,22 @@ def _handle_command(text: str) -> None:
     elif cmd == "/flip":
         if not _check_rate(cmd_key): return
         _handle_flip(parts)
+
+    elif cmd == "/buy":
+        if not _check_rate(cmd_key): return
+        _handle_buy(parts)
+
+    elif cmd == "/sell":
+        if not _check_rate(cmd_key): return
+        _handle_sell(parts)
+
+    elif cmd == "/liquidez":
+        if not _check_rate(cmd_key): return
+        _handle_liquidez(parts)
+
+    elif cmd == "/portfolio":
+        if not _check_rate(cmd_key): return
+        _handle_portfolio(parts)
 
     elif cmd == "/mldata":
         if not _check_rate(cmd_key): return
