@@ -21,6 +21,15 @@ Lógica:
     sem contaminar o modelo com fundamentais de empresas estruturalmente
     diferentes há mais de 5 anos).
 
+  LOOK-AHEAD BIAS (fix v2):
+    _build_hybrid_fund() usa apenas features técnicas calculadas no
+    timestamp histórico exacto (price, rsi, drawdown, volume).
+    Fundamentais slow-moving do yf.info (pe, fcf_yield, revenue_growth,
+    debt_equity, gross_margin, analyst_upside) foram removidos — eram
+    valores de hoje a avaliar dips de 2020/2022.
+    O motor score_from_fundamentals() penaliza automaticamente a ausência
+    dessas métricas via confidence, garantindo honestidade matemática.
+
 Nenhuma API key necessária — usa yfinance.history().
 """
 
@@ -289,6 +298,9 @@ _TD_1M  = 21
 _TD_3M  = 63
 _TD_6M  = 126
 
+# Colunas do CSV de treino.
+# Fundamentais contaminadas (pe, fcf_yield, etc.) mantêm-se no schema
+# para backward-compatibility, mas são gravadas a vazio pelo backtest histórico.
 _HIST_FIELDS = [
     "date_iso", "symbol", "name", "sector",
     "category", "score",
@@ -326,28 +338,32 @@ def _drawdown_from_rolling_high(close_series, window: int = 252):
 
 
 def _build_hybrid_fund(info: dict, row) -> dict:
-    price    = float(row["Close"])
-    mc_today = info.get("marketCap") or 0
-    fcf_raw  = info.get("freeCashflow")
-    fcf_yield = (fcf_raw / mc_today) if (fcf_raw and mc_today > 0) else None
+    """
+    Constrói um dicionário historicamente honesto para scoring retroactivo.
 
+    Regras de isolamento temporal:
+      INCLUÍDO — features técnicas calculadas no timestamp histórico exacto:
+        price, rsi, drawdown_from_high, volume, average_volume
+      INCLUÍDO — constantes toleráveis para segmentação (imprecisão aceite):
+        market_cap, sector, name, beta
+      REMOVIDO expressamente (look-ahead bias):
+        pe, revenue_growth, fcf_yield, debt_equity, roic,
+        gross_margin, dividend_yield, analyst_upside
+
+    A ausência das métricas fundamentais activa automaticamente a penalização
+    de confiança no motor score_from_fundamentals(), que assume z=0
+    (neutralidade) e reduz o confidence multiplier — matematicamente honesto.
+    """
     return {
-        "price":              price,
-        "rsi":                float(row["rsi_14"]) if row["rsi_14"] == row["rsi_14"] else None,
-        "drawdown_from_high": float(row["drawdown_52w"]),
-        "volume":             float(row["Volume"]),
-        "average_volume":     float(row["avg_vol_20d"]) if row["avg_vol_20d"] == row["avg_vol_20d"] else 0,
-        "market_cap":         mc_today,
-        "fcf_yield":          fcf_yield,
-        "gross_margin":       info.get("grossMargins") or 0,
-        "revenue_growth":     info.get("revenueGrowth") or 0,
-        "debt_equity":        info.get("debtToEquity"),
-        "dividend_yield":     info.get("dividendYield") or 0,
-        "beta":               info.get("beta"),
-        "analyst_upside":     _analyst_upside(info),
-        "pe":                 info.get("trailingPE") or 0,
+        "price":              float(row["Close"]),
+        "rsi":                float(row["rsi_14"])     if row["rsi_14"]     == row["rsi_14"]     else None,
+        "drawdown_from_high": float(row["drawdown_52w"]) if row["drawdown_52w"] == row["drawdown_52w"] else None,
+        "volume":             float(row["Volume"])     if row["Volume"]     == row["Volume"]     else None,
+        "average_volume":     float(row["avg_vol_20d"]) if row["avg_vol_20d"] == row["avg_vol_20d"] else None,
+        "market_cap":         info.get("marketCap") or 0,
         "sector":             info.get("sector") or "",
         "name":               (info.get("longName") or info.get("shortName") or "")[:40],
+        "beta":               info.get("beta"),
     }
 
 
@@ -503,7 +519,7 @@ def run_historical_backtest(
     drawdown_threshold: float = -15.0,
     dry_run: bool = False,
 ) -> dict:
-    from score import calculate_dip_score, classify_dip_category, is_bluechip
+    from score import score_from_fundamentals, classify_dip_category, is_bluechip
 
     stats: dict = {
         "total_dips": 0, "written": 0, "skipped": 0,
@@ -539,25 +555,32 @@ def run_historical_backtest(
 
             for dip_date, row in dip_df.iterrows():
                 try:
-                    fund  = _build_hybrid_fund(info, row)
-                    score, _ = calculate_dip_score(
-                        fundamentals=fund,
-                        symbol=symbol,
-                        sector_change=None,
-                        stock_change_pct=float(row["change_pct"]) if row["change_pct"] == row["change_pct"] else None,
-                    )
+                    fund_hist = _build_hybrid_fund(info, row)
 
-                    if score < min_score:
+                    score_data = score_from_fundamentals(fund_hist)
+
+                    if score_data.get("skip_recommended", False):
+                        stats["skipped"] += 1
+                        logging.info(
+                            f"[hist_backtest] skip {symbol} {dip_date.date()} | "
+                            f"confidence={score_data.get('confidence', 0):.2f}"
+                        )
+                        continue
+
+                    final_score = float(score_data["final_score"])
+                    if final_score < min_score:
                         stats["skipped"] += 1
                         continue
 
-                    bc_flag  = is_bluechip(fund)
-                    category = classify_dip_category(fund, score, bc_flag)
+                    bc_flag  = is_bluechip(fund_hist)
+                    category = classify_dip_category(fund_hist, final_score, bc_flag)
                     dip_iloc = df_full.index.get_loc(dip_date)
 
                     outcomes = _forward_outcomes(
-                        df=df_full, dip_iloc=dip_iloc,
-                        price_entry=float(row["Close"]), category=category,
+                        df=df_full,
+                        dip_iloc=dip_iloc,
+                        price_entry=float(row["Close"]),
+                        category=category,
                     )
 
                     if outcomes["outcome_label"] == "":
@@ -571,22 +594,23 @@ def run_historical_backtest(
                         "symbol":         symbol,
                         "date_iso":       dip_date.date().isoformat(),
                         "price":          round(float(row["Close"]), 4),
-                        "score":          round(score, 1),
+                        "score":          round(final_score, 1),
                         "rsi":            round(float(row["rsi_14"]), 1) if row["rsi_14"] == row["rsi_14"] else "",
                         "drawdown_52w":   round(float(row["drawdown_52w"]), 2),
                         "volume_ratio":   vol_ratio,
                         "change_day_pct": round(float(row["change_pct"]), 2) if row["change_pct"] == row["change_pct"] else "",
                         "category":       category,
-                        "sector":         fund.get("sector", ""),
-                        "name":           fund.get("name", ""),
-                        "market_cap_b":   round((fund.get("market_cap") or 0) / 1e9, 2),
-                        "fcf_yield":      round(fund["fcf_yield"], 4) if fund.get("fcf_yield") is not None else "",
-                        "gross_margin":   round(fund.get("gross_margin") or 0, 4),
-                        "revenue_growth": round(fund.get("revenue_growth") or 0, 4),
-                        "debt_equity":    fund.get("debt_equity") or "",
-                        "dividend_yield": round(fund.get("dividend_yield") or 0, 4),
-                        "pe":             fund.get("pe") or "",
-                        "analyst_upside": fund.get("analyst_upside") or 0,
+                        "sector":         fund_hist.get("sector", ""),
+                        "name":           fund_hist.get("name", ""),
+                        "market_cap_b":   round((fund_hist.get("market_cap") or 0) / 1e9, 2),
+                        # Fundamentais contaminadas: gravadas a vazio (look-ahead bias removido)
+                        "fcf_yield":      "",
+                        "gross_margin":   "",
+                        "revenue_growth": "",
+                        "debt_equity":    "",
+                        "dividend_yield": "",
+                        "pe":             "",
+                        "analyst_upside": "",
                         "price_1m":  outcomes["price_1m"]  if outcomes["price_1m"]  is not None else "",
                         "price_3m":  outcomes["price_3m"]  if outcomes["price_3m"]  is not None else "",
                         "price_6m":  outcomes["price_6m"]  if outcomes["price_6m"]  is not None else "",
@@ -596,7 +620,7 @@ def run_historical_backtest(
                         "mfe_3m":    outcomes["mfe_3m"]    if outcomes["mfe_3m"]    is not None else "",
                         "mae_3m":    outcomes["mae_3m"]    if outcomes["mae_3m"]    is not None else "",
                         "outcome_label": outcomes["outcome_label"],
-                        "source":        "historical_backtest",
+                        "source":        "historical_backtest_v2",
                     }
 
                     stats["dip_rows"].append(dip_record)
@@ -604,10 +628,11 @@ def run_historical_backtest(
 
                     logging.info(
                         f"[hist_backtest] \u2714 {symbol} {dip_date.date()} | "
-                        f"score={score:.0f} | rsi={dip_record['rsi']} | "
-                        f"dd={dip_record['drawdown_52w']:.1f}% | cat={category} | "
-                        f"r3m={outcomes['return_3m']} | mfe={outcomes['mfe_3m']} | "
-                        f"mae={outcomes['mae_3m']} | label={outcomes['outcome_label'] or 'pending'}"
+                        f"score={final_score:.0f} | conf={score_data.get('confidence', 0):.2f} | "
+                        f"rsi={dip_record['rsi']} | dd={dip_record['drawdown_52w']:.1f}% | "
+                        f"cat={category} | r3m={outcomes['return_3m']} | "
+                        f"mfe={outcomes['mfe_3m']} | mae={outcomes['mae_3m']} | "
+                        f"label={outcomes['outcome_label'] or 'pending'}"
                     )
 
                 except Exception as e:
