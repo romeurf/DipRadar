@@ -105,7 +105,7 @@ def register_callbacks(
     _cb_fill_db_outcomes = fill_db_outcomes
 
 
-# ── poll() bridge ─────────────────────────────────────────────────────────────
+# ── poll() bridge ────────────────────────────────────────────────────────────────
 
 def poll(
     token: str,
@@ -168,7 +168,7 @@ def _check_rate(cmd: str) -> bool:
     return allowed
 
 
-# ── /comparar ─────────────────────────────────────────────────────────────────
+# ── /comparar ──────────────────────────────────────────────────────────────────
 
 def _handle_comparar(symbols: list[str]) -> None:
     if len(symbols) < 2:
@@ -241,7 +241,7 @@ def _handle_comparar(symbols: list[str]) -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
-# ── /historico ────────────────────────────────────────────────────────────────
+# ── /historico ─────────────────────────────────────────────────────────────────
 
 def _handle_historico(symbol: str) -> None:
     history = get_ticker_score_history(symbol)
@@ -276,7 +276,7 @@ def _handle_historico(symbol: str) -> None:
     _reply("\n".join(lines))
 
 
-# ── /mldata ───────────────────────────────────────────────────────────────────
+# ── /mldata ────────────────────────────────────────────────────────────────────
 
 def _handle_mldata(force_update: bool = False) -> None:
     get_db_stats     = _poll_context.get("get_db_stats") or _cb_get_db_stats
@@ -311,7 +311,7 @@ def _handle_mldata(force_update: bool = False) -> None:
         lines = [
             "🤖 *ML Alert Database*",
             f"_{datetime.now().strftime('%d/%m/%Y %H:%M')}_", "",
-            f"*🗓️ Total de alertas:* {total}",
+            f"*🗃️ Total de alertas:* {total}",
             (f"*📊 Classificados:* {labeled} ({labeled/total*100:.0f}% do total)" if total > 0 else "*📊 Classificados:* 0"),
             f"*🗂️ Ficheiro:* `{db_path}`", "",
         ]
@@ -347,7 +347,7 @@ def _handle_mldata(force_update: bool = False) -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
-# ── /admin_backfill_ml ────────────────────────────────────────────────────────
+# ── /admin_backfill_ml ──────────────────────────────────────────────────────────
 
 def _handle_admin_backfill_ml() -> None:
     global _backfill_running
@@ -437,20 +437,9 @@ def _handle_admin_backfill_ml() -> None:
     threading.Thread(target=_run, daemon=True, name="admin-backfill").start()
 
 
-# ── /admin_train_ml ───────────────────────────────────────────────────────────
+# ── /admin_train_ml ─────────────────────────────────────────────────────────────
 
 def _handle_admin_train_ml() -> None:
-    """
-    Comando de administrador (escondido do /help) para treinar o modelo ML
-    e gerar os ficheiros dip_model_stage1.pkl e dip_model_stage2.pkl.
-
-    Comportamento:
-      - Só pode correr uma instância de cada vez (_train_running flag).
-      - Responde imediatamente para não bloquear o bot.
-      - Corre train_all() numa daemon thread.
-      - Quando termina, envia o relatório completo para o Telegram:
-          algoritmo vencedor, AUC-PR, threshold, top-5 features.
-    """
     global _train_running
 
     if _train_running:
@@ -478,7 +467,6 @@ def _handle_admin_train_ml() -> None:
             s1         = result.get("stage1", {})
             s2         = result.get("stage2")
 
-            # ── Relatório para o Telegram ─────────────────────────────────
             lines = [
                 "🎓 *Treino ML concluído!*",
                 f"_{datetime.now().strftime('%d/%m/%Y %H:%M')} — {mins}m{secs:02d}s_",
@@ -489,27 +477,27 @@ def _handle_admin_train_ml() -> None:
                 f"  🎯 Threshold:        *{s1.get('threshold', 0):.4f}*",
                 f"  📦 Amostras:         *{s1.get('n_samples', 0)}* "
                     f"(WIN={s1.get('n_win', 0)} | NOT-WIN={s1.get('n_not_win', 0)})",
-                f"  🧬 SMOTE activado:   {'Sim' if s1.get('smote_used') else 'Não'}",
+                f"  🧬 SMOTE activado:   {'Sim' if s1.get('smote_used') else 'N\u00e3o'}",
                 "",
             ]
 
             if s2:
+                n_win40 = s2.get('n_win40', 0)
+                n_win20 = s2.get('n_win20', 0)
                 lines += [
-                    "*🍷 Andar 2 (Sommelier WIN\_40 vs WIN\_20):*",
+                    "*🍷 Andar 2 (Sommelier WIN40 vs WIN20):*",
                     f"  🏆 Algoritmo: *{s2.get('algorithm', 'N/D')}*",
                     f"  📊 AUC-PR:    *{s2.get('auc_pr', 0):.4f}*",
                     f"  📦 Amostras:  *{s2.get('n_samples', 0)}* "
-                        f"(WIN\_40={s2.get('n_win40', 0)} | WIN\_20={s2.get('n_win20', 0)})",
+                        f"(WIN40={n_win40} | WIN20={n_win20})",
                     "",
                 ]
             else:
-                lines.append("_Andar 2: dados insuficientes (precisa ≥15 amostras WIN)._\n")
+                lines.append("_Andar 2: dados insuficientes (precisa \u226515 amostras WIN)._\n")
 
-            # Top-5 features
             feat_imp = s1.get("feature_importance", [])
             if feat_imp:
                 lines.append("*🔬 Top-5 features (Andar 1):*")
-                bars = ["▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"]
                 max_imp = feat_imp[0]["importance"] if feat_imp else 1
                 for fi in feat_imp[:5]:
                     ratio    = fi["importance"] / max_imp if max_imp > 0 else 0
@@ -518,13 +506,12 @@ def _handle_admin_train_ml() -> None:
                     lines.append(f"  `{fi['feature']:<20}` {bar} *{fi['importance']:.4f}*")
                 lines.append("")
 
-            # Qualidade do modelo
             auc = s1.get("auc_pr", 0)
             if auc >= 0.80:
-                lines.append("🟢 *Modelo excelente!* AUC-PR ≥ 0.80 — pronto para produção.")
+                lines.append("🟢 *Modelo excelente!* AUC-PR \u2265 0.80 — pronto para produção.")
                 lines.append("_Chunk I vai integrar este cérebro no scanner ao vivo._")
             elif auc >= 0.65:
-                lines.append("🟡 *Modelo bom.* AUC-PR ≥ 0.65 — funcional, vai melhorar com mais dados.")
+                lines.append("🟡 *Modelo bom.* AUC-PR \u2265 0.65 — funcional, vai melhorar com mais dados.")
             else:
                 lines.append("🔴 *Modelo fraco.* AUC-PR < 0.65 — precisa de mais amostras.")
                 lines.append("_Corre `/admin_backfill_ml` com mais tickers na watchlist._")
@@ -536,7 +523,6 @@ def _handle_admin_train_ml() -> None:
             )
 
         except ValueError as e:
-            # Erro de dados insuficientes
             _reply(
                 f"⚠️ *Dados insuficientes para treinar:*\n`{e}`\n\n"
                 "*Solução:*\n"
@@ -547,7 +533,7 @@ def _handle_admin_train_ml() -> None:
         except FileNotFoundError as e:
             _reply(
                 f"⚠️ *Ficheiro de dados não encontrado:*\n`{e}`\n\n"
-                "_Corre `/admin_backfill_ml` primeiro para gerar o hist\_backtest.csv._"
+                "_Corre `/admin_backfill_ml` primeiro para gerar o hist_backtest.csv._"
             )
         except Exception as e:
             logging.error(f"[admin_train] Erro fatal: {e}")
@@ -561,7 +547,7 @@ def _handle_admin_train_ml() -> None:
     threading.Thread(target=_run, daemon=True, name="admin-train").start()
 
 
-# ── Earnings alerts ───────────────────────────────────────────────────────────
+# ── Earnings alerts ───────────────────────────────────────────────────────────────
 
 def send_earnings_alerts(watchlist: list[str] | None = None) -> int:
     earnings_days_fn = _poll_context.get("get_earnings_days") or _cb_earnings_days
@@ -599,7 +585,7 @@ def send_earnings_alerts(watchlist: list[str] | None = None) -> int:
     return sent
 
 
-# ── /watchlist handler ────────────────────────────────────────────────────────
+# ── /watchlist handler ─────────────────────────────────────────────────────────────
 
 def _handle_watchlist(parts: list[str]) -> None:
     sub = parts[1].lower() if len(parts) > 1 else "list"
@@ -650,7 +636,7 @@ def _handle_watchlist(parts: list[str]) -> None:
         )
 
 
-# ── /flip handler ─────────────────────────────────────────────────────────────
+# ── /flip handler ─────────────────────────────────────────────────────────────────
 
 def _handle_flip(parts: list[str]) -> None:
     sub = parts[1].lower() if len(parts) > 1 else "summary"
@@ -661,7 +647,7 @@ def _handle_flip(parts: list[str]) -> None:
         pnl_em   = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
         lines = [
             f"*🎯 Flip Fund — {datetime.now().strftime('%d/%m/%Y')}*", "",
-            f"  {pnl_em} *P&L realizado:* ${"+" if pnl >= 0 else ""}{pnl:.2f}",
+            f"  {pnl_em} *P&L realizado:* ${'+' if pnl >= 0 else ''}{pnl:.2f}",
             f"  📊 Trades fechados: *{summary['n_closed']}* | Win rate: *{summary['win_rate']:.0f}%*",
         ]
         if summary["best_trade"]:
@@ -683,7 +669,7 @@ def _handle_flip(parts: list[str]) -> None:
                     pnl_s = f"${t['pnl_eur']:+.2f}" if t["pnl_eur"] is not None else "N/D"
                     em    = "🟢" if (t["pnl_eur"] or 0) > 0 else "🔴"
                     lines.append(f"  {em} #{t['id']} *{t['symbol']}* ${t['price_entry']:.2f}→${t['price_exit']:.2f} | *{pnl_s}*")
-        lines += ["", "_`/flip add TICK ENTRY SHARES` · `/flip close ID EXIT`_"]
+        lines += ["", "_`/flip add TICK ENTRY SHR` · `/flip close ID EXIT`_"]
         _reply("\n".join(lines))
         return
 
@@ -749,7 +735,7 @@ def _handle_flip(parts: list[str]) -> None:
     _reply("⚠️ Usa `/flip` · `/flip list` · `/flip add` · `/flip close` · `/flip del`")
 
 
-# ── Command router ─────────────────────────────────────────────────────────────
+# ── Command router ────────────────────────────────────────────────────────────────
 
 def _handle_command(text: str) -> None:
     parts   = text.strip().split()
@@ -801,7 +787,6 @@ def _handle_command(text: str) -> None:
                 db_str = f" | ML DB: {ds.get('total', 0)} alertas"
             except Exception:
                 pass
-        # Indicar se modelos ML estão prontos
         from pathlib import Path
         data_dir  = Path("/data") if Path("/data").exists() else Path("/tmp")
         ml_status = "🟢 PKL pronto" if (data_dir / "dip_model_stage1.pkl").exists() else "🔴 Não treinado"
@@ -925,7 +910,6 @@ def _handle_command(text: str) -> None:
         force = len(parts) > 1 and parts[1].lower() in ("update", "atualizar", "force")
         _handle_mldata(force_update=force)
 
-    # ── Comandos de administrador (escondidos do /help) ───────────────────────
     elif cmd == "/admin_backfill_ml":
         _handle_admin_backfill_ml()
 
@@ -937,7 +921,7 @@ def _handle_command(text: str) -> None:
             _reply(f"_Comando desconhecido: `{cmd}` — usa /help_")
 
 
-# ── Poll loop (legacy) ────────────────────────────────────────────────────────
+# ── Poll loop (legacy) ─────────────────────────────────────────────────────────────
 
 def _poll_loop() -> None:
     global _last_update_id
