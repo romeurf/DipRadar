@@ -38,6 +38,8 @@ from market_client import (
 from portfolio import (
     HOLDINGS, CASHBACK_EUR_VALUES, PPR_SHARES, PPR_AVG_COST,
     DIRECT_TICKERS, FLIP_FUND_EUR, suggest_position_size,
+    get_positions, update_position_data,
+    mark_degradation_alerted, reset_degradation_flag,
 )
 from sectors import get_sector_config, score_fundamentals
 from valuation import format_valuation_block
@@ -74,6 +76,9 @@ MIN_DIP_SCORE     = int(os.environ.get("MIN_DIP_SCORE", "50"))
 STRESS_PCT        = float(os.environ.get("PORTFOLIO_STRESS_PCT", "5"))
 RECOVERY_PCT      = float(os.environ.get("RECOVERY_TARGET_PCT", "15"))
 WATCHLIST_ENABLED = os.environ.get("WATCHLIST_SCAN_ENABLED", "true").lower() == "true"
+
+# Degradação: alerta quando score cai >= este valor face ao entry_score
+DEGRADATION_DROP_THRESHOLD = int(os.environ.get("DEGRADATION_DROP_THRESHOLD", "15"))
 
 _alerted_today:  set  = load_alerts()
 _scan_running:   bool = False
@@ -385,6 +390,113 @@ def check_portfolio_stress() -> None:
                 logging.warning(f"Portfolio stress MACRO: {pct_total:.1f}%")
 
 
+# ── Thesis Degradation Check ──────────────────────────────────────────────────
+
+def check_thesis_degradation() -> None:
+    """
+    Corre diariamente às 15:30 (mercado US aberto).
+    Para cada posição activa com entry_score definido e category != ETF:
+      - Calcula score actual via calculate_dip_score()
+      - Actualiza last_score e last_price
+      - Se drop >= DEGRADATION_DROP_THRESHOLD e ainda não alertado → envia alerta
+      - Se score recuperou para >= entry_score - 5 → reseta flag
+    ETFs são ignorados (category == "ETF" ou entry_score is None).
+    """
+    if not is_market_open():
+        logging.info("[degradation] Mercado fechado, check ignorado.")
+        return
+
+    positions = get_positions()
+    if not positions:
+        logging.info("[degradation] Sem posições activas.")
+        return
+
+    logging.info(f"[degradation] A verificar {len(positions)} posições...")
+
+    for sym, pos in positions.items():
+        entry_score = pos.get("entry_score")
+        category    = pos.get("category", "")
+
+        # ETFs e posições sem entry_score não participam
+        if entry_score is None or category == "ETF":
+            continue
+
+        try:
+            time.sleep(3)
+            fund = get_fundamentals(sym, min_market_cap=0)
+            if fund.get("skip"):
+                logging.warning(f"[degradation] {sym}: skip ({fund.get('skip_reason')})")
+                continue
+
+            earnings_days = get_earnings_days(sym)
+            sector_chg    = get_sector_change(fund.get("sector", ""))
+            score, _      = calculate_dip_score(fund, sym, earnings_days, sector_change=sector_chg)
+            price         = fund.get("price") or 0
+
+            # Actualiza dados na posição
+            update_position_data(sym, price=price, score=score, category=category)
+
+            drop = entry_score - score
+            already_alerted = pos.get("degradation_alerted", False)
+
+            # Reset se score recuperou
+            if already_alerted and score >= entry_score - 5:
+                reset_degradation_flag(sym)
+                send_telegram(
+                    f"♻️ *Tese recuperada: {sym}*\n"
+                    f"Score actual: *{score:.0f}/100* — voltou perto do entry score ({entry_score}/100)\n"
+                    f"_Flag de degradação limpa — posição estabilizada_\n"
+                    f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_"
+                )
+                logging.info(f"[degradation] {sym}: tese recuperada (score {score:.0f} vs entry {entry_score})")
+                continue
+
+            # Alerta se degradação significativa e ainda não alertado
+            if drop >= DEGRADATION_DROP_THRESHOLD and not already_alerted:
+                entry_date  = pos.get("entry_date", "N/D")
+                avg_price   = pos.get("avg_price", 0)
+                pnl_pct     = (price - avg_price) / avg_price * 100 if avg_price else 0
+                sector_cfg  = get_sector_config(fund.get("sector", ""))
+                sector_name = sector_cfg.get("label", fund.get("sector", ""))
+
+                score_breakdown = build_score_breakdown(fund, sym, earnings_days, sector_change=sector_chg)
+
+                lines = [
+                    f"🧨 *Degradação de Tese: {sym}*",
+                    f"_Posição em carteira desde {entry_date}_",
+                    "",
+                    f"  📉 Score entry: *{entry_score}/100*",
+                    f"  📊 Score actual: *{score:.0f}/100*",
+                    f"  🔻 Drop: *-{drop:.0f} pts*",
+                    "",
+                    f"  💰 Preço médio: ${avg_price:.2f} | Actual: ${price:.2f}",
+                    f"  {_pnl_emoji(pnl_pct)} P&L posição: {pnl_pct:+.1f}%",
+                    f"  🏷️ Categoria: {category} | {sector_name}",
+                    "",
+                    score_breakdown,
+                    "",
+                    f"*⚠️ Reavalia a tese de investimento.*",
+                    f"_Considera: reforçar (se fundamentais OK), manter ou fechar_",
+                    f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_",
+                ]
+                send_telegram("\n".join(lines))
+                mark_degradation_alerted(sym)
+                logging.warning(
+                    f"[degradation] Alerta enviado: {sym} "
+                    f"entry={entry_score} actual={score:.0f} drop={drop:.0f}pts"
+                )
+            else:
+                logging.info(
+                    f"[degradation] {sym}: score {score:.0f}/100 "
+                    f"(entry {entry_score}, drop {drop:.0f}pts) — OK"
+                )
+
+        except Exception as e:
+            logging.error(f"[degradation] Erro em {sym}: {e}", exc_info=True)
+
+    logging.info("[degradation] Check concluído.")
+
+
 # ── Recovery Alert ────────────────────────────────────────────────────────────
 
 def check_recovery_alerts() -> None:
@@ -647,7 +759,6 @@ def calculate_flip_target(
     if not price or price <= 0:
         return "N/D", "SEM DADOS"
 
-    # ── Hold Forever: nunca calcular target de saída ──────────────────────
     if category == CATEGORY_HOLD_FOREVER or (is_bluechip(fundamentals) and dip_score >= 60):
         return "HOLD ETERNO", "💎 Hold Forever — Acumular em dips, nunca vender"
 
@@ -829,11 +940,6 @@ def build_alert(
 # ── On-demand ticker analysis (usado pelo /analisar command) ──────────────────
 
 def analyze_ticker(symbol: str) -> str:
-    """
-    Análise completa a pedido para qualquer ticker.
-    Retorna string formatada pronta para enviar via Telegram.
-    Chamado pelo /analisar command através do poll() context.
-    """
     symbol = symbol.upper().strip()
     try:
         fund = get_fundamentals(symbol, min_market_cap=0)
@@ -1112,25 +1218,30 @@ def poll_bot_commands() -> None:
             chat_id=TELEGRAM_CHAT_ID,
             send_fn=send_telegram,
             context={
-                "get_snapshot":          _get_snapshot,
-                "DIRECT_TICKERS":        DIRECT_TICKERS,
-                "MIN_MARKET_CAP":        MIN_MARKET_CAP,
-                "MIN_DIP_SCORE":         MIN_DIP_SCORE,
-                "DROP_THRESHOLD":        DROP_THRESHOLD,
-                "get_sector_change":     get_sector_change,
-                "is_bluechip":           is_bluechip,
-                "score_badge":           score_badge,
-                "calculate_flip_target": calculate_flip_target,
-                "build_flip_ranking":    build_flip_ranking,
-                "last_tier3":            _last_tier3,
-                "FLIP_FUND_EUR":         FLIP_FUND_EUR,
-                "build_backtest_summary": build_backtest_summary,
-                "get_db_stats":          get_db_stats,
-                "fill_db_outcomes":      fill_db_outcomes,
-                # ── gap corrigido: /analisar e /comparar agora funcionam ──
-                "analyze_ticker":        analyze_ticker,
-                "get_fundamentals":      get_fundamentals,
-                "get_earnings_days":     get_earnings_days,
+                "get_snapshot":               _get_snapshot,
+                "DIRECT_TICKERS":             DIRECT_TICKERS,
+                "MIN_MARKET_CAP":             MIN_MARKET_CAP,
+                "MIN_DIP_SCORE":              MIN_DIP_SCORE,
+                "DROP_THRESHOLD":             DROP_THRESHOLD,
+                "get_sector_change":          get_sector_change,
+                "is_bluechip":                is_bluechip,
+                "score_badge":                score_badge,
+                "calculate_flip_target":      calculate_flip_target,
+                "build_flip_ranking":         build_flip_ranking,
+                "last_tier3":                 _last_tier3,
+                "FLIP_FUND_EUR":              FLIP_FUND_EUR,
+                "build_backtest_summary":     build_backtest_summary,
+                "get_db_stats":               get_db_stats,
+                "fill_db_outcomes":           fill_db_outcomes,
+                "analyze_ticker":             analyze_ticker,
+                "get_fundamentals":           get_fundamentals,
+                "get_earnings_days":          get_earnings_days,
+                # Chunk 2c — portfolio activo
+                "get_positions":              get_positions,
+                "update_position_data":       update_position_data,
+                "mark_degradation_alerted":   mark_degradation_alerted,
+                "reset_degradation_flag":     reset_degradation_flag,
+                "DEGRADATION_DROP_THRESHOLD": DEGRADATION_DROP_THRESHOLD,
             },
         )
     except Exception as e:
@@ -1145,6 +1256,7 @@ def setup_schedule() -> None:
     schedule.every(15).minutes.do(check_portfolio_stress)
     schedule.every(45).minutes.do(run_watchlist_job)
     schedule.every().day.at("15:00").do(check_recovery_alerts)
+    schedule.every().day.at("15:30").do(check_thesis_degradation)   # Chunk 2c
     schedule.every().day.at("17:30").do(check_recovery_alerts)
     schedule.every().monday.at("08:45").do(send_weekly_dip_scan)
     schedule.every().saturday.at("10:00").do(send_saturday_report)
