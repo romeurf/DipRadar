@@ -16,7 +16,7 @@ Lógica:
     para gerar dados de treino ML sem esperar 6 meses de dados live.
     F2-A: detecção de dips + scoring (anti-clustering 20d).
     F2-B: MFE/MAE/returns forward-looking + outcome_label canónico.
-    F2-C: escrita do CSV final (próxima fase).
+    F2-C: escrita do CSV idempotente + build_historical_training_set().
     Lookback fixo: 5 anos (sweet spot: apanha 2022 bear + 2023 recovery
     sem contaminar o modelo com fundamentais de empresas estruturalmente
     diferentes há mais de 5 anos).
@@ -24,6 +24,7 @@ Lógica:
 Nenhuma API key necessária — usa yfinance.history().
 """
 
+import csv
 import time
 import logging
 from datetime import datetime, timedelta
@@ -293,6 +294,37 @@ _TD_1M  = 21
 _TD_3M  = 63
 _TD_6M  = 126
 
+# Colunas do CSV de saída: super-conjunto de alert_db._FIELDS + campos extra
+# de backtest. O modelo ML apenas usa as colunas que existem em ambas as
+# fontes — o campo 'source' permite filtrar na fase de treino.
+_HIST_FIELDS = [
+    # Identificação
+    "date_iso", "symbol", "name", "sector",
+    # Classificação
+    "category", "score",
+    # Preço e mercado
+    "price", "market_cap_b", "drawdown_52w", "change_day_pct",
+    # Técnicos
+    "rsi", "volume_ratio",
+    # Fundamentais (snapshot de hoje)
+    "pe", "fcf_yield", "revenue_growth", "gross_margin",
+    "debt_equity", "dividend_yield", "analyst_upside",
+    # Outcomes forward-looking (F2-B)
+    "price_1m", "price_3m", "price_6m",
+    "return_1m", "return_3m", "return_6m",
+    "mfe_3m", "mae_3m",
+    "outcome_label",  # WIN_40 | WIN_20 | NEUTRAL | LOSS_15 | "" (pending)
+    # Metadado de rastreabilidade
+    "source",         # sempre "historical_backtest"
+]
+
+# Caminho padrão do CSV histórico (separado do alert_db.csv live)
+_HIST_DB_PATH = (
+    Path("/data/hist_backtest.csv")
+    if Path("/data").exists()
+    else Path("/tmp/hist_backtest.csv")
+)
+
 
 def _rsi_series(close_series, period: int = 14):
     """
@@ -318,10 +350,8 @@ def _drawdown_from_rolling_high(close_series, window: int = 252):
 
 def _build_hybrid_fund(info: dict, row) -> dict:
     """
-    Constrói o dicionário `fund` híbrido:
-      - Técnicos: do dia histórico (Dia 0) — sem data leakage.
-      - Fundamentais: snapshot estático de hoje (concessão necessária;
-        válida para lookback <= 5 anos).
+    Dicionário `fund` híbrido:
+      Técnicos = Dia 0 real | Fundamentais = snapshot de hoje.
     """
     price    = float(row["Close"])
     mc_today = info.get("marketCap") or 0
@@ -359,11 +389,8 @@ def _analyst_upside(info: dict) -> float:
 
 def _detect_dips(df) -> object:
     """
-    Calcula indicadores vectorizados e devolve apenas as linhas dip,
-    com anti-clustering de 20 dias de calendário.
-
-    Condições de dip (ambas obrigatórias):
-      RSI < 35  AND  Drawdown 52w < -15%
+    Indicadores vectorizados + anti-clustering 20d.
+    Condições: RSI < 35 AND Drawdown 52w < -15%.
     """
     import pandas as pd
 
@@ -396,136 +423,142 @@ def _forward_outcomes(
     category: str,
 ) -> dict:
     """
-    F2-B — Calcula todas as métricas forward-looking para um dip dado,
-    usando o DataFrame OHLCV já em memória (zero chamadas de rede).
+    F2-B — Métricas forward-looking para um dip, usando OHLCV em memória.
 
-    Janelas temporais em trading days (td):
-      T+1m  = iloc+1  ..  iloc+21   (21 td)
-      T+3m  = iloc+1  ..  iloc+63   (63 td)
-      T+6m  = iloc+1  ..  iloc+126  (126 td)
+    Janelas (trading days):
+      T+1m = iloc+21 | T+3m = iloc+63 | T+6m = iloc+126
 
-    Right-edge censor:
-      Se o dip está próximo da borda direita do dataframe (ex: dip de
-      Abril 2026 num lookback de 5 anos), a janela será truncada até ao
-      último candle disponível.  Outcomes incompletos ficam como None
-      (seráo escritos como string vazia no CSV — "pending", tal como o
-      sistema live).
+    Right-edge censor: se offset > len(df), devolve None ("pending").
 
-    MFE (Maximum Favorable Excursion):
-      Maior High dentro da janela T+3m, normalizado pelo preço de entrada.
-      Representa o melhor ponto de saída possível — métrica de qualidade
-      do dip.
+    MFE = Max(High[iloc+1..iloc+63] - price_entry) / price_entry
+    MAE = Min(Low[iloc+1..iloc+63]  - price_entry) / price_entry
 
-    MAE (Maximum Adverse Excursion):
-      Menor Low dentro da janela T+3m, normalizado pelo preço de entrada.
-      Representa o pior drawdown suportado após a entrada — métrica de risco.
-
-    outcome_label (canónico — idêntico ao alert_db._resolve_outcome_label):
-      WIN_40  : return_ref >= +40%
-      WIN_20  : return_ref >= +20%
-      NEUTRAL : return_ref >= -15%
-      LOSS_15 : return_ref <  -15%
-
-    Referência por categoria (mirror do fill_db_outcomes em alert_db.py):
-      Apartamento  → return_6m > return_3m > return_1m
-      Hold Forever → sem label (postura de posse permanente)
-      Rotação      → return_3m > return_6m > return_1m
-
-    Retorna dict com as chaves:
-      price_1m, price_3m, price_6m,
-      return_1m, return_3m, return_6m,
-      mfe_3m, mae_3m, outcome_label
-      (None quando dados insuficientes para a janela)
+    outcome_label: canónico via alert_db._resolve_outcome_label.
+      Apartamento  → 6m > 3m > 1m
+      Rotação      → 3m > 6m > 1m
+      Hold Forever → sem label
     """
     from alert_db import _resolve_outcome_label
     from score import CATEGORY_APARTAMENTO, CATEGORY_HOLD_FOREVER
 
-    total_rows   = len(df)
-    max_forward  = total_rows - dip_iloc - 1  # número de candles disponíveis após Dia 0
+    total_rows  = len(df)
+    max_forward = total_rows - dip_iloc - 1
 
     result = {
-        "price_1m":    None, "price_3m":    None, "price_6m":    None,
-        "return_1m":   None, "return_3m":   None, "return_6m":   None,
-        "mfe_3m":      None, "mae_3m":      None,
-        "outcome_label": "",
+        "price_1m":  None, "price_3m":  None, "price_6m":  None,
+        "return_1m": None, "return_3m": None, "return_6m": None,
+        "mfe_3m": None, "mae_3m": None, "outcome_label": "",
     }
 
     if max_forward <= 0 or price_entry <= 0:
         return result
 
-    def _close_at(offset_td: int) -> float | None:
-        """
-        Preço de fecho exato no offset `offset_td` trading days após Dia 0.
-        Se esse offset ultrapassar a borda direita (right-edge censor),
-        devolve None — o campo ficará pendente.
-        """
-        target_iloc = dip_iloc + offset_td
-        if target_iloc >= total_rows:
-            return None
-        return float(df["Close"].iloc[target_iloc])
+    def _close_at(offset_td):
+        t = dip_iloc + offset_td
+        return float(df["Close"].iloc[t]) if t < total_rows else None
 
-    def _slice_forward(offset_end_td: int):
-        """
-        Slice df.iloc[dip_iloc+1 : dip_iloc+offset_end_td+1].
-        Trunca na borda direita sem erro.
-        """
-        start = dip_iloc + 1
-        end   = min(dip_iloc + offset_end_td + 1, total_rows)
-        if start >= total_rows:
-            return None
-        return df.iloc[start:end]
+    def _slice_forward(end_td):
+        s, e = dip_iloc + 1, min(dip_iloc + end_td + 1, total_rows)
+        return df.iloc[s:e] if s < total_rows else None
 
-    # ── T+1m (21 td) ────────────────────────────────────────────────
     p1m = _close_at(_TD_1M)
-    if p1m is not None:
+    if p1m:
         result["price_1m"]  = round(p1m, 4)
         result["return_1m"] = round((p1m - price_entry) / price_entry * 100, 2)
 
-    # ── T+3m (63 td) — inclui MFE/MAE ──────────────────────────────
     p3m = _close_at(_TD_3M)
-    if p3m is not None:
+    if p3m:
         result["price_3m"]  = round(p3m, 4)
         result["return_3m"] = round((p3m - price_entry) / price_entry * 100, 2)
 
-    # MFE/MAE: calcula sempre que há pelo menos 1 candle forward,
-    # mesmo que T+3m ainda não esteja completo (right-edge parcial)
-    sl_3m = _slice_forward(_TD_3M)
-    if sl_3m is not None and not sl_3m.empty:
-        mfe = (sl_3m["High"].max() - price_entry) / price_entry * 100
-        mae = (sl_3m["Low"].min()  - price_entry) / price_entry * 100
-        result["mfe_3m"] = round(mfe, 2)
-        result["mae_3m"] = round(mae, 2)
+    sl = _slice_forward(_TD_3M)
+    if sl is not None and not sl.empty:
+        result["mfe_3m"] = round((sl["High"].max() - price_entry) / price_entry * 100, 2)
+        result["mae_3m"] = round((sl["Low"].min()  - price_entry) / price_entry * 100, 2)
 
-    # ── T+6m (126 td) ───────────────────────────────────────────────
     p6m = _close_at(_TD_6M)
-    if p6m is not None:
+    if p6m:
         result["price_6m"]  = round(p6m, 4)
         result["return_6m"] = round((p6m - price_entry) / price_entry * 100, 2)
 
-    # ── outcome_label canónico (mirror de alert_db._resolve_outcome_label) ──
-    #
-    # Hold Forever: nunca recebe label — postura de posse permanente
     if CATEGORY_HOLD_FOREVER not in category:
-        # Prioridade por categoria (idêntico ao fill_db_outcomes):
-        #   Apartamento  → 6m > 3m > 1m
-        #   Rotação      → 3m > 6m > 1m
-        if CATEGORY_APARTAMENTO in category:
-            priority_fields = ("return_6m", "return_3m", "return_1m")
-        else:
-            priority_fields = ("return_3m", "return_6m", "return_1m")
-
-        ref_return = None
-        for field in priority_fields:
+        prio = (
+            ("return_6m", "return_3m", "return_1m")
+            if CATEGORY_APARTAMENTO in category
+            else ("return_3m", "return_6m", "return_1m")
+        )
+        for field in prio:
             val = result.get(field)
             if val is not None:
-                ref_return = val
+                result["outcome_label"] = _resolve_outcome_label(val)
                 break
 
-        if ref_return is not None:
-            result["outcome_label"] = _resolve_outcome_label(ref_return)
-        # Se ref_return ainda é None: dip recente, censor — label fica ""
-
     return result
+
+
+# ── F2-C: CSV writer + idempotency + public entry-point ───────────────
+
+def _load_existing_keys(csv_path: Path) -> set:
+    """
+    Lê o CSV existente e devolve um set de chaves compostas
+    (symbol, date_iso) para evitar duplicados.
+
+    Idempotência: re-correr o build_historical_training_set() não
+    duplica linhas — apenas acrescenta dips novos ou substitui
+    dips com label pendente que entretanto ficaram resolvidos.
+    """
+    keys: set = set()
+    if not csv_path.exists():
+        return keys
+    try:
+        with csv_path.open("r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                sym  = row.get("symbol", "")
+                date = row.get("date_iso", "")
+                if sym and date:
+                    keys.add((sym, date))
+    except Exception as e:
+        logging.warning(f"[hist_csv] Erro a ler chaves existentes: {e}")
+    return keys
+
+
+def _write_hist_csv(
+    dip_rows: list[dict],
+    csv_path: Path,
+    existing_keys: set,
+) -> int:
+    """
+    Acrescenta ao CSV apenas as linhas que ainda não existem
+    (guard by existing_keys).
+
+    Cria o ficheiro com cabeçalho se não existir.
+    Devolve o número de linhas efectivamente escritas.
+    """
+    new_rows = [
+        r for r in dip_rows
+        if (r["symbol"], r["date_iso"]) not in existing_keys
+    ]
+    if not new_rows:
+        logging.info("[hist_csv] Nenhuma linha nova para escrever.")
+        return 0
+
+    write_header = not csv_path.exists()
+    try:
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with csv_path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=_HIST_FIELDS,
+                extrasaction="ignore",  # ignora campos extra do dip_record
+            )
+            if write_header:
+                writer.writeheader()
+            writer.writerows(new_rows)
+        logging.info(f"[hist_csv] {len(new_rows)} linha(s) escritas em {csv_path}")
+        return len(new_rows)
+    except Exception as e:
+        logging.error(f"[hist_csv] Erro ao escrever CSV: {e}")
+        return 0
 
 
 def run_historical_backtest(
@@ -538,59 +571,35 @@ def run_historical_backtest(
     dry_run: bool = False,
 ) -> dict:
     """
-    F2 — Simula dips históricos para gerar dados de treino ML retroactivos.
+    F2 (A+B) — Motor interno: detecção de dips + outcomes forward-looking.
 
-    F2-A: detecção de dips + scoring + anti-clustering 20d.
-    F2-B: MFE/MAE/returns forward-looking + outcome_label canónico
-          (WIN_40/WIN_20/NEUTRAL/LOSS_15) + right-edge censor.
-    F2-C (próxima fase): escrita do CSV com estrutura _FIELDS do alert_db.
-
-    Garantias anti-data-leakage:
-      - RSI, drawdown, volume: calculados apenas com dados [0..Dia_0].
-      - MFE/MAE/returns: calculados apenas com dados [Dia_0+1..fim].
-      - Fundamentais: snapshot de hoje (concessão; válida para <= 5 anos).
-      - outcome_label: usa a função canónica de alert_db.py —
-        live e backtest falam a mesma língua.
-
-    Argumentos:
-      tickers            : lista de símbolos a processar
-      output_path        : caminho do CSV (None = auto, usado em F2-C)
-      lookback_years     : anos de histórico (default fixo: 5)
-      min_score          : score mínimo para incluir o dip (default: 45)
-      rsi_threshold      : threshold RSI (referencial; aplicado em _detect_dips)
-      drawdown_threshold : drawdown mínimo % (referencial; aplicado em _detect_dips)
-      dry_run            : se True, não grava nada (F2-C responsável pela escrita)
+    Preferência: chama build_historical_training_set() para a orquestração
+    completa com escrita CSV (F2-C). Esta função é mantida pública para
+    testes unitários e dry_run.
 
     Retorna dict:
-      total_dips : int   — dips detectados antes do filtro de score
-      written    : int   — dips que passaram min_score e têm dip_record completo
-      skipped    : int   — dips abaixo de min_score
-      censored   : int   — dips recentes sem outcome_label (right-edge)
-      errors     : int   — tickers/dips com falha
-      dip_rows   : list  — lista de dicts prontos para F2-C (CSV)
+      total_dips, written, skipped, censored, errors, dip_rows
     """
     from score import calculate_dip_score, classify_dip_category, is_bluechip
 
     stats: dict = {
         "total_dips": 0, "written": 0, "skipped": 0,
-        "censored": 0,   "errors":  0, "dip_rows": [],
+        "censored":   0, "errors":  0, "dip_rows": [],
     }
 
     for symbol in tickers:
         logging.info(f"[hist_backtest] A processar {symbol}...")
         try:
-            time.sleep(2)  # rate limit gentil
+            time.sleep(2)
             ticker_obj = yf.Ticker(symbol)
             info       = ticker_obj.info or {}
 
-            # Descarregar OHLCV (5 anos) — uma única chamada de rede por ticker
             df_full = ticker_obj.history(period=f"{lookback_years}y", interval="1d")
             if df_full is None or df_full.empty or len(df_full) < 30:
                 logging.warning(f"[hist_backtest] {symbol}: histórico insuficiente")
                 stats["errors"] += 1
                 continue
 
-            # Detectar dips vectorizados (já com indicadores calculados)
             dip_df = _detect_dips(df_full)
             if dip_df.empty:
                 logging.info(f"[hist_backtest] {symbol}: nenhum dip detectado")
@@ -599,10 +608,7 @@ def run_historical_backtest(
             logging.info(f"[hist_backtest] {symbol}: {len(dip_df)} dip(s) candidatos")
             stats["total_dips"] += len(dip_df)
 
-            # Reconstruir o df_full com as colunas calculadas por _detect_dips
-            # para poder usar iloc corretamente no _forward_outcomes.
-            # _detect_dips devolve um subset do df já com as colunas; precisamos
-            # do df completo com as mesmas colunas para o slicing forward.
+            # Recalcular indicadores no df_full completo para o slicing forward
             df_full = df_full.copy()
             df_full["rsi_14"]       = _rsi_series(df_full["Close"])
             df_full["drawdown_52w"] = _drawdown_from_rolling_high(df_full["Close"], window=252)
@@ -611,8 +617,8 @@ def run_historical_backtest(
 
             for dip_date, row in dip_df.iterrows():
                 try:
-                    fund = _build_hybrid_fund(info, row)
-                    score, _rsi_str = calculate_dip_score(
+                    fund  = _build_hybrid_fund(info, row)
+                    score, _ = calculate_dip_score(
                         fundamentals=fund,
                         symbol=symbol,
                         sector_change=None,
@@ -621,66 +627,54 @@ def run_historical_backtest(
 
                     if score < min_score:
                         stats["skipped"] += 1
-                        logging.debug(
-                            f"[hist_backtest] {symbol} {dip_date.date()} — "
-                            f"score {score:.0f} < {min_score} — ignorado"
-                        )
                         continue
 
                     bc_flag  = is_bluechip(fund)
                     category = classify_dip_category(fund, score, bc_flag)
-
-                    # ── F2-B: forward-looking outcomes ────────────────────
-                    # Localizar o índice iloc do dip no df_full (O(log n) via searchsorted)
                     dip_iloc = df_full.index.get_loc(dip_date)
 
                     outcomes = _forward_outcomes(
-                        df       = df_full,
-                        dip_iloc = dip_iloc,
-                        price_entry = float(row["Close"]),
-                        category    = category,
+                        df=df_full, dip_iloc=dip_iloc,
+                        price_entry=float(row["Close"]), category=category,
                     )
 
                     if outcomes["outcome_label"] == "":
-                        stats["censored"] += 1  # dip recente: right-edge
+                        stats["censored"] += 1
+
+                    vol_ratio = ""
+                    if row["avg_vol_20d"] and row["avg_vol_20d"] > 0:
+                        vol_ratio = round(float(row["Volume"]) / float(row["avg_vol_20d"]), 2)
 
                     dip_record = {
-                        # ── Identificação ──
-                        "symbol":       symbol,
-                        "date_iso":     dip_date.date().isoformat(),
-                        "price":        round(float(row["Close"]), 4),
-                        "score":        round(score, 1),
-                        # ── Técnicos do Dia 0 ──
-                        "rsi":          round(float(row["rsi_14"]), 1) if row["rsi_14"] == row["rsi_14"] else "",
-                        "drawdown_52w": round(float(row["drawdown_52w"]), 2),
-                        "volume_ratio": round(float(row["Volume"]) / float(row["avg_vol_20d"]), 2)
-                                        if row["avg_vol_20d"] and row["avg_vol_20d"] > 0 else "",
+                        "symbol":         symbol,
+                        "date_iso":       dip_date.date().isoformat(),
+                        "price":          round(float(row["Close"]), 4),
+                        "score":          round(score, 1),
+                        "rsi":            round(float(row["rsi_14"]), 1) if row["rsi_14"] == row["rsi_14"] else "",
+                        "drawdown_52w":   round(float(row["drawdown_52w"]), 2),
+                        "volume_ratio":   vol_ratio,
                         "change_day_pct": round(float(row["change_pct"]), 2) if row["change_pct"] == row["change_pct"] else "",
-                        # ── Classificação ──
-                        "category":     category,
-                        "sector":       fund.get("sector", ""),
-                        "name":         fund.get("name", ""),
-                        # ── Fundamentais estáticos de hoje (snapshot) ──
-                        "market_cap_b": round((fund.get("market_cap") or 0) / 1e9, 2),
-                        "fcf_yield":    round(fund["fcf_yield"], 4) if fund.get("fcf_yield") is not None else "",
-                        "gross_margin": round(fund.get("gross_margin") or 0, 4),
+                        "category":       category,
+                        "sector":         fund.get("sector", ""),
+                        "name":           fund.get("name", ""),
+                        "market_cap_b":   round((fund.get("market_cap") or 0) / 1e9, 2),
+                        "fcf_yield":      round(fund["fcf_yield"], 4) if fund.get("fcf_yield") is not None else "",
+                        "gross_margin":   round(fund.get("gross_margin") or 0, 4),
                         "revenue_growth": round(fund.get("revenue_growth") or 0, 4),
-                        "debt_equity":  fund.get("debt_equity") or "",
+                        "debt_equity":    fund.get("debt_equity") or "",
                         "dividend_yield": round(fund.get("dividend_yield") or 0, 4),
-                        "pe":           fund.get("pe") or "",
+                        "pe":             fund.get("pe") or "",
                         "analyst_upside": fund.get("analyst_upside") or 0,
-                        # ── F2-B: outcomes forward-looking ──
-                        "price_1m":     outcomes["price_1m"] if outcomes["price_1m"] is not None else "",
-                        "price_3m":     outcomes["price_3m"] if outcomes["price_3m"] is not None else "",
-                        "price_6m":     outcomes["price_6m"] if outcomes["price_6m"] is not None else "",
-                        "return_1m":    outcomes["return_1m"] if outcomes["return_1m"] is not None else "",
-                        "return_3m":    outcomes["return_3m"] if outcomes["return_3m"] is not None else "",
-                        "return_6m":    outcomes["return_6m"] if outcomes["return_6m"] is not None else "",
-                        "mfe_3m":       outcomes["mfe_3m"] if outcomes["mfe_3m"] is not None else "",
-                        "mae_3m":       outcomes["mae_3m"] if outcomes["mae_3m"] is not None else "",
-                        "outcome_label": outcomes["outcome_label"],  # "" = pending (censored)
-                        # ── Metadado ──
-                        "source":       "historical_backtest",
+                        "price_1m":  outcomes["price_1m"]  if outcomes["price_1m"]  is not None else "",
+                        "price_3m":  outcomes["price_3m"]  if outcomes["price_3m"]  is not None else "",
+                        "price_6m":  outcomes["price_6m"]  if outcomes["price_6m"]  is not None else "",
+                        "return_1m": outcomes["return_1m"] if outcomes["return_1m"] is not None else "",
+                        "return_3m": outcomes["return_3m"] if outcomes["return_3m"] is not None else "",
+                        "return_6m": outcomes["return_6m"] if outcomes["return_6m"] is not None else "",
+                        "mfe_3m":    outcomes["mfe_3m"]    if outcomes["mfe_3m"]    is not None else "",
+                        "mae_3m":    outcomes["mae_3m"]    if outcomes["mae_3m"]    is not None else "",
+                        "outcome_label": outcomes["outcome_label"],
+                        "source":        "historical_backtest",
                     }
 
                     stats["dip_rows"].append(dip_record)
@@ -689,11 +683,9 @@ def run_historical_backtest(
                     logging.info(
                         f"[hist_backtest] \u2714 {symbol} {dip_date.date()} | "
                         f"score={score:.0f} | rsi={dip_record['rsi']} | "
-                        f"dd={dip_record['drawdown_52w']:.1f}% | "
-                        f"cat={category} | "
-                        f"r3m={outcomes['return_3m']} | "
-                        f"mfe={outcomes['mfe_3m']} | mae={outcomes['mae_3m']} | "
-                        f"label={outcomes['outcome_label'] or 'pending'}"
+                        f"dd={dip_record['drawdown_52w']:.1f}% | cat={category} | "
+                        f"r3m={outcomes['return_3m']} | mfe={outcomes['mfe_3m']} | "
+                        f"mae={outcomes['mae_3m']} | label={outcomes['outcome_label'] or 'pending'}"
                     )
 
                 except Exception as e:
@@ -705,11 +697,90 @@ def run_historical_backtest(
             stats["errors"] += 1
 
     logging.info(
-        f"[hist_backtest] Concluído — "
-        f"total_dips={stats['total_dips']} | "
-        f"escritos={stats['written']} | "
-        f"ignorados={stats['skipped']} | "
-        f"censurados={stats['censored']} | "
-        f"erros={stats['errors']}"
+        f"[hist_backtest] Concluído — total={stats['total_dips']} | "
+        f"escritos={stats['written']} | ignorados={stats['skipped']} | "
+        f"censurados={stats['censored']} | erros={stats['errors']}"
+    )
+    return stats
+
+
+def build_historical_training_set(
+    tickers: list[str],
+    output_path: Path | None = None,
+    min_score: float = 45.0,
+    dry_run: bool = False,
+) -> dict:
+    """
+    F2-C — Ponto de entrada público do pipeline histórico completo.
+
+    Orquestra F2-A + F2-B + escrita CSV idempotente:
+      1. Chama run_historical_backtest() para detectar dips e calcular
+         todos os outcomes forward-looking (A+B).
+      2. Carrega as chaves (symbol, date_iso) já presentes no CSV para
+         evitar duplicados (idempotência total).
+      3. Escreve apenas as linhas novas no CSV histórico.
+      4. Reporta stats completas ao chamador.
+
+    O CSV de saída (hist_backtest.csv) tem a mesma estrutura de colunas
+    que alert_db.csv para todas as features de ML partilhadas. O campo
+    'source="historical_backtest"' distingue as duas origens.
+
+    Uso típico (Railway, via main.py ou one-shot):
+      from config import WATCHLIST
+      from backtest import build_historical_training_set
+      stats = build_historical_training_set(tickers=WATCHLIST)
+      print(stats)
+
+    Argumentos:
+      tickers     : lista de símbolos
+      output_path : caminho do CSV (None = _HIST_DB_PATH auto)
+      min_score   : score mínimo (default: 45)
+      dry_run     : se True, não grava nada — devolve stats e dip_rows
+
+    Retorna dict:
+      total_dips : dips detectados antes do filtro score
+      written    : dips que passaram score + foram adicionados ao CSV
+      skipped    : dips abaixo de min_score
+      censored   : dips recentes sem outcome_label (right-edge)
+      duplicates : dips já existentes no CSV (ignorados)
+      errors     : falhas de ticker/dip
+      csv_path   : str — caminho do CSV escrito (ou None em dry_run)
+      dip_rows   : list — todos os dip_records (incluindo duplicados)
+    """
+    csv_path = output_path or _HIST_DB_PATH
+
+    # F2-A + F2-B
+    stats = run_historical_backtest(
+        tickers=tickers,
+        output_path=csv_path,
+        min_score=min_score,
+        dry_run=dry_run,
+    )
+
+    dip_rows = stats.get("dip_rows", [])
+
+    if dry_run:
+        logging.info(f"[hist_csv] dry_run=True — {len(dip_rows)} linhas geradas, sem escrita.")
+        stats["duplicates"] = 0
+        stats["csv_path"]   = None
+        return stats
+
+    # F2-C: idempotência + escrita
+    existing_keys = _load_existing_keys(csv_path)
+    duplicates    = sum(
+        1 for r in dip_rows
+        if (r["symbol"], r["date_iso"]) in existing_keys
+    )
+
+    written_now = _write_hist_csv(dip_rows, csv_path, existing_keys)
+
+    stats["written"]    = written_now  # substitui o contador interno
+    stats["duplicates"] = duplicates
+    stats["csv_path"]   = str(csv_path)
+
+    logging.info(
+        f"[hist_csv] Pipeline completo — "
+        f"novas={written_now} | duplicados={duplicates} | "
+        f"censurados={stats['censored']} | CSV={csv_path}"
     )
     return stats
