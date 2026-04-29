@@ -999,7 +999,7 @@ def analyze_ticker(symbol: str) -> str:
         }
         ml_result = ml_score(ml_features)
               
-      # ── Score V2 Engine (Chunk 9) ──────────────────────────────
+        # ── Score V2 Engine (Chunk 9) ──────────────────────────────
         ml_prob_v2 = ml_result.win_prob if ml_result.model_ready else None
         score_data = score_from_fundamentals(fund, ml_prob=ml_prob_v2)
         score      = score_data["final_score"]
