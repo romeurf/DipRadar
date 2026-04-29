@@ -12,7 +12,7 @@ Comandos disponíveis:
   /rejeitados              → Log de rejeitados de hoje
   /tier3                   → Gems Raras do último resumo de fecho (score ≥80)
   /watchlist               → Ver watchlist dinâmica actual
-  /watchlist add TICK      → Adicionar ticker à watchlist
+  /watchlist add TICK      → Adicionar ticker à watchlist (suporta IEMA.L, IS3N.AS, ALV.DE, etc.)
   /watchlist rm TICK       → Remover ticker da watchlist
   /watchlist clear         → Limpar toda a watchlist dinâmica
   /flip                    → Ver log e P&L do Flip Fund
@@ -366,8 +366,9 @@ def _handle_admin_backfill_ml() -> None:
     dynamic = load_dynamic_watchlist()
     static  = []
     try:
-        from config import WATCHLIST as _STATIC_WL
-        static = list(_STATIC_WL)
+        # fix: importar de watchlist (lista de dicts), não de config
+        from watchlist import WATCHLIST as _STATIC_WL
+        static = [e["symbol"] for e in _STATIC_WL]
     except Exception:
         pass
     tickers = list(dict.fromkeys(dynamic + static))
@@ -647,11 +648,14 @@ def _handle_watchlist(parts: list[str]) -> None:
         _reply("\n".join(lines))
     elif sub in ("add", "adicionar", "+"):
         if len(parts) < 3:
-            _reply("⚠️ Uso: `/watchlist add <TICKER>`")
+            _reply("⚠️ Uso: `/watchlist add <TICKER>`\n_Exemplos: `AAPL`, `IEMA.L`, `IS3N.AS`, `ALV.DE`_")
             return
-        ticker = parts[2].upper().strip().split(".")[0]
-        if len(ticker) > 10 or not ticker.isalpha():
-            _reply(f"⚠️ Ticker inválido: `{ticker}`")
+        # Preserva sufixo de exchange (ex: .L, .AS, .DE) — não faz split no ponto
+        ticker = parts[2].upper().strip()
+        # Valida: até 15 chars, só letras/números/ponto/hífen (ex: BRK-B, IS3N.AS)
+        ticker_clean = ticker.replace(".", "").replace("-", "").replace("_", "")
+        if len(ticker) > 15 or not ticker_clean.isalnum() or not ticker_clean:
+            _reply(f"⚠️ Ticker inválido: `{ticker}`\n_Exemplos válidos: `AAPL`, `IEMA.L`, `ALV.DE`, `BRK-B`_")
             return
         added = add_to_dynamic_watchlist(ticker)
         if added:
@@ -1075,7 +1079,7 @@ def _handle_command(text: str) -> None:
             "`/rejeitados`              → Rejeitados de hoje\n"
             "`/tier3`                   → Gems Raras (score ≥80)\n"
             "`/watchlist`               → Ver watchlist dinâmica\n"
-            "`/watchlist add TICK`      → Adicionar ticker\n"
+            "`/watchlist add TICK`      → Adicionar ticker (ex: IEMA.L, ALV.DE)\n"
             "`/watchlist rm TICK`       → Remover ticker\n"
             "`/watchlist clear`         → Limpar watchlist\n"
             "`/flip`                    → P&L e trades abertos\n"
