@@ -20,7 +20,7 @@ Cache write-through:
 
 Compatibilidade com código legado:
   HOLDINGS            — list[(ticker, shares, avg_cost)] lida de env HOLDING_<TICKER>=shares,avg_cost
-  CASHBACK_EUR_VALUES — dict[ticker, eur_value] lida de env CASHBACK_<TICKER>=value
+  CASHBACK_EUR_VALUES — dict vazio (cashback eliminado; posições migradas para HOLDING_<TICKER>)
   PPR_SHARES          — float lido de env PPR_SHARES
   PPR_AVG_COST        — float lido de env PPR_AVG_COST
   DIRECT_TICKERS / CASHBACK_TICKERS — mantidos para não quebrar imports.
@@ -44,8 +44,9 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────
 # Compatibilidade legado
 # ─────────────────────────────────────────────────────────────────────────
-DIRECT_TICKERS   = ["NVO", "ADBE", "UBER", "EUNL", "MSFT", "PINS", "ADP", "CRM", "VICI"]
-CASHBACK_TICKERS = ["CRWD", "PLTR", "NOW", "DUOL"]
+DIRECT_TICKERS   = ["NVO", "ADBE", "UBER", "EUNL", "MSFT", "PINS", "ADP", "CRM", "VICI",
+                    "CRWD", "PLTR", "NOW", "DUOL"]
+CASHBACK_TICKERS: list = []  # eliminado — posições migradas para HOLDING_<TICKER>
 
 USD_TICKERS = {
     "NVO", "ADBE", "UBER", "MSFT", "PINS", "ADP", "CRM", "VICI",
@@ -69,8 +70,9 @@ FLIP_FUND_EUR = _float_env("FLIP_FUND_EUR")
 # HOLDINGS: lê env vars com o padrão HOLDING_<TICKER>=shares,avg_cost
 #   Ex: HOLDING_NVO=25,87.50  →  ("NVO", 25.0, 87.50)
 #
-# CASHBACK_EUR_VALUES: lê env vars com o padrão CASHBACK_<TICKER>=eur_value
-#   Ex: CASHBACK_CRWD=340.00  →  {"CRWD": 340.0}
+# CASHBACK_EUR_VALUES: dict vazio — cashback eliminado.
+#   As antigas posições CASHBACK_CRWD, CASHBACK_PLTR, etc. estão agora
+#   em HOLDING_CRWD, HOLDING_PLTR, etc. com shares e avg_cost reais.
 #
 # PPR_SHARES / PPR_AVG_COST: lidos directamente de env vars homónimas
 # ─────────────────────────────────────────────────────────────────────────
@@ -94,25 +96,9 @@ def _parse_holdings_env() -> list[tuple[str, float, float]]:
     return result
 
 
-def _parse_cashback_env() -> dict[str, float]:
-    """Constrói CASHBACK_EUR_VALUES a partir das env vars CASHBACK_<TICKER>=eur_value."""
-    result: dict[str, float] = {}
-    for key, val in os.environ.items():
-        if not key.startswith("CASHBACK_"):
-            continue
-        ticker = key[len("CASHBACK_"):].strip().upper()
-        if not ticker:
-            continue
-        try:
-            result[ticker] = float(val)
-        except (ValueError, TypeError):
-            log.warning(f"[portfolio] env var malformada: {key}={val}")
-    return result
-
-
 # Variáveis públicas exigidas pelo main.py
 HOLDINGS: list[tuple[str, float, float]] = _parse_holdings_env()
-CASHBACK_EUR_VALUES: dict[str, float]    = _parse_cashback_env()
+CASHBACK_EUR_VALUES: dict[str, float]    = {}  # cashback eliminado
 PPR_SHARES   = _float_env("PPR_SHARES")
 PPR_AVG_COST = _float_env("PPR_AVG_COST")
 
