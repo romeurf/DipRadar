@@ -20,6 +20,7 @@ Comandos disponíveis:
   /flip close ID EXIT                  → Fechar trade pelo ID com preço de saída
   /flip del ID                         → Apagar trade pelo ID
   /mldata                  → Estatísticas da base de dados ML + forçar update de outcomes
+  /admin_backfill_ml       → [ADMIN] Semear hist_backtest.csv com 5 anos de dips históricos
   /help                    → Lista de comandos
 """
 
@@ -51,6 +52,9 @@ _EARNINGS_ALERT_DAYS: int = int(os.environ.get("EARNINGS_ALERT_DAYS", 7))
 
 _last_update_id: int = 0
 _bot_start_time: datetime = datetime.now()
+
+# Flag de segurança: evita lançar dois backfills em simultâneo
+_backfill_running: bool = False
 
 # Callbacks injectados pelo main.py via register_callbacks() ou poll()
 _cb_send_telegram    = None
@@ -349,11 +353,6 @@ def _handle_mldata(force_update: bool = False) -> None:
 
         if by_cat:
             lines.append("*🏠 Por categoria:*")
-            cat_emojis = {
-                "🏗️ Hold Forever": "🏗️",
-                "🏠 Apartamento":   "🏠",
-                "🔄 Rotação":       "🔄",
-            }
             for cat, count in sorted(by_cat.items(), key=lambda x: x[1], reverse=True):
                 pct = count / total * 100 if total > 0 else 0
                 lines.append(f"  {cat}: *{count}* ({pct:.0f}%)")
@@ -377,7 +376,6 @@ def _handle_mldata(force_update: bool = False) -> None:
                 lines.append(f"  {em} {label}: *{count}* ({pct:.0f}%)")
             lines.append("")
 
-            # Win rate calculado
             wins   = outcomes.get("WIN_40", 0) + outcomes.get("WIN_20", 0)
             losses = outcomes.get("LOSS_15", 0)
             if labeled > 0:
@@ -387,14 +385,12 @@ def _handle_mldata(force_update: bool = False) -> None:
                     lines.append(f"  ⚠️ *Value Traps detectadas:* {losses} ({losses/labeled*100:.0f}%)")
             lines.append("")
 
-        # Se houve update, mostrar stats do update
         if update_stats:
             lines.append(f"*✅ Update concluído:* {update_stats.get('updated', 0)} novas classificações")
             if update_stats.get('errors', 0) > 0:
                 lines.append(f"  ⚠️ Erros: {update_stats['errors']}")
             lines.append("")
 
-        # Progresso para treino do modelo
         if total == 0:
             lines.append("🕐 _Base de dados vazia — aguarda os primeiros alertas._")
         elif labeled < 50:
@@ -414,6 +410,148 @@ def _handle_mldata(force_update: bool = False) -> None:
         _reply("\n".join(lines))
 
     threading.Thread(target=_run, daemon=True).start()
+
+
+# ── /admin_backfill_ml ────────────────────────────────────────────────────────────────
+
+def _handle_admin_backfill_ml() -> None:
+    """
+    Comando de administrador (escondido do /help) para semear o hist_backtest.csv
+    com 5 anos de dips históricos.
+
+    Comportamento:
+      - Só pode correr uma instância de cada vez (_backfill_running flag).
+      - Responde imediatamente com mensagem de arranque para não bloquear o bot.
+      - Corre build_historical_training_set() numa daemon thread.
+      - Quando termina, formata e envia o relatório de stats para o Telegram.
+
+    Idempotência: pode ser chamado múltiplas vezes em segurança.
+    O _write_hist_csv() interno garante que nunca duplica linhas.
+    """
+    global _backfill_running
+
+    if _backfill_running:
+        _reply(
+            "⚠️ *Backfill já está a correr.*\n"
+            "_Aguarda a conclusão antes de lançar novamente._"
+        )
+        return
+
+    # Resolver watchlist: dinâmica + estática (WATCHLIST do config)
+    dynamic = load_dynamic_watchlist()
+    static  = []
+    try:
+        from config import WATCHLIST as _STATIC_WL
+        static = list(_STATIC_WL)
+    except Exception:
+        pass
+    tickers = list(dict.fromkeys(dynamic + static))  # dedup, preserva ordem
+
+    if not tickers:
+        _reply(
+            "⚠️ *Watchlist vazia.*\n"
+            "_Adiciona tickers com `/watchlist add TICK` antes de fazer backfill._"
+        )
+        return
+
+    n = len(tickers)
+    _reply(
+        f"⏳ *A iniciar a Máquina do Tempo* — {n} ticker(s) | lookback 5 anos\n"
+        f"_Isto pode demorar {n * 4 // 60 + 1}–{n * 6 // 60 + 2} minutos..._\n"
+        f"_O bot continua a responder durante o processo._"
+    )
+    logging.info(f"[admin_backfill] Iniciando para {n} tickers: {tickers}")
+
+    def _run():
+        global _backfill_running
+        _backfill_running = True
+        start_ts = time.time()
+        try:
+            from backtest import build_historical_training_set
+            stats = build_historical_training_set(tickers=tickers)
+            elapsed = int(time.time() - start_ts)
+            mins, secs = divmod(elapsed, 60)
+
+            # ── Formatar relatório de stats ─────────────────────────────────
+            total    = stats.get("total_dips", 0)
+            written  = stats.get("written", 0)
+            skipped  = stats.get("skipped", 0)
+            censored = stats.get("censored", 0)
+            dupes    = stats.get("duplicates", 0)
+            errors   = stats.get("errors", 0)
+            csv_path = stats.get("csv_path") or "N/D"
+
+            # Calcular distribuição de outcome_labels
+            dip_rows = stats.get("dip_rows", [])
+            label_counts: dict = {}
+            for row in dip_rows:
+                lbl = row.get("outcome_label") or "pending"
+                label_counts[lbl] = label_counts.get(lbl, 0) + 1
+
+            label_emoji = {
+                "WIN_40":  "🟢",
+                "WIN_20":  "✅",
+                "NEUTRAL": "🟡",
+                "LOSS_15": "🔴",
+                "pending": "⏳",
+            }
+
+            lines = [
+                f"✅ *Backfill ML concluído!*",
+                f"_{datetime.now().strftime('%d/%m/%Y %H:%M')} — {mins}m{secs:02d}s_",
+                "",
+                f"*🗂️ Ficheiro:* `{csv_path}`",
+                "",
+                "*📊 Pipeline stats:*",
+                f"  📡 Dips detectados:  *{total}*",
+                f"  ✍️  Escritos no CSV: *{written}*",
+                f"  🚫 Ignorados (score): *{skipped}*",
+                f"  ⏳ Censurados (edge): *{censored}*",
+                f"  🔁 Duplicados (skip): *{dupes}*",
+            ]
+            if errors > 0:
+                lines.append(f"  ⚠️ Erros de ticker:  *{errors}*")
+            lines.append("")
+
+            if label_counts:
+                lines.append("*🎯 Distribuição de outcomes:*")
+                for lbl, cnt in sorted(label_counts.items(), key=lambda x: x[1], reverse=True):
+                    em  = label_emoji.get(lbl, "📊")
+                    pct = cnt / len(dip_rows) * 100 if dip_rows else 0
+                    lines.append(f"  {em} {lbl}: *{cnt}* ({pct:.0f}%)")
+                lines.append("")
+
+            # Conselho sobre próximo passo
+            total_labeled = sum(
+                cnt for lbl, cnt in label_counts.items() if lbl != "pending"
+            )
+            if total_labeled >= 100:
+                lines.append("🟢 *Pronto para treinar o modelo ML!*")
+                lines.append("_Usa `/mldata` para ver o estado completo._")
+            elif total_labeled >= 50:
+                lines.append(f"🟡 *{total_labeled} outcomes classificados* — quase a chegar aos 100.")
+                lines.append("_Adiciona mais tickers à watchlist e volta a correr._")
+            else:
+                lines.append(f"🕐 *{total_labeled} outcomes classificados* — precisa de mais dados.")
+                lines.append("_Aumenta a watchlist ou aguarda dados live._")
+
+            _reply("\n".join(lines))
+            logging.info(
+                f"[admin_backfill] Concluído em {mins}m{secs:02d}s — "
+                f"escrito={written} | ignorado={skipped} | censurado={censored} | erro={errors}"
+            )
+
+        except Exception as e:
+            logging.error(f"[admin_backfill] Erro fatal: {e}")
+            _reply(
+                f"❌ *Backfill falhou com erro:*\n"
+                f"`{e}`\n"
+                "_Verifica os logs no Railway para mais detalhes._"
+            )
+        finally:
+            _backfill_running = False
+
+    threading.Thread(target=_run, daemon=True, name="admin-backfill").start()
 
 
 # ── Earnings alerts (chamado pelo scheduler do main.py) ────────────────────────
@@ -536,7 +674,6 @@ def _handle_watchlist(parts: list[str]) -> None:
 def _handle_flip(parts: list[str]) -> None:
     sub = parts[1].lower() if len(parts) > 1 else "summary"
 
-    # ── Resumo / lista ───────────────────────────────────────────────────────────
     if sub in ("summary", "list", "ls", "ver", "show") or len(parts) == 1:
         summary = get_flip_summary()
         lines = [
@@ -566,7 +703,7 @@ def _handle_flip(parts: list[str]) -> None:
                     f" (desde {t['date_entry']}){notes_str}"
                 )
         else:
-            lines += ["", "_Sem posições abertas._"]
+            lines += ["", "_Sem posições abertas._")
 
         if sub in ("list", "ls"):
             closed = summary["trades_closed"]
@@ -591,7 +728,6 @@ def _handle_flip(parts: list[str]) -> None:
         _reply("\n".join(lines))
         return
 
-    # ── /flip add ──────────────────────────────────────────────────────────────
     if sub in ("add", "entrada", "open"):
         if len(parts) < 5:
             _reply(
@@ -622,7 +758,6 @@ def _handle_flip(parts: list[str]) -> None:
         )
         return
 
-    # ── /flip close ────────────────────────────────────────────────────────────
     if sub in ("close", "fechar", "sell"):
         if len(parts) < 4:
             _reply("⚠️ Uso: `/flip close <ID> <PREÇO_SAÍDA>`\n_Exemplo: `/flip close 3 121.80`_")
@@ -653,7 +788,6 @@ def _handle_flip(parts: list[str]) -> None:
         )
         return
 
-    # ── /flip del ───────────────────────────────────────────────────────────────
     if sub in ("del", "delete", "rm", "apagar", "remover"):
         if len(parts) < 3:
             _reply("⚠️ Uso: `/flip del <ID>`\n_Exemplo: `/flip del 2`_")
@@ -882,6 +1016,13 @@ def _handle_command(text: str) -> None:
             _handle_mldata(force_update=force)
         except Exception as e:
             _reply(f"_Erro no mldata: {e}_")
+
+    # ── Comando de administrador (escondido do /help) ─────────────────────────
+    elif cmd == "/admin_backfill_ml":
+        try:
+            _handle_admin_backfill_ml()
+        except Exception as e:
+            _reply(f"_Erro no backfill: {e}_")
 
     else:
         if text.startswith("/"):
