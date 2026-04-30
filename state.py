@@ -10,6 +10,7 @@ Estrutura de ficheiros:
   _dipr_watchlist.json   → watchlist dinâmica (add/remove via Telegram)
   _dipr_score_log.json   → histórico de scores por ticker (para upgrades + /historico)
   _dipr_flip_log.json    → log de trades do Flip Fund (/flip)
+  _dipr_dip_streaks.json → Feature 8: rasteia dips consecutivos dia-a-dia
 """
 
 import json
@@ -28,6 +29,7 @@ _RECOVERY_FILE  = _DATA_DIR / "_dipr_recovery.json"
 _WATCHLIST_FILE = _DATA_DIR / "_dipr_watchlist.json"
 _SCORE_LOG_FILE = _DATA_DIR / "_dipr_score_log.json"
 _FLIP_LOG_FILE  = _DATA_DIR / "_dipr_flip_log.json"
+_DIP_STREAKS_FILE = _DATA_DIR / "_dipr_dip_streaks.json"
 
 
 # ── helpers genéricos ────────────────────────────────────────────────────────
@@ -405,3 +407,169 @@ def get_flip_summary() -> dict:
         "n_open":        len(opened),
         "n_closed":      len(closed),
     }
+
+
+# ── Feature 8 — Dip Persistente (streak dia-a-dia) ───────────────────────────
+#
+# Estrutura do JSON (_dipr_dip_streaks.json):
+# {
+#   "streaks": {
+#     "AAPL": {
+#       "first_seen":       "2026-04-28",
+#       "last_seen":        "2026-04-30",
+#       "streak_days":      3,
+#       "alerted_at_streak": 2,      ← último streak_day em que enviámos alerta
+#       "entries": [
+#         {"date": "2026-04-28", "score": 65.2, "price": 180.5,
+#          "change": -5.2, "verdict": "MONITORIZAR"},
+#         ...
+#       ]
+#     }
+#   }
+# }
+
+def load_dip_streaks() -> dict:
+    """Devolve o dicionário completo de streaks activos."""
+    return _read(_DIP_STREAKS_FILE).get("streaks", {})
+
+def _save_dip_streaks(streaks: dict) -> None:
+    _write(_DIP_STREAKS_FILE, {"streaks": streaks})
+
+
+def record_dip_day(
+    symbol: str,
+    score: float,
+    price: float,
+    change_pct: float,
+    verdict: str,
+) -> dict:
+    """
+    Regista que `symbol` apareceu hoje no scan com score >= MIN_DIP_SCORE.
+
+    Regras:
+      - Se já foi registado hoje (scan correu duas vezes), devolve o estado
+        actual sem duplicar a entrada.
+      - Se `last_seen` é de um dia anterior, incrementa streak_days.
+      - Se symbol é novo, cria entrada com streak_days=1.
+
+    Devolve o dict do streak actualizado (útil para decidir o alerta).
+    """
+    streaks = load_dip_streaks()
+    today   = datetime.now().date().isoformat()
+    sym     = symbol.upper()
+
+    if sym in streaks:
+        s = streaks[sym]
+        if s.get("last_seen") == today:
+            # Já registado hoje — devolve sem alterar
+            return s
+        # Dia novo — incrementa streak
+        s["streak_days"] += 1
+        s["last_seen"]    = today
+    else:
+        # Primeira vez que este ticker aparece no scan
+        streaks[sym] = {
+            "first_seen":        today,
+            "last_seen":         today,
+            "streak_days":       1,
+            "alerted_at_streak": 0,
+            "entries":           [],
+        }
+
+    streaks[sym]["entries"].append({
+        "date":    today,
+        "score":   round(score, 1),
+        "price":   round(price, 4) if price else None,
+        "change":  round(change_pct, 2),
+        "verdict": verdict,
+    })
+    # Mantém apenas os últimos 30 dias de histórico por ticker
+    streaks[sym]["entries"] = streaks[sym]["entries"][-30:]
+
+    _save_dip_streaks(streaks)
+    logging.debug(
+        f"[streak] {sym}: streak_days={streaks[sym]['streak_days']} "
+        f"score={score:.1f} last_seen={today}"
+    )
+    return streaks[sym]
+
+
+def get_dip_streak(symbol: str) -> dict | None:
+    """Devolve o estado do streak de `symbol`, ou None se não existe."""
+    return load_dip_streaks().get(symbol.upper())
+
+
+def reset_dip_streak(symbol: str) -> None:
+    """Remove o streak de `symbol` (stock recuperou ou saiu do scan)."""
+    streaks = load_dip_streaks()
+    sym     = symbol.upper()
+    if sym in streaks:
+        del streaks[sym]
+        _save_dip_streaks(streaks)
+        logging.debug(f"[streak] {sym}: streak resetado")
+
+
+def mark_persistent_alerted(symbol: str, streak_day: int) -> None:
+    """
+    Marca o streak de `symbol` como tendo sido alertado no dia `streak_day`.
+    Evita enviar o mesmo alerta de persistência múltiplas vezes no mesmo nível.
+    """
+    streaks = load_dip_streaks()
+    sym     = symbol.upper()
+    if sym in streaks:
+        streaks[sym]["alerted_at_streak"] = streak_day
+        _save_dip_streaks(streaks)
+
+
+def expire_missing_streaks(seen_symbols: set) -> list[str]:
+    """
+    Remove da store os streaks de symbols que NÃO apareceram no scan de hoje
+    (i.e., o stock saiu do radar — recuperou ou desceu abaixo do threshold).
+
+    Chamado no finally de run_scan() com o conjunto de symbols que passaram
+    score >= MIN_DIP_SCORE neste ciclo de scan.
+
+    Devolve lista de symbols expirados (para logging).
+    """
+    streaks = load_dip_streaks()
+    today   = datetime.now().date().isoformat()
+    seen    = {s.upper() for s in seen_symbols}
+    expired = []
+
+    to_delete = [
+        sym for sym, s in streaks.items()
+        if sym not in seen and s.get("last_seen") != today
+    ]
+    for sym in to_delete:
+        del streaks[sym]
+        expired.append(sym)
+
+    if expired:
+        _save_dip_streaks(streaks)
+        logging.info(f"[streak] Expirados (saíram do scan): {expired}")
+
+    return expired
+
+
+def get_all_active_streaks(min_days: int = 2) -> list[dict]:
+    """
+    Devolve lista de streaks activos com streak_days >= min_days.
+    Útil para o heartbeat ou um comando /streaks.
+    Cada item: {symbol, streak_days, first_seen, last_seen, last_score, last_price}
+    """
+    streaks = load_dip_streaks()
+    result  = []
+    for sym, s in streaks.items():
+        if s.get("streak_days", 0) >= min_days:
+            entries    = s.get("entries", [])
+            last_entry = entries[-1] if entries else {}
+            result.append({
+                "symbol":      sym,
+                "streak_days": s["streak_days"],
+                "first_seen":  s["first_seen"],
+                "last_seen":   s["last_seen"],
+                "last_score":  last_entry.get("score"),
+                "last_price":  last_entry.get("price"),
+                "last_change": last_entry.get("change"),
+            })
+    return sorted(result, key=lambda x: x["streak_days"], reverse=True)
