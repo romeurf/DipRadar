@@ -4,13 +4,16 @@ watchlist.py — Monitorização personalizada de stocks com critérios de entra
 Filosofia: acumular qualidade em dip profundo, longo prazo.
 Não é dip→flip. É dip→hold indefinidamente.
 
+Fonte primária : yfinance (price, drawdown, dividend_yield, change_day)
+Double-check   : Tiingo confirma preço e drawdown nos hits (fail-open).
+                  Se Tiingo falhar/throttled/ticker não coberto, o alerta
+                  é enviado na mesma com dados Yahoo e nota de estado Tiingo.
+
 Cada entrada define:
   - symbol        : ticker Yahoo Finance correcto (com sufixo se necessário)
   - name          : nome legível
   - slot          : P1/P2/P3 — prioridade de alocação
   - category      : intenção estratégica (CATEGORY_* de score.py) — opcional
-                    Se definida, é comparada com a categoria dinâmica do score.py.
-                    Divergência → aviso no alerta ("Intenção vs Realidade").
   - criteria      : lista de condições que devem ser verificadas (qualquer uma basta)
   - notes         : contexto / tese de investimento
   - alert_once    : se True, só alerta uma vez por dia por condição satisfeita
@@ -21,6 +24,10 @@ Critérios suportados:
   dividend_yield    : yield actual >= X %  (ex: 5.5 → 5.5%)
   price_above       : preço actual >= X  (para targets de saída)
   change_day_pct    : queda no dia >= X %
+
+Tiingo confirma apenas critérios baseados em EOD histórico:
+  drawdown_52w_pct, price_below, price_above
+Critérios dividend_yield e change_day_pct ficam exclusivamente em Yahoo.
 """
 
 from __future__ import annotations
@@ -32,8 +39,12 @@ import pytz
 import yfinance as yf
 from state import load_alerts, save_alerts
 from score import CATEGORY_HOLD_FOREVER, CATEGORY_APARTAMENTO, CATEGORY_ROTACAO
+from data_feed import get_tiingo_confirmation
 
 LISBON_TZ = pytz.timezone("Europe/Lisbon")
+
+# Critérios para os quais faz sentido pedir confirmação Tiingo
+_TIINGO_CONFIRMABLE_CRITERIA: set[str] = {"drawdown_52w_pct", "price_below", "price_above"}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -194,16 +205,14 @@ def _get_ticker_data(symbol: str) -> dict | None:
         mc         = info.get("marketCap") or 0
         sector     = info.get("sector") or ""
 
-        # Yahoo Finance devolve dividendYield já em % (ex: 5.11 para 5.11%)
-        # Não multiplicar por 100 — usamos directamente para display e critérios
         div_yield_raw = info.get("dividendYield") or 0
-        div_yield     = div_yield_raw  # já em %, ex: 5.11
+        div_yield     = div_yield_raw
 
         return {
             "price":       price,
             "high_52w":    high_52w,
             "drawdown":    drawdown,
-            "div_yield":   div_yield,        # % para display e critérios (ex: 5.11)
+            "div_yield":   div_yield,
             "change_day":  change_day,
             "name":        name,
             "mc_b":        mc / 1e9,
@@ -213,12 +222,59 @@ def _get_ticker_data(symbol: str) -> dict | None:
             "gross_margins":   info.get("grossMargins") or 0,
             "debt_to_equity":  info.get("debtToEquity"),
             "revenue_growth":  info.get("revenueGrowth") or 0,
-            # score.py espera dividend_yield como decimal (0.05 para 5%)
             "dividend_yield_raw": div_yield_raw / 100.0,
         }
     except Exception as e:
         logging.warning(f"[watchlist] {symbol}: {e}")
         return None
+
+
+def _should_confirm_with_tiingo(criteria: list[dict]) -> bool:
+    """Verdadeiro se algum critério triggado é confirmável via Tiingo EOD."""
+    return any(c["type"] in _TIINGO_CONFIRMABLE_CRITERIA for c in criteria)
+
+
+def _build_tiingo_confirmation_line(
+    symbol: str,
+    yf_data: dict,
+    tiingo: dict | None,
+    criteria_triggered: list[str],
+) -> str:
+    """
+    Gera linha de confirmação Tiingo para o alerta.
+
+    Limiares de divergência:
+      - Preço    : >2% entre Yahoo e Tiingo
+      - Drawdown : >2pp entre Yahoo e Tiingo
+    """
+    # Só mostra se o critério triggado é do tipo EOD (confirmável por Tiingo)
+    has_eod_criterion = any(
+        ct in c for c in criteria_triggered
+        for ct in ("Drawdown", "💲 Preço")
+    )
+    if not has_eod_criterion:
+        return ""
+
+    if tiingo is None:
+        return "_ℹ️ Tiingo indisponível — dados Yahoo apenas_"
+
+    yf_price = yf_data["price"]
+    yf_dd    = yf_data["drawdown"]
+    t_price  = tiingo["price"]
+    t_dd     = tiingo["drawdown"]
+
+    price_diff_pct = abs(yf_price - t_price) / yf_price * 100 if yf_price else 0
+    dd_diff        = abs(yf_dd - t_dd)
+
+    if price_diff_pct <= 2.0 and dd_diff <= 2.0:
+        return f"✅ *Tiingo confirma:* ${t_price:.2f} | 52w ↓{t_dd:.1f}%"
+
+    parts: list[str] = []
+    if price_diff_pct > 2.0:
+        parts.append(f"preço Yahoo ${yf_price:.2f} vs Tiingo ${t_price:.2f} ({price_diff_pct:.1f}%Δ)")
+    if dd_diff > 2.0:
+        parts.append(f"drawdown Yahoo {yf_dd:.1f}% vs Tiingo {t_dd:.1f}% ({dd_diff:.1f}ppΔ)")
+    return f"⚠️ *Divergência Yahoo/Tiingo:* {'; '.join(parts)}"
 
 
 def _check_criteria(data: dict, criteria: list[dict]) -> list[str]:
@@ -276,6 +332,8 @@ def _build_watchlist_alert(
     triggered: list[str],
     in_portfolio: bool,
     divergence: str | None = None,
+    tiingo_conf: dict | None = None,
+    tiingo_skipped: bool = False,
 ) -> str:
     symbol    = entry["symbol"]
     slot      = entry["slot"]
@@ -299,6 +357,16 @@ def _build_watchlist_alert(
     ]
     for t in triggered:
         lines.append(f"  {t}")
+
+    # ── Bloco de confirmação Tiingo ──────────────────────────────────────
+    if not tiingo_skipped:
+        confirm_line = _build_tiingo_confirmation_line(
+            symbol, data, tiingo_conf, triggered
+        )
+        if confirm_line:
+            lines.append(f"\n{confirm_line}")
+    # ─────────────────────────────────────────────────────────────────────
+
     if data.get("sector"):
         lines.append(f"\n  _Sector: {data['sector']}_")
     lines += [
@@ -335,12 +403,27 @@ def run_watchlist_scan(
 
         divergence = _check_category_divergence(entry.get("category"), symbol, data)
 
+        # ── Tiingo double-confirmer (fail-open) ──────────────────────────
+        tiingo_conf    = None
+        tiingo_skipped = True
+        if _should_confirm_with_tiingo(entry["criteria"]):
+            tiingo_skipped = False
+            tiingo_conf    = get_tiingo_confirmation(symbol)
+            if tiingo_conf is None:
+                logging.info(
+                    f"[watchlist] Tiingo confirm indisponível para {symbol} "
+                    "— alerta enviado com dados Yahoo"
+                )
+        # ─────────────────────────────────────────────────────────────────
+
         msg = _build_watchlist_alert(
             entry,
             data,
             triggered,
             in_portfolio=(symbol in in_port),
             divergence=divergence,
+            tiingo_conf=tiingo_conf,
+            tiingo_skipped=tiingo_skipped,
         )
         if send_telegram(msg):
             alerted.add(alert_key)

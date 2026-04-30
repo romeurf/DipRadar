@@ -1,16 +1,20 @@
 """
 data_feed.py — Módulo de ingestão de dados EOD para o DipRadar 2.0.
 
-Fonte primária : Tiingo API (EOD limpos, sem rate limit agressivo)
-Fallback       : yfinance (fundamentais e tickers não cobertos pela Tiingo)
+Fonte primária : yfinance (fundamentais, bulk scan, watchlist)
+Tiingo          : double-confirmer opcional para watchlist hits
+                  (EOD limpos para cross-validação de preço/drawdown)
 
 Variáveis de ambiente necessárias (Railway):
   TIINGO_API_KEY   — chave da API Tiingo (gratuita em api.tiingo.com)
+                     Se não definida, confirmações Tiingo são silenciosamente
+                     ignoradas — o programa continua inteiro com yfinance.
 
 Auto-Recovery:
   Todos os pedidos têm try/except defensivo.
   Tickers que falham devolvem DataFrame vazio — NUNCA crasham o scan.
   get_bulk_eod() devolve também a lista de tickers falhados para telemetria.
+  get_tiingo_confirmation() é fail-open: devolve None em qualquer falha.
 """
 
 from __future__ import annotations
@@ -45,6 +49,11 @@ _TIINGO_EXCHANGE_MAP: dict[str, str] = {
 }
 
 TIINGO_UNSUPPORTED: set[str] = set()
+
+# Confirmações watchlist — cap para preservar free tier (1000 req/dia, 500 símbolos/mês)
+_tiingo_rate_limited:       bool = False
+_tiingo_confirmation_count: int  = 0
+_TIINGO_CONFIRMATION_CAP:   int  = 20  # max confirmações por sessão/restart
 
 # Contadores de telemetria desta sessão
 _session_failed_tickers: list[str] = []
@@ -160,7 +169,6 @@ def _yfinance_fetch(ticker: str, lookback_days: int) -> pd.DataFrame:
         cols = [c for c in ["date", "Open", "High", "Low", "Close", "Adj Close", "Volume", "ticker"] if c in raw.columns]
         result = raw[cols]
 
-        # Valida que temos dados suficientes
         if len(result) < 2:
             log.debug(f"[data_feed] yfinance dados insuficientes para {ticker} ({len(result)} linhas)")
             return pd.DataFrame()
@@ -173,7 +181,7 @@ def _yfinance_fetch(ticker: str, lookback_days: int) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# API pública
+# API pública — EOD prices
 # ─────────────────────────────────────────────────────────────────────────
 
 def get_eod_prices(
@@ -238,7 +246,6 @@ def get_bulk_eod(
     if failed:
         log.warning(f"[data_feed] Tickers falhados: {', '.join(failed)}")
 
-    # Expõe lista de falhados para telemetria no main.py
     get_bulk_eod.failed_tickers = failed
     _session_failed_tickers     = failed
     return results
@@ -278,3 +285,82 @@ def is_tiingo_available() -> bool:
         return r.status_code == 200
     except Exception:
         return False
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Tiingo double-confirmer para watchlist hits
+# ─────────────────────────────────────────────────────────────────────────
+
+def get_tiingo_confirmation(ticker: str) -> dict | None:
+    """
+    Cross-validação Tiingo para watchlist hits detectados pelo yfinance.
+
+    Devolve {price, high_52w, drawdown} com dados EOD limpos do Tiingo,
+    ou None se Tiingo estiver indisponível, throttled, ou o ticker não coberto.
+
+    Comportamento garantido:
+      - NUNCA crasha nem bloqueia o fluxo da watchlist (fail-open).
+      - Para ao atingir _TIINGO_CONFIRMATION_CAP (preserva free tier).
+      - Em 429/401/403 desativa confirmações para o resto da sessão.
+      - Em 404 salta silenciosamente (ticker não coberto pelo Tiingo).
+      - Usa lookback 365 dias para calcular 52w high de forma independente.
+    """
+    global _tiingo_rate_limited, _tiingo_confirmation_count
+
+    if not TIINGO_API_KEY:
+        return None
+    if _tiingo_rate_limited:
+        return None
+    if _tiingo_confirmation_count >= _TIINGO_CONFIRMATION_CAP:
+        log.info("[data_feed] Tiingo confirmation cap atingido — a usar só yfinance esta sessão")
+        return None
+
+    try:
+        tiingo_ticker        = _to_tiingo_ticker(ticker)
+        start_date, end_date = _date_range(365)
+        url    = f"{TIINGO_BASE}/{tiingo_ticker}/prices"
+        params = {"startDate": start_date, "endDate": end_date, "resampleFreq": "daily"}
+
+        r = requests.get(url, headers=TIINGO_HEADERS, params=params, timeout=10)
+
+        if r.status_code == 429:
+            log.warning("[data_feed] Tiingo rate limit (429) — confirmações desativadas esta sessão")
+            _tiingo_rate_limited = True
+            return None
+        if r.status_code in (401, 403):
+            log.warning(f"[data_feed] Tiingo auth error {r.status_code} — confirmações desativadas")
+            _tiingo_rate_limited = True
+            return None
+        if r.status_code == 404:
+            log.debug(f"[data_feed] Tiingo 404 para {ticker} — ticker não coberto, skip confirmação")
+            return None
+
+        r.raise_for_status()
+        data = r.json()
+        if not data or len(data) < 5:
+            return None
+
+        df = _parse_tiingo_response(data, ticker)
+        if df.empty or "Adj Close" not in df.columns:
+            return None
+
+        price    = float(df["Adj Close"].iloc[-1])
+        high_52w = float(df["Adj Close"].max())
+        drawdown = (high_52w - price) / high_52w * 100 if high_52w else 0.0
+
+        _tiingo_confirmation_count += 1
+        log.debug(
+            f"[data_feed] Tiingo confirm #{_tiingo_confirmation_count}/{_TIINGO_CONFIRMATION_CAP} "
+            f"{ticker}: price={price:.2f} drawdown={drawdown:.1f}%"
+        )
+        return {"price": price, "high_52w": high_52w, "drawdown": drawdown}
+
+    except requests.exceptions.Timeout:
+        log.debug(f"[data_feed] Tiingo confirm timeout para {ticker}")
+        return None
+    except requests.exceptions.ConnectionError:
+        log.debug(f"[data_feed] Tiingo confirm connection error para {ticker}")
+        return None
+    except Exception as e:
+        log.debug(f"[data_feed] Tiingo confirm erro inesperado para {ticker}: {e}")
+        return None
