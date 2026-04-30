@@ -9,9 +9,6 @@ fredapi>=0.5.1
 APScheduler>=3.10.0
 pytz>=2024.1
 
-# Data feed (Chunk 3a)
-tiingo>=0.14.0
-
 # Machine Learning (Chunk H)
 scikit-learn>=1.4.0
 xgboost>=2.0.0
