@@ -6,7 +6,7 @@ Fontes:
   - Nasdaq 100    : Wikipedia (scraped dinamicamente, fallback completo 101)
   - STOXX 600     : Lista estática curada (top 200 por liquidez)
   - FTSE 100      : Lista estática curada
-  - Carteira atual: Inclui ETFs (EUNL, IEMA) — monitorização de preço apenas
+  - Carteira atual: Inclui ETFs (EUNL.DE, IEMA) — monitorização de preço apenas
 
 ETFs são excluídos do pipeline ML (sem fundamentais válidos).
 Usar ETF_TICKERS para esta exclusão nos outros módulos:
@@ -27,7 +27,7 @@ from functools import lru_cache
 #         Treinar o modelo com ETFs baralha completamente os features.
 # ─────────────────────────────────────────────────────────────────────────
 ETF_TICKERS: set[str] = {
-    "EUNL",    # iShares Core MSCI World UCITS ETF (carteira)
+    "EUNL.DE",  # iShares Core MSCI World UCITS ETF (carteira)
     "IEMA",    # iShares MSCI EM ESG Leaders (watchlist)
     "IS3N.L",  # alias antigo — manter por compatibilidade com alertas guardados
     # Acrescenta outros ETFs aqui se necessaire
@@ -47,7 +47,7 @@ USER_PORTFOLIO: list[str] = [
     "NVO", "ADBE", "UBER", "MSFT", "PINS",
     "ADP", "CRM", "VICI", "CRWD", "PLTR", "NOW", "DUOL",
     # ETFs (monitorização apenas, sem ML)
-    "EUNL",
+    "EUNL.DE",
 ]
 
 # Watchlist pessoal (tickers de interesse, mesmo fora da carteira)
@@ -169,7 +169,7 @@ def _fetch_nasdaq100() -> list[str]:
 def get_full_universe() -> list[str]:
     """
     Universo completo incluindo ETFs.
-    Para scan de watchlist/preço. NÃO usar directamente no pipeline ML.
+    Para scan de watchlist/preço. NÃO usar directamente no pipeline ML.
     """
     sp500  = _fetch_sp500()
     ndx100 = _fetch_nasdaq100()
@@ -304,5 +304,5 @@ _NASDAQ100_FALLBACK: list[str] = [
     "NVDA","NXPI","ORLY","ODFL","ON","PCAR","PANW","PAYX","PYPL",
     "PDD","PEP","QCOM","REGN","ROP","ROST","SBUX","SGEN","SIRI",
     "SNPS","TSLA","TXN","TMUS","TTWO","VRSK","VRTX","WBA","WBD",
-    "WDAY","XEL","ZM","ZS",
+    "WYDAY","XEL","ZM","ZS",
 ]
