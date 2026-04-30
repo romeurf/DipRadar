@@ -28,9 +28,12 @@ import time
 import logging
 from datetime import datetime
 from typing import Any
+import pytz
 import yfinance as yf
 from state import load_alerts, save_alerts
 from score import CATEGORY_HOLD_FOREVER, CATEGORY_APARTAMENTO, CATEGORY_ROTACAO
+
+LISBON_TZ = pytz.timezone("Europe/Lisbon")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -184,7 +187,6 @@ def _get_ticker_data(symbol: str) -> dict | None:
 
         price      = info.get("regularMarketPrice") or info.get("currentPrice") or 0
         high_52w   = info.get("fiftyTwoWeekHigh") or 0
-        div_yield  = (info.get("dividendYield") or 0) * 100
         prev_close = info.get("regularMarketPreviousClose") or price
         change_day = abs((price - prev_close) / prev_close * 100) if prev_close else 0
         drawdown   = (high_52w - price) / high_52w * 100 if high_52w else 0
@@ -192,11 +194,16 @@ def _get_ticker_data(symbol: str) -> dict | None:
         mc         = info.get("marketCap") or 0
         sector     = info.get("sector") or ""
 
+        # Yahoo Finance devolve dividendYield já em % (ex: 5.11 para 5.11%)
+        # Não multiplicar por 100 — usamos directamente para display e critérios
+        div_yield_raw = info.get("dividendYield") or 0
+        div_yield     = div_yield_raw  # já em %, ex: 5.11
+
         return {
             "price":       price,
             "high_52w":    high_52w,
             "drawdown":    drawdown,
-            "div_yield":   div_yield,
+            "div_yield":   div_yield,        # % para display e critérios (ex: 5.11)
             "change_day":  change_day,
             "name":        name,
             "mc_b":        mc / 1e9,
@@ -206,7 +213,8 @@ def _get_ticker_data(symbol: str) -> dict | None:
             "gross_margins":   info.get("grossMargins") or 0,
             "debt_to_equity":  info.get("debtToEquity"),
             "revenue_growth":  info.get("revenueGrowth") or 0,
-            "dividend_yield_raw": info.get("dividendYield") or 0,
+            # score.py espera dividend_yield como decimal (0.05 para 5%)
+            "dividend_yield_raw": div_yield_raw / 100.0,
         }
     except Exception as e:
         logging.warning(f"[watchlist] {symbol}: {e}")
@@ -296,7 +304,7 @@ def _build_watchlist_alert(
     lines += [
         "",
         f"*📝 Tese:* _{notes}_",
-        f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_",
+        f"_⏰ {datetime.now(LISBON_TZ).strftime('%d/%m %H:%M')}_",
     ]
     return "\n".join(lines)
 
@@ -306,7 +314,7 @@ def run_watchlist_scan(
     direct_tickers: set | list,
 ) -> int:
     alerted  = load_alerts()
-    today    = datetime.now().date().isoformat()
+    today    = datetime.now(LISBON_TZ).date().isoformat()
     sent     = 0
     in_port  = set(direct_tickers)
 
@@ -364,5 +372,5 @@ def build_watchlist_morning_summary(direct_tickers: set | list) -> str:
             f"${data['price']:.2f} | 52w \u2193{data['drawdown']:.0f}% | "
             f"Yield {data['div_yield']:.1f}%"
         )
-    lines.append(f"\n_⏰ {datetime.now().strftime('%d/%m %H:%M')}_")
+    lines.append(f"\n_⏰ {datetime.now(LISBON_TZ).strftime('%d/%m %H:%M')}_")
     return "\n".join(lines)
