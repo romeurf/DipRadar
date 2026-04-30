@@ -65,9 +65,11 @@ _MARKET_OPEN_MIN  = 30
 _MARKET_CLOSE_UTC = 20
 _MARKET_CLOSE_MIN = 0
 
-# Yield máximo aceitável (25 %). Qualquer valor acima é lixo do yfinance
-# e seria injectado como feature inválida no modelo ML.
-_MAX_DIVIDEND_YIELD = 0.25
+# Se o yield normalizado (após /100 ou não) ultrapassar este limiar,
+# assume que a nossa lógica de normalização errou e tenta usar o valor
+# raw do yfinance directamente (em decimal). Se esse também for > 1.0
+# (ex: bug histórico de valor = 640), descarta.
+_YIELD_SANITY_THRESHOLD = 0.15   # 15 %
 
 
 def is_market_open() -> bool:
@@ -408,18 +410,29 @@ def _normalize_dividend_yield(raw: float | None) -> float | None:
 
     O yfinance é inconsistente: pode devolver 0.032, 3.2 ou até valores absurdos
     como 640 (bug conhecido). A lógica:
-      1. Se raw > 0.50 → assume que está em percentagem → divide por 100
-      2. Após normalização, aplica hard cap de _MAX_DIVIDEND_YIELD (25%)
-         — qualquer yield > 25% é lixo de dados e devolvemos None
-         para não contaminar features do modelo ML.
+      1. Se raw > 0.50 → assume que está em percentagem → divide por 100.
+      2. Se o resultado normalizado > _YIELD_SANITY_THRESHOLD (15%):
+           → A nossa normalização provavelmente errou (ou a acção tem yield
+             genuinamente alto). Nesse caso, usa o valor raw do yfinance
+             directamente SEM dividir por 100.
+           → Se o raw também for > 1.0, é lixo de dados → descarta (None).
+      3. Caso contrário, devolve o valor normalizado.
     """
     if raw is None or raw <= 0:
         return None
-    normalized = float(raw) / 100 if raw > 0.50 else float(raw)
-    if normalized > _MAX_DIVIDEND_YIELD:
+    normalized = float(raw) / 100.0 if raw > 0.50 else float(raw)
+    if normalized > _YIELD_SANITY_THRESHOLD:
+        # Tenta confiar no valor raw do yfinance tal como está
+        raw_f = float(raw)
+        if 0 < raw_f <= 1.0:
+            logging.info(
+                f"dividend_yield: normalized={normalized:.4f} >{_YIELD_SANITY_THRESHOLD:.0%} "
+                f"→ fallback para raw={raw_f:.4f} (yfinance directo)"
+            )
+            return round(raw_f, 6)
         logging.warning(
             f"dividend_yield descartado: raw={raw} → normalized={normalized:.4f} "
-            f"(>{_MAX_DIVIDEND_YIELD:.0%}) — provável lixo do yfinance"
+            f"(>{_YIELD_SANITY_THRESHOLD:.0%}) e raw também fora de escala"
         )
         return None
     return normalized
