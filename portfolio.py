@@ -19,13 +19,11 @@ Cache write-through:
   Leituras usam sempre a cache (zero chamadas extra à API).
 
 Variáveis de ambiente esperadas no Railway:
-  HOLDING_<TICKER>=shares,avg_cost  — 4 posições holding (ex: HOLDING_CRWD=10,180.50)
+  HOLDING_<TICKER>=shares,avg_cost  — posições holding (ex: HOLDING_CRWD=10,180.50)
+  HOLDING_EUNL=shares,avg_cost      — será mapeado automaticamente para EUNL.DE
   PPR_SHARES=<float>                — actualizado manualmente no Railway
   PPR_AVG_COST=<float>              — actualizado manualmente no Railway
   FLIP_FUND_EUR=<float>             — capital do Flip Fund
-
-Nota: o sistema de CASHBACK foi eliminado. As antigas posições CASHBACK_<TICKER>
-foram migradas para HOLDING_<TICKER> com shares e avg_cost reais.
 """
 
 from __future__ import annotations
@@ -42,10 +40,6 @@ from universe import is_etf
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────
-# Tickers legacy (mantidos para compatibilidade de imports em main.py)
-# NOTA: ETFs europeus requerem sufixo de bolsa para o yfinance funcionar.
-#       EUNL → EUNL.DE (Xetra). Sem sufixo devolve 404.
-# ─────────────────────────────────────────────────────────────────────────
 DIRECT_TICKERS = ["NVO", "ADBE", "UBER", "EUNL.DE", "MSFT", "PINS", "ADP", "CRM", "VICI",
                    "CRWD", "PLTR", "NOW", "DUOL"]
 
@@ -54,6 +48,15 @@ USD_TICKERS = {
     "CRWD", "PLTR", "NOW", "DUOL",
 }
 EUR_TICKERS = {"EUNL.DE", "IS3N.DE", "ALV.DE", "IEMA"}
+
+# Mapa de aliases: env vars sem sufixo → ticker correcto para yfinance
+# Permite usar HOLDING_EUNL=... no Railway sem ter de configurar HOLDING_EUNL.DE
+_TICKER_ALIASES: dict[str, str] = {
+    "EUNL":  "EUNL.DE",
+    "IS3N":  "IS3N.DE",
+    "ALV":   "ALV.DE",
+    "IEMA":  "IEMA.L",
+}
 
 
 def _float_env(key: str, default: float = 0.0) -> float:
@@ -67,20 +70,22 @@ FLIP_FUND_EUR = _float_env("FLIP_FUND_EUR")
 
 # ─────────────────────────────────────────────────────────────────────────
 # HOLDINGS — lê env vars com o padrão HOLDING_<TICKER>=shares,avg_cost
-#   Ex: HOLDING_NVO=25,87.50  →  ("NVO", 25.0, 87.50)
-#
-# PPR_SHARES / PPR_AVG_COST: actualizados manualmente no Railway
 # ─────────────────────────────────────────────────────────────────────────
 
 def _parse_holdings_env() -> list[tuple[str, float, float]]:
-    """Constrói HOLDINGS a partir das env vars HOLDING_<TICKER>=shares[,avg_cost]."""
+    """Constrói HOLDINGS a partir das env vars HOLDING_<TICKER>=shares[,avg_cost].
+    Aplica _TICKER_ALIASES para normalizar tickers sem sufixo de bolsa
+    (ex: HOLDING_EUNL → EUNL.DE).
+    """
     result: list[tuple[str, float, float]] = []
     for key, val in os.environ.items():
         if not key.startswith("HOLDING_"):
             continue
-        ticker = key[len("HOLDING_"):].strip().upper()
-        if not ticker:
+        raw_ticker = key[len("HOLDING_"):].strip().upper()
+        if not raw_ticker:
             continue
+        # Normaliza alias (ex: EUNL → EUNL.DE)
+        ticker = _TICKER_ALIASES.get(raw_ticker, raw_ticker)
         parts = [p.strip() for p in val.split(",")]
         try:
             shares = float(parts[0]) if parts else 0.0
@@ -145,7 +150,13 @@ def _gs_load_liquidity() -> float:
     if sheet is None:
         return 0.0
     try:
-        ws  = sheet.worksheet("Liquidez")
+        try:
+            ws = sheet.worksheet("Liquidez")
+        except Exception:
+            # Aba não existe — cria automaticamente no primeiro arranque
+            log.info("[portfolio] GS: criando aba 'Liquidez'")
+            ws = sheet.add_worksheet(title="Liquidez", rows=10, cols=2)
+            ws.update([["Liquidez"], [0.0]])
         val = ws.acell("A2").value
         return float(val) if val else 0.0
     except Exception as e:
@@ -158,7 +169,11 @@ def _gs_write_liquidity(amount: float) -> None:
     if sheet is None:
         return
     try:
-        ws = sheet.worksheet("Liquidez")
+        try:
+            ws = sheet.worksheet("Liquidez")
+        except Exception:
+            ws = sheet.add_worksheet(title="Liquidez", rows=10, cols=2)
+            ws.update([["Liquidez"], [0.0]])
         ws.update("A2", [[round(amount, 2)]])
     except Exception as e:
         log.warning(f"[portfolio] GS write liquidez erro: {e}")
@@ -169,7 +184,14 @@ def _gs_load_positions() -> dict:
     if sheet is None:
         return {}
     try:
-        ws      = sheet.worksheet("Posicoes")
+        try:
+            ws = sheet.worksheet("Posicoes")
+        except Exception:
+            # Aba não existe — cria automaticamente com cabeçalho
+            log.info("[portfolio] GS: criando aba 'Posicoes'")
+            ws = sheet.add_worksheet(title="Posicoes", rows=100, cols=len(GS_COLS))
+            ws.update([GS_COLS])
+            return {}
         records = ws.get_all_records()
         positions = {}
         for row in records:
@@ -205,7 +227,10 @@ def _gs_write_positions(positions: dict) -> None:
     if sheet is None:
         return
     try:
-        ws   = sheet.worksheet("Posicoes")
+        try:
+            ws = sheet.worksheet("Posicoes")
+        except Exception:
+            ws = sheet.add_worksheet(title="Posicoes", rows=100, cols=len(GS_COLS))
         rows = [GS_COLS]
         now_hm = datetime.now().strftime("%d/%m %H:%M")
         for ticker, pos in positions.items():
@@ -311,7 +336,7 @@ def buy(
     entry_score: int | None = None,
     name:        str        = "",
 ) -> dict:
-    symbol = symbol.upper().strip()
+    symbol = _TICKER_ALIASES.get(symbol.upper().strip(), symbol.upper().strip())
     _ensure_cache()
     cost = round(price * shares, 2)
 
@@ -377,7 +402,6 @@ def buy(
 
 # ─────────────────────────────────────────────────────────────────────────
 # seed_position — popula o GSheets a partir de env vars sem tocar na liquidez
-# Usado pelo comando /importar para migrar HOLDING_* → Posicoes tab
 # ─────────────────────────────────────────────────────────────────────────
 
 def seed_position(
@@ -391,7 +415,7 @@ def seed_position(
 ) -> dict:
     """Regista uma posição existente no backend (GSheets/JSON) SEM afectar a liquidez.
     Idempotente: se o ticker já existir, devolve action='exists' e não sobrescreve."""
-    symbol = symbol.upper().strip()
+    symbol = _TICKER_ALIASES.get(symbol.upper().strip(), symbol.upper().strip())
     _ensure_cache()
 
     if is_etf(symbol):
@@ -447,7 +471,7 @@ def sell(
     price:  float,
     shares: float | None = None,
 ) -> dict | None:
-    symbol = symbol.upper().strip()
+    symbol = _TICKER_ALIASES.get(symbol.upper().strip(), symbol.upper().strip())
     _ensure_cache()
     positions = _cache["positions"]
 
@@ -526,7 +550,7 @@ def update_position_data(
     score:    int | None = None,
     category: str | None = None,
 ) -> None:
-    symbol = symbol.upper().strip()
+    symbol = _TICKER_ALIASES.get(symbol.upper().strip(), symbol.upper().strip())
     _ensure_cache()
     pos = _cache["positions"].get(symbol)
     if not pos:
@@ -541,7 +565,7 @@ def update_position_data(
 
 
 def mark_degradation_alerted(symbol: str) -> None:
-    symbol = symbol.upper().strip()
+    symbol = _TICKER_ALIASES.get(symbol.upper().strip(), symbol.upper().strip())
     _ensure_cache()
     pos = _cache["positions"].get(symbol)
     if pos:
@@ -550,7 +574,7 @@ def mark_degradation_alerted(symbol: str) -> None:
 
 
 def reset_degradation_flag(symbol: str) -> None:
-    symbol = symbol.upper().strip()
+    symbol = _TICKER_ALIASES.get(symbol.upper().strip(), symbol.upper().strip())
     _ensure_cache()
     pos = _cache["positions"].get(symbol)
     if pos:
