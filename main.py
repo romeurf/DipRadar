@@ -270,8 +270,10 @@ def send_heartbeat() -> None:
         f"  {_pnl_emoji(pnl_w)}  *Semana:*            €{pnl_w:+,.2f}{_pct(pnl_w, total - pnl_w)}",
         f"  {_pnl_emoji(pnl_m)}  *Mês:*               €{pnl_m:+,.2f}{_pct(pnl_m, total - pnl_m)}",
     ]
+    # FIX Bug 2: só mostra % se a base (total_cost) for fiável (> 100 €)
     if pnl_tot is not None:
-        lines.append(f"  {_pnl_emoji(pnl_tot)}  *Total investido:*   €{pnl_tot:+,.2f}{_pct(pnl_tot, total_cost)}")
+        pnl_pct_str = f" ({pnl_tot / total_cost * 100:+.1f}%)" if total_cost and total_cost > 100 else ""
+        lines.append(f"  {_pnl_emoji(pnl_tot)}  *P&L acumulado:*     €{pnl_tot:+,.2f}{pnl_pct_str}")
 
     movers = sorted(
         [p for p in snapshot["positions"] if p["pnl_day"] is not None],
@@ -326,6 +328,9 @@ def send_heartbeat() -> None:
     earnings_alerts = []
     for sym, shares, _ in HOLDINGS:
         if not shares:
+            continue
+        # FIX Bug 1: ETFs não têm earnings — evita 404 no yfinance (ex: EUNL.DE)
+        if is_etf(sym):
             continue
         clean_sym = sym.split(".")[0]
         try:
