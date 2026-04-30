@@ -7,18 +7,26 @@ SUBSTITUI as heurísticas de limites fixos pelo motor estatístico:
   Confidence Penalty  →  penaliza scores com dados em falta
   ML Prob Multiplier  →  integra a probabilidade WIN do classificador
 
+Hemisfério Timing — 3 componentes:
+  RSI          (peso base 50% quando volume ausente, 35% quando presente)
+  Drawdown 52w (peso base 50% quando volume ausente, 35% quando presente)
+  Volume Spike (peso 30% — bonus, não penaliza confidence se ausente)
+
+Penalização near-earnings (earnings_days < 14):
+  Confidence multiplicada por 0.85 — zona de incerteza pré-relatório.
+
 Equação final:
   base_score  = 0.50 * quality + 0.30 * value + 0.20 * timing
   final_score = base_score * ml_prob * confidence * 100
 
 API pública (compatível com toda a base de código existente):
-  calculate_score(features, ml_prob)           — motor puro
-  score_from_fundamentals(fund, ml_prob)       — adaptador market_client
-  format_score_v2_breakdown(result)            — bloco Telegram
-  calculate_dip_score(fund, sym, ..., ml_prob) — shim retro-compat (ml_prob propagado)
-  build_score_breakdown(fund, sym, ..., ml_prob) — shim retro-compat (ml_prob propagado)
-  is_bluechip(fund)                            — mantido sem alterações
-  classify_dip_category(fund, score, bc_flag)  — mantido sem alterações
+  calculate_score(features, ml_prob)                    — motor puro
+  score_from_fundamentals(fund, ml_prob, earnings_days) — adaptador market_client
+  format_score_v2_breakdown(result)                     — bloco Telegram
+  calculate_dip_score(fund, sym, ..., ml_prob)          — shim retro-compat
+  build_score_breakdown(fund, sym, ..., ml_prob)        — shim retro-compat
+  is_bluechip(fund)                                     — mantido sem alterações
+  classify_dip_category(fund, score, bc_flag)           — mantido sem alterações
   CATEGORY_HOLD_FOREVER / APARTAMENTO / ROTACAO
 """
 
@@ -209,7 +217,7 @@ def _compute_quality(
     scores: list[float] = []
 
     roic_mean = _SECTOR_ROIC_MEAN.get(sector, _DEFAULT_MEAN["roic"])
-    roic_std  = _SECTOR_ROIC_STD.get(sector, _DEFAULT_STD["roic"])  # sector-aware std
+    roic_std  = _SECTOR_ROIC_STD.get(sector, _DEFAULT_STD["roic"])
 
     # ROIC (com fallback para fcf_yield como proxy)
     n_total.append(1)
@@ -299,6 +307,17 @@ def _compute_timing(
     missing: list[str],
     n_total: list[int],
 ) -> float:
+    """
+    Três componentes de timing:
+      1. RSI          — sinal sobrevendido (sem Z-score, já adimensional)
+      2. Drawdown 52w — queda face ao máximo (maior queda = mais oportunidade)
+      3. Volume Spike — confirmação de capitulação (BONUS: não conta para confidence)
+
+    Quando volume está disponível:
+      timing = 0.70 * base(RSI + drawdown) + 0.30 * volume_score
+    Quando volume está ausente:
+      timing = base(RSI + drawdown)   ← sem penalização de confidence
+    """
     scores: list[float] = []
 
     # RSI — direto, sem Z-score (já é adimensional [0, 100])
@@ -322,7 +341,26 @@ def _compute_timing(
         z_dd = -_z(drawdown, -15.0, 15.0)
         scores.append(z_to_score(z_dd))
 
-    return float(np.mean(scores))
+    base_timing = float(np.mean(scores))
+
+    # ── Volume Spike (bonus — não afecta confidence) ───────────────────────
+    # vol/avg = 1.0 → z=0 → 0.50 (neutro)
+    # vol/avg = 1.5 → z=+1.0 → 0.73
+    # vol/avg = 2.0 → z=+2.0 → 0.88 (capitulação/climax — sinal de reversão)
+    # vol/avg = 0.5 → z=-1.0 → 0.27 (volume seco — interesse a decair)
+    vol     = _safe_float(features.get("volume"))
+    avg_vol = _safe_float(features.get("average_volume"))
+
+    if math.isnan(vol) or math.isnan(avg_vol) or avg_vol <= 0:
+        # Sem dados de volume: usa apenas base timing, sem penalização
+        return base_timing
+
+    vol_ratio  = vol / avg_vol
+    z_vol      = (vol_ratio - 1.0) / 0.5   # std empírico 0.5x de ratio
+    vol_score  = z_to_score(z_vol)
+
+    # Blend: 70% base (RSI + drawdown) + 30% volume spike
+    return base_timing * 0.70 + vol_score * 0.30
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +395,8 @@ def calculate_score(
     ----------
     features : dict
         Chaves esperadas: roic, fcf_margin, fcf_yield, revenue_growth,
-        debt_equity, pe, rsi, drawdown_from_high, sector, gross_margin
+        debt_equity, pe, rsi, drawdown_from_high, sector, gross_margin,
+        volume, average_volume, earnings_days
     ml_prob : float | None
         Probabilidade WIN do classificador ML [0, 1]. None = 1.0.
 
@@ -395,12 +434,27 @@ def calculate_score(
         quality *= 0.5
         logging.debug("[score] value trap detected — quality halved")
 
-    # Confidence
+    # Confidence (baseada apenas nas métricas formais — volume não conta)
     total_attempted = len(n_total)
     n_missing       = len(missing)
     n_valid         = max(0, total_attempted - n_missing)
     confidence      = (n_valid / total_attempted) if total_attempted > 0 else 0.0
-    skip            = confidence < 0.6
+
+    # Near-earnings confidence penalty — zona de incerteza pré-relatório
+    # earnings_days < 14: −15% na confiança (resultado iminente = risco binário)
+    earnings_days = features.get("earnings_days")
+    if earnings_days is not None:
+        try:
+            ed = float(earnings_days)
+            if math.isfinite(ed) and ed < 14:
+                confidence *= 0.85
+                logging.debug(
+                    f"[score] earnings in {ed:.0f}d — confidence penalised to {confidence:.2f}"
+                )
+        except (TypeError, ValueError):
+            pass
+
+    skip = confidence < 0.6
 
     if skip:
         logging.debug(
@@ -435,12 +489,16 @@ def calculate_score(
 def score_from_fundamentals(
     fundamentals: dict,
     ml_prob: float | None = None,
+    earnings_days: int | None = None,
 ) -> dict:
     """
     Adapta o dicionário de get_fundamentals() ao motor calculate_score().
+
     Mapeamento:
-      gross_margin  → fcf_margin proxy (quando fcf_margin não existe)
-      todos os outros campos são passados directamente
+      gross_margin    → fcf_margin proxy (quando fcf_margin não existe)
+      volume          → componente volume spike no hemisfério Timing
+      average_volume  → referência para normalizar o volume spike
+      earnings_days   → penalização de confiança se < 14 dias
     """
     features = {
         "roic":               fundamentals.get("roic"),
@@ -452,6 +510,11 @@ def score_from_fundamentals(
         "rsi":                fundamentals.get("rsi"),
         "drawdown_from_high": fundamentals.get("drawdown_from_high"),
         "sector":             fundamentals.get("sector"),
+        # Timing bonus — volume spike
+        "volume":             fundamentals.get("volume"),
+        "average_volume":     fundamentals.get("average_volume"),
+        # Near-earnings uncertainty
+        "earnings_days":      earnings_days,
     }
     return calculate_score(features, ml_prob=ml_prob)
 
@@ -482,8 +545,10 @@ def format_score_v2_breakdown(result: dict) -> str:
     ]
     if vt:
         lines.append("  🔴 *Value Trap detectada* — quality penalizada em 50%")
-    if miss:
-        lines.append(f"  _Em falta: {', '.join(miss)}_")
+    # Remove volume_spike dos campos em falta (é bonus, não obrigatório)
+    reportable_miss = [m for m in miss if m != "volume_spike"]
+    if reportable_miss:
+        lines.append(f"  _Em falta: {', '.join(reportable_miss)}_")
     return "\n".join(lines)
 
 
@@ -553,8 +618,7 @@ def classify_dip_category(fundamentals: dict, dip_score: float, is_bluechip_flag
 
 # ---------------------------------------------------------------------------
 # 14. Shims de retro-compatibilidade
-#     ml_prob propagado ao motor — check_thesis_degradation e weekly scan
-#     passam agora o peso ML correto.
+#     ml_prob e earnings_days propagados ao motor.
 # ---------------------------------------------------------------------------
 
 def calculate_dip_score(
@@ -567,12 +631,13 @@ def calculate_dip_score(
 ) -> tuple[float, str | None]:
     """
     Shim de compatibilidade. Chama o motor quantitativo internamente.
-    Aceita ml_prob opcional — se fornecido, é propagado ao motor como
-    ponderador ML, tornando todas as chamadas ML-aware automaticamente.
+
+    earnings_days propagado → penalização de confiança se < 14 dias.
+    ml_prob propagado       → ponderador ML no score final.
 
     Devolve (final_score: float, rsi_str: str | None).
     """
-    result  = score_from_fundamentals(fundamentals, ml_prob=ml_prob)
+    result  = score_from_fundamentals(fundamentals, ml_prob=ml_prob, earnings_days=earnings_days)
     rsi_val = fundamentals.get("rsi")
     rsi_str = f"{float(rsi_val):.0f}" if rsi_val is not None else None
     return result["final_score"], rsi_str
@@ -588,10 +653,11 @@ def build_score_breakdown(
 ) -> str:
     """
     Shim de compatibilidade. Devolve o bloco Telegram do motor quantitativo.
-    Aceita ml_prob opcional — propagado ao motor para reflectir o peso ML
-    na breakdown exibida no Telegram.
+
+    earnings_days propagado → reflectido na confiança e na breakdown.
+    ml_prob propagado       → reflectido no score final da breakdown.
     """
-    result = score_from_fundamentals(fundamentals, ml_prob=ml_prob)
+    result = score_from_fundamentals(fundamentals, ml_prob=ml_prob, earnings_days=earnings_days)
     return format_score_v2_breakdown(result)
 
 
@@ -601,21 +667,23 @@ def build_score_breakdown(
 
 if __name__ == "__main__":
     sample = {
-        "roic":              0.22,
-        "fcf_margin":        0.14,
-        "fcf_yield":         0.06,
-        "revenue_growth":    0.12,
-        "debt_equity":       45.0,
-        "pe":                18.0,
-        "rsi":               28.0,
+        "roic":               0.22,
+        "fcf_margin":         0.14,
+        "fcf_yield":          0.06,
+        "revenue_growth":     0.12,
+        "debt_equity":        45.0,
+        "pe":                 18.0,
+        "rsi":                28.0,
         "drawdown_from_high": -32.0,
-        "sector":            "Technology",
-        "market_cap":        200_000_000_000,
-        "gross_margin":      0.65,
-        "dividend_yield":    0.008,
+        "sector":             "Technology",
+        "market_cap":         200_000_000_000,
+        "gross_margin":       0.65,
+        "dividend_yield":     0.008,
+        "volume":             8_000_000,
+        "average_volume":     4_000_000,  # 2× spike
     }
 
-    print("=== calculate_score ===")
+    print("=== calculate_score (com volume spike 2×) ===")
     res = calculate_score(sample, ml_prob=0.85)
     for k, v in res.items():
         print(f"  {k}: {v}")
@@ -623,17 +691,17 @@ if __name__ == "__main__":
     print(format_score_v2_breakdown(res))
     print()
 
-    print("=== shim calculate_dip_score (com ml_prob) ===")
-    score, rsi_str = calculate_dip_score(sample, "AAPL", ml_prob=0.85)
-    print(f"  score={score:.1f}  rsi_str={rsi_str}")
-    bc = is_bluechip(sample)
+    print("=== shim calculate_dip_score (com earnings_days=10 → penalty) ===")
+    score, rsi_str = calculate_dip_score(sample, "AAPL", earnings_days=10, ml_prob=0.85)
+    print(f"  score={score:.1f}  rsi_str={rsi_str}  (earnings em 10d → conf×0.85)")
+    bc  = is_bluechip(sample)
     cat = classify_dip_category(sample, score, bc)
     print(f"  is_bluechip={bc}  category={cat}")
     print()
 
     print("=== shim calculate_dip_score (sem ml_prob — retro-compat) ===")
     score2, _ = calculate_dip_score(sample, "AAPL")
-    print(f"  score={score2:.1f}  (ml_prob=None → usa 1.0)")
+    print(f"  score={score2:.1f}  (ml_prob=None → usa 1.0, sem earnings penalty)")
     print()
 
     print("=== Value Trap ===")
@@ -641,6 +709,13 @@ if __name__ == "__main__":
     res2 = calculate_score(trap, ml_prob=0.70)
     for k, v in res2.items():
         print(f"  {k}: {v}")
+    print()
+
+    print("=== Sem volume (volume_spike ausente — timing usa só RSI+drawdown) ===")
+    no_vol = {k: v for k, v in sample.items() if k not in ("volume", "average_volume")}
+    res4 = calculate_score(no_vol, ml_prob=0.85)
+    print(f"  timing_score: {res4['timing_score']:.4f}")
+    print(f"  confidence:   {res4['confidence']:.4f}  (volume não conta para conf)")
     print()
 
     print("=== Baixa confiança ===")
