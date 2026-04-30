@@ -376,6 +376,69 @@ def buy(
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# seed_position — popula o GSheets a partir de env vars sem tocar na liquidez
+# Usado pelo comando /importar para migrar HOLDING_* → Posicoes tab
+# ─────────────────────────────────────────────────────────────────────────
+
+def seed_position(
+    symbol:      str,
+    price:       float,
+    shares:      float,
+    category:    str        = "",
+    entry_score: int | None = None,
+    name:        str        = "",
+    entry_date:  str        = "",
+) -> dict:
+    """Regista uma posição existente no backend (GSheets/JSON) SEM afectar a liquidez.
+    Idempotente: se o ticker já existir, devolve action='exists' e não sobrescreve."""
+    symbol = symbol.upper().strip()
+    _ensure_cache()
+
+    if is_etf(symbol):
+        category    = "ETF"
+        entry_score = None
+
+    positions = _cache["positions"]
+
+    if symbol in positions:
+        log.info(f"[portfolio] SEED {symbol} — já existe, ignorado")
+        return {"symbol": symbol, "shares": shares, "price": price,
+                "cost": round(price * shares, 2), "action": "exists",
+                "position": positions[symbol]}
+
+    now_str = entry_date or datetime.now().strftime("%d/%m/%Y")
+    now_iso = datetime.now().date().isoformat()
+    now_hm  = datetime.now().strftime("%d/%m %H:%M")
+    cost    = round(price * shares, 2)
+
+    positions[symbol] = {
+        "symbol":              symbol,
+        "name":                name or symbol,
+        "shares":              round(shares, 6),
+        "avg_price":           round(price, 4),
+        "total_cost":          cost,
+        "category":            category or "Holding",
+        "entry_score":         entry_score,
+        "entry_date":          now_str,
+        "entry_date_iso":      now_iso,
+        "last_score":          entry_score,
+        "last_price":          price,
+        "last_update":         now_hm,
+        "degradation_alerted": False,
+    }
+    _flush()
+    log.info(f"[portfolio] SEED {symbol} x{shares} @ ${price} | custo ${cost} | nova posição")
+    return {
+        "symbol":   symbol,
+        "shares":   shares,
+        "price":    price,
+        "cost":     cost,
+        "action":   "new",
+        "position": positions[symbol],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # /sell
 # ─────────────────────────────────────────────────────────────────────────
 
