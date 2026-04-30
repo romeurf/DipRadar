@@ -15,8 +15,8 @@ API pública (compatível com toda a base de código existente):
   calculate_score(features, ml_prob)           — motor puro
   score_from_fundamentals(fund, ml_prob)       — adaptador market_client
   format_score_v2_breakdown(result)            — bloco Telegram
-  calculate_dip_score(fund, sym, ...)          — shim retro-compat
-  build_score_breakdown(fund, sym, ...)        — shim retro-compat
+  calculate_dip_score(fund, sym, ..., ml_prob) — shim retro-compat (ml_prob propagado)
+  build_score_breakdown(fund, sym, ..., ml_prob) — shim retro-compat (ml_prob propagado)
   is_bluechip(fund)                            — mantido sem alterações
   classify_dip_category(fund, score, bc_flag)  — mantido sem alterações
   CATEGORY_HOLD_FOREVER / APARTAMENTO / ROTACAO
@@ -137,6 +137,20 @@ _SECTOR_ROIC_MEAN: dict[str, float] = {
     "Basic Materials":        0.09,
 }
 
+_SECTOR_ROIC_STD: dict[str, float] = {
+    "Technology":             0.12,
+    "Healthcare":             0.10,
+    "Communication Services": 0.09,
+    "Financial Services":     0.07,
+    "Consumer Cyclical":      0.09,
+    "Consumer Defensive":     0.08,
+    "Industrials":            0.07,
+    "Energy":                 0.07,
+    "Utilities":              0.04,
+    "Real Estate":            0.05,
+    "Basic Materials":        0.07,
+}
+
 
 # ---------------------------------------------------------------------------
 # 3. Função Sigmóide — o "esmagador de outliers"
@@ -195,7 +209,7 @@ def _compute_quality(
     scores: list[float] = []
 
     roic_mean = _SECTOR_ROIC_MEAN.get(sector, _DEFAULT_MEAN["roic"])
-    roic_std  = _DEFAULT_STD["roic"]
+    roic_std  = _SECTOR_ROIC_STD.get(sector, _DEFAULT_STD["roic"])  # sector-aware std
 
     # ROIC (com fallback para fcf_yield como proxy)
     n_total.append(1)
@@ -539,7 +553,8 @@ def classify_dip_category(fundamentals: dict, dip_score: float, is_bluechip_flag
 
 # ---------------------------------------------------------------------------
 # 14. Shims de retro-compatibilidade
-#     Permitem que main.py e bot_commands.py funcionem sem qualquer alteração.
+#     ml_prob propagado ao motor — check_thesis_degradation e weekly scan
+#     passam agora o peso ML correto.
 # ---------------------------------------------------------------------------
 
 def calculate_dip_score(
@@ -548,14 +563,16 @@ def calculate_dip_score(
     earnings_days: int | None = None,
     sector_change: float | None = None,
     stock_change_pct: float | None = None,
+    ml_prob: float | None = None,
 ) -> tuple[float, str | None]:
     """
     Shim de compatibilidade. Chama o motor quantitativo internamente.
-    Assinatura idêntica à função antiga — zero alterações em main.py.
+    Aceita ml_prob opcional — se fornecido, é propagado ao motor como
+    ponderador ML, tornando todas as chamadas ML-aware automaticamente.
 
     Devolve (final_score: float, rsi_str: str | None).
     """
-    result  = score_from_fundamentals(fundamentals)
+    result  = score_from_fundamentals(fundamentals, ml_prob=ml_prob)
     rsi_val = fundamentals.get("rsi")
     rsi_str = f"{float(rsi_val):.0f}" if rsi_val is not None else None
     return result["final_score"], rsi_str
@@ -567,12 +584,14 @@ def build_score_breakdown(
     earnings_days: int | None = None,
     sector_change: float | None = None,
     stock_change_pct: float | None = None,
+    ml_prob: float | None = None,
 ) -> str:
     """
     Shim de compatibilidade. Devolve o bloco Telegram do motor quantitativo.
-    Assinatura idêntica à função antiga — zero alterações em main.py.
+    Aceita ml_prob opcional — propagado ao motor para reflectir o peso ML
+    na breakdown exibida no Telegram.
     """
-    result = score_from_fundamentals(fundamentals)
+    result = score_from_fundamentals(fundamentals, ml_prob=ml_prob)
     return format_score_v2_breakdown(result)
 
 
@@ -604,12 +623,17 @@ if __name__ == "__main__":
     print(format_score_v2_breakdown(res))
     print()
 
-    print("=== shim calculate_dip_score ===")
-    score, rsi_str = calculate_dip_score(sample, "AAPL")
+    print("=== shim calculate_dip_score (com ml_prob) ===")
+    score, rsi_str = calculate_dip_score(sample, "AAPL", ml_prob=0.85)
     print(f"  score={score:.1f}  rsi_str={rsi_str}")
     bc = is_bluechip(sample)
     cat = classify_dip_category(sample, score, bc)
     print(f"  is_bluechip={bc}  category={cat}")
+    print()
+
+    print("=== shim calculate_dip_score (sem ml_prob — retro-compat) ===")
+    score2, _ = calculate_dip_score(sample, "AAPL")
+    print(f"  score={score2:.1f}  (ml_prob=None → usa 1.0)")
     print()
 
     print("=== Value Trap ===")
