@@ -154,7 +154,7 @@ def get_insider_buy_flag(symbol: str) -> str:
         transactions = yf.Ticker(symbol).insider_transactions
         if transactions is None or transactions.empty:
             return ""
-        cutoff = datetime.now() - timedelta(days=90)
+        cutoff = datetime.now(LISBON_TZ) - timedelta(days=90)
         recent = transactions[
             (transactions.index >= cutoff) &
             (transactions["Shares"].fillna(0) > 0)
@@ -217,17 +217,18 @@ def _pnl_emoji(v: float) -> str:
 def _get_snapshot() -> dict:
     usd_eur = get_usdeur()
     return get_portfolio_snapshot(
-        HOLDINGS, {}, PPR_SHARES, PPR_AVG_COST, usd_eur
+        HOLDINGS, PPR_SHARES, PPR_AVG_COST, usd_eur
     )
 
 def send_heartbeat() -> None:
     logging.info("A gerar heartbeat de carteira...")
+    now_lisbon = datetime.now(LISBON_TZ)
     try:
         snapshot = _get_snapshot()
     except Exception as e:
         logging.error(f"Heartbeat snapshot: {e}")
         send_telegram(
-            f"🤖 *DipRadar* ativo — {datetime.now().strftime('%d/%m %H:%M')}\n"
+            f"🤖 *DipRadar* ativo — {now_lisbon.strftime('%d/%m %H:%M')}\n"
             f"_Erro ao calcular carteira: {e}_"
         )
         return
@@ -236,7 +237,7 @@ def send_heartbeat() -> None:
     total_cost = snapshot.get("total_cost", 0)
     if total == 0:
         send_telegram(
-            f"🤖 *DipRadar — Bom dia!* {datetime.now().strftime('%d/%m/%Y')}\n"
+            f"🤖 *DipRadar — Bom dia!* {now_lisbon.strftime('%d/%m/%Y')}\n"
             f"⚠️ *Variáveis da carteira em falta no Railway.*\n"
             f"_Adiciona HOLDING_*, PPR_SHARES, PPR_AVG_COST nas env vars._"
         )
@@ -253,9 +254,9 @@ def send_heartbeat() -> None:
             return f" ({'+' if pnl >= 0 else ''}{pnl / base * 100:.2f}%)"
         return ""
 
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%d/%m")
+    yesterday = (now_lisbon - timedelta(days=1)).strftime("%d/%m")
     lines = [
-        f"🤖 *DipRadar — Bom dia!* {datetime.now().strftime('%d/%m/%Y')}",
+        f"🤖 *DipRadar — Bom dia!* {now_lisbon.strftime('%d/%m/%Y')}",
         f"_USD/EUR: {fx:.4f}_",
         "",
         f"*📦 Carteira total: €{total:,.2f}*",
@@ -325,7 +326,7 @@ def send_heartbeat() -> None:
         try:
             days = get_earnings_days(clean_sym)
             if days is not None:
-                dt_str = (datetime.now() + timedelta(days=days)).strftime("%d/%m")
+                dt_str = (now_lisbon + timedelta(days=days)).strftime("%d/%m")
                 urgency = "🔴" if days <= 7 else "🟡" if days <= 21 else "📅"
                 earnings_alerts.append(f"  {urgency} *{clean_sym}*: earnings em {days}d ({dt_str})")
         except Exception:
@@ -333,6 +334,16 @@ def send_heartbeat() -> None:
 
     if earnings_alerts:
         lines += ["", "*📅 Earnings próximos (carteira):*"] + sorted(earnings_alerts)
+
+    # Semáforo macro
+    try:
+        mc_ctx = get_macro_context()
+        if mc_ctx.get("summary"):
+            lines += ["", mc_ctx["summary"]]
+            if mc_ctx.get("alert"):
+                lines.append("_⚠️ Condições macro adversas — redobrar cautela nas entradas_")
+    except Exception as e:
+        logging.warning(f"Heartbeat macro context: {e}")
 
     # Indicador Tiingo + ML
     tiingo_ok = is_tiingo_available()
@@ -385,7 +396,7 @@ def check_portfolio_stress() -> None:
                 f"🚨 *Alerta de stress: {sym}*{in_portfolio}\n"
                 f"Queda de *{pct_d:.1f}%* no dia de hoje\n"
                 f"P&L dia: €{pnl_d:+,.2f} | Valor actual: €{val:,.2f}\n"
-                f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_"
+                f"_⏰ {datetime.now(LISBON_TZ).strftime('%d/%m %H:%M')}_"
             )
             _stress_alerted.add(sym)
             logging.warning(f"Portfolio stress: {sym} {pct_d:.1f}%")
@@ -402,7 +413,7 @@ def check_portfolio_stress() -> None:
                     f"🚨 *Carteira em stress macro*\n"
                     f"Queda de *{pct_total:.1f}%* no dia de hoje{spy_str}\n"
                     f"P&L dia: €{pnl_day:+,.2f} | Total: €{total_eur:,.2f}\n"
-                    f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_"
+                    f"_⏰ {datetime.now(LISBON_TZ).strftime('%d/%m %H:%M')}_"
                 )
                 logging.warning(f"Portfolio stress MACRO: {pct_total:.1f}%")
 
@@ -483,7 +494,7 @@ def check_thesis_degradation(region: str = "ALL") -> None:
                     f"♻️ *Tese recuperada: {sym}*\n"
                     f"Score actual: *{score:.0f}/100* — voltou perto do entry score ({entry_score}/100)\n"
                     f"_Flag de degradação limpa — posição estabilizada_\n"
-                    f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_"
+                    f"_⏰ {datetime.now(LISBON_TZ).strftime('%d/%m %H:%M')}_"
                 )
                 continue
 
@@ -511,7 +522,7 @@ def check_thesis_degradation(region: str = "ALL") -> None:
                     "",
                     f"*⚠️ Reavalia a tese de investimento.*",
                     f"_Preço de fecho limpo — considera a tua ordem para amanhã_",
-                    f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_",
+                    f"_⏰ {datetime.now(LISBON_TZ).strftime('%d/%m %H:%M')}_",
                 ]
                 send_telegram("\n".join(lines))
                 mark_degradation_alerted(sym)
@@ -536,7 +547,7 @@ def check_recovery_alerts() -> None:
         for p in stale:
             sym          = p["symbol"]
             in_portfolio = " 📦" if sym in DIRECT_TICKERS else ""
-            days_held    = (datetime.now() - datetime.fromisoformat(p["date_iso"])).days
+            days_held    = (datetime.now(LISBON_TZ) - datetime.fromisoformat(p["date_iso"]).replace(tzinfo=LISBON_TZ)).days
             send_telegram(
                 f"⏹️ *Recovery Watch — Stop Temporal: {sym}*{in_portfolio}\n"
                 f"*{days_held} dias* sem atingir o target de recuperação.\n"
@@ -544,7 +555,7 @@ def check_recovery_alerts() -> None:
                 f"Target: *+{p['target_pct']}%* (${p['target_price']:.2f})\n"
                 f"Score original: {p.get('score', 'N/A')}/100\n"
                 f"_Considera fechar a posição ou manter manualmente._\n"
-                f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_"
+                f"_⏰ {datetime.now(LISBON_TZ).strftime('%d/%m %H:%M')}_"
             )
             mark_stale_alerted(sym)
     except Exception as e:
@@ -567,7 +578,7 @@ def check_recovery_alerts() -> None:
                     f"Preço actual: *${current:.2f}* | Alerta foi a *${price_alert:.2f}*\n"
                     f"Recuperação: *+{pct_recovery:.1f}%* ✅\n"
                     f"_Score original: {pos.get('score', 'N/A')}/100 | Alerta em {pos.get('date', '')}_\n"
-                    f"_⏰ {datetime.now().strftime('%d/%m %H:%M')}_"
+                    f"_⏰ {datetime.now(LISBON_TZ).strftime('%d/%m %H:%M')}_"
                 )
                 mark_recovery_alerted(sym)
         except Exception as e:
@@ -577,7 +588,7 @@ def check_recovery_alerts() -> None:
 # ── Weekly structural dip scan ────────────────────────────────────────────────
 
 def send_weekly_dip_scan() -> None:
-    if datetime.now().weekday() != 0:
+    if datetime.now(LISBON_TZ).weekday() != 0:
         return
     logging.info("A correr weekly structural dip scan...")
     candidates = screen_structural_dips(min_drawdown_pct=25.0, min_market_cap=MIN_MARKET_CAP)
@@ -623,7 +634,7 @@ def send_weekly_dip_scan() -> None:
         return
     scored.sort(key=lambda x: x["score"], reverse=True)
     lines = [
-        f"*📶 Weekly Structural Dip Scan — {datetime.now().strftime('%d/%m/%Y')}*",
+        f"*📶 Weekly Structural Dip Scan — {datetime.now(LISBON_TZ).strftime('%d/%m/%Y')}*",
         f"_Stocks ≥25% abaixo dos máximos de 52 semanas com score ≥70/100_",
         "",
     ]
@@ -645,11 +656,11 @@ def send_weekly_dip_scan() -> None:
 # ── Saturday Weekly Report ────────────────────────────────────────────────────
 
 def send_saturday_report() -> None:
-    if datetime.now().weekday() != 5:
+    if datetime.now(LISBON_TZ).weekday() != 5:
         return
     logging.info("A gerar Saturday Weekly Report...")
     entries    = load_weekly_log()
-    now        = datetime.now()
+    now        = datetime.now(LISBON_TZ)
     week_start = (now - timedelta(days=now.weekday() + 1)).strftime("%d/%m")
     week_end   = (now - timedelta(days=1)).strftime("%d/%m")
     lines      = [f"*📊 Weekly Report — {week_start} a {week_end}*", ""]
@@ -1043,7 +1054,7 @@ def analyze_ticker(symbol: str) -> str:
             ml_result=ml_result,
         )
 
-        header = f"🔍 *Análise on-demand — {symbol}*\n_Pedido via /analisar — {datetime.now().strftime('%d/%m %H:%M')}_\n\n"
+        header = f"🔍 *Análise on-demand — {symbol}*\n_Pedido via /analisar — {datetime.now(LISBON_TZ).strftime('%d/%m %H:%M')}_\n\n"
         return header + alert_text
 
     except Exception as e:
@@ -1196,11 +1207,11 @@ def run_scan() -> None:
                 append_weekly_log({
                     "symbol": sym, "score": score, "change": stock["change_pct"],
                     "verdict": verdict, "sector": fund.get("sector", ""),
-                    "date": datetime.now().strftime("%d/%m"),
-                    "time": datetime.now().strftime("%H:%M"),
+                    "date": datetime.now(LISBON_TZ).strftime("%d/%m"),
+                    "time": datetime.now(LISBON_TZ).strftime("%H:%M"),
                 })
                 append_backtest_entry({
-                    "symbol": sym, "date": datetime.now().strftime("%Y-%m-%d"),
+                    "symbol": sym, "date": datetime.now(LISBON_TZ).strftime("%Y-%m-%d"),
                     "price": fund.get("price") or stock.get("price", 0),
                     "score": score, "verdict": verdict,
                 })
@@ -1260,7 +1271,7 @@ def run_ml_outcomes_job() -> None:
 
     lines = [
         f"🤖 *ML Outcomes — Update semanal*",
-        f"_{datetime.now().strftime('%d/%m/%Y %H:%M')}_",
+        f"_{datetime.now(LISBON_TZ).strftime('%d/%m/%Y %H:%M')}_",
         "",
         f"*🗓️ Alertas na base de dados:* {total}",
         f"*📊 Classificados:* {labeled} ({labeled/total*100:.0f}% do total)" if total > 0 else "*📊 Classificados:* 0",
