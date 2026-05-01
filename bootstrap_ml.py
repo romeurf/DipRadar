@@ -6,29 +6,39 @@ MODO AUTOMÁTICO (agendado pelo bot, corre às 02:00 UTC todos os dias):
     - Registos fora da janela são eliminados automaticamente
     - Retreina ambas as camadas
 
-MODO MANUAL (Railway CLI / Colab):
+MODO MANUAL (Railway CLI):
     python bootstrap_ml.py                          # tudo com defaults
-    python bootstrap_ml.py --algo xgb              # XGBoost
-    python bootstrap_ml.py --layer price           # só Camada A
-    python bootstrap_ml.py --layer fund            # só Camada B
-    python bootstrap_ml.py --years-price 20        # janela Camada A
-    python bootstrap_ml.py --years-fund 7          # janela Camada B
-    python bootstrap_ml.py --skip-backfill         # só treino
-    python bootstrap_ml.py --force-full            # refaz backfill completo
+    python bootstrap_ml.py --algo xgb
+    python bootstrap_ml.py --layer price
+    python bootstrap_ml.py --layer fund
+    python bootstrap_ml.py --skip-backfill          # só treino
+    python bootstrap_ml.py --force-full             # refaz backfill completo
+
+MODO COLAB — backfill em batches (Google Drive como persistência):
+    # Sessão 1 — tickers 0..199
+    python bootstrap_ml.py --layer price --slice 0 200 --drive-dir /content/drive/MyDrive/DipRadar
+    # Sessão 2 — tickers 200..399
+    python bootstrap_ml.py --layer price --slice 200 400 --drive-dir /content/drive/MyDrive/DipRadar
+    # ... (repetir até esgotar todos os tickers)
+    # Sessão final — treino com o Parquet completo
+    python bootstrap_ml.py --layer price --skip-backfill --drive-dir /content/drive/MyDrive/DipRadar
+
+    O argumento --slice START END limita o backfill aos tickers UNIVERSE[START:END].
+    O Parquet no Drive é acumulado incrementalmente — cada sessão retoma de onde parou.
+    --drive-dir define o directório onde os Parquets e .pkl são guardados/lidos.
 
 OUTPUT:
-    /data/dip_model_price.pkl    ← Camada A (só técnicas)
-    /data/dip_model_stage1.pkl   ← Camada B stage 1 (win vs no-win)
-    /data/dip_model_stage2.pkl   ← Camada B stage 2 (win40 vs win20)
-    /data/ml_training_price.parquet   ← dados Camada A
-    /data/ml_training_fund.parquet    ← dados Camada B
+    <data_dir>/dip_model_price.pkl    ← Camada A (só técnicas)
+    <data_dir>/dip_model_stage1.pkl   ← Camada B stage 1 (win vs no-win)
+    <data_dir>/dip_model_stage2.pkl   ← Camada B stage 2 (win40 vs win20)
+    <data_dir>/ml_training_price.parquet
+    <data_dir>/ml_training_fund.parquet
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
-import os
 import pickle
 import sys
 import time
@@ -47,20 +57,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("bootstrap_ml")
 
-# ── Caminhos ──────────────────────────────────────────────────────────────────
-DATA_DIR = Path("/data") if Path("/data").exists() else Path("./data")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-PKL_PRICE = DATA_DIR / "dip_model_price.pkl"   # Camada A
-PKL_S1    = DATA_DIR / "dip_model_stage1.pkl"  # Camada B — win vs no-win
-PKL_S2    = DATA_DIR / "dip_model_stage2.pkl"  # Camada B — win40 vs win20
-
-PARQUET_PRICE = DATA_DIR / "ml_training_price.parquet"   # janela Camada A
-PARQUET_FUND  = DATA_DIR / "ml_training_fund.parquet"    # janela Camada B
-
 # ── Janelas deslizantes ────────────────────────────────────────────────────────
-YEARS_PRICE = 20   # Camada A — preço puro
-YEARS_FUND  = 7    # Camada B — fundamentais
+YEARS_PRICE = 20
+YEARS_FUND  = 7
 
 
 def _window(years: int) -> tuple[date, date]:
@@ -70,14 +69,12 @@ def _window(years: int) -> tuple[date, date]:
 
 
 # ── Features ──────────────────────────────────────────────────────────────────
-# Camada A — só técnicas (disponíveis nos 20 anos de histórico)
 FEATURES_PRICE: list[str] = [
     "rsi", "drawdown_pct", "change_day_pct",
     "beta", "spy_change", "sector_etf_change",
     "volume_ratio", "atr_pct",
 ]
 
-# Camada B — técnicas + fundamentais
 FEATURES_FUND: list[str] = [
     "rsi", "drawdown_pct", "change_day_pct",
     "pe_ratio", "pb_ratio", "fcf_yield", "analyst_upside",
@@ -87,7 +84,7 @@ FEATURES_FUND: list[str] = [
     "market_cap_b", "dip_score",
 ]
 
-# ── Universo ──────────────────────────────────────────────────────────────────
+# ── Universo (880 tickers) ────────────────────────────────────────────────────
 UNIVERSE = [
     # Tech
     "AAPL","MSFT","NVDA","GOOGL","META","AMZN","TSLA","AMD","INTC","CRM",
@@ -123,17 +120,15 @@ def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 
 def calc_atr_pct(hist: pd.DataFrame, period: int = 14) -> pd.Series:
-    """ATR como % do preço de fecho."""
     high_low   = hist["High"] - hist["Low"]
     high_close = (hist["High"] - hist["Close"].shift()).abs()
-    low_close  = (hist["Low"] - hist["Close"].shift()).abs()
+    low_close  = (hist["Low"]  - hist["Close"].shift()).abs()
     tr  = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     atr = tr.rolling(period).mean()
     return (atr / hist["Close"]) * 100
 
 
 def calc_volume_ratio(hist: pd.DataFrame, period: int = 20) -> pd.Series:
-    """Volume do dia / média dos últimos N dias."""
     avg = hist["Volume"].rolling(period).mean()
     return hist["Volume"] / (avg + 1e-9)
 
@@ -145,7 +140,7 @@ def outcome_label(ret: float) -> str:
     else:            return "LOSS_15"
 
 
-def get_price_near(hist: pd.DataFrame, target: date, window: int = 5) -> float | None:
+def get_price_near(hist: pd.DataFrame, target: date) -> float | None:
     for d in range(-3, 6):
         check = target + timedelta(days=d)
         m = hist[hist.index.date == check]
@@ -188,19 +183,16 @@ def simple_dip_score(r: dict) -> float:
     return min(max(score, 0), 100)
 
 
-# ── Backfill — Camada A (preço puro, 20 anos) ─────────────────────────────────
+# ── Backfill — Camada A (preço puro) ─────────────────────────────────────────
 
 def backfill_price(
     start: date,
     end:   date,
+    tickers: list[str],
     dip_thresh: float = 0.04,
     max_per_ticker: int = 10,
     existing_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """
-    Só features técnicas — sem chamadas a .info().
-    Funciona com 20 anos de histórico no yfinance.
-    """
     try:
         import yfinance as yf
     except ImportError:
@@ -214,11 +206,10 @@ def backfill_price(
                 existing_df["alert_date"].astype(str))
         )
 
-    start_str  = start.isoformat()
-    fetch_end  = min(end + timedelta(days=200), date.today()).isoformat()
+    start_str = start.isoformat()
+    fetch_end = min(end + timedelta(days=200), date.today()).isoformat()
 
-    log.info(f"[CamadaA] Backfill preço: {start_str} → {end.isoformat()}")
-    log.info(f"  Já existentes: {len(existing_keys)}")
+    log.info(f"[CamadaA] {start_str} → {end.isoformat()} | {len(tickers)} tickers | existentes: {len(existing_keys)}")
 
     spy_hist = yf.Ticker("SPY").history(start=start_str, end=fetch_end, interval="1d")
     spy_hist["spy_ret"] = spy_hist["Close"].pct_change() * 100
@@ -226,20 +217,19 @@ def backfill_price(
 
     all_alerts: list[dict] = []
 
-    for i, ticker in enumerate(UNIVERSE):
+    for i, ticker in enumerate(tickers):
         try:
             hist = yf.Ticker(ticker).history(start=start_str, end=fetch_end, interval="1d")
             if hist.empty or len(hist) < 60:
                 continue
 
-            hist["rsi"]          = calc_rsi(hist["Close"])
-            hist["ret_1d"]       = hist["Close"].pct_change() * 100
-            hist["atr_pct"]      = calc_atr_pct(hist)
-            hist["vol_ratio"]    = calc_volume_ratio(hist)
-            roll_max             = hist["Close"].rolling(252, min_periods=30).max()
-            hist["ddp"]          = (hist["Close"] - roll_max) / roll_max * 100
+            hist["rsi"]       = calc_rsi(hist["Close"])
+            hist["ret_1d"]    = hist["Close"].pct_change() * 100
+            hist["atr_pct"]   = calc_atr_pct(hist)
+            hist["vol_ratio"] = calc_volume_ratio(hist)
+            roll_max          = hist["Close"].rolling(252, min_periods=30).max()
+            hist["ddp"]       = (hist["Close"] - roll_max) / roll_max * 100
 
-            # beta aproximado via correlação com SPY na janela de 252 dias
             spy_aligned = pd.Series(spy_map).reindex(
                 [d.date() for d in hist.index], fill_value=np.nan
             )
@@ -290,24 +280,24 @@ def backfill_price(
                     continue
 
                 all_alerts.append({
-                    "symbol":         ticker,
-                    "alert_date":     alert_date.isoformat(),
-                    "price":          round(entry, 2),
-                    "rsi":            round(safe_float(row["rsi"], 50), 1),
-                    "drawdown_pct":   round(safe_float(row["ddp"], 0), 2),
-                    "change_day_pct": round(float(row["ret_1d"]), 2),
-                    "beta":           round(safe_float(row["beta_roll"], 1.0), 2),
-                    "atr_pct":        round(safe_float(row["atr_pct"], 1.0), 2),
-                    "volume_ratio":   round(safe_float(row["vol_ratio"], 1.0), 2),
-                    "spy_change":     round(spy_chg, 2),
+                    "symbol":            ticker,
+                    "alert_date":        alert_date.isoformat(),
+                    "price":             round(entry, 2),
+                    "rsi":               round(safe_float(row["rsi"], 50), 1),
+                    "drawdown_pct":      round(safe_float(row["ddp"], 0), 2),
+                    "change_day_pct":    round(float(row["ret_1d"]), 2),
+                    "beta":              round(safe_float(row["beta_roll"], 1.0), 2),
+                    "atr_pct":           round(safe_float(row["atr_pct"], 1.0), 2),
+                    "volume_ratio":      round(safe_float(row["vol_ratio"], 1.0), 2),
+                    "spy_change":        round(spy_chg, 2),
                     "sector_etf_change": round(spy_chg * 0.9, 2),
-                    "return_3m":      round(r3m, 2) if r3m is not None else None,
-                    "return_6m":      round(r6m, 2) if r6m is not None else None,
-                    "outcome_label":  outcome_label(ref),
+                    "return_3m":         round(r3m, 2) if r3m is not None else None,
+                    "return_6m":         round(r6m, 2) if r6m is not None else None,
+                    "outcome_label":     outcome_label(ref),
                 })
 
             if (i + 1) % 20 == 0:
-                log.info(f"  [{i+1}/{len(UNIVERSE)}] {len(all_alerts)} alertas")
+                log.info(f"  [{i+1}/{len(tickers)}] {len(all_alerts)} alertas")
             time.sleep(0.2)
 
         except Exception as e:
@@ -317,19 +307,16 @@ def backfill_price(
     return pd.DataFrame(all_alerts) if all_alerts else pd.DataFrame()
 
 
-# ── Backfill — Camada B (fundamentais, 7 anos) ───────────────────────────────
+# ── Backfill — Camada B (fundamentais) ───────────────────────────────────────
 
 def backfill_fund(
     start: date,
     end:   date,
+    tickers: list[str],
     dip_thresh: float = 0.04,
     max_per_ticker: int = 8,
     existing_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """
-    Features técnicas + fundamentais via yfinance .info().
-    Janela mais curta (7 anos) onde os fundamentais são fiáveis.
-    """
     try:
         import yfinance as yf
     except ImportError:
@@ -346,8 +333,7 @@ def backfill_fund(
     start_str = start.isoformat()
     fetch_end = min(end + timedelta(days=200), date.today()).isoformat()
 
-    log.info(f"[CamadaB] Backfill fundamentais: {start_str} → {end.isoformat()}")
-    log.info(f"  Já existentes: {len(existing_keys)}")
+    log.info(f"[CamadaB] {start_str} → {end.isoformat()} | {len(tickers)} tickers | existentes: {len(existing_keys)}")
 
     spy_hist = yf.Ticker("SPY").history(start=start_str, end=fetch_end, interval="1d")
     spy_hist["spy_ret"] = spy_hist["Close"].pct_change() * 100
@@ -355,7 +341,7 @@ def backfill_fund(
 
     all_alerts: list[dict] = []
 
-    for i, ticker in enumerate(UNIVERSE):
+    for i, ticker in enumerate(tickers):
         try:
             tk   = yf.Ticker(ticker)
             hist = tk.history(start=start_str, end=fetch_end, interval="1d")
@@ -368,19 +354,19 @@ def backfill_fund(
             roll_max       = hist["Close"].rolling(252, min_periods=30).max()
             hist["ddp"]    = (hist["Close"] - roll_max) / roll_max * 100
 
-            pe    = safe_float(info.get("trailingPE") or info.get("forwardPE"))
-            pb    = safe_float(info.get("priceToBook"))
-            mcap  = safe_float(info.get("marketCap"), 0) / 1e9
-            fcf   = safe_float(info.get("freeCashflow"))
+            pe     = safe_float(info.get("trailingPE") or info.get("forwardPE"))
+            pb     = safe_float(info.get("priceToBook"))
+            mcap   = safe_float(info.get("marketCap"), 0) / 1e9
+            fcf    = safe_float(info.get("freeCashflow"))
             mc_raw = safe_float(info.get("marketCap"))
-            fcfy  = (fcf / mc_raw * 100) if fcf and mc_raw else None
-            revg  = safe_float(info.get("revenueGrowth"), 0) * 100
-            gm    = safe_float(info.get("grossMargins"), 0) * 100
-            de    = safe_float(info.get("debtToEquity"), 0) / 100
-            beta  = safe_float(info.get("beta"), 1.0)
-            short = safe_float(info.get("shortPercentOfFloat"), 0) * 100
-            tgt   = safe_float(info.get("targetMeanPrice"))
-            cur   = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"), 1)
+            fcfy   = (fcf / mc_raw * 100) if fcf and mc_raw else None
+            revg   = safe_float(info.get("revenueGrowth"), 0) * 100
+            gm     = safe_float(info.get("grossMargins"), 0) * 100
+            de     = safe_float(info.get("debtToEquity"), 0) / 100
+            beta   = safe_float(info.get("beta"), 1.0)
+            short  = safe_float(info.get("shortPercentOfFloat"), 0) * 100
+            tgt    = safe_float(info.get("targetMeanPrice"))
+            cur    = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"), 1)
             upside = ((tgt - cur) / cur * 100) if tgt and cur else 0.0
 
             mask = (
@@ -425,22 +411,22 @@ def backfill_fund(
                     continue
 
                 feat: dict = {
-                    "rsi":              round(safe_float(row["rsi"], 50), 1),
-                    "drawdown_pct":     round(safe_float(row["ddp"], 0), 2),
-                    "change_day_pct":   round(float(row["ret_1d"]), 2),
-                    "pe_ratio":         round(pe, 1) if pe else None,
-                    "pb_ratio":         round(pb, 2) if pb else None,
-                    "fcf_yield":        round(fcfy, 4) if fcfy else None,
-                    "analyst_upside":   round(upside, 1),
-                    "revenue_growth":   round(revg, 2),
-                    "gross_margin":     round(gm, 2),
-                    "debt_to_equity":   round(de, 2),
-                    "beta":             round(beta, 2),
-                    "short_pct":        round(short, 2),
-                    "spy_change":       round(spy_chg, 2),
+                    "rsi":               round(safe_float(row["rsi"], 50), 1),
+                    "drawdown_pct":      round(safe_float(row["ddp"], 0), 2),
+                    "change_day_pct":    round(float(row["ret_1d"]), 2),
+                    "pe_ratio":          round(pe, 1) if pe else None,
+                    "pb_ratio":          round(pb, 2) if pb else None,
+                    "fcf_yield":         round(fcfy, 4) if fcfy else None,
+                    "analyst_upside":    round(upside, 1),
+                    "revenue_growth":    round(revg, 2),
+                    "gross_margin":      round(gm, 2),
+                    "debt_to_equity":    round(de, 2),
+                    "beta":              round(beta, 2),
+                    "short_pct":         round(short, 2),
+                    "spy_change":        round(spy_chg, 2),
                     "sector_etf_change": round(spy_chg * 0.9, 2),
-                    "earnings_days":    90,
-                    "market_cap_b":     round(mcap, 2),
+                    "earnings_days":     90,
+                    "market_cap_b":      round(mcap, 2),
                 }
                 feat["dip_score"]     = round(simple_dip_score(feat), 1)
                 feat["symbol"]        = ticker
@@ -452,7 +438,7 @@ def backfill_fund(
                 all_alerts.append(feat)
 
             if (i + 1) % 20 == 0:
-                log.info(f"  [{i+1}/{len(UNIVERSE)}] {len(all_alerts)} alertas")
+                log.info(f"  [{i+1}/{len(tickers)}] {len(all_alerts)} alertas")
             time.sleep(0.3)
 
         except Exception as e:
@@ -468,6 +454,7 @@ def load_and_slide(
     parquet: Path,
     start: date,
     new_df: pd.DataFrame,
+    skip_exit_on_empty: bool = False,
 ) -> pd.DataFrame:
     start_str = start.isoformat()
 
@@ -483,6 +470,9 @@ def load_and_slide(
         existing = pd.DataFrame()
 
     if new_df.empty and existing.empty:
+        if skip_exit_on_empty:
+            log.warning("Sem dados novos e Parquet inexistente — a saltar treino.")
+            return pd.DataFrame()
         log.error("Sem dados — Parquet vazio e backfill sem resultados.")
         sys.exit(1)
 
@@ -539,8 +529,19 @@ def _build_pipeline(algo: str = "rf"):
     return Pipeline(steps)
 
 
-def _train_layer(df: pd.DataFrame, features: list[str], pkl_s1: Path, pkl_s2: Path | None, algo: str, label: str) -> None:
+def _train_layer(
+    df: pd.DataFrame,
+    features: list[str],
+    pkl_s1: Path,
+    pkl_s2: Path | None,
+    algo: str,
+    label: str,
+) -> None:
     from sklearn.metrics import average_precision_score, classification_report
+
+    if df.empty:
+        log.warning(f"[{label}] DataFrame vazio — treino saltado.")
+        return
 
     df2 = df[df["outcome_label"].notna()].copy()
     df2["target_s1"] = df2["outcome_label"].apply(
@@ -594,7 +595,6 @@ def _train_layer(df: pd.DataFrame, features: list[str], pkl_s1: Path, pkl_s2: Pa
         pickle.dump(bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
     log.info(f"✅ {pkl_s1}  ({pkl_s1.stat().st_size / 1024:.0f} KB)")
 
-    # Stage 2
     if pkl_s2 is not None:
         wins_tr = train_df[train_df["outcome_label"].isin(["WIN_40", "WIN_20"])].copy()
         wins_tr["target_s2"] = (wins_tr["outcome_label"] == "WIN_40").astype(int)
@@ -632,34 +632,73 @@ def run_auto() -> None:
         log.error("scikit-learn não instalado")
         return
 
-    # Camada A — preço 20 anos
-    start_p, end_p = _window(YEARS_PRICE)
-    existing_p = pd.read_parquet(PARQUET_PRICE) if PARQUET_PRICE.exists() else pd.DataFrame()
-    new_p  = backfill_price(start=start_p, end=end_p, existing_df=existing_p)
-    df_p   = load_and_slide(PARQUET_PRICE, start_p, new_p)
-    _train_layer(df_p, FEATURES_PRICE, PKL_PRICE, None, "rf", "CamadaA")
+    data_dir = Path("/data") if Path("/data").exists() else Path("./data")
+    data_dir.mkdir(parents=True, exist_ok=True)
 
-    # Camada B — fundamentais 7 anos
+    pkl_price     = data_dir / "dip_model_price.pkl"
+    pkl_s1        = data_dir / "dip_model_stage1.pkl"
+    pkl_s2        = data_dir / "dip_model_stage2.pkl"
+    parquet_price = data_dir / "ml_training_price.parquet"
+    parquet_fund  = data_dir / "ml_training_fund.parquet"
+
+    # Camada A
+    start_p, end_p = _window(YEARS_PRICE)
+    existing_p = pd.read_parquet(parquet_price) if parquet_price.exists() else pd.DataFrame()
+    new_p  = backfill_price(start=start_p, end=end_p, tickers=UNIVERSE, existing_df=existing_p)
+    df_p   = load_and_slide(parquet_price, start_p, new_p, skip_exit_on_empty=True)
+    _train_layer(df_p, FEATURES_PRICE, pkl_price, None, "rf", "CamadaA")
+
+    # Camada B
     start_f, end_f = _window(YEARS_FUND)
-    existing_f = pd.read_parquet(PARQUET_FUND) if PARQUET_FUND.exists() else pd.DataFrame()
-    new_f  = backfill_fund(start=start_f, end=end_f, existing_df=existing_f)
-    df_f   = load_and_slide(PARQUET_FUND, start_f, new_f)
-    _train_layer(df_f, FEATURES_FUND, PKL_S1, PKL_S2, "rf", "CamadaB")
+    existing_f = pd.read_parquet(parquet_fund) if parquet_fund.exists() else pd.DataFrame()
+    new_f  = backfill_fund(start=start_f, end=end_f, tickers=UNIVERSE, existing_df=existing_f)
+    df_f   = load_and_slide(parquet_fund, start_f, new_f, skip_exit_on_empty=True)
+    _train_layer(df_f, FEATURES_FUND, pkl_s1, pkl_s2, "rf", "CamadaB")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="DipRadar — Dual-Layer ML (Camada A: preço 20a | Camada B: fundamentais 7a)"
+        description=(
+            "DipRadar — Dual-Layer ML\n"
+            "Camada A: preço 20a | Camada B: fundamentais 7a\n\n"
+            "COLAB (batch incremental):\n"
+            "  Sessão 1: python bootstrap_ml.py --layer price --slice 0 200 "
+            "--drive-dir /content/drive/MyDrive/DipRadar\n"
+            "  Sessão 2: python bootstrap_ml.py --layer price --slice 200 400 "
+            "--drive-dir /content/drive/MyDrive/DipRadar\n"
+            "  Sessão N: python bootstrap_ml.py --layer price --skip-backfill "
+            "--drive-dir /content/drive/MyDrive/DipRadar  # treino final"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--algo",         choices=["rf", "xgb"], default="rf")
-    p.add_argument("--layer",        choices=["all", "price", "fund"], default="all")
-    p.add_argument("--years-price",  type=int, default=YEARS_PRICE)
-    p.add_argument("--years-fund",   type=int, default=YEARS_FUND)
-    p.add_argument("--dip-thresh",   type=float, default=0.04)
-    p.add_argument("--skip-backfill",action="store_true")
-    p.add_argument("--force-full",   action="store_true")
+    p.add_argument("--algo",          choices=["rf", "xgb"], default="rf")
+    p.add_argument("--layer",         choices=["all", "price", "fund"], default="all")
+    p.add_argument("--years-price",   type=int, default=YEARS_PRICE)
+    p.add_argument("--years-fund",    type=int, default=YEARS_FUND)
+    p.add_argument("--dip-thresh",    type=float, default=0.04)
+    p.add_argument("--skip-backfill", action="store_true",
+                   help="Salta o backfill e treina directamente com o Parquet existente")
+    p.add_argument("--force-full",    action="store_true",
+                   help="Ignora dados existentes e refaz backfill completo")
+    p.add_argument(
+        "--slice", nargs=2, type=int, metavar=("START", "END"), default=None,
+        help=(
+            "Limita o backfill a UNIVERSE[START:END]. "
+            "Ideal para sessões Colab de ~200 tickers. "
+            "Exemplo: --slice 0 200"
+        ),
+    )
+    p.add_argument(
+        "--drive-dir", type=str, default=None,
+        metavar="DIR",
+        help=(
+            "Directório onde os Parquets e .pkl são lidos/guardados. "
+            "Substitui /data (Railway) ou ./data. "
+            "Exemplo: --drive-dir /content/drive/MyDrive/DipRadar"
+        ),
+    )
     return p.parse_args()
 
 
@@ -672,47 +711,85 @@ def main() -> None:
         log.error("scikit-learn não instalado")
         sys.exit(1)
 
+    # ── Resolução do data_dir ─────────────────────────────────────────────────
+    if args.drive_dir:
+        data_dir = Path(args.drive_dir)
+    elif Path("/data").exists():
+        data_dir = Path("/data")
+    else:
+        data_dir = Path("./data")
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    pkl_price     = data_dir / "dip_model_price.pkl"
+    pkl_s1        = data_dir / "dip_model_stage1.pkl"
+    pkl_s2        = data_dir / "dip_model_stage2.pkl"
+    parquet_price = data_dir / "ml_training_price.parquet"
+    parquet_fund  = data_dir / "ml_training_fund.parquet"
+
+    # ── Slice de tickers ──────────────────────────────────────────────────────
+    if args.slice:
+        s_start, s_end = args.slice
+        tickers = UNIVERSE[s_start:s_end]
+        log.info(f"🔪 Slice UNIVERSE[{s_start}:{s_end}] = {len(tickers)} tickers")
+    else:
+        tickers = UNIVERSE
+
     run_price = args.layer in ("all", "price")
     run_fund  = args.layer in ("all", "fund")
 
     # ── Camada A ──────────────────────────────────────────────────────────────
     if run_price:
         start_p, end_p = _window(args.years_price)
-        log.info(f"[CamadaA] Janela: {start_p} → {end_p}")
+        log.info(f"[CamadaA] Janela: {start_p} → {end_p} | data_dir: {data_dir}")
         if args.skip_backfill:
-            df_p = pd.read_parquet(PARQUET_PRICE) if PARQUET_PRICE.exists() else pd.DataFrame()
+            df_p = pd.read_parquet(parquet_price) if parquet_price.exists() else pd.DataFrame()
         else:
             existing_p = pd.DataFrame() if args.force_full else (
-                pd.read_parquet(PARQUET_PRICE) if PARQUET_PRICE.exists() else pd.DataFrame()
+                pd.read_parquet(parquet_price) if parquet_price.exists() else pd.DataFrame()
             )
             new_p = backfill_price(
                 start=start_p, end=end_p,
+                tickers=tickers,
                 dip_thresh=args.dip_thresh,
                 existing_df=existing_p,
             )
-            df_p = load_and_slide(PARQUET_PRICE, start_p, new_p)
-        _train_layer(df_p, FEATURES_PRICE, PKL_PRICE, None, args.algo, "CamadaA")
+            df_p = load_and_slide(parquet_price, start_p, new_p, skip_exit_on_empty=bool(args.slice))
+        if not df_p.empty and args.skip_backfill:
+            _train_layer(df_p, FEATURES_PRICE, pkl_price, None, args.algo, "CamadaA")
+        elif not args.skip_backfill and not args.slice:
+            # treino automático só quando não é um slice parcial
+            _train_layer(df_p, FEATURES_PRICE, pkl_price, None, args.algo, "CamadaA")
+        else:
+            n = len(df_p) if not df_p.empty else 0
+            log.info(f"[CamadaA] Batch concluído — Parquet acumulado: {n} registos. Treino adiado para sessão final (--skip-backfill).")
 
     # ── Camada B ──────────────────────────────────────────────────────────────
     if run_fund:
         start_f, end_f = _window(args.years_fund)
-        log.info(f"[CamadaB] Janela: {start_f} → {end_f}")
+        log.info(f"[CamadaB] Janela: {start_f} → {end_f} | data_dir: {data_dir}")
         if args.skip_backfill:
-            df_f = pd.read_parquet(PARQUET_FUND) if PARQUET_FUND.exists() else pd.DataFrame()
+            df_f = pd.read_parquet(parquet_fund) if parquet_fund.exists() else pd.DataFrame()
         else:
             existing_f = pd.DataFrame() if args.force_full else (
-                pd.read_parquet(PARQUET_FUND) if PARQUET_FUND.exists() else pd.DataFrame()
+                pd.read_parquet(parquet_fund) if parquet_fund.exists() else pd.DataFrame()
             )
             new_f = backfill_fund(
                 start=start_f, end=end_f,
+                tickers=tickers,
                 dip_thresh=args.dip_thresh,
                 existing_df=existing_f,
             )
-            df_f = load_and_slide(PARQUET_FUND, start_f, new_f)
-        _train_layer(df_f, FEATURES_FUND, PKL_S1, PKL_S2, args.algo, "CamadaB")
+            df_f = load_and_slide(parquet_fund, start_f, new_f, skip_exit_on_empty=bool(args.slice))
+        if not df_f.empty and args.skip_backfill:
+            _train_layer(df_f, FEATURES_FUND, pkl_s1, pkl_s2, args.algo, "CamadaB")
+        elif not args.skip_backfill and not args.slice:
+            _train_layer(df_f, FEATURES_FUND, pkl_s1, pkl_s2, args.algo, "CamadaB")
+        else:
+            n = len(df_f) if not df_f.empty else 0
+            log.info(f"[CamadaB] Batch concluído — Parquet acumulado: {n} registos. Treino adiado para sessão final (--skip-backfill).")
 
     log.info("=" * 55)
-    log.info("TREINO CONCLUÍDO")
+    log.info("CONCLUÍDO")
     log.info("=" * 55)
 
 
