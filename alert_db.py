@@ -9,12 +9,16 @@ Fase 2 (actual): fill_db_outcomes() preenche MFE/MAE a 1, 3, 6 meses.
 Fase 3 (futuro): treinar modelo sklearn/xgboost com os dados acumulados.
 
 Formato: CSV em /data/alert_db.csv (Railway Volume) ou /tmp/alert_db.csv.
+
+Fonte de preços: Tiingo API (via tiingo_client.py).
+  Mais fiável que yfinance — dados ajustados, sem rate limits agressivos.
+  Requer TIINGO_API_KEY no ambiente.
 """
 
 import csv
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from pathlib import Path
 
 # Persistência em /data/ se Railway Volume disponível, senão /tmp/
@@ -192,6 +196,9 @@ def fill_db_outcomes() -> dict:
     Fase 2 — preenche os campos de resultado (MFE/MAE/returns) para alertas
     com pelo menos 30 dias de histórico disponível.
 
+    Fonte de preços: Tiingo API (tiingo_client.py).
+    Requer TIINGO_API_KEY no ambiente.
+
     Lógica por janela:
       - return_1m  / price_1m  : preenchido se alerta tem >= 30 dias
       - return_3m  / price_3m  : preenchido se alerta tem >= 90 dias
@@ -202,15 +209,13 @@ def fill_db_outcomes() -> dict:
       - outcome_label: WIN_40 | WIN_20 | NEUTRAL | LOSS_15
         Referência por categoria:
           Apartamento  → prioridade return_6m > return_3m > return_1m
-                         (tese de reprecificação a médio/longo prazo)
           Hold Forever → nunca classifica (posição sem target de saída)
           Rotação      → prioridade return_3m > return_6m > return_1m
-                         (tese de flip de curto/médio prazo)
 
     Só actualiza linhas onde os campos ainda estão vazios.
     Retorna dict com stats do run para logging/Telegram.
     """
-    import yfinance as yf
+    from tiingo_client import get_ohlcv, get_price_at, get_mfe_mae
     from score import CATEGORY_APARTAMENTO, CATEGORY_HOLD_FOREVER
 
     if not _DB_PATH.exists():
@@ -230,7 +235,7 @@ def fill_db_outcomes() -> dict:
     updated    = 0
     skipped    = 0
     errors     = 0
-    sym_cache: dict = {}  # cache de histórico por símbolo — evita chamadas duplicadas
+    sym_cache: dict = {}  # cache de candles por símbolo — evita chamadas duplicadas
 
     for i, row in enumerate(rows):
         # Só processar linhas que ainda têm campos em falta
@@ -241,17 +246,17 @@ def fill_db_outcomes() -> dict:
             skipped += 1
             continue
 
-        date_iso = row.get("date_iso", "")
-        symbol   = row.get("symbol", "")
+        date_iso       = row.get("date_iso", "")
+        symbol         = row.get("symbol", "")
         price_at_alert = row.get("price", "")
-        category = row.get("category", "")
+        category       = row.get("category", "")
 
         if not date_iso or not symbol or not price_at_alert:
             skipped += 1
             continue
 
         try:
-            alert_date  = datetime.fromisoformat(date_iso).date()
+            alert_date  = date.fromisoformat(date_iso)
             price_entry = float(price_at_alert)
         except (ValueError, TypeError):
             skipped += 1
@@ -264,98 +269,82 @@ def fill_db_outcomes() -> dict:
             skipped += 1
             continue
 
-        # Buscar histórico (com cache por símbolo)
+        # Buscar histórico via Tiingo (com cache por símbolo)
         if symbol not in sym_cache:
             try:
-                # Pede 7 meses para cobrir T+6m + margem
                 start = alert_date - timedelta(days=1)
                 end   = min(today, alert_date + timedelta(days=210))
-                hist  = yf.Ticker(symbol).history(start=start, end=end, interval="1d")
-                sym_cache[symbol] = hist
-                time.sleep(1)  # respeitar rate limit do Yahoo Finance
+                candles = get_ohlcv(symbol, start, end)
+                sym_cache[symbol] = candles
+            except EnvironmentError as e:
+                # TIINGO_API_KEY não definida — aborta imediatamente
+                logging.error(f"[fill_db] {e}")
+                return {
+                    "total": len(rows),
+                    "updated": updated,
+                    "skipped": skipped,
+                    "errors": errors + 1,
+                    "abort_reason": str(e),
+                }
             except Exception as e:
-                logging.warning(f"[fill_db] yfinance {symbol}: {e}")
-                sym_cache[symbol] = None
+                logging.warning(f"[fill_db] Tiingo {symbol}: {e}")
+                sym_cache[symbol] = []
                 errors += 1
                 continue
 
-        hist = sym_cache[symbol]
-        if hist is None or hist.empty:
-            skipped += 1
-            continue
-
-        # Filtrar apenas candles APÓS a data do alerta
-        try:
-            hist_after = hist[hist.index.date > alert_date]
-        except Exception:
-            skipped += 1
-            continue
-
-        if hist_after.empty:
+        candles = sym_cache[symbol]
+        if not candles:
             skipped += 1
             continue
 
         changed = False
 
-        def _get_price_at(target_date):
-            """
-            Preço de fecho mais próximo de target_date.
-            Testa delta=0 PRIMEIRO (dia exacto), depois adjacentes por prioridade.
-            Evita gravar preços de dias anteriores quando o dia alvo tem mercado aberto.
-            """
-            for delta in [0, 1, -1, 2, -2, 3, -3, 4, 5]:
-                check = target_date + timedelta(days=delta)
-                matches = hist_after[hist_after.index.date == check]
-                if not matches.empty:
-                    return float(matches["Close"].iloc[0])
-            return None
-
-        # ── T+1m ──────────────────────────────────────────────────────────
+        # ── T+1m ──────────────────────────────────────────────────────────────────────
         if needs_1m and days_elapsed >= 30:
-            p1m = _get_price_at(alert_date + timedelta(days=30))
+            p1m = get_price_at(candles, alert_date + timedelta(days=30))
             if p1m is not None and price_entry > 0:
                 r1m = (p1m - price_entry) / price_entry * 100
                 row["price_1m"]  = round(p1m, 4)
                 row["return_1m"] = round(r1m, 2)
                 changed = True
 
-        # ── T+3m ──────────────────────────────────────────────────────────
+        # ── T+3m ──────────────────────────────────────────────────────────────────────
         if needs_3m and days_elapsed >= 90:
-            p3m = _get_price_at(alert_date + timedelta(days=91))
+            p3m = get_price_at(candles, alert_date + timedelta(days=91))
             if p3m is not None and price_entry > 0:
                 r3m = (p3m - price_entry) / price_entry * 100
                 row["price_3m"]  = round(p3m, 4)
                 row["return_3m"] = round(r3m, 2)
                 changed = True
 
-                # ── MFE / MAE nos primeiros 90 dias ───────────────────────
-                window_90 = hist_after[hist_after.index.date <= alert_date + timedelta(days=91)]
-                if not window_90.empty:
-                    highs  = window_90["High"]
-                    lows   = window_90["Low"]
-                    mfe    = (highs.max() - price_entry) / price_entry * 100
-                    mae    = (lows.min() - price_entry) / price_entry * 100
-                    row["mfe_3m"] = round(mfe, 2)
-                    row["mae_3m"] = round(mae, 2)
+                # ── MFE / MAE nos primeiros 90 dias ─────────────────────────────
+                if row.get("mfe_3m") == "":
+                    mfe, mae = get_mfe_mae(
+                        candles,
+                        after_date=alert_date,
+                        price_entry=price_entry,
+                        window_days=91,
+                    )
+                    if mfe is not None:
+                        row["mfe_3m"] = mfe
+                    if mae is not None:
+                        row["mae_3m"] = mae
 
-        # ── T+6m ──────────────────────────────────────────────────────────
+        # ── T+6m ──────────────────────────────────────────────────────────────────────
         if needs_6m and days_elapsed >= 180:
-            p6m = _get_price_at(alert_date + timedelta(days=182))
+            p6m = get_price_at(candles, alert_date + timedelta(days=182))
             if p6m is not None and price_entry > 0:
                 r6m = (p6m - price_entry) / price_entry * 100
                 row["price_6m"]  = round(p6m, 4)
                 row["return_6m"] = round(r6m, 2)
                 changed = True
 
-        # ── outcome_label ─────────────────────────────────────────────────
+        # ── outcome_label ────────────────────────────────────────────────────────────
         if changed and row.get("outcome_label") == "":
             # Hold Forever nunca recebe label — não há target de saída
             if CATEGORY_HOLD_FOREVER in category:
                 pass
             else:
-                # Ordem de prioridade dos campos de referência por categoria:
-                #   Apartamento → 6m > 3m > 1m  (reprecificação a médio/longo prazo)
-                #   Rotação     → 3m > 6m > 1m  (flip de curto/médio prazo)
                 if CATEGORY_APARTAMENTO in category:
                     priority = ("return_6m", "return_3m", "return_1m")
                 else:
@@ -385,12 +374,13 @@ def fill_db_outcomes() -> dict:
                 writer = csv.DictWriter(f, fieldnames=_FIELDS)
                 writer.writeheader()
                 writer.writerows(rows)
-            logging.info(f"[fill_db] CSV actualizado: {updated} linhas novas | {skipped} ignoradas | {errors} erros")
+            logging.info(
+                f"[fill_db] CSV actualizado: {updated} linhas novas "
+                f"| {skipped} ignoradas | {errors} erros"
+            )
         except Exception as e:
-            logging.error(f"[fill_db] Erro a escrever CSV: {e}")
+            logging.error(f"[fill_db] Erro ao reescrever CSV: {e}")
             errors += 1
-    else:
-        logging.info(f"[fill_db] Nada a actualizar ({skipped} linhas ignoradas)")
 
     return {
         "total":   len(rows),
@@ -398,44 +388,3 @@ def fill_db_outcomes() -> dict:
         "skipped": skipped,
         "errors":  errors,
     }
-
-
-def get_db_stats() -> dict:
-    """
-    Devolve estatísticas da base de dados:
-    total de registos, por categoria, por verdict, últimos 5 alertas.
-    """
-    if not _DB_PATH.exists():
-        return {"total": 0, "by_category": {}, "by_verdict": {}, "last_5": []}
-    try:
-        rows = []
-        with _DB_PATH.open("r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            rows   = list(reader)
-        total       = len(rows)
-        by_category = {}
-        by_verdict  = {}
-        outcomes    = {}
-        labeled     = 0
-        for r in rows:
-            cat = r.get("category", "?") or "?"
-            vrd = r.get("verdict", "?") or "?"
-            lbl = r.get("outcome_label", "") or ""
-            by_category[cat] = by_category.get(cat, 0) + 1
-            by_verdict[vrd]  = by_verdict.get(vrd, 0) + 1
-            if lbl:
-                outcomes[lbl] = outcomes.get(lbl, 0) + 1
-                labeled += 1
-        last_5 = rows[-5:][::-1]  # os 5 mais recentes
-        return {
-            "total":       total,
-            "by_category": by_category,
-            "by_verdict":  by_verdict,
-            "outcomes":    outcomes,
-            "labeled":     labeled,
-            "last_5":      last_5,
-            "db_path":     str(_DB_PATH),
-        }
-    except Exception as e:
-        logging.warning(f"[alert_db] get_db_stats: {e}")
-        return {"total": 0, "error": str(e)}
