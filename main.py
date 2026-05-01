@@ -83,6 +83,9 @@ from ml_predictor import ml_score, ml_badge, is_model_ready, MLResult
 # Feature 8 — Dip Persistente
 from persistent_dip import check_and_alert_streak
 
+# ── Label Resolver — Flywheel de ML ──────────────────────────────────────────
+from label_resolver import run_label_resolver_job
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
@@ -1569,6 +1572,14 @@ def setup_schedule() -> BlockingScheduler:
         run_vigilante_check,
         CronTrigger(hour=21, minute=30, day_of_week="mon-fri", timezone=LISBON_TZ),
         id="daily_vigilante", name="Vigilante EOD 21:30",
+        misfire_grace_time=3600,
+        replace_existing=True,
+    )
+    # ── Label Resolver — Flywheel ML 03:00 (todos os dias) ────────────────────
+    scheduler.add_job(
+        lambda: run_label_resolver_job(send_telegram_fn=send_telegram),
+        CronTrigger(hour=3, minute=0, timezone=LISBON_TZ),
+        id="label_resolver", name="Label Resolver Flywheel 03:00",
         misfire_grace_time=3600,
         replace_existing=True,
     )
