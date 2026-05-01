@@ -69,6 +69,7 @@ from backtest import backtest_runner, build_backtest_summary
 from watchlist import run_watchlist_scan, build_watchlist_morning_summary, WATCHLIST
 from alert_db import log_alert_snapshot, get_db_stats, fill_db_outcomes
 import bot_commands
+from position_monitor import run_daily_check
 
 # Chunk 3a — data feed
 from data_feed import get_eod_prices, get_latest_price, is_tiingo_available
@@ -1408,6 +1409,35 @@ def run_monthly_retrain() -> None:
         )
 
 
+# ── Vigilante — wrapper síncrono para APScheduler ────────────────────────────
+
+def run_vigilante_check() -> None:
+    """
+    Wrapper síncrono que envolve a coroutine run_daily_check do position_monitor.
+    Necessário porque o APScheduler (BlockingScheduler) é síncrono e não pode
+    executar coroutines directamente. asyncio.run() cria uma event loop temporária,
+    executa a coroutine até ao fim, e fecha-a limpa.
+    """
+    import asyncio
+
+    class _SyncBot:
+        """Shim mínimo: converte await bot.send_message() em requests.post() síncrono."""
+        async def send_message(self, chat_id, text, parse_mode=None):
+            send_telegram(text)
+
+    logging.info("[vigilante] A iniciar check diário do Vigilante...")
+    try:
+        asyncio.run(run_daily_check(_SyncBot(), TELEGRAM_CHAT_ID))
+        logging.info("[vigilante] Check concluído.")
+    except Exception as e:
+        logging.error(f"[vigilante] Erro no check diário: {e}", exc_info=True)
+        send_telegram(
+            f"⚠️ *Vigilante — Erro no check diário*\n"
+            f"`{e}`\n"
+            f"_⏰ {datetime.now(LISBON_TZ).strftime('%d/%m %H:%M')}_"
+        )
+
+
 # ── Bot commands handler ──────────────────────────────────────────────────────
 
 def poll_bot_commands() -> None:
@@ -1533,6 +1563,14 @@ def setup_schedule() -> BlockingScheduler:
         run_monthly_retrain,
         CronTrigger(day=1, hour=6, minute=0, timezone=LISBON_TZ),
         id="monthly_retrain", name="Retreino ML dia 1 06:00",
+    )
+    # ── Vigilante — check diário pós-fecho US ─────────────────────────────────
+    scheduler.add_job(
+        run_vigilante_check,
+        CronTrigger(hour=21, minute=30, day_of_week="mon-fri", timezone=LISBON_TZ),
+        id="daily_vigilante", name="Vigilante EOD 21:30",
+        misfire_grace_time=3600,
+        replace_existing=True,
     )
 
     def _daily_reset():
