@@ -1227,9 +1227,12 @@ def run_scan() -> None:
                 if verdict == "COMPRAR":
                     comprar_syms.add(sym)
                     add_recovery_position(
-                        sym, score,
-                        price=fund.get("price") or stock.get("price", 0),
+                        sym,
+                        price_alert=fund.get("price") or stock.get("price", 0),
+                        score=score,
                         target_pct=RECOVERY_PCT,
+                        verdict=verdict,
+                        category=category,
                     )
 
                 append_weekly_log({
@@ -1265,9 +1268,8 @@ def run_watchlist_job() -> None:
         return
     logging.info("A correr watchlist scan...")
     try:
-        alerts = run_watchlist_scan(DIRECT_TICKERS)
-        for alert in alerts:
-            send_telegram(alert)
+        count = run_watchlist_scan(send_telegram, DIRECT_TICKERS)
+        logging.info(f"Watchlist scan: {count} alertas enviados")
     except Exception as e:
         logging.error(f"Watchlist scan: {e}")
 

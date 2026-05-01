@@ -24,6 +24,8 @@ from pathlib import Path
 
 _DATA_DIR = Path("/data") if Path("/data").exists() else Path("/tmp")
 
+_REJECTED_FILE = "rejected_log.json"
+
 
 def _path(filename: str) -> Path:
     return _DATA_DIR / filename
@@ -49,6 +51,22 @@ def _save_json(filename: str, data) -> None:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logging.error(f"[state] Erro ao gravar {filename}: {e}")
+
+
+def _read(filename: str) -> dict:
+    p = _path(filename)
+    if not p.exists():
+        return {}
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logging.warning(f"[state] Erro ao ler {filename}: {e}")
+        return {}
+
+
+def _write(filename: str, data: dict) -> None:
+    _save_json(filename, data)
 
 
 # ── Alertas diários ────────────────────────────────────────────────────────
@@ -88,13 +106,16 @@ def load_rejected_log() -> list:
 
 
 def append_rejected_log(entry: dict) -> None:
-    entries = load_rejected_log()
-    # Mantém apenas o dia actual (limpa entradas > 1 dia)
-    today = datetime.now().strftime("%Y-%m-%d")
-    entries = [e for e in entries if e.get("date", today) == today]
-    entry.setdefault("date", today)
-    entries.append(entry)
-    _save_json("rejected_log.json", entries)
+    data    = _read(_REJECTED_FILE)
+    entries = data.get("entries", [])
+    today   = datetime.now().date().isoformat()
+    entries = [e for e in entries if e.get("date_iso") == today]
+    entries.append({
+        **entry,
+        "time":     datetime.now().strftime("%H:%M"),
+        "date_iso": today,
+    })
+    _write(_REJECTED_FILE, {"entries": entries})
 
 
 # ── Backtest log ──────────────────────────────────────────────────────────
@@ -108,46 +129,13 @@ def save_backtest_log(entries: list) -> None:
 
 
 def append_backtest_entry(entry: dict) -> None:
-    """
-    Regista uma entrada no log de backtest.
-
-    BUG FIX: price_alert era gravado como None/0 quando fund.get('price')
-    retornava None. O backtest_runner já tem `if not price_alert: continue`,
-    mas entradas sem preço poluíam o CSV. Agora usamos float() seguro e
-    ignoramos silenciosamente entradas sem preço válido.
-    """
-    # Normaliza o preço — garante float com fallback 0.0
-    raw_price = entry.get("price") or entry.get("price_alert")
-    try:
-        price_alert = float(raw_price) if raw_price is not None else 0.0
-    except (TypeError, ValueError):
-        price_alert = 0.0
-
-    if price_alert <= 0:
-        logging.debug(
-            f"[state] append_backtest_entry ignorado para "
-            f"{entry.get('symbol', '?')}: price_alert={raw_price!r} inválido"
-        )
-        return
-
-    now_iso = datetime.now().strftime("%Y-%m-%d")
-    record = {
-        "symbol":      entry.get("symbol", ""),
-        "date":        entry.get("date", now_iso),
-        "date_iso":    entry.get("date", now_iso),
-        "price_alert": round(price_alert, 4),
-        "score":       entry.get("score") or 0,
-        "verdict":     entry.get("verdict", ""),
-        "price_5d":    None,
-        "price_10d":   None,
-        "price_20d":   None,
-        "pnl_5d":      None,
-        "pnl_10d":     None,
-        "pnl_20d":     None,
-        "resolved":    False,
-    }
     entries = load_backtest_log()
-    entries.append(record)
+    entries.append({
+        **entry,
+        "price_5d":  None, "price_10d": None, "price_20d": None,
+        "pnl_5d":    None, "pnl_10d":   None, "pnl_20d":   None,
+        "resolved":  False,
+    })
     save_backtest_log(entries)
 
 
@@ -164,20 +152,24 @@ def save_recovery_watch(positions: list) -> None:
 def add_recovery_position(
     symbol: str,
     score: float,
-    price: float,
+    price_alert: float,
     target_pct: float = 15.0,
+    verdict: str = "",
+    category: str = "",
 ) -> None:
     positions = load_recovery_watch()
     # Não duplica — se já existe, actualiza
     positions = [p for p in positions if p["symbol"] != symbol]
     now = datetime.now()
-    target_price = price * (1 + target_pct / 100) if price > 0 else 0
+    target_price = price_alert * (1 + target_pct / 100) if price_alert > 0 else 0
     positions.append({
         "symbol":       symbol,
         "score":        score,
-        "price_alert":  round(price, 4),
+        "price_alert":  round(price_alert, 4),
         "target_price": round(target_price, 4),
         "target_pct":   target_pct,
+        "verdict":      verdict,
+        "category":     category,
         "date":         now.strftime("%d/%m/%Y"),
         "date_iso":     now.strftime("%Y-%m-%d"),
         "alerted":      False,
