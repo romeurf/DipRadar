@@ -1,9 +1,9 @@
 """
 bootstrap_ml.py — Dual-Layer ML: Camada A (preço, 20 anos) + Camada B (fundamentais, 7 anos).
 
-O UNIVERSO é carregado de universe.py via get_ml_universe() — inclui S&P 500,
-Nasdaq 100, STOXX 200, FTSE 100, carteira e watchlist do utilizador (sem ETFs).
-No Colab sem internet o fallback estático (~880 tickers) é activado automaticamente.
+O UNIVERSO está hardcoded directamente neste ficheiro (S&P 500, Nasdaq 100, STOXX 200,
+FTSE 100, carteira e watchlist do utilizador). Zero dependências externas, zero scraping.
+~830 tickers únicos após deduplicação.
 
 MODO AUTOMÁTICO (agendado pelo bot, corre às 02:00 UTC todos os dias):
     - Janela = [hoje - anos_config, ontem]
@@ -23,7 +23,12 @@ MODO COLAB — backfill em batches (Google Drive como persistência):
     python bootstrap_ml.py --layer price --slice 0 200 --drive-dir /content/drive/MyDrive/DipRadar
     # Sessão 2 — tickers 200..400
     python bootstrap_ml.py --layer price --slice 200 400 --drive-dir /content/drive/MyDrive/DipRadar
-    # ... (repetir até esgotar todos os tickers, ~880 total)
+    # Sessão 3 — tickers 400..600
+    python bootstrap_ml.py --layer price --slice 400 600 --drive-dir /content/drive/MyDrive/DipRadar
+    # Sessão 4 — tickers 600..800
+    python bootstrap_ml.py --layer price --slice 600 800 --drive-dir /content/drive/MyDrive/DipRadar
+    # Sessão 5 — resto
+    python bootstrap_ml.py --layer price --slice 800 999 --drive-dir /content/drive/MyDrive/DipRadar
     # Sessão final — treino com o Parquet completo
     python bootstrap_ml.py --layer price --skip-backfill --drive-dir /content/drive/MyDrive/DipRadar
 
@@ -64,32 +69,152 @@ log = logging.getLogger("bootstrap_ml")
 YEARS_PRICE = 20
 YEARS_FUND  = 7
 
+# ── Universo hardcoded ─────────────────────────────────────────────────────────
+
+_SP500 = [
+    "MMM","AOS","ABT","ABBV","ACN","ADBE","AMD","AES","AFL","A","APD","ABNB","AKAM","ALB",
+    "ARE","ALGN","ALLE","LNT","ALL","GOOGL","GOOG","MO","AMZN","AMCR","AEE","AAL","AEP",
+    "AXP","AIG","AMT","AWK","AMP","AME","AMGN","APH","ADI","ANSS","AON","APA","AAPL",
+    "AMAT","APTV","ACGL","ADM","ANET","AJG","AIZ","T","ATO","ADSK","AZO","AVB","AVY",
+    "AXON","BKR","BALL","BAC","BK","BBWI","BAX","BDX","BRK-B","BBY","BIO","TECH","BIIB",
+    "BLK","BX","BA","BCR","BWA","BSX","BMY","AVGO","BR","BRO","BF-B","BLDR","BG","CDNS",
+    "CZR","CPT","CPB","COF","CAH","KMX","CCL","CARR","CTLT","CAT","CBOE","CBRE","CDW",
+    "CE","COR","CNC","CNP","CF","CHRW","CRL","SCHW","CHTR","CVX","CMG","CB","CHD","CI",
+    "CINF","CTAS","CSCO","C","CFG","CLX","CME","CMS","KO","CTSH","CL","CMCSA","CAG",
+    "COP","ED","STZ","CEG","COO","CPRT","GLW","CPAY","CTVA","CSGP","COST","CTRA","CRWD",
+    "CCI","CSX","CMI","CVS","DHR","DRI","DVA","DAY","DE","DAL","XRAY","DVN","DXCM","FANG",
+    "DLR","DFS","DG","DLTR","D","DPZ","DOV","DHI","DTE","DUK","DD","EMN","ETN","EBAY",
+    "ECL","EIX","EW","EA","ELV","EMR","ENPH","ETR","EOG","EPAM","EQT","EFX","EQIX","EQR",
+    "ESS","EL","ETSY","EG","EVRG","ES","EXC","EXPE","EXPD","EXR","XOM","FFIV","FDS","FICO",
+    "FAST","FRT","FDX","FIS","FITB","FSLR","FE","FI","FMC","F","FTNT","FTV","FOXA","FOX",
+    "BEN","FCX","GRMN","IT","GE","GEHC","GEV","GEN","GNRC","GD","GIS","GM","GPC","GILD",
+    "GPN","GL","GDDY","GS","HAL","HIG","HAS","HCA","DOC","HSIC","HSY","HES","HPE","HLT",
+    "HOLX","HD","HON","HRL","HST","HWM","HPQ","HUBB","HUM","HBAN","HII","IBM","IEX","IDXX",
+    "ITW","INCY","IR","PODD","INTC","ICE","IFF","IP","IPG","INTU","ISRG","IVZ","INVH","IQV",
+    "IRM","JBHT","JBL","JKHY","J","JNJ","JCI","JPM","JNPR","K","KVUE","KDP","KEY","KEYS",
+    "KMB","KIM","KMI","KKR","KLAC","KHC","KR","LHX","LH","LRCX","LW","LVS","LDOS","LEN",
+    "LLY","LIN","LYV","LKQ","LMT","L","LOW","LULU","LYB","MTB","MRO","MPC","MKTX","MAR",
+    "MMC","MLM","MAS","MA","MTCH","MKC","MCD","MCK","MDT","MRK","META","MET","MTD","MGM",
+    "MCHP","MU","MSFT","MAA","MRNA","MHK","MOH","TAP","MDLZ","MPWR","MNST","MCO","MS",
+    "MOS","MSI","MSCI","NDAQ","NTAP","NFLX","NEM","NWSA","NWS","NEE","NKE","NI","NDSN",
+    "NSC","NTRS","NOC","NCLH","NRG","NUE","NVDA","NVR","NXPI","ORLY","OXY","ODFL","OMC",
+    "ON","OKE","ORCL","OTIS","PCAR","PKG","PLTR","PANW","PARA","PH","PAYX","PAYC","PYPL",
+    "PNR","PEP","PFE","PCG","PM","PSX","PNW","PNC","POOL","PPG","PPL","PFG","PG","PGR",
+    "PLD","PRU","PEG","PTC","PSA","PHM","QRVO","PWR","QCOM","DGX","RL","RJF","RTX","O",
+    "REG","REGN","RF","RSG","RMD","RVTY","ROK","ROL","ROP","ROST","RCL","SPGI","CRM",
+    "SBAC","SLB","STX","SRE","NOW","SHW","SPG","SWKS","SJM","SW","SNA","SOLV","SO","LUV",
+    "SWK","SBUX","STT","STLD","STE","SYK","SMCI","SYF","SNPS","SYY","TMUS","TROW","TTWO",
+    "TPR","TRGP","TGT","TEL","TDY","TFX","TER","TSLA","TXN","TPL","TXT","TMO","TJX",
+    "TSCO","TT","TDG","TRV","TRMB","TFC","TYL","TSN","USB","UBER","UDR","ULTA","UNP",
+    "UAL","UPS","URI","UNH","UHS","VLO","VTR","VLTO","VRSN","VRSK","VZ","VRTX","VTRS",
+    "VICI","V","VST","VMC","WRB","GWW","WAB","WBA","WMT","DIS","WBD","WM","WAT","WEC",
+    "WFC","WELL","WST","WDC","WRK","WY","WHR","WMB","WTW","WYNN","XEL","XYL","YUM",
+    "ZBRA","ZBH","ZTS",
+]
+
+_NASDAQ100 = [
+    "ADBE","ADP","ABNB","ALGN","GOOGL","GOOG","AMZN","AMD","AEP","AMGN","ADI","ANSS",
+    "AAPL","AMAT","ASML","AZN","TEAM","ADSK","BIDU","BIIB","BKNG","AVGO","CDNS","CDW",
+    "CHTR","CTAS","CSCO","CCEP","CTSH","CMCSA","CEG","CPRT","CSGP","COST","CRWD","CSX",
+    "DDOG","DXCM","FANG","DLTR","EBAY","EA","EXC","FAST","FTNT","GILD","GFS","HON",
+    "IDXX","ILMN","INTC","INTU","ISRG","JD","KDP","KLAC","KHC","LRCX","LIN","LULU",
+    "MAR","MRVL","MELI","META","MCHP","MU","MSFT","MRNA","MDLZ","MDB","MNST","NFLX",
+    "NVDA","NXPI","ORLY","ODFL","ON","PCAR","PANW","PAYX","PYPL","PDD","PEP","QCOM",
+    "REGN","ROP","ROST","SBUX","SGEN","SIRI","SNPS","TSLA","TXN","TMUS","TTWO","VRSK",
+    "VRTX","WBA","WBD","XEL","ZM","ZS",
+]
+
+_STOXX200 = [
+    # Alemanha (DAX)
+    "SAP.DE","SIE.DE","ALV.DE","MRK.DE","BMW.DE","MBG.DE","BAS.DE","BAYN.DE","DTE.DE",
+    "DBK.DE","VOW3.DE","ADS.DE","HNR1.DE","RWE.DE","HEI.DE","ENR.DE","EOAN.DE","CON.DE",
+    "FRE.DE","ZAL.DE","LIN.DE","MUV2.DE","DHER.DE","SHL.DE","MTX.DE","1COV.DE","BOSS.DE",
+    "HAB.DE","HFG.DE","VNA.DE","BEI.DE","SYMB.DE","SY1.DE","KGX.DE","AIXA.DE","CARL.DE",
+    "QIA.DE","EVD.DE","DHL.DE","PUM.DE",
+    # França (CAC 40)
+    "MC.PA","OR.PA","TTE.PA","SAN.PA","AIR.PA","BNP.PA","ACA.PA","SGO.PA","SU.PA",
+    "DG.PA","RI.PA","CS.PA","KER.PA","ATO.PA","CAP.PA","VIE.PA","LR.PA","DSY.PA",
+    "HO.PA","ML.PA","ORA.PA","ENGI.PA","STM.PA","SAF.PA","BN.PA","SG.PA","EL.PA",
+    "RMS.PA","WLN.PA","CA.PA","ATO.PA","TEP.PA","RNO.PA","URW.PA","PUB.PA",
+    # Países Baixos
+    "ASML.AS","HEIA.AS","PHIA.AS","REN.AS","UNA.AS","INGA.AS","ABN.AS","NN.AS",
+    "RAND.AS","AKZA.AS","IMCD.AS","WKL.AS","ADY.AS","BESI.AS","LIGHT.AS",
+    # Suíça
+    "NESN.SW","NOVN.SW","ROG.SW","UBSG.SW","CSGN.SW","ABBN.SW","ZURN.SW","GIVN.SW",
+    "LONN.SW","CFR.SW","SREN.SW","SCMN.SW","BAER.SW","ALC.SW","GEBN.SW","SIKA.SW",
+    # Espanha
+    "ITX.MC","SAN.MC","TEF.MC","BBVA.MC","IBE.MC","AMS.MC","REP.MC","CABK.MC",
+    "BKT.MC","GRF.MC","MAP.MC","ENG.MC","NTGY.MC","MTS.MC",
+    # Itália
+    "ENI.MI","ENEL.MI","ISP.MI","UCG.MI","STM.MI","LDO.MI","MB.MI","FCA.MI",
+    "PRY.MI","RACE.MI","MONC.MI","BMED.MI","PST.MI",
+    # Suécia
+    "VOLV-B.ST","ERIC-B.ST","ATCO-A.ST","SEB-A.ST","SHB-A.ST","SWED-A.ST","INVE-B.ST",
+    "SSAB-A.ST","SAND.ST","SKF-B.ST","HM-B.ST","ALFA.ST","NIBE-B.ST","TELIA.ST",
+    # Dinamarca
+    "NOVO-B.CO","ORSTED.CO","CARL-B.CO","DSV.CO","COLO-B.CO","DEMANT.CO","GN.CO",
+    # Noruega
+    "EQNR.OL","DNB.OL","MOWI.OL","TEL.OL","YAR.OL","NHY.OL","ORKLA.OL",
+    # Finlândia
+    "NOKIA.HE","FORTUM.HE","NESTE.HE","KNEBV.HE","STERV.HE",
+    # Bélgica
+    "UCB.BR","ABI.BR","SOLB.BR","AGS.BR","GLPG.BR",
+    # Irlanda
+    "CRH.I","KYGA.I","AIB.I","BIRG.I",
+    # Portugal
+    "EDP.LS","GALP.LS","BCP.LS","EDPR.LS",
+    # Áustria
+    "VIG.VI","OMV.VI","EBS.VI",
+    # Polónia
+    "PKN.WA","PKO.WA","PZU.WA","DNP.WA","LPP.WA",
+    # Luxemburgo / outros
+    "APAM.AS","TKWY.AS",
+]
+
+_FTSE100 = [
+    "AZN.L","SHEL.L","HSBA.L","ULVR.L","BP.L","RIO.L","GSK.L","DGE.L","REL.L",
+    "BATS.L","LLOY.L","BARC.L","VOD.L","BT-A.L","NG.L","SSE.L","IMB.L","CRH.L",
+    "LSEG.L","NWG.L","PRU.L","EXPN.L","ABF.L","FERG.L","TSCO.L","CPG.L","RKT.L",
+    "WPP.L","IAG.L","EZJ.L","AAL.L","ANTO.L","BHP.L","GLEN.L","EVR.L","MNDI.L",
+    "SMDS.L","SMT.L","III.L","LAND.L","SGRO.L","HMSO.L","BLND.L","DLN.L","PSN.L",
+    "BWY.L","TW.L","BA.L","RR.L","AUTO.L","OCDO.L","MKS.L","NEXT.L","JD.L","SPX.L",
+    "RS1.L","DCC.L","SKG.L","IMI.L","PHNX.L","LGEN.L","AV.L","ADM.L","STAN.L",
+    "INVP.L","RTO.L","SBRY.L","MRO.L","SVT.L","UU.L","PNN.L","HLN.L","BDEV.L",
+    "BME.L","CRDA.L","ENT.L","FLTR.L","KGF.L","LGEN.L","MNG.L","SGRO.L","SN.L",
+    "SPX.L","WEIR.L","WTB.L","XP.L",
+]
+
+_CARTEIRA = [
+    "NVO","ADBE","UBER","MSFT","PINS","ADP","CRM","VICI","CRWD","PLTR","NOW","DUOL","EUNL.DE",
+]
+
+_WATCHLIST = [
+    "O","MDT","ABBV","LMT","RTX","PANW","TSM","AVGO","ALV.DE","IEMA",
+]
+
 
 def _load_universe() -> list[str]:
-    """Carrega o universo ML de universe.py (sem ETFs). Fallback para lista mínima."""
-    try:
-        from universe import get_ml_universe
-        tickers = get_ml_universe()
-        log.info(f"[universe] {len(tickers)} tickers ML carregados de universe.py")
-        return tickers
-    except Exception as e:
-        log.warning(f"[universe] Falha ao importar universe.py ({e}) — a usar fallback mínimo")
-        return [
-            "AAPL","MSFT","NVDA","GOOGL","META","AMZN","TSLA","AMD","INTC","CRM",
-            "ORCL","ADBE","QCOM","TXN","AVGO","MU","AMAT","LRCX","KLAC",
-            "NOW","SNOW","PANW","CRWD","DDOG","NET","ZS","FTNT",
-            "JPM","BAC","WFC","GS","MS","BLK","SCHW","AXP","V","MA",
-            "C","USB","PNC","TFC","COF",
-            "JNJ","UNH","PFE","ABBV","LLY","MRK","BMY","AMGN","GILD",
-            "CVS","CI","HUM","ISRG","EW","BSX","MDT",
-            "WMT","COST","TGT","HD","LOW","MCD","SBUX","NKE","PG","KO",
-            "PEP","PM","MO","MDLZ","GIS","CL",
-            "CAT","DE","HON","MMM","GE","RTX","LMT","NOC","BA","UPS",
-            "FDX","CSX","UNP","EMR","ITW","ETN",
-            "XOM","CVX","COP","EOG","SLB","MPC","VLO","OXY",
-            "AMT","PLD","EQIX","SPG","O","DLR","PSA",
-            "NEE","DUK","SO","AEP","EXC","D","AWK",
-        ]
+    """
+    Universo ML completo hardcoded — sem scraping, sem dependências externas.
+    S&P 500 (~504) + Nasdaq 100 (~103) + STOXX 200 (~200) + FTSE 100 (~85)
+    + carteira + watchlist, deduplicado e sem ETFs.
+    """
+    ETF_BLACKLIST = {
+        "SPY","QQQ","IWM","DIA","GLD","SLV","TLT","HYG","LQD","EEM","VWO","EFA",
+        "VEA","VTI","VNQ","XLF","XLK","XLE","XLV","XLI","XLU","XLB","XLP","XLY",
+        "XLRE","XLC","IEMA","EUNL.DE","SCHD","JEPI","JEPQ","SOXL","TQQQ","SQQQ",
+    }
+    all_tickers: list[str] = []
+    seen: set[str] = set()
+    for lst in (_SP500, _NASDAQ100, _STOXX200, _FTSE100, _CARTEIRA, _WATCHLIST):
+        for t in lst:
+            t = t.strip()
+            if t and t not in seen and t not in ETF_BLACKLIST:
+                all_tickers.append(t)
+                seen.add(t)
+
+    log.info(f"[universe] Universo total: {len(all_tickers)} tickers (hardcoded, zero scraping)")
+    return all_tickers
 
 
 def _window(years: int) -> tuple[date, date]:
@@ -661,13 +786,12 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
             "DipRadar — Dual-Layer ML\n"
-            "Universo: get_ml_universe() de universe.py (~880 tickers)\n\n"
+            "Universo: hardcoded (~830 tickers únicos, zero scraping)\n\n"
             "COLAB (batch incremental, ~200 tickers por sessão de 90 min):\n"
             "  Sessão 1: python bootstrap_ml.py --layer price --slice 0 200 --drive-dir /content/drive/MyDrive/DipRadar\n"
             "  Sessão 2: python bootstrap_ml.py --layer price --slice 200 400 --drive-dir /content/drive/MyDrive/DipRadar\n"
             "  Sessão 3: python bootstrap_ml.py --layer price --slice 400 600 --drive-dir /content/drive/MyDrive/DipRadar\n"
-            "  Sessão 4: python bootstrap_ml.py --layer price --slice 600 800 --drive-dir /content/drive/MyDrive/DipRadar\n"
-            "  Sessão 5: python bootstrap_ml.py --layer price --slice 800 999 --drive-dir /content/drive/MyDrive/DipRadar\n"
+            "  Sessão 4: python bootstrap_ml.py --layer price --slice 600 830 --drive-dir /content/drive/MyDrive/DipRadar\n"
             "  Sessão final: python bootstrap_ml.py --layer price --skip-backfill --drive-dir /content/drive/MyDrive/DipRadar"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -684,7 +808,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--slice", nargs=2, type=int, metavar=("START", "END"), default=None,
                    help="Limita o backfill a UNIVERSE[START:END]. Exemplo: --slice 0 200")
     p.add_argument("--drive-dir", type=str, default=None, metavar="DIR",
-                   help="Directório onde os Parquets e .pkl são lidos/guardados. Ex.: /content/drive/MyDrive/DipRadar")
+                   help="Directório onde os Parquets e .pkl são lidos/guardados.")
     return p.parse_args()
 
 
@@ -710,7 +834,6 @@ def main() -> None:
     parquet_price = data_dir / "ml_training_price.parquet"
     parquet_fund  = data_dir / "ml_training_fund.parquet"
 
-    # Carrega universo completo uma vez
     universe = _load_universe()
     log.info(f"📋 Universo total: {len(universe)} tickers ML")
 
