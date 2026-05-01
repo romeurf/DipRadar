@@ -233,10 +233,32 @@ def _normalize_history_index(hist: pd.DataFrame) -> pd.DataFrame:
     return hist.sort_index()
 
 
+# ── Features da Camada A (melhoradas) ─────────────────────────────────────────
+#
+# Novas vs versão anterior:
+#   + dist_ma50        — distância % à MA50 (dip técnico real vs ruído)
+#   + dist_ma200       — distância % à MA200 (bear market vs correcção)
+#   + ret_1m           — momentum do mês anterior ao dip
+#   + ret_3m_prior     — momentum 3 meses antes do dip
+#   + month            — sazonalidade (Set/Out historicamente piores)
+#   + high_52w_pct     — % abaixo do máximo de 52 semanas
+#
+# Label: alpha vs SPY — um dip que sobe 20% com SPY +25% é NEUTRAL, não WIN
+#   alpha_6m = ret_6m - ret_spy_6m   (ou 3m se 6m não disponível)
+#   WIN_40 → alpha >= 30%
+#   WIN_20 → alpha >= 15%
+#   NEUTRAL → alpha >= -10%
+#   LOSS    → alpha < -10%
+
 FEATURES_PRICE: list[str] = [
+    # originais
     "rsi", "drawdown_pct", "change_day_pct",
     "beta", "spy_change", "sector_etf_change",
     "volume_ratio", "atr_pct",
+    # novas
+    "dist_ma50", "dist_ma200",
+    "ret_1m", "ret_3m_prior",
+    "month", "high_52w_pct",
 ]
 
 FEATURES_FUND: list[str] = [
@@ -270,7 +292,17 @@ def calc_volume_ratio(hist: pd.DataFrame, period: int = 20) -> pd.Series:
     return hist["Volume"] / (avg + 1e-9)
 
 
+def outcome_label_alpha(stock_ret: float, spy_ret: float) -> str:
+    """Label ajustado ao SPY — mede alpha real, não retorno absoluto."""
+    alpha = stock_ret - spy_ret
+    if   alpha >= 30:  return "WIN_40"
+    elif alpha >= 15:  return "WIN_20"
+    elif alpha >= -10: return "NEUTRAL"
+    else:              return "LOSS_15"
+
+
 def outcome_label(ret: float) -> str:
+    """Label absoluto — usado na Camada B (fundamentais)."""
     if   ret >= 40:  return "WIN_40"
     elif ret >= 20:  return "WIN_20"
     elif ret >= -15: return "NEUTRAL"
@@ -350,7 +382,8 @@ def backfill_price(
     spy_hist = yf.Ticker("SPY").history(start=start_str, end=fetch_end, interval="1d")
     spy_hist = _normalize_history_index(spy_hist)
     spy_hist["spy_ret"] = spy_hist["Close"].pct_change() * 100
-    spy_map = {d.date(): float(r) for d, r in spy_hist["spy_ret"].items()}
+    spy_map  = {d.date(): float(r) for d, r in spy_hist["spy_ret"].items()}
+    spy_close = {d.date(): float(c) for d, c in spy_hist["Close"].items()}
 
     all_alerts: list[dict] = []
 
@@ -361,13 +394,31 @@ def backfill_price(
             if hist.empty or len(hist) < 60:
                 continue
 
+            # ── indicadores técnicos ───────────────────────────────────────
             hist["rsi"]       = calc_rsi(hist["Close"])
             hist["ret_1d"]    = hist["Close"].pct_change() * 100
             hist["atr_pct"]   = calc_atr_pct(hist)
             hist["vol_ratio"] = calc_volume_ratio(hist)
-            roll_max          = hist["Close"].rolling(252, min_periods=30).max()
-            hist["ddp"]       = (hist["Close"] - roll_max) / roll_max * 100
 
+            # drawdown desde máximo rolante 252d
+            roll_max     = hist["Close"].rolling(252, min_periods=30).max()
+            hist["ddp"]  = (hist["Close"] - roll_max) / roll_max * 100
+
+            # distância às médias móveis
+            hist["ma50"]      = hist["Close"].rolling(50, min_periods=20).mean()
+            hist["ma200"]     = hist["Close"].rolling(200, min_periods=60).mean()
+            hist["dist_ma50"] = (hist["Close"] - hist["ma50"])  / hist["ma50"]  * 100
+            hist["dist_ma200"]= (hist["Close"] - hist["ma200"]) / hist["ma200"] * 100
+
+            # % abaixo do máximo de 52 semanas (diferente do drawdown: usa só 252d)
+            high_52w           = hist["Close"].rolling(252, min_periods=30).max()
+            hist["high_52w_pct"] = (hist["Close"] - high_52w) / high_52w * 100
+
+            # momentum prévio ao dip (retorno 1m e 3m antes)
+            hist["ret_1m"]     = hist["Close"].pct_change(21)  * 100   # ~1 mês
+            hist["ret_3m"]     = hist["Close"].pct_change(63)  * 100   # ~3 meses
+
+            # beta rolante 252d vs SPY
             spy_aligned = pd.Series(spy_map).reindex([d.date() for d in hist.index], fill_value=np.nan)
             spy_aligned.index = hist.index
             cov = hist["ret_1d"].rolling(252).cov(spy_aligned)
@@ -404,21 +455,51 @@ def backfill_price(
                     continue
 
                 entry = float(row["Close"])
+
+                # retorno do ticker
                 p3m = get_price_near(hist_after, alert_date + timedelta(days=91))
                 p6m = get_price_near(hist_after, alert_date + timedelta(days=182))
                 if p3m is None and p6m is None:
                     continue
-
                 r3m = (p3m - entry) / entry * 100 if p3m else None
                 r6m = (p6m - entry) / entry * 100 if p6m else None
-                ref = r6m if r6m is not None else r3m
+
+                # retorno do SPY no mesmo período (para calcular alpha)
+                spy_dates = sorted(spy_close.keys())
+                def spy_ret_period(days: int) -> float | None:
+                    target = alert_date + timedelta(days=days)
+                    # preço SPY no dia do alerta
+                    spy_entry = spy_close.get(alert_date)
+                    if spy_entry is None:
+                        # procura vizinho
+                        for d in range(-3, 6):
+                            spy_entry = spy_close.get(alert_date + timedelta(days=d))
+                            if spy_entry:
+                                break
+                    if spy_entry is None:
+                        return None
+                    # preço SPY ~days depois
+                    for d in range(-3, 6):
+                        sp = spy_close.get(target + timedelta(days=d))
+                        if sp is not None:
+                            return (sp - spy_entry) / spy_entry * 100
+                    return None
+
+                spy_r3m = spy_ret_period(91)
+                spy_r6m = spy_ret_period(182)
+
+                # escolhe janela principal (6m preferido)
+                ref        = r6m if r6m is not None else r3m
+                spy_ref    = spy_r6m if r6m is not None else spy_r3m
                 if ref is None:
                     continue
+                spy_ref = spy_ref if spy_ref is not None else 0.0
 
                 all_alerts.append({
                     "symbol":            ticker,
                     "alert_date":        alert_date.isoformat(),
                     "price":             round(entry, 2),
+                    # features originais
                     "rsi":               round(safe_float(row["rsi"], 50), 1),
                     "drawdown_pct":      round(safe_float(row["ddp"], 0), 2),
                     "change_day_pct":    round(float(row["ret_1d"]), 2),
@@ -427,9 +508,19 @@ def backfill_price(
                     "volume_ratio":      round(safe_float(row["vol_ratio"], 1.0), 2),
                     "spy_change":        round(spy_chg, 2),
                     "sector_etf_change": round(spy_chg * 0.9, 2),
+                    # novas features
+                    "dist_ma50":         round(safe_float(row["dist_ma50"], 0.0), 2),
+                    "dist_ma200":        round(safe_float(row["dist_ma200"], 0.0), 2),
+                    "ret_1m":            round(safe_float(row["ret_1m"], 0.0), 2),
+                    "ret_3m_prior":      round(safe_float(row["ret_3m"], 0.0), 2),
+                    "month":             alert_date.month,
+                    "high_52w_pct":      round(safe_float(row["high_52w_pct"], 0.0), 2),
+                    # outcomes
                     "return_3m":         round(r3m, 2) if r3m is not None else None,
                     "return_6m":         round(r6m, 2) if r6m is not None else None,
-                    "outcome_label":     outcome_label(ref),
+                    "spy_return_ref":    round(spy_ref, 2),
+                    # label alpha vs SPY
+                    "outcome_label":     outcome_label_alpha(ref, spy_ref),
                 })
 
             if (i + 1) % 50 == 0:
