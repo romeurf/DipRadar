@@ -246,6 +246,9 @@ def _normalize_history_index(hist: pd.DataFrame) -> pd.DataFrame:
 #   + month            — sazonalidade (Set/Out historicamente piores)
 #   + high_52w_pct     — % abaixo do máximo de 52 semanas
 #
+# NOTA: sector_etf_change foi REMOVIDO de FEATURES_PRICE — era SPY*0.9,
+#       ou seja, informação redundante/falsa que prejudicava o modelo.
+#
 # Label: alpha vs SPY — um dip que sobe 20% com SPY +25% é NEUTRAL, não WIN
 #   alpha_6m = ret_6m - ret_spy_6m   (ou 3m se 6m não disponível)
 #   WIN_40 → alpha >= 30%
@@ -254,13 +257,15 @@ def _normalize_history_index(hist: pd.DataFrame) -> pd.DataFrame:
 #   LOSS    → alpha < -10%
 
 FEATURES_PRICE: list[str] = [
-    # originais
+    # técnicas base
     "rsi", "drawdown_pct", "change_day_pct",
-    "beta", "spy_change", "sector_etf_change",
+    "beta", "spy_change",
     "volume_ratio", "atr_pct",
-    # novas
+    # distância às médias móveis
     "dist_ma50", "dist_ma200",
+    # momentum prévio
     "ret_1m", "ret_3m_prior",
+    # sazonalidade e profundidade do dip
     "month", "high_52w_pct",
 ]
 
@@ -362,7 +367,7 @@ def backfill_price(
     end: date,
     tickers: list[str],
     dip_thresh: float = 0.04,
-    max_per_ticker: int = 10,
+    max_per_ticker: int = 15,
     existing_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     try:
@@ -468,20 +473,16 @@ def backfill_price(
                 r6m = (p6m - entry) / entry * 100 if p6m else None
 
                 # retorno do SPY no mesmo período (para calcular alpha)
-                spy_dates = sorted(spy_close.keys())
                 def spy_ret_period(days: int) -> float | None:
                     target = alert_date + timedelta(days=days)
-                    # preço SPY no dia do alerta
                     spy_entry = spy_close.get(alert_date)
                     if spy_entry is None:
-                        # procura vizinho
                         for d in range(-3, 6):
                             spy_entry = spy_close.get(alert_date + timedelta(days=d))
                             if spy_entry:
                                 break
                     if spy_entry is None:
                         return None
-                    # preço SPY ~days depois
                     for d in range(-3, 6):
                         sp = spy_close.get(target + timedelta(days=d))
                         if sp is not None:
@@ -502,7 +503,7 @@ def backfill_price(
                     "symbol":            ticker,
                     "alert_date":        alert_date.isoformat(),
                     "price":             round(entry, 2),
-                    # features originais
+                    # features técnicas
                     "rsi":               round(safe_float(row["rsi"], 50), 1),
                     "drawdown_pct":      round(safe_float(row["ddp"], 0), 2),
                     "change_day_pct":    round(float(row["ret_1d"]), 2),
@@ -510,12 +511,13 @@ def backfill_price(
                     "atr_pct":           round(safe_float(row["atr_pct"], 1.0), 2),
                     "volume_ratio":      round(safe_float(row["vol_ratio"], 1.0), 2),
                     "spy_change":        round(spy_chg, 2),
-                    "sector_etf_change": round(spy_chg * 0.9, 2),
-                    # novas features
+                    # distância às médias móveis
                     "dist_ma50":         round(safe_float(row["dist_ma50"], 0.0), 2),
                     "dist_ma200":        round(safe_float(row["dist_ma200"], 0.0), 2),
+                    # momentum prévio
                     "ret_1m":            round(safe_float(row["ret_1m"], 0.0), 2),
                     "ret_3m_prior":      round(safe_float(row["ret_3m"], 0.0), 2),
+                    # sazonalidade e profundidade
                     "month":             alert_date.month,
                     "high_52w_pct":      round(safe_float(row["high_52w_pct"], 0.0), 2),
                     # outcomes
@@ -731,7 +733,7 @@ def _build_pipeline(algo: str = "rf"):
     steps = [("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())]
     if algo == "rf":
         clf = RandomForestClassifier(
-            n_estimators=400, max_depth=8, min_samples_leaf=5,
+            n_estimators=400, max_depth=10, min_samples_leaf=5,
             class_weight="balanced", random_state=42, n_jobs=-1,
         )
     elif algo == "xgb":
@@ -762,7 +764,11 @@ def _train_layer(
     algo: str,
     label: str,
 ) -> None:
-    from sklearn.metrics import average_precision_score, classification_report
+    from sklearn.metrics import (
+        average_precision_score,
+        classification_report,
+        precision_recall_curve,
+    )
 
     if df.empty:
         log.warning(f"[{label}] DataFrame vazio — treino saltado.")
@@ -797,16 +803,23 @@ def _train_layer(
     pipe.fit(X_tr, y_tr)
 
     probs  = pipe.predict_proba(X_te)[:, 1]
-    y_pred = (probs >= 0.50).astype(int)
     auc_pr = average_precision_score(y_te, probs)
 
+    # ── Threshold óptimo via F1-max na curva Precision-Recall ────────────────
+    precisions, recalls, thresholds = precision_recall_curve(y_te, probs)
+    f1s = 2 * precisions[:-1] * recalls[:-1] / (precisions[:-1] + recalls[:-1] + 1e-9)
+    best_thresh = float(thresholds[np.argmax(f1s)])
+    best_thresh = round(max(0.30, min(best_thresh, 0.70)), 3)  # limita entre 0.30 e 0.70
+    log.info(f"[{label}] Threshold óptimo F1: {best_thresh:.3f}  (raw: {thresholds[np.argmax(f1s)]:.3f})")
+
+    y_pred = (probs >= best_thresh).astype(int)
     log.info(f"[{label}] AUC-PR: {auc_pr:.4f}")
     log.info("\n" + classification_report(y_te, y_pred, target_names=["NO_WIN", "WIN"], digits=3))
 
     bundle = {
         "model":           pipe,
         "feature_columns": features,
-        "threshold":       0.50,
+        "threshold":       best_thresh,
         "algorithm":       algo,
         "auc_pr":          round(auc_pr, 4),
         "n_samples":       int(len(X_tr)),
@@ -891,14 +904,16 @@ def _parse_args() -> argparse.Namespace:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--algo",          choices=["rf", "xgb"], default="rf")
-    p.add_argument("--layer",         choices=["all", "price", "fund"], default="all")
-    p.add_argument("--years-price",   type=int, default=YEARS_PRICE)
-    p.add_argument("--years-fund",    type=int, default=YEARS_FUND)
-    p.add_argument("--dip-thresh",    type=float, default=0.04)
-    p.add_argument("--skip-backfill", action="store_true",
+    p.add_argument("--algo",           choices=["rf", "xgb"], default="rf")
+    p.add_argument("--layer",          choices=["all", "price", "fund"], default="all")
+    p.add_argument("--years-price",    type=int, default=YEARS_PRICE)
+    p.add_argument("--years-fund",     type=int, default=YEARS_FUND)
+    p.add_argument("--dip-thresh",     type=float, default=0.04)
+    p.add_argument("--max-per-ticker", type=int, default=15,
+                   help="Máximo de alertas históricos por ticker (default: 15)")
+    p.add_argument("--skip-backfill",  action="store_true",
                    help="Salta o backfill e treina directamente com o Parquet existente")
-    p.add_argument("--force-full",    action="store_true",
+    p.add_argument("--force-full",     action="store_true",
                    help="Ignora dados existentes e refaz backfill completo")
     p.add_argument("--slice", nargs=2, type=int, metavar=("START", "END"), default=None,
                    help="Limita o backfill a UNIVERSE[START:END]. Exemplo: --slice 0 200")
@@ -953,7 +968,9 @@ def main() -> None:
             )
             new_p = backfill_price(
                 start=start_p, end=end_p, tickers=tickers,
-                dip_thresh=args.dip_thresh, existing_df=existing_p,
+                dip_thresh=args.dip_thresh,
+                max_per_ticker=args.max_per_ticker,
+                existing_df=existing_p,
             )
             df_p = load_and_slide(parquet_price, start_p, new_p, skip_exit_on_empty=bool(args.slice))
         if not df_p.empty and args.skip_backfill:
