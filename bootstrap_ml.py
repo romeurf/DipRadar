@@ -83,7 +83,7 @@ logging.basicConfig(
 log = logging.getLogger("bootstrap_ml")
 
 YEARS_PRICE = 20
-YEARS_FUND  = 7
+YEARS_FUND  = 3
 
 # ── Universo hardcoded ─────────────────────────────────────────────────────────
 
