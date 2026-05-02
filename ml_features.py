@@ -66,6 +66,14 @@ FEATURE_COLUMNS: list[str] = [
     "rsi_14",               # RSI 14-period [0, 100]
     "atr_ratio",            # ATR(14) / current price — normalised volatility
     "volume_spike",         # today's volume / 20-day avg volume (e.g. 2.1)
+
+    # ── Stage 3: Engineered / Non-linear interactions (5 features) ────
+    # Captures non-linearities and interactions that flat tree models miss.
+    "rsi_oversold_strength", # max(0, 40 - rsi_14): magnitude of oversold (0 if not oversold)
+    "vix_regime",            # 0=low (<15), 1=medium (15-25), 2=high (>25)
+    "pe_attractive",         # max(0, 1 - pe_vs_fair): magnitude of undervaluation
+    "drop_x_drawdown",       # drop_pct_today * drawdown_52w / 100: capitulation pressure
+    "vol_x_drop",            # volume_spike * abs(drop_pct_today): capitulation volume
 ]
 
 LABEL_COLUMNS: list[str] = [
@@ -116,7 +124,52 @@ _FALLBACK: dict[str, float] = {
     "rsi_14":            40.0,
     "atr_ratio":          0.02,
     "volume_spike":       1.0,   # no spike
+    # Engineered fallbacks (derived from neutral defaults above)
+    "rsi_oversold_strength": 0.0,   # max(0, 40 - 40) = 0
+    "vix_regime":            1.0,   # medium (vix=20)
+    "pe_attractive":         0.0,   # max(0, 1 - 1) = 0
+    "drop_x_drawdown":       1.2,   # -8 * -15 / 100 = 1.2
+    "vol_x_drop":            8.0,   # 1.0 * 8 = 8
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Derived feature engineering — shared between training & inference
+# ─────────────────────────────────────────────────────────────────────────────
+
+def add_derived_features(features: dict) -> dict:
+    """
+    Compute the 5 engineered features (Stage 3) from base features.
+
+    All 5 are deterministic functions of base features that are guaranteed
+    to be present (after fallback). Same code is used at training time
+    (over a parquet) and at inference (live feature dict) — guaranteed
+    consistent.
+
+    Mutates and returns the same dict for convenience.
+    """
+    rsi    = float(features.get("rsi_14",        _FALLBACK["rsi_14"]))
+    vix    = float(features.get("vix",           _FALLBACK["vix"]))
+    pe_vf  = float(features.get("pe_vs_fair",    _FALLBACK["pe_vs_fair"]))
+    drop   = float(features.get("drop_pct_today", _FALLBACK["drop_pct_today"]))
+    dd52   = float(features.get("drawdown_52w",  _FALLBACK["drawdown_52w"]))
+    volsp  = float(features.get("volume_spike",  _FALLBACK["volume_spike"]))
+
+    features["rsi_oversold_strength"] = round(max(0.0, 40.0 - rsi), 4)
+
+    if vix < 15.0:
+        vix_reg = 0.0
+    elif vix < 25.0:
+        vix_reg = 1.0
+    else:
+        vix_reg = 2.0
+    features["vix_regime"] = vix_reg
+
+    features["pe_attractive"]   = round(max(0.0, 1.0 - pe_vf), 4)
+    features["drop_x_drawdown"] = round(drop * dd52 / 100.0, 4)
+    features["vol_x_drop"]      = round(volsp * abs(drop), 4)
+
+    return features
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -320,10 +373,13 @@ def build_features(
         "rsi_14":               rsi_14,
         "atr_ratio":            atr_ratio,
         "volume_spike":         volume_spike,
-        # Labels (None in production, int/float during training)
-        "label_win":            label_win,
-        "label_further_drop":   label_further_drop,
     }
+    # Stage 3 — engineered/derived features (shared with training pipeline)
+    add_derived_features(feature_vector)
+
+    # Labels (None in production, int/float during training)
+    feature_vector["label_win"]          = label_win
+    feature_vector["label_further_drop"] = label_further_drop
 
     # ── Sanity check ─────────────────────────────────────────────────
     # Verify no NaN/Inf leaked into features (labels can be None)
