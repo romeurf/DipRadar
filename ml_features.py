@@ -6,8 +6,9 @@ Used identically during training (with labels) and inference in production (labe
 
 Architecture: 3-stage pipeline
   Stage 0 — Macro:   macro regime, VIX, SPY/sector drawdown, FRED recession prob
-  Stage 1 — Quality: FCF yield, revenue growth, gross margin, D/E, P/E vs sector fair
+  Stage 1 — Quality: gross margin, D/E, P/E vs sector fair
                       analyst upside, ROIC — sourced from score.py hemispheres
+                      (fcf_yield and revenue_growth removed: importance=0.0)
   Stage 2 — Timing:  drop today, drawdown 52w, RSI, ATR ratio, volume spike
 
 Label schema (training only, None in production):
@@ -51,9 +52,11 @@ FEATURE_COLUMNS: list[str] = [
     "spy_drawdown_5d",      # SPY % change last 5 trading days (negative=down)
     "sector_drawdown_5d",   # sector ETF % change last 5 trading days
 
-    # ── Stage 1: Quality / Value (7 features) ──────────────────────
-    "fcf_yield",            # Free Cash Flow yield (e.g. 0.06 = 6%)
-    "revenue_growth",       # YoY revenue growth (e.g. 0.12 = 12%)
+    # ── Stage 1: Quality / Value (5 features) ──────────────────────
+    # NOTE: fcf_yield and revenue_growth were removed (importance=0.0 in
+    # both Stage 1 and Stage 2 as of ml_report 2026-05-02). Their values
+    # are still computed in build_features() for score.py / downstream use,
+    # but they are no longer model input columns.
     "gross_margin",         # Gross margin ratio (e.g. 0.65)
     "de_ratio",             # Debt-to-Equity ratio (yfinance scale, e.g. 45)
     "pe_vs_fair",           # P/E actual / sector fair P/E (< 1 = cheap)
@@ -82,7 +85,7 @@ LABEL_COLUMNS: list[str] = [
 ]
 
 # Total feature count (used as sanity check in training)
-N_FEATURES = len(FEATURE_COLUMNS)  # 21 (16 base + 5 engineered)
+N_FEATURES = len(FEATURE_COLUMNS)  # 19 (14 base + 5 engineered)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -112,8 +115,8 @@ _FALLBACK: dict[str, float] = {
     "vix":               20.0,
     "spy_drawdown_5d":    0.0,
     "sector_drawdown_5d": 0.0,
-    "fcf_yield":          0.04,  # 4% — global median
-    "revenue_growth":     0.05,  # 5%
+    "fcf_yield":          0.04,  # 4% — kept for score.py / downstream, not a model column
+    "revenue_growth":     0.05,  # 5% — kept for score.py / downstream, not a model column
     "gross_margin":       0.35,
     "de_ratio":          80.0,
     "pe_vs_fair":         1.0,   # fairly valued
@@ -278,7 +281,7 @@ def build_features(
 
     Returns
     -------
-    dict with keys = FEATURE_COLUMNS + LABEL_COLUMNS
+    dict with keys = FEATURE_COLUMNS + LABEL_COLUMNS (+ fcf_yield, revenue_growth for downstream)
     All feature values are float. Labels are int/float/None.
     """
     fund = fundamentals  # alias for brevity
@@ -293,6 +296,8 @@ def build_features(
     sector_drawdown_5d = float(macro_context.get("sector_drawdown_5d", _FALLBACK["sector_drawdown_5d"]))
 
     # ── Stage 1: Quality / Value ─────────────────────────────────────
+    # fcf_yield and revenue_growth are computed but NOT in FEATURE_COLUMNS
+    # (importance=0.0 — kept here for score.py / downstream consumers only)
     fcf_yield      = _sf(fund.get("fcf_yield"),      "fcf_yield")
     revenue_growth = _sf(fund.get("revenue_growth"), "revenue_growth")
     gross_margin   = _sf(fund.get("gross_margin"),   "gross_margin")
@@ -359,9 +364,7 @@ def build_features(
         "vix":                  vix,
         "spy_drawdown_5d":      spy_drawdown_5d,
         "sector_drawdown_5d":   sector_drawdown_5d,
-        # Stage 1
-        "fcf_yield":            fcf_yield,
-        "revenue_growth":       revenue_growth,
+        # Stage 1 (model columns — fcf_yield & revenue_growth excluded)
         "gross_margin":         gross_margin,
         "de_ratio":             de_ratio,
         "pe_vs_fair":           pe_vs_fair,
@@ -373,6 +376,9 @@ def build_features(
         "rsi_14":               rsi_14,
         "atr_ratio":            atr_ratio,
         "volume_spike":         volume_spike,
+        # Downstream-only (not model input columns)
+        "fcf_yield":            fcf_yield,
+        "revenue_growth":       revenue_growth,
     }
     # Stage 3 — engineered/derived features (shared with training pipeline)
     add_derived_features(feature_vector)
