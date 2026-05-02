@@ -625,6 +625,11 @@ def backfill_price(
                     "spy_return_ref":     round(spy_ref, 2),
                 }
 
+                # Computa as 5 derived features (rsi_oversold_strength, vix_regime,
+                # pe_attractive, drop_x_drawdown, vol_x_drop) — exactly o mesmo
+                # código usado no train e no inference (zero training-serving skew).
+                add_derived_features(alert_row)
+
                 missing = [c for c in FEATURE_COLUMNS if c not in alert_row]
                 if missing:
                     log.warning(f"[CamadaA] {ticker} {alert_date}: features em falta {missing} — alerta ignorado")
@@ -834,6 +839,9 @@ def backfill_fund(
                     "return_3m":          round(r3m, 2) if r3m is not None else None,
                     "return_6m":          round(r6m, 2) if r6m is not None else None,
                 }
+
+                # Computa as 5 derived features (mesma função usada em treino/inferência).
+                add_derived_features(alert_row)
 
                 missing = [c for c in FEATURE_COLUMNS if c not in alert_row]
                 if missing:

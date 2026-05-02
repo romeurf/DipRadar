@@ -144,8 +144,11 @@ def get_log_stats() -> dict:
         import pandas as pd
         df = pd.read_csv(PREDICTIONS_PATH)
         total = len(df)
-        labeled = int(df["outcome_label"].notna().sum() & (df["outcome_label"] != "").sum()) \
-            if "outcome_label" in df.columns else 0
+        if "outcome_label" in df.columns:
+            mask = df["outcome_label"].notna() & (df["outcome_label"].astype(str) != "")
+            labeled = int(mask.sum())
+        else:
+            labeled = 0
         last_ts = str(df["ts"].max()) if "ts" in df.columns and total else None
         return {"total": total, "labeled": labeled, "last_ts": last_ts}
     except Exception as e:

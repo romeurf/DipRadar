@@ -54,6 +54,13 @@ PRODUCTION_REPORT  = PRODUCTION_DIR / "ml_report.json"
 CANDIDATE_REPORT   = CANDIDATE_DIR / "ml_report.json"
 
 DEFAULT_GATING_RATIO = 0.95     # candidate só substitui se AUC-PR ≥ prod × 0.95
+
+# Floor absoluto: o gating nunca aceita candidate < FLOOR_AUC_PR mesmo que a
+# produção tenha derivado para baixo. Inicializado a 0.18 (ligeiramente abaixo
+# do baseline 0.192 do bootstrap inicial — Tier A+B+C). Persistido em /data/
+# para sobreviver a redeploys e ser editável manualmente se preciso.
+FLOOR_AUC_PR_DEFAULT = 0.18
+FLOOR_PATH = _DATA_DIR / "ml_floor_auc_pr.json"
 LABEL_HORIZON_DAYS   = 182      # 6m de price action necessários para resolver outcome
 
 
@@ -93,8 +100,12 @@ def _resolve_snapshot_outcomes(snap: pd.DataFrame,
     snap_idx = snap.set_index(["symbol", "alert_date"])["price"].sort_index()
 
     def _price_near(symbol: str, target: pd.Timestamp) -> Optional[float]:
-        """Procura preço para symbol em [target-3d, target+5d]."""
-        for delta in (0, -1, -2, -3, 1, 2, 3, 4, 5):
+        """
+        Procura preço para symbol em [target, target+5d] — forward-only.
+        Evita look-ahead implicito que poderia introduzir leakage temporal
+        em casos de earnings gaps ou halts próximos da data alvo.
+        """
+        for delta in (0, 1, 2, 3, 4, 5):
             t = target + pd.Timedelta(days=delta)
             try:
                 v = snap_idx.loc[(symbol, t)]
@@ -126,9 +137,10 @@ def _resolve_snapshot_outcomes(snap: pd.DataFrame,
         log.warning(f"[outcome] Falha a buscar SPY benchmark ({e}); fallback absoluto.")
 
     def _spy_near(target: pd.Timestamp) -> Optional[float]:
+        """SPY price em [target, target+5d] — forward-only para consistência."""
         if not spy_close:
             return None
-        for delta in range(-3, 6):
+        for delta in range(0, 6):
             t = target + pd.Timedelta(days=delta)
             v = spy_close.get(t)
             if v is not None:
@@ -343,25 +355,68 @@ def _read_auc_pr(report_path: Path) -> Optional[float]:
         return None
 
 
+def _read_floor_auc_pr() -> float:
+    """
+    Lê o floor AUC-PR persistido. Cria com FLOOR_AUC_PR_DEFAULT se não existe.
+    Editável manualmente via JSON ({"floor_auc_pr": 0.18, "set_at": "..."}).
+    """
+    try:
+        if FLOOR_PATH.exists():
+            data = json.loads(FLOOR_PATH.read_text())
+            val = float(data.get("floor_auc_pr", FLOOR_AUC_PR_DEFAULT))
+            return val
+    except Exception as e:
+        log.warning(f"[gating] Floor file corrupt at {FLOOR_PATH}: {e} — usando default")
+
+    # Inicializa com default
+    try:
+        FLOOR_PATH.parent.mkdir(parents=True, exist_ok=True)
+        FLOOR_PATH.write_text(json.dumps({
+            "floor_auc_pr": FLOOR_AUC_PR_DEFAULT,
+            "set_at":       datetime.utcnow().isoformat() + "Z",
+            "comment":      "Initial floor — bootstrap baseline ~0.192 (PR #3 Tier A+B+C).",
+        }, indent=2))
+    except Exception as e:
+        log.debug(f"[gating] Não foi possível persistir floor: {e}")
+    return FLOOR_AUC_PR_DEFAULT
+
+
 def gate_and_promote(gating_ratio: float = DEFAULT_GATING_RATIO) -> dict:
     """
     Compara CANDIDATE_REPORT vs PRODUCTION_REPORT (Stage1 AUC-PR test).
-    Promove candidate se ≥ produção × gating_ratio. Atomic via shutil.move + archive.
+    Promove candidate se:
+      - candidate ≥ produção × gating_ratio   (gating relativo)
+      - E candidate ≥ floor_auc_pr             (gating absoluto, anti-drift)
+    Atomic via shutil.move + archive.
     """
     cand_auc = _read_auc_pr(CANDIDATE_REPORT)
     prod_auc = _read_auc_pr(PRODUCTION_REPORT)
+    floor    = _read_floor_auc_pr()
 
     log.info(f"[gating] candidate AUC-PR={cand_auc} | production AUC-PR={prod_auc} "
-             f"| ratio_threshold={gating_ratio}")
+             f"| ratio_threshold={gating_ratio} | floor={floor:.4f}")
 
     if cand_auc is None:
         return {"decision": "FAILED", "reason": "candidate report missing/invalid",
-                "candidate_auc_pr": None, "production_auc_pr": prod_auc}
+                "candidate_auc_pr": None, "production_auc_pr": prod_auc,
+                "floor_auc_pr": floor}
+
+    # Gate absoluto primeiro — recusa qualquer candidate abaixo do floor mínimo,
+    # mesmo em cold start ou quando a produção derivou para baixo.
+    if cand_auc < floor:
+        return {
+            "decision":          "KEPT",
+            "reason":            f"candidate {cand_auc:.4f} < floor {floor:.4f} (absolute minimum)",
+            "candidate_auc_pr":  cand_auc,
+            "production_auc_pr": prod_auc,
+            "gating_ratio":      gating_ratio,
+            "floor_auc_pr":      floor,
+        }
 
     if prod_auc is None:
-        # Cold start — sem produção anterior, promove candidate
+        # Cold start — sem produção anterior, mas candidate ≥ floor → promove
         decision = "PROMOTED"
-        reason   = "cold start (no production model)"
+        reason   = f"cold start (no production model); candidate {cand_auc:.4f} ≥ floor {floor:.4f}"
     else:
         threshold = prod_auc * gating_ratio
         if cand_auc >= threshold:
@@ -377,6 +432,7 @@ def gate_and_promote(gating_ratio: float = DEFAULT_GATING_RATIO) -> dict:
         "candidate_auc_pr":   cand_auc,
         "production_auc_pr":  prod_auc,
         "gating_ratio":       gating_ratio,
+        "floor_auc_pr":       floor,
     }
 
     if decision != "PROMOTED":

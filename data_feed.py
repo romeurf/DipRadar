@@ -193,11 +193,46 @@ def _yfinance_fetch(ticker: str, lookback_days: int) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────
 
 def _to_stooq_ticker(ticker: str) -> str:
-    """Stooq usa lowercase + sufixo `.us` para US tickers (sem ponto). EU mantem."""
-    if "." in ticker:
-        # Já tem suffix de mercado (ALV.DE, EUNL.DE, ASML.AS) — só lowercase
-        return ticker.lower()
-    return f"{ticker.lower()}.us"
+    """
+    Stooq usa lowercase + sufixos próprios. Mapeamento de mercados:
+      .DE/.F  → .de   Frankfurt
+      .PA     → .fr   Paris
+      .L/.LON → .uk   London
+      .AS     → .nl   Amsterdam
+      .MI     → .it   Milan (Borsa Italiana)
+      .MC     → .es   Madrid
+      .SW/.VX → .ch   Switzerland
+      .TO     → .ca   Toronto
+      .BR     → .be   Brussels
+      .HE     → .fi   Helsinki
+      .ST     → .se   Stockholm
+      .CO     → .dk   Copenhagen
+      .OL     → .no   Oslo
+      .LS     → .pt   Lisboa
+      sem ponto → .us   default US tickers
+    """
+    if "." not in ticker:
+        return f"{ticker.lower()}.us"
+
+    base, _, suffix = ticker.rpartition(".")
+    suffix_map = {
+        "DE": "de", "F": "de",
+        "PA": "fr",
+        "L": "uk", "LON": "uk",
+        "AS": "nl",
+        "MI": "it",
+        "MC": "es",
+        "SW": "ch", "VX": "ch",
+        "TO": "ca",
+        "BR": "be",
+        "HE": "fi",
+        "ST": "se",
+        "CO": "dk",
+        "OL": "no",
+        "LS": "pt",
+    }
+    mapped = suffix_map.get(suffix.upper(), suffix.lower())
+    return f"{base.lower()}.{mapped}"
 
 
 def _stooq_fetch(ticker: str, lookback_days: int) -> pd.DataFrame:
