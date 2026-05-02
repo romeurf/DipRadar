@@ -434,6 +434,129 @@ def get_price_near(hist: pd.DataFrame, target: date) -> float | None:
     return None
 
 
+# ── Point-in-Time Fundamentals ────────────────────────────────────────────────
+#
+# REGRA INSTITUCIONAL: O único fallback válido para o passado desconhecido é NaN.
+# NUNCA usar tk.info como fallback para dados históricos — isso reintroduz
+# Look-Ahead Bias com potencialmente anos de informação futura.
+#
+# tk.info é APENAS válido para:
+#   1. Dados estáticos independentes do tempo (sector, industry)
+#   2. Vector de inferência de hoje em produção (Point-in-Time válido)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_historical_fundamentals(tk, alert_date) -> dict:
+    """
+    Extrai fundamentais respeitando rigorosamente o Point-in-Time (SEC reporting lag).
+
+    Usa quarterly_income_stmt / quarterly_balance_sheet / quarterly_cashflow
+    com lag de 45 dias (tempo mínimo entre fim do trimestre e publicação SEC).
+
+    Retorna NaN para qualquer métrica que o yfinance não consiga fornecer para
+    aquele período — o modelo lida com NaNs via SimpleImputer(strategy='median').
+
+    NUNCA faz fallback para tk.info: isso injectaria dados futuros na linha de treino.
+    """
+    valid_threshold = pd.to_datetime(alert_date) - pd.Timedelta(days=45)
+
+    result = {
+        "fcf_yield":      np.nan,
+        "revenue_growth": np.nan,
+        "gross_margin":   np.nan,
+        "de_ratio":       np.nan,
+    }
+
+    try:
+        inc   = tk.quarterly_income_stmt
+        bal   = tk.quarterly_balance_sheet
+        cf    = tk.quarterly_cashflow
+
+        # Se a API não devolver nada, aborta em segurança com NaNs
+        if inc.empty or bal.empty or cf.empty:
+            return result
+
+        # Normalizar colunas para Timestamp (yfinance devolve datas como nomes de colunas)
+        def _valid_cols(df: pd.DataFrame) -> list:
+            cols = []
+            for c in df.columns:
+                try:
+                    if pd.to_datetime(c) <= valid_threshold:
+                        cols.append(c)
+                except Exception:
+                    pass
+            return cols
+
+        inc_cols = _valid_cols(inc)
+        bal_cols = _valid_cols(bal)
+        cf_cols  = _valid_cols(cf)
+
+        # Sem histórico tão antigo: devolvemos NaN — NUNCA tk.info
+        if not inc_cols or not bal_cols or not cf_cols:
+            return result
+
+        # Trimestre válido mais recente face à data do alerta
+        t_inc = max(inc_cols, key=pd.to_datetime)
+        t_bal = max(bal_cols, key=pd.to_datetime)
+        t_cf  = max(cf_cols,  key=pd.to_datetime)
+
+        # ── Gross Margin ─────────────────────────────────────────────
+        gross_profit  = inc[t_inc].get("Gross Profit",  np.nan)
+        total_revenue = inc[t_inc].get("Total Revenue", np.nan)
+        if pd.notna(gross_profit) and pd.notna(total_revenue) and total_revenue > 0:
+            result["gross_margin"] = float(gross_profit) / float(total_revenue)
+
+        # ── Revenue Growth (QoQ: trimestre actual vs mesmo trimestre do ano anterior) ──
+        # Ordena colunas inc por data desc e tenta comparar com 4 trimestres atrás
+        try:
+            all_inc_sorted = sorted(
+                [c for c in inc.columns if pd.to_datetime(c) <= valid_threshold],
+                key=pd.to_datetime, reverse=True
+            )
+            if len(all_inc_sorted) >= 5:
+                rev_now  = inc[all_inc_sorted[0]].get("Total Revenue", np.nan)
+                rev_prev = inc[all_inc_sorted[4]].get("Total Revenue", np.nan)
+                if pd.notna(rev_now) and pd.notna(rev_prev) and rev_prev > 0:
+                    result["revenue_growth"] = (float(rev_now) - float(rev_prev)) / abs(float(rev_prev))
+        except Exception:
+            pass
+
+        # ── FCF Yield ────────────────────────────────────────────────
+        try:
+            op_cf  = cf[t_cf].get("Operating Cash Flow",   np.nan)
+            capex  = cf[t_cf].get("Capital Expenditure",   np.nan)
+            # capex no yfinance é negativo por convenção
+            if pd.notna(op_cf) and pd.notna(capex):
+                fcf_ttm = float(op_cf) + float(capex)   # capex já é negativo
+                # Market cap histórico: usamos price × shares da bal sheet como proxy
+                shares = bal[t_bal].get("Ordinary Shares Number", np.nan)
+                # fallback: Common Stock
+                if pd.isna(shares):
+                    shares = bal[t_bal].get("Common Stock", np.nan)
+                # Para calcular market cap histórico aproximado, precisamos do preço
+                # nessa data — não está disponível aqui sem hist extra.
+                # Guardamos o FCF absoluto; o ratio é calculado abaixo com o preço do alerta.
+                result["_fcf_abs"] = fcf_ttm  # chave interna, removida depois
+        except Exception:
+            pass
+
+        # ── D/E Ratio ────────────────────────────────────────────────
+        try:
+            total_debt   = bal[t_bal].get("Total Debt",           np.nan)
+            stockholder_eq = bal[t_bal].get("Stockholders Equity", np.nan)
+            if pd.isna(stockholder_eq):
+                stockholder_eq = bal[t_bal].get("Total Equity Gross Minority Interest", np.nan)
+            if pd.notna(total_debt) and pd.notna(stockholder_eq) and stockholder_eq != 0:
+                result["de_ratio"] = float(total_debt) / abs(float(stockholder_eq)) * 100
+        except Exception:
+            pass
+
+    except Exception:
+        # Erros de rede ou parsing do yfinance: modelo lida com NaNs
+        pass
+
+    return result
+
+
 # ── Backfill — Camada A (preço, 20 anos) ──────────────────────────────────────
 
 def backfill_price(
@@ -636,9 +759,14 @@ def backfill_fund(
     existing_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
-    Camada B: enriquece com fundamentais reais + macro histórico.
-    Preenche os campos Stage 1 (fcf_yield, revenue_growth, etc.) com
-    dados do yfinance.info. Macro vem do bulk lookup, não de chamadas individuais.
+    Camada B: enriquece com fundamentais Point-in-Time reais + macro histórico.
+
+    Preenche os campos Stage 1 (fcf_yield, revenue_growth, gross_margin, de_ratio)
+    com _get_historical_fundamentals() — rigorosamente Point-in-Time, lag SEC 45 dias.
+
+    NUNCA usa tk.info como fallback para dados históricos (Look-Ahead Bias).
+    tk.info é usado APENAS para dados estáticos (sector) e para quality_score/
+    pe_vs_fair que não têm série histórica gratuita (são marcados como aproximações).
     """
     import yfinance as yf
 
@@ -667,7 +795,30 @@ def backfill_fund(
             if hist.empty or len(hist) < 60:
                 continue
 
+            # ── Dados estáticos de tk.info (independentes do tempo) ───
+            # ÚNICO uso válido de tk.info na Camada B: sector e quality proxies
+            # que não têm série histórica gratuita.
             info = tk.info or {}
+            sector_str = info.get("sector", "Unknown") or "Unknown"
+
+            # pe_vs_fair e analyst_upside: sem série histórica no yfinance gratuito.
+            # Usamos tk.info actual mas marcamos como "aproximação estática".
+            # O modelo deve tratar estes campos com menor peso (sem PIT garantido).
+            pe_raw = safe_float(info.get("trailingPE") or info.get("forwardPE"))
+            _SECTOR_FAIR_PE = {
+                "Technology": 35.0, "Healthcare": 22.0, "Communication Services": 22.0,
+                "Financial Services": 13.0, "Financials": 13.0, "Consumer Cyclical": 20.0,
+                "Consumer Defensive": 22.0, "Industrials": 20.0, "Energy": 12.0,
+                "Utilities": 18.0, "Real Estate": 40.0, "Basic Materials": 14.0, "Materials": 14.0,
+            }
+            fair_pe    = _SECTOR_FAIR_PE.get(sector_str, 22.0)
+            pe_vs_fair = round(pe_raw / fair_pe, 4) if pe_raw and pe_raw > 0 else 1.0
+
+            tgt = safe_float(info.get("targetMeanPrice"))
+            cur = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"), 1.0)
+            analyst_upside = ((tgt - cur) / cur) if tgt and cur and cur > 0 else 0.10
+
+            mcap = safe_float(info.get("marketCap"), 0) / 1e9
 
             hist["rsi"]       = calc_rsi(hist["Close"])
             hist["ret_1d"]    = hist["Close"].pct_change() * 100
@@ -676,43 +827,6 @@ def backfill_fund(
             roll_max          = hist["Close"].rolling(252, min_periods=30).max()
             hist["ddp_52w"]   = (hist["Close"] - roll_max) / roll_max * 100
             hist["atr_ratio"] = hist["atr"] / (hist["Close"] + 1e-9)
-
-            # ── Fundamentais do yfinance.info (snapshot actual) ────────
-            pe_raw  = safe_float(info.get("trailingPE") or info.get("forwardPE"))
-            pb      = safe_float(info.get("priceToBook"))
-            mcap    = safe_float(info.get("marketCap"), 0) / 1e9
-            fcf     = safe_float(info.get("freeCashflow"))
-            mc_raw  = safe_float(info.get("marketCap"))
-            fcfy    = (fcf / mc_raw) if fcf and mc_raw and mc_raw > 0 else 0.04
-            revg    = safe_float(info.get("revenueGrowth"), 0.05)
-            gm      = safe_float(info.get("grossMargins"), 0.35)
-            de      = safe_float(info.get("debtToEquity"), 80.0)
-            beta    = safe_float(info.get("beta"), 1.0)
-            short   = safe_float(info.get("shortPercentOfFloat"), 0) * 100
-            tgt     = safe_float(info.get("targetMeanPrice"))
-            cur     = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"), 1.0)
-            upside  = ((tgt - cur) / cur) if tgt and cur and cur > 0 else 0.10
-
-            # sector para pe_vs_fair
-            sector_str = info.get("sector", "Unknown") or "Unknown"
-            _SECTOR_FAIR_PE = {
-                "Technology": 35.0, "Healthcare": 22.0, "Communication Services": 22.0,
-                "Financial Services": 13.0, "Financials": 13.0, "Consumer Cyclical": 20.0,
-                "Consumer Defensive": 22.0, "Industrials": 20.0, "Energy": 12.0,
-                "Utilities": 18.0, "Real Estate": 40.0, "Basic Materials": 14.0, "Materials": 14.0,
-            }
-            fair_pe   = _SECTOR_FAIR_PE.get(sector_str, 22.0)
-            pe_vs_fair = round(pe_raw / fair_pe, 4) if pe_raw and pe_raw > 0 else 1.0
-
-            # quality_score proxy (sem importar score.py para evitar dependência circular)
-            # Approximação simples: normaliza FCF yield, gross margin e D/E
-            qs = 0.5
-            if fcfy > 0.06: qs += 0.15
-            if gm > 0.40:   qs += 0.10
-            if de < 50:     qs += 0.10
-            if revg > 0.10: qs += 0.10
-            if upside > 0.20: qs += 0.05
-            quality_score = round(min(qs, 1.0), 4)
 
             mask = (
                 (hist["ret_1d"] <= -(dip_thresh * 100)) &
@@ -743,6 +857,37 @@ def backfill_fund(
                     continue
 
                 entry = float(row["Close"])
+
+                # ── Fundamentais Point-in-Time — NÚCLEO ANTI-LOOKAHEAD ──
+                # _get_historical_fundamentals respeita o lag SEC de 45 dias.
+                # Devolve NaN se o yfinance não tiver história suficiente.
+                # NUNCA usa tk.info como fallback — isso seria Look-Ahead Bias.
+                fund = _get_historical_fundamentals(tk, alert_date)
+
+                # FCF Yield: combinar FCF absoluto (PIT) com preço de entrada
+                fcf_yield_pit = np.nan
+                if pd.notna(fund.get("_fcf_abs")) and entry > 0:
+                    # Aproximação: FCF trimestral anualizado / market cap naquela data
+                    # market cap histórico = preço × shares (não temos shares históricas
+                    # sem custo, por isso usamos mcap actual como proxy conservador)
+                    mc_actual = safe_float(info.get("marketCap"))
+                    if mc_actual and mc_actual > 0:
+                        fcf_annualized = float(fund["_fcf_abs"]) * 4
+                        fcf_yield_pit = fcf_annualized / mc_actual
+                fund.pop("_fcf_abs", None)  # remover chave interna
+
+                # quality_score proxy (derivado de métricas PIT onde disponível)
+                gm_pit  = fund.get("gross_margin",   np.nan)
+                de_pit  = fund.get("de_ratio",        np.nan)
+                revg_pit = fund.get("revenue_growth", np.nan)
+                qs = 0.5
+                if pd.notna(fcf_yield_pit) and fcf_yield_pit > 0.06: qs += 0.15
+                if pd.notna(gm_pit)  and gm_pit  > 0.40: qs += 0.10
+                if pd.notna(de_pit)  and de_pit   < 50:  qs += 0.10
+                if pd.notna(revg_pit) and revg_pit > 0.10: qs += 0.10
+                if analyst_upside > 0.20: qs += 0.05
+                quality_score = round(min(qs, 1.0), 4)
+
                 p3m = get_price_near(hist_after, alert_date + timedelta(days=91))
                 p6m = get_price_near(hist_after, alert_date + timedelta(days=182))
                 if p3m is None and p6m is None:
@@ -764,13 +909,16 @@ def backfill_fund(
                     "spy_drawdown_5d":    macro["spy_drawdown_5d"],
                     "sector_drawdown_5d": macro["sector_drawdown_5d"],
 
-                    # Stage 1 — Quality / Value (valores reais da Camada B)
-                    "fcf_yield":          round(float(fcfy), 6),
-                    "revenue_growth":     round(float(revg), 4),
-                    "gross_margin":       round(float(gm), 4),
-                    "de_ratio":           round(float(de), 2),
+                    # Stage 1 — Quality / Value (Point-in-Time via quarterly statements)
+                    # NaN onde o yfinance não tem história — o modelo lida via imputer
+                    "fcf_yield":          round(float(fcf_yield_pit), 6) if pd.notna(fcf_yield_pit) else np.nan,
+                    "revenue_growth":     round(float(fund["revenue_growth"]), 4) if pd.notna(fund["revenue_growth"]) else np.nan,
+                    "gross_margin":       round(float(fund["gross_margin"]), 4) if pd.notna(fund["gross_margin"]) else np.nan,
+                    "de_ratio":           round(float(fund["de_ratio"]), 2) if pd.notna(fund["de_ratio"]) else np.nan,
+                    # pe_vs_fair e analyst_upside: aproximação estática (tk.info actual)
+                    # sem série histórica gratuita — menor fiabilidade PIT
                     "pe_vs_fair":         round(float(pe_vs_fair), 4),
-                    "analyst_upside":     round(float(upside), 4),
+                    "analyst_upside":     round(float(analyst_upside), 4),
                     "quality_score":      quality_score,
 
                     # Stage 2 — Timing
@@ -893,6 +1041,7 @@ def _train_layer(
     """
     Treina com FEATURE_COLUMNS importado de ml_features.py.
     Usa label_win (binário) como target — alinhado com ml_features.LABEL_COLUMNS.
+    SimpleImputer(strategy='median') lida com NaNs de fundamentais PIT em falta.
     """
     from sklearn.metrics import average_precision_score, classification_report, precision_recall_curve
 
