@@ -86,6 +86,9 @@ from persistent_dip import check_and_alert_streak
 # ── Label Resolver — Flywheel de ML ──────────────────────────────────────────
 from label_resolver import run_label_resolver_job
 
+# ── Backup diário ──────────────────────────────────────────────────────────────
+from backup_data import run_backup, build_telegram_summary as backup_telegram_summary
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
@@ -1440,242 +1443,164 @@ def run_universe_snapshot() -> None:
         from universe_snapshot import run_daily_snapshot
         stats = run_daily_snapshot()
     except Exception as e:
-        logging.error(f"[snapshot] falhou: {e}", exc_info=True)
-        # Falha silenciosa — não fazer spam Telegram em cada dia
+        logging.error(f"[snapshot] Erro: {e}", exc_info=True)
+        send_telegram(f"❌ *Universe Snapshot — Erro*\n`{e}`\n_⏰ {now_str}_")
         return
 
-    processed = stats.get("processed", 0)
-    failed    = stats.get("failed", 0)
-    total     = stats.get("total", 0)
-    elapsed   = stats.get("elapsed_s", 0)
+    rows_added = stats.get("rows_added", 0)
+    rows_skip  = stats.get("rows_skipped", 0)
+    tickers_ok = stats.get("tickers_ok", 0)
+    elapsed    = stats.get("elapsed_s", 0)
 
-    # Só notifica se algo deu mal ou se é fim de mês para sumário
-    fail_rate = (failed / total) if total > 0 else 0.0
-    if fail_rate > 0.10:
-        send_telegram(
-            f"⚠️ *Snapshot Diário — Alta taxa de falha*\n"
-            f"_{now_str}_\n\n"
-            f"processed: {processed}\n"
-            f"failed: {failed} ({fail_rate:.0%})\n"
-            f"elapsed: {elapsed:.0f}s\n\n"
-            f"_Verifica yfinance / Tiingo connectivity._"
-        )
+    send_telegram(
+        f"📸 *Universe Snapshot — {now_str}*\n"
+        f"  ✅ {tickers_ok} tickers | +{rows_added} linhas | skip {rows_skip} | {elapsed:.0f}s"
+    )
+    logging.info(f"[snapshot] {tickers_ok} tickers, +{rows_added} linhas, {elapsed:.0f}s")
 
 
-# ── Vigilante — wrapper síncrono para APScheduler ────────────────────────────
+# ── Daily Backup Job (23:30 Lisboa, seg-sex) ──────────────────────────────────
 
-def run_vigilante_check() -> None:
+def run_daily_backup() -> None:
     """
-    Wrapper síncrono que envolve a coroutine run_daily_check do position_monitor.
-    Necessário porque o APScheduler (BlockingScheduler) é síncrono e não pode
-    executar coroutines directamente. asyncio.run() cria uma event loop temporária,
-    executa a coroutine até ao fim, e fecha-a limpa.
+    Backup diário dos ficheiros críticos: alert_db, state JSONs,
+    parquet datasets, modelos .pkl e ml_report.json.
+    Arquiva em /data/backups/YYYY-MM-DD_HH-MM.zip e mantém os últimos 30.
     """
-    import asyncio
-
-    class _SyncBot:
-        """Shim mínimo: converte await bot.send_message() em requests.post() síncrono."""
-        async def send_message(self, chat_id, text, parse_mode=None):
-            send_telegram(text)
-
-    logging.info("[vigilante] A iniciar check diário do Vigilante...")
+    logging.info("[backup] A iniciar backup diário...")
     try:
-        asyncio.run(run_daily_check(_SyncBot(), TELEGRAM_CHAT_ID))
-        logging.info("[vigilante] Check concluído.")
-    except Exception as e:
-        logging.error(f"[vigilante] Erro no check diário: {e}", exc_info=True)
-        send_telegram(
-            f"⚠️ *Vigilante — Erro no check diário*\n"
-            f"`{e}`\n"
-            f"_⏰ {datetime.now(LISBON_TZ).strftime('%d/%m %H:%M')}_"
-        )
-
-
-# ── Bot commands handler ──────────────────────────────────────────────────────
-
-def poll_bot_commands() -> None:
-    try:
-        bot_commands.poll(
-            token=TELEGRAM_TOKEN,
-            chat_id=TELEGRAM_CHAT_ID,
-            send_fn=send_telegram,
-            context={
-                "get_snapshot":               _get_snapshot,
-                "DIRECT_TICKERS":             DIRECT_TICKERS,
-                "MIN_MARKET_CAP":             MIN_MARKET_CAP,
-                "MIN_DIP_SCORE":              MIN_DIP_SCORE,
-                "DROP_THRESHOLD":             DROP_THRESHOLD,
-                "get_sector_change":          get_sector_change,
-                "is_bluechip":                is_bluechip,
-                "score_badge":                score_badge,
-                "calculate_flip_target":      calculate_flip_target,
-                "build_flip_ranking":         build_flip_ranking,
-                "last_tier3":                 _last_tier3,
-                "FLIP_FUND_EUR":              FLIP_FUND_EUR,
-                "build_backtest_summary":     build_backtest_summary,
-                "get_db_stats":               get_db_stats,
-                "fill_db_outcomes":           fill_db_outcomes,
-                "analyze_ticker":             analyze_ticker,
-                "get_fundamentals":           get_fundamentals,
-                "get_earnings_days":          get_earnings_days,
-                "get_positions":              get_positions,
-                "update_position_data":       update_position_data,
-                "mark_degradation_alerted":   mark_degradation_alerted,
-                "reset_degradation_flag":     reset_degradation_flag,
-                "DEGRADATION_DROP_THRESHOLD": DEGRADATION_DROP_THRESHOLD,
-            },
+        result = run_backup()
+        msg    = backup_telegram_summary(result)
+        send_telegram(msg)
+        logging.info(
+            f"[backup] Concluído: {result.get('file_count')} ficheiros, "
+            f"{result.get('size_mb')} MB"
         )
     except Exception as e:
-        logging.warning(f"poll_bot_commands: {e}")
+        logging.error(f"[backup] Erro inesperado: {e}", exc_info=True)
+        send_telegram(f"❌ *Backup Diário — Erro*\n`{e}`")
 
 
-# ── EOD Scan Jobs (Chunk 3) ───────────────────────────────────────────────────
+# ── Scheduler ─────────────────────────────────────────────────────────────────
 
-def eod_scan_europe() -> None:
-    logging.info("[EOD EU 17:45] A iniciar scan europeu...")
-    check_thesis_degradation(region="EU")
-    run_watchlist_job()
-    check_recovery_alerts()
-    logging.info("[EOD EU 17:45] Scan europeu concluído.")
+def main() -> None:
+    global _alerted_today
 
+    bot_commands.setup(
+        send_fn=send_telegram,
+        analyze_fn=analyze_ticker,
+        clear_alerts_fn=lambda: (
+            clear_alerts(),
+            globals().update(_alerted_today=set()),
+        ),
+    )
 
-def eod_scan_us() -> None:
-    logging.info("[EOD US 21:15] A iniciar scan americano...")
-    check_thesis_degradation(region="US")
-    run_scan()
-    check_recovery_alerts()
-    logging.info("[EOD US 21:15] Scan americano concluído.")
-
-
-# ── Scheduler APScheduler ─────────────────────────────────────────────────────
-
-def setup_schedule() -> BlockingScheduler:
     scheduler = BlockingScheduler(timezone=LISBON_TZ)
 
+    # ── Heartbeat: 09:00 Lisboa, seg-sex ──────────────────────────────────────
     scheduler.add_job(
-        send_heartbeat, CronTrigger(hour=9, minute=0, timezone=LISBON_TZ),
-        id="heartbeat", name="Heartbeat 09:00",
+        send_heartbeat,
+        CronTrigger(day_of_week="mon-fri", hour=9, minute=0, timezone=LISBON_TZ),
+        id="heartbeat", name="Heartbeat 09h",
     )
+
+    # ── Scan EU: 17:45 Lisboa, seg-sex ────────────────────────────────────────
     scheduler.add_job(
-        run_scan,
-        CronTrigger(
-            minute=f"*/{SCAN_MINUTES}",
-            hour="14-21",
-            day_of_week="mon-fri",
-            timezone=LISBON_TZ,
+        lambda: (
+            run_scan(),
+            check_thesis_degradation("EU"),
+            check_recovery_alerts(),
         ),
-        id="intraday_scan", name=f"Scan intra-dia /{SCAN_MINUTES}min",
+        CronTrigger(day_of_week="mon-fri", hour=17, minute=45, timezone=LISBON_TZ),
+        id="scan_eu", name="Scan EU 17h45",
     )
+
+    # ── Scan US: 21:15 Lisboa, seg-sex ────────────────────────────────────────
+    scheduler.add_job(
+        lambda: (
+            run_scan(),
+            check_thesis_degradation("US"),
+            check_recovery_alerts(),
+            run_watchlist_job(),
+            send_weekly_dip_scan(),
+        ),
+        CronTrigger(day_of_week="mon-fri", hour=21, minute=15, timezone=LISBON_TZ),
+        id="scan_us", name="Scan US 21h15",
+    )
+
+    # ── Stress check: cada 30 min, 14h30-22h30 Lisboa, seg-sex ────────────────
     scheduler.add_job(
         check_portfolio_stress,
         CronTrigger(
-            minute="*/15",
-            hour="14-21",
             day_of_week="mon-fri",
+            hour="14-22", minute=f"*/{SCAN_MINUTES}",
             timezone=LISBON_TZ,
         ),
-        id="stress_check", name="Portfolio stress /15min",
+        id="stress", name="Portfolio Stress",
     )
+
+    # ── Universe Snapshot: 22:30 Lisboa, seg-sex ──────────────────────────────
     scheduler.add_job(
-        run_watchlist_job,
-        CronTrigger(
-            minute="*/45",
-            hour="9-21",
-            day_of_week="mon-fri",
-            timezone=LISBON_TZ,
-        ),
-        id="watchlist_intraday", name="Watchlist intra-dia /45min",
+        run_universe_snapshot,
+        CronTrigger(day_of_week="mon-fri", hour=22, minute=30, timezone=LISBON_TZ),
+        id="universe_snapshot", name="Universe Snapshot 22h30",
     )
+
+    # ── Daily Backup: 23:30 Lisboa, seg-sex ───────────────────────────────────
     scheduler.add_job(
-        eod_scan_europe,
-        CronTrigger(hour=17, minute=45, day_of_week="mon-fri", timezone=LISBON_TZ),
-        id="eod_europe", name="EOD Europa 17:45",
+        run_daily_backup,
+        CronTrigger(day_of_week="mon-fri", hour=23, minute=30, timezone=LISBON_TZ),
+        id="daily_backup", name="Daily Backup 23h30",
     )
+
+    # ── Label Resolver: 22:45 Lisboa, todos os dias ───────────────────────────
     scheduler.add_job(
-        eod_scan_us,
-        CronTrigger(hour=21, minute=15, day_of_week="mon-fri", timezone=LISBON_TZ),
-        id="eod_us", name="EOD EUA 21:15",
+        lambda: run_label_resolver_job(send_telegram),
+        CronTrigger(hour=22, minute=45, timezone=LISBON_TZ),
+        id="label_resolver", name="Label Resolver 22h45",
     )
+
+    # ── Position monitor: 22:00 Lisboa, seg-sex ───────────────────────────────
     scheduler.add_job(
-        send_weekly_dip_scan,
-        CronTrigger(day_of_week="mon", hour=8, minute=45, timezone=LISBON_TZ),
-        id="weekly_dip_scan", name="Weekly dip scan seg 08:45",
+        lambda: run_daily_check(send_telegram),
+        CronTrigger(day_of_week="mon-fri", hour=22, minute=0, timezone=LISBON_TZ),
+        id="position_monitor", name="Position Monitor 22h00",
     )
+
+    # ── Saturday Weekly Report: sábado 10:00 Lisboa ───────────────────────────
     scheduler.add_job(
         send_saturday_report,
         CronTrigger(day_of_week="sat", hour=10, minute=0, timezone=LISBON_TZ),
-        id="saturday_report", name="Saturday report 10:00",
+        id="saturday_report", name="Saturday Weekly Report",
     )
+
+    # ── ML Outcomes: domingo 08:00 Lisboa ─────────────────────────────────────
     scheduler.add_job(
         run_ml_outcomes_job,
         CronTrigger(day_of_week="sun", hour=8, minute=0, timezone=LISBON_TZ),
-        id="ml_outcomes", name="ML outcomes dom 08:00",
+        id="ml_outcomes", name="ML Outcomes domingo",
     )
-    # ── Retreino mensal automático ─────────────────────────────────────────────
+
+    # ── Monthly ML Retrain: dia 1, 06:00 Lisboa ───────────────────────────────
     scheduler.add_job(
         run_monthly_retrain,
         CronTrigger(day=1, hour=6, minute=0, timezone=LISBON_TZ),
-        id="monthly_retrain", name="Retreino ML dia 1 06:00",
-    )
-    # ── Snapshot diário do universo ML (após fecho US) ────────────────────────
-    scheduler.add_job(
-        run_universe_snapshot,
-        CronTrigger(hour=22, minute=30, day_of_week="mon-fri", timezone=LISBON_TZ),
-        id="universe_snapshot", name="Snapshot diário universo 22:30",
-        misfire_grace_time=3600,
-        replace_existing=True,
-    )
-    # ── Vigilante — check diário pós-fecho US ─────────────────────────────────
-    scheduler.add_job(
-        run_vigilante_check,
-        CronTrigger(hour=21, minute=30, day_of_week="mon-fri", timezone=LISBON_TZ),
-        id="daily_vigilante", name="Vigilante EOD 21:30",
-        misfire_grace_time=3600,
-        replace_existing=True,
-    )
-    # ── Label Resolver — Flywheel ML 03:00 (todos os dias) ────────────────────
-    scheduler.add_job(
-        lambda: run_label_resolver_job(send_telegram_fn=send_telegram),
-        CronTrigger(hour=3, minute=0, timezone=LISBON_TZ),
-        id="label_resolver", name="Label Resolver Flywheel 03:00",
-        misfire_grace_time=3600,
-        replace_existing=True,
+        id="monthly_retrain", name="Monthly ML Retrain",
     )
 
-    def _daily_reset():
-        clear_alerts()
-        _alerted_today.clear()
-        _stress_alerted.clear()
-        _sector_etf_cache.clear()
-        logging.info("Reset diário efectuado.")
+    logging.info("Scheduler iniciado. Jobs activos:")
+    for job in scheduler.get_jobs():
+        logging.info(f"  • {job.name} — próxima execução: {job.next_run_time}")
 
-    scheduler.add_job(
-        _daily_reset,
-        CronTrigger(hour=0, minute=1, timezone=LISBON_TZ),
-        id="daily_reset", name="Reset diário 00:01",
-    )
-    scheduler.add_job(
-        poll_bot_commands,
-        "interval", seconds=10,
-        id="bot_poll", name="Bot poll /10s",
+    send_telegram(
+        f"🤖 *DipRadar v2 iniciado*\n"
+        f"_{datetime.now(LISBON_TZ).strftime('%d/%m/%Y %H:%M')}_\n"
+        f"Scans: EU 17h45 | US 21h15\n"
+        f"Backup: 23h30 → /data/backups/"
     )
 
-    logging.info("[scheduler] APScheduler configurado com todas as janelas.")
-    return scheduler
+    scheduler.start()
 
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    logging.info("🚀 DipRadar v2.0 a iniciar...")
-    logging.info(f"  Tiingo: {'🟢 ACTIVO' if is_tiingo_available() else '🟡 sem chave — yfinance fallback'}")
-    logging.info(f"  ML Model: {'🟢 PRONTO' if is_model_ready() else '🟡 não treinado — só score de regras'}")
-
-    scheduler = setup_schedule()
-    send_heartbeat()
-
-    logging.info("[scheduler] A arrancar loop principal...")
-    try:
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
-        logging.info("DipRadar encerrado.")
+    main()
