@@ -4,3 +4,20 @@ builder = "nixpacks"
 [deploy]
 startCommand = "python main.py"
 restartPolicyType = "always"
+
+# ─────────────────────────────────────────────────────────
+# Scheduled jobs
+# ─────────────────────────────────────────────────────────
+
+# Retrain Stage 1 + Stage 2 models on the 1st of every month at 06:00 UTC.
+# Overwrites dip_model_stage1.pkl, dip_model_stage2.pkl and ml_report.json.
+[[crons]]
+schedule = "0 6 1 * *"
+command  = "python monthly_retrain.py"
+
+# Resolve labels for past alerts every Sunday at 05:00 UTC.
+# Closes the WIN/LOSS feedback loop so the training dataset grows
+# continuously with real outcomes — must run before monthly_retrain.
+[[crons]]
+schedule = "0 5 * * 0"
+command  = "python label_resolver.py"
