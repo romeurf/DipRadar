@@ -202,6 +202,11 @@ PPR_AVG_COST=<preco_medio>
 | `ml_walk_forward.py` | Backtest mensal expanding-window 2022-2025, métricas por janela |
 | `bootstrap_ml.py` | Backfill histórico (Camada A=preço/macro, Camada B=fundamentais PIT) + invocação de `train_model.train_all` |
 | `colab_bootstrap.ipynb` | Notebook Colab: Fase A (preços) → Fase B (fundamentais) → Fase C (treino robusto) |
+| `universe_snapshot.py` | **Snapshot diário (~780 tickers, 22:30 Lisboa)** — alimenta o modelo com dados frescos para retreino mensal |
+| `monthly_retrain.py` | **Retreino mensal v2** com walk-forward gating ×0.95 + atomic deploy + archive |
+| `prediction_log.py` | Log append-only de cada `ml_score()` em produção — feedback loop para drift detection |
+| `alert_db.py` | Snapshot por alerta + outcome back-fill (1m/3m/6m via Tiingo) |
+| `data_feed.py` | EOD prices: Tiingo → yfinance → **Stooq** (3-tier fallback grátis) |
 
 ---
 
@@ -270,6 +275,69 @@ python train_model.py --parquet ml_training_merged.parquet --output-dir /tmp/dip
 | 0.135 | 28% | **37%** | máx wins (mais ruído) |
 | **0.229** | **34%** | 26% | balanceado (default) |
 | 0.239 | 30% | 7% | máx precision (poucos sinais) |
+
+---
+
+### 🔁 Continuous Learning Pipeline (Tier E)
+
+A robustez "estática" tem o tecto que o dataset 2023+ permite (288 amostras → ±0.05 AUC-PR é ruído). Para subir de forma sustentada precisamos de **mais dados modernos** e **monitorização de drift**. O Tier E implementa o ciclo end-to-end de aprendizagem contínua, sem custos extra (yfinance + Stooq grátis).
+
+**1. Snapshot diário do universo** (`universe_snapshot.py`)
+- Cron seg-sex 22:30 Lisboa (após fecho US)
+- Itera os ~780 tickers de `get_ml_universe()` (S&P 500 + Nasdaq 100 + STOXX 200 + FTSE 100 + carteira + watchlist)
+- Para cada ticker: OHLCV + indicadores técnicos + macro snapshot + fundamentais (cache 7d) → 1 linha em `/data/universe_snapshot.parquet`
+- **Idempotente**: skip dos que já têm linha para o dia. Permite retomar após crash.
+- **Failure-tolerant**: cadeia Tiingo → yfinance → Stooq, falhas individuais não param o batch
+- **Telemetria**: `data_source`, `fund_age_days`, `ingest_ts` em cada linha
+- Volume estimado: ≈200k linhas/ano, ~50MB parquet
+
+**2. Retreino mensal automático** (`monthly_retrain.py`, dia 1 06:00)
+- Constrói `ml_training_input.parquet` consolidando 3 fontes:
+  - bootstrap historical (2014-2025, ≈17k linhas)
+  - `alert_db.csv` (alertas reais com outcome 1m/3m/6m)
+  - `universe_snapshot.parquet` filtrado para snapshots ≥6m maduras (resolve outcome via lookup intra-tabela + alpha vs SPY)
+- Treina **candidate** em `/data/candidate/`
+- **Walk-forward gating**: candidate só substitui produção se `AUC-PR ≥ produção × 0.95` (default; configurável via `--gating-ratio`)
+- **Atomic deploy**: candidate.pkl → `/data/dip_model_stage{1,2}.pkl` via `shutil.copy + replace`
+- **Archive**: versão antiga vai para `/data/archive/dip_model_stageN_<timestamp>.pkl`
+- Telegram: decisão (PROMOTED / KEPT / FAILED) + delta % + métricas Stage 1/2
+
+**3. Prediction logging** (`prediction_log.py`)
+- Cada `ml_score()` em produção append a `/data/ml_predictions.csv` com timestamp + features + win_prob + threshold + label + vix_regime
+- Failure-tolerant: erros não afectam o caller
+- Schema preparado para back-fill posterior de `outcome_label / return_3m / return_6m` quando o tempo passar
+- Permite reconstruir a precision/recall **real** em produção (vs estimada in-sample) e detectar drift por janela mensal
+
+**4. Data provider robustness** (`data_feed.py`)
+- 3-tier fallback grátis: Tiingo (key opcional) → yfinance → **Stooq**
+- Stooq adiciona resiliência contra rate-limits do yfinance em batches de 800 tickers
+- Sem credenciais novas necessárias
+
+**Comandos manuais**
+```bash
+# Snapshot manual (debug)
+python universe_snapshot.py --tickers AAPL,MSFT --dry-run
+
+# Retreino mensal (com flags de override)
+python monthly_retrain.py --gating-ratio 0.90 --no-snapshot
+python monthly_retrain.py --dry-run               # só constrói o input
+
+# Ver últimas previsões loggadas
+python -c "from prediction_log import get_log_stats; print(get_log_stats())"
+```
+
+**Estado do volume `/data/`** (Railway):
+
+| Ficheiro | Origem | Crescimento |
+| :--- | :--- | :--- |
+| `dip_model_stage{1,2}.pkl` | monthly_retrain | substituído mensalmente |
+| `ml_report.json` | train_model | substituído mensalmente |
+| `universe_snapshot.parquet` | universe_snapshot | +~800 linhas/dia |
+| `universe_fund_cache.parquet` | universe_snapshot | ~780 linhas, refreshed 7d |
+| `alert_db.csv` | main.py (snapshot por alerta) | ~10 linhas/dia |
+| `ml_predictions.csv` | prediction_log | ~50-100 linhas/dia |
+| `archive/dip_model_stageN_<ts>.pkl` | gating | versionamento histórico |
+| `candidate/dip_model_stage{1,2}.pkl` | retrain (intermediário) | substituído mensalmente |
 
 ---
 

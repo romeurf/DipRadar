@@ -492,7 +492,7 @@ def check_thesis_degradation(region: str = "ALL") -> None:
                 "sector_etf_change": sector_chg,
                 "earnings_days":     earnings_days,
             }
-            _ml_res_deg  = ml_score(_ml_feat_deg)
+            _ml_res_deg  = ml_score(_ml_feat_deg, symbol=sym)
             _ml_prob_deg = _ml_res_deg.win_prob if _ml_res_deg.model_ready else None
             score, _      = calculate_dip_score(fund, sym, earnings_days, sector_change=sector_chg, ml_prob=_ml_prob_deg)
             category      = pos.get("category", "")
@@ -622,7 +622,7 @@ def send_weekly_dip_scan() -> None:
                 "sector_etf_change": sector_chg,
                 "earnings_days":     earnings_days,
             }
-            _ml_res_wk   = ml_score(_ml_feat_wk)
+            _ml_res_wk   = ml_score(_ml_feat_wk, symbol=sym)
             _ml_prob_wk  = _ml_res_wk.win_prob if _ml_res_wk.model_ready else None
             score, rsi_str = calculate_dip_score(fund, sym, earnings_days, sector_change=sector_chg, ml_prob=_ml_prob_wk)
             if score >= 70:
@@ -1038,7 +1038,7 @@ def analyze_ticker(symbol: str) -> str:
             "earnings_days":    earnings_days,
             "change_day_pct":   change_pct,
         }
-        ml_result = ml_score(ml_features)
+        ml_result = ml_score(ml_features, symbol=symbol)
 
         # ── Score V2 Engine (Chunk 9) ──────────────────────────────
         ml_prob_v2 = ml_result.win_prob if ml_result.model_ready else None
@@ -1158,7 +1158,7 @@ def run_scan() -> None:
                     "earnings_days":     earnings_days,
                     "change_day_pct":    stock["change_pct"],
                 }
-                ml_result = ml_score(ml_features)
+                ml_result = ml_score(ml_features, symbol=sym)
                 if ml_result.model_ready:
                     logging.info(
                         f"[ml] {sym}: label={ml_result.label} "
@@ -1331,84 +1331,134 @@ def run_ml_outcomes_job() -> None:
 def run_monthly_retrain() -> None:
     """
     Corre no dia 1 de cada mês às 06:00 Lisboa.
-    1. Preenche outcomes em falta (fill_db_outcomes via Tiingo).
-    2. Retreina o modelo ML se houver dados suficientes.
-    3. Envia relatório de métricas pelo Telegram.
+
+    Delega para `monthly_retrain.run_monthly_retrain_v2` que faz:
+      1. Build training input (bootstrap + alert_db + universe_snapshot)
+      2. Treina candidate em /data/candidate/
+      3. Walk-forward gating: candidate só substitui produção se
+         AUC-PR ≥ prod × 0.95
+      4. Atomic deploy + archive da versão antiga
+
+    Telegram: status final (PROMOTED / KEPT / FAILED) + delta de AUC-PR.
     """
-    logging.info("[monthly_retrain] A iniciar retreino mensal...")
+    logging.info("[monthly_retrain] A iniciar retreino mensal v2...")
     now_str = datetime.now(LISBON_TZ).strftime("%d/%m/%Y %H:%M")
 
-    # Passo 1: preencher outcomes
     try:
-        stats = fill_db_outcomes()
-        updated  = stats.get("updated", 0)
-        skipped  = stats.get("skipped", 0)
-        logging.info(f"[monthly_retrain] Outcomes: {updated} actualizados, {skipped} ignorados")
+        from monthly_retrain import run_monthly_retrain_v2
+        result = run_monthly_retrain_v2()
     except Exception as e:
-        logging.error(f"[monthly_retrain] fill_db_outcomes: {e}")
+        logging.error(f"[monthly_retrain] v2 falhou: {e}", exc_info=True)
         send_telegram(
-            f"⚠️ *Retreino Mensal — Erro ao preencher outcomes*\n"
+            f"❌ *Retreino Mensal — Erro*\n"
             f"`{e}`\n_⏰ {now_str}_"
         )
         return
 
-    # Passo 2: treinar modelo
-    try:
-        from train_model import train_all
-        result = train_all()
+    decision  = result.get("decision", "?")
+    cand_auc  = result.get("candidate_auc_pr")
+    prod_auc  = result.get("production_auc_pr")
+    reason    = result.get("reason", "")
+    elapsed   = result.get("elapsed_s", 0)
+    s1        = result.get("candidate_stage1") or {}
+    s2        = result.get("candidate_stage2") or {}
+    outcomes  = result.get("outcome_stats") or {}
 
-        s1 = result.get("stage1", {})
-        s2 = result.get("stage2", {})
+    # Header com decisão
+    icon = {"PROMOTED": "🚀", "KEPT": "🛑", "FAILED": "❌", "DRY-RUN": "🧪"}.get(decision, "⚙️")
 
-        lines = [
-            f"🤖 *Retreino Mensal Concluído*",
-            f"_{now_str}_",
-            "",
-            f"*📊 Stage 1 (filtro de qualidade):*",
-            f"  AUC-PR: *{s1.get('auc_pr', 'N/A')}*",
-            f"  Amostras: *{s1.get('n_samples', 'N/A')}*",
-            f"  Features: {s1.get('n_features', 'N/A')}",
-        ]
-        if s2:
-            lines += [
-                "",
-                f"*📈 Stage 2 (timing):*",
-                f"  AUC-PR: *{s2.get('auc_pr', 'N/A')}*",
-                f"  Amostras: *{s2.get('n_samples', 'N/A')}*",
-            ]
+    def _fmt(v) -> str:
+        if v is None:
+            return "N/A"
+        try:
+            return f"{float(v):.4f}"
+        except (TypeError, ValueError):
+            return str(v)
+
+    lines = [
+        f"{icon} *Retreino Mensal v2 — {decision}*",
+        f"_{now_str} ({elapsed:.0f}s)_",
+        "",
+    ]
+    if reason:
+        lines.append(f"_{reason}_")
+        lines.append("")
+
+    if cand_auc is not None or prod_auc is not None:
         lines += [
-            "",
-            f"*✅ Outcomes preenchidos agora:* {updated}",
-            f"*⏩ Ignorados:* {skipped}",
-            "",
-            f"_Próximo retreino: dia 1 do mês seguinte às 06h_",
+            f"*Stage 1 AUC-PR:*",
+            f"  candidate : *{_fmt(cand_auc)}*",
+            f"  produção  : *{_fmt(prod_auc)}*",
         ]
-        send_telegram("\n".join(lines))
-        logging.info(f"[monthly_retrain] Retreino concluído. S1 AUC-PR={s1.get('auc_pr')}")
+        if cand_auc and prod_auc:
+            delta = (cand_auc - prod_auc) / prod_auc * 100
+            sign  = "+" if delta >= 0 else ""
+            lines.append(f"  delta     : *{sign}{delta:.1f}%*")
+        lines.append("")
 
-    except ValueError as e:
-        # Dados insuficientes — não é erro crítico
-        db_stats = get_db_stats()
-        labeled  = db_stats.get("labeled", 0)
-        needed   = 30
-        lines = [
-            f"⏳ *Retreino Mensal — Dados insuficientes*",
-            f"_{now_str}_",
+    if s1:
+        lines += [
+            f"*Candidate Stage 1:*",
+            f"  threshold: {s1.get('threshold', 'N/A')}",
+            f"  precision: {s1.get('test_precision', 'N/A')}",
+            f"  recall   : {s1.get('test_recall', 'N/A')}",
+            f"  n_test   : {s1.get('n_test', 'N/A')}",
             "",
-            f"Alertas classificados: *{labeled}/{needed}*",
-            f"`{e}`",
-            "",
-            f"*✅ Outcomes preenchidos agora:* {updated}",
-            f"_O modelo será treinado quando houver {needed} alertas classificados._",
         ]
-        send_telegram("\n".join(lines))
-        logging.warning(f"[monthly_retrain] Dados insuficientes: {e}")
+    if s2 and s2.get("auc_pr_test"):
+        lines += [
+            "*Candidate Stage 2:*",
+            f"  AUC-PR: {_fmt(s2.get('auc_pr_test'))}",
+            "",
+        ]
 
+    if outcomes:
+        lines += [
+            f"*alert_db outcomes preenchidos:* {outcomes.get('updated', 0)}",
+            f"*ignorados:* {outcomes.get('skipped', 0)}",
+            "",
+        ]
+
+    lines.append("_Próximo retreino: dia 1 do mês seguinte às 06h_")
+    send_telegram("\n".join(lines))
+    logging.info(f"[monthly_retrain] decision={decision} cand={cand_auc} prod={prod_auc}")
+
+
+# ── Daily Universe Snapshot (após fecho US) ────────────────────────────────────
+
+def run_universe_snapshot() -> None:
+    """
+    Snapshot diário dos ~780 tickers do ML universe.
+
+    Corre seg-sex às 22:30 Lisboa (após fecho US 22:00 UTC inverno / 21:00 UTC verão).
+    Idempotente: skip dos que já têm linha para hoje.
+    """
+    logging.info("[snapshot] A iniciar snapshot diário do universo...")
+    now_str = datetime.now(LISBON_TZ).strftime("%d/%m/%Y %H:%M")
+
+    try:
+        from universe_snapshot import run_daily_snapshot
+        stats = run_daily_snapshot()
     except Exception as e:
-        logging.error(f"[monthly_retrain] train_all: {e}", exc_info=True)
+        logging.error(f"[snapshot] falhou: {e}", exc_info=True)
+        # Falha silenciosa — não fazer spam Telegram em cada dia
+        return
+
+    processed = stats.get("processed", 0)
+    failed    = stats.get("failed", 0)
+    total     = stats.get("total", 0)
+    elapsed   = stats.get("elapsed_s", 0)
+
+    # Só notifica se algo deu mal ou se é fim de mês para sumário
+    fail_rate = (failed / total) if total > 0 else 0.0
+    if fail_rate > 0.10:
         send_telegram(
-            f"❌ *Retreino Mensal — Erro*\n"
-            f"`{e}`\n_⏰ {now_str}_"
+            f"⚠️ *Snapshot Diário — Alta taxa de falha*\n"
+            f"_{now_str}_\n\n"
+            f"processed: {processed}\n"
+            f"failed: {failed} ({fail_rate:.0%})\n"
+            f"elapsed: {elapsed:.0f}s\n\n"
+            f"_Verifica yfinance / Tiingo connectivity._"
         )
 
 
@@ -1566,6 +1616,14 @@ def setup_schedule() -> BlockingScheduler:
         run_monthly_retrain,
         CronTrigger(day=1, hour=6, minute=0, timezone=LISBON_TZ),
         id="monthly_retrain", name="Retreino ML dia 1 06:00",
+    )
+    # ── Snapshot diário do universo ML (após fecho US) ────────────────────────
+    scheduler.add_job(
+        run_universe_snapshot,
+        CronTrigger(hour=22, minute=30, day_of_week="mon-fri", timezone=LISBON_TZ),
+        id="universe_snapshot", name="Snapshot diário universo 22:30",
+        misfire_grace_time=3600,
+        replace_existing=True,
     )
     # ── Vigilante — check diário pós-fecho US ─────────────────────────────────
     scheduler.add_job(
