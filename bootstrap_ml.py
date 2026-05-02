@@ -85,6 +85,15 @@ log = logging.getLogger("bootstrap_ml")
 YEARS_PRICE = 20
 YEARS_FUND  = 3
 
+# ── Mercados europeus sem dados fundamentais gratuitos no yfinance ─────────────
+# Blocklist aplicada no backfill_fund: se o sufixo estiver aqui, o ticker é
+# ignorado instantaneamente (poupa centenas de chamadas que devolveriam 100% NaN).
+EU_SUFFIXES: frozenset[str] = frozenset({
+    ".DE", ".PA", ".L", ".AS", ".SW", ".MC", ".MI",
+    ".ST", ".CO", ".OL", ".HE", ".BR", ".I",  ".LS",
+    ".VI", ".WA",
+})
+
 # ── Universo hardcoded ─────────────────────────────────────────────────────────
 
 _SP500 = [
@@ -226,78 +235,45 @@ def _normalize_history_index(hist: pd.DataFrame) -> pd.DataFrame:
 
 
 # ── MACRO BULK FETCH ──────────────────────────────────────────────────────────
-# Descarga uma única vez as séries macro para toda a janela histórica.
-# Resultado: DataFrame indexado por date com colunas:
-#   vix, spy_close, spy_ret_1d, t10y2y
-# + colunas derivadas: macro_score, spy_drawdown_5d
-#
-# 3 pedidos de rede no total. Lookup O(1) por alert_date no backfill.
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _compute_macro_score(vix: float, spy_ret_5d: float, t10y2y: float) -> int:
-    """
-    Replica a lógica do macro_semaphore.py para dados históricos.
-    Retorna int 0–4: BEAR=0-1, NEUTRAL=2, BULL=3-4.
-    """
-    score = 2  # neutral base
-
-    # VIX: medo elevado → bearish
+    score = 2
     if vix >= 35:
         score -= 2
     elif vix >= 25:
         score -= 1
     elif vix <= 15:
         score += 1
-
-    # SPY momentum 5d
     if spy_ret_5d <= -3.0:
         score -= 1
     elif spy_ret_5d >= 2.0:
         score += 1
-
-    # Yield spread: invertida é sinal bearish histórico
     if t10y2y <= -0.5:
         score -= 1
     elif t10y2y >= 1.0:
         score += 1
-
     return int(max(0, min(4, score)))
 
 
 def build_global_macro_df(start: date, end: date) -> pd.DataFrame:
-    """
-    Descarrega VIX, SPY e T10Y2Y (FRED) de uma só vez.
-    Retorna DataFrame diário com ffill para weekends/feriados, indexado por date.
-
-    Colunas produzidas (alinhadas com ml_features.FEATURE_COLUMNS):
-        vix, spy_close, spy_drawdown_5d, t10y2y, macro_score
-    """
     import yfinance as yf
 
     start_str = start.isoformat()
-    end_str   = (end + timedelta(days=5)).isoformat()  # margem para ffill
+    end_str   = (end + timedelta(days=5)).isoformat()
 
     log.info(f"[macro] Bulk-fetch VIX + SPY ({start_str} → {end_str}) ...")
 
-    # ── 1. VIX ───────────────────────────────────────────────────────
     vix_hist = yf.Ticker("^VIX").history(start=start_str, end=end_str, interval="1d")
     vix_hist = _normalize_history_index(vix_hist)
     vix_s    = vix_hist["Close"].rename("vix")
 
-    # ── 2. SPY ───────────────────────────────────────────────────────
     spy_hist  = yf.Ticker("SPY").history(start=start_str, end=end_str, interval="1d")
     spy_hist  = _normalize_history_index(spy_hist)
     spy_close = spy_hist["Close"].rename("spy_close")
-
-    # spy_drawdown_5d: retorno dos últimos 5 dias de trading (em %)
     spy_ret5d = spy_hist["Close"].pct_change(5) * 100
     spy_ret5d.name = "spy_drawdown_5d"
-
-    # spy_ret_1d: para uso interno no macro_score
     spy_ret1d = spy_hist["Close"].pct_change() * 100
     spy_ret1d.name = "spy_ret_1d"
 
-    # ── 3. T10Y2Y via FRED (pandas_datareader) ───────────────────────
     t10y2y_s: pd.Series
     try:
         from pandas_datareader import data as pdr
@@ -308,27 +284,21 @@ def build_global_macro_df(start: date, end: date) -> pd.DataFrame:
         log.warning(f"[macro] FRED indisponível ({e}) — T10Y2Y = 0.5 (fallback)")
         t10y2y_s = pd.Series(0.5, index=spy_close.index, name="t10y2y")
 
-    # ── Juntar tudo e forward-fill ────────────────────────────────────
     df = pd.concat([vix_s, spy_close, spy_ret5d, spy_ret1d, t10y2y_s], axis=1)
-    df.index = pd.to_datetime(df.index).normalize()  # garantir só datas
+    df.index = pd.to_datetime(df.index).normalize()
     df = df.sort_index()
-
-    # Criar índice contínuo diário e ffill para weekends/feriados
     full_idx = pd.date_range(start=df.index.min(), end=df.index.max(), freq="D")
     df = df.reindex(full_idx).ffill().bfill()
-    df.index = df.index.date  # converter para date puro para lookups simples
+    df.index = df.index.date
 
-    # ── Macro score derivado ──────────────────────────────────────────
     df["macro_score"] = df.apply(
         lambda r: _compute_macro_score(
-            vix      = float(r["vix"])            if pd.notna(r["vix"])            else 20.0,
+            vix        = float(r["vix"])            if pd.notna(r["vix"])            else 20.0,
             spy_ret_5d = float(r["spy_drawdown_5d"]) if pd.notna(r["spy_drawdown_5d"]) else 0.0,
-            t10y2y   = float(r["t10y2y"])         if pd.notna(r["t10y2y"])         else 0.5,
+            t10y2y     = float(r["t10y2y"])         if pd.notna(r["t10y2y"])         else 0.5,
         ),
         axis=1,
     )
-
-    # Valores de fallback para células ainda em NaN
     df["vix"]             = df["vix"].fillna(20.0)
     df["spy_drawdown_5d"] = df["spy_drawdown_5d"].fillna(0.0)
     df["t10y2y"]          = df["t10y2y"].fillna(0.5)
@@ -339,16 +309,8 @@ def build_global_macro_df(start: date, end: date) -> pd.DataFrame:
 
 
 def _macro_lookup(macro_df: pd.DataFrame, alert_date: date) -> dict:
-    """
-    Lookup O(1) no DataFrame global.
-    Retorna os 4 campos macro que entram no FEATURE_COLUMNS:
-        macro_score, vix, spy_drawdown_5d, sector_drawdown_5d
-    sector_drawdown_5d usa spy_drawdown_5d como proxy conservador no histórico
-    (sem série histórica por sector ETF sem custo).
-    """
     row = macro_df.loc[alert_date] if alert_date in macro_df.index else None
     if row is None:
-        # tentar o dia mais próximo (máx ±3 dias)
         for delta in range(1, 4):
             for sign in (1, -1):
                 candidate = alert_date + timedelta(days=delta * sign)
@@ -357,16 +319,12 @@ def _macro_lookup(macro_df: pd.DataFrame, alert_date: date) -> dict:
                     break
             if row is not None:
                 break
-
     if row is None:
         return {"macro_score": 2, "vix": 20.0, "spy_drawdown_5d": 0.0, "sector_drawdown_5d": 0.0}
-
     return {
         "macro_score":        int(row["macro_score"]),
         "vix":                round(float(row["vix"]), 2),
         "spy_drawdown_5d":    round(float(row["spy_drawdown_5d"]), 3),
-        # Proxy histórico: sem série por sector ETF; usamos SPY como conservador
-        # Em produção o macro_semaphore.py usa o ETF de sector real.
         "sector_drawdown_5d": round(float(row["spy_drawdown_5d"]), 3),
     }
 
@@ -417,11 +375,6 @@ def outcome_label(ret: float) -> str:
 
 
 def label_win_binary(outcome: str) -> int:
-    """
-    Converte outcome_label para label_win binário (alinhado com ml_features.LABEL_COLUMNS).
-    1 = WIN_20 ou WIN_40 (recovery ≥15-20%)
-    0 = NEUTRAL ou LOSS
-    """
     return 1 if outcome in ("WIN_40", "WIN_20") else 0
 
 
@@ -435,28 +388,8 @@ def get_price_near(hist: pd.DataFrame, target: date) -> float | None:
 
 
 # ── Point-in-Time Fundamentals ────────────────────────────────────────────────
-#
-# REGRA INSTITUCIONAL: O único fallback válido para o passado desconhecido é NaN.
-# NUNCA usar tk.info como fallback para dados históricos — isso reintroduz
-# Look-Ahead Bias com potencialmente anos de informação futura.
-#
-# tk.info é APENAS válido para:
-#   1. Dados estáticos independentes do tempo (sector, industry)
-#   2. Vector de inferência de hoje em produção (Point-in-Time válido)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _get_historical_fundamentals(tk, alert_date) -> dict:
-    """
-    Extrai fundamentais respeitando rigorosamente o Point-in-Time (SEC reporting lag).
-
-    Usa quarterly_income_stmt / quarterly_balance_sheet / quarterly_cashflow
-    com lag de 45 dias (tempo mínimo entre fim do trimestre e publicação SEC).
-
-    Retorna NaN para qualquer métrica que o yfinance não consiga fornecer para
-    aquele período — o modelo lida com NaNs via SimpleImputer(strategy='median').
-
-    NUNCA faz fallback para tk.info: isso injectaria dados futuros na linha de treino.
-    """
     valid_threshold = pd.to_datetime(alert_date) - pd.Timedelta(days=45)
 
     result = {
@@ -471,11 +404,9 @@ def _get_historical_fundamentals(tk, alert_date) -> dict:
         bal   = tk.quarterly_balance_sheet
         cf    = tk.quarterly_cashflow
 
-        # Se a API não devolver nada, aborta em segurança com NaNs
         if inc.empty or bal.empty or cf.empty:
             return result
 
-        # Normalizar colunas para Timestamp (yfinance devolve datas como nomes de colunas)
         def _valid_cols(df: pd.DataFrame) -> list:
             cols = []
             for c in df.columns:
@@ -490,23 +421,18 @@ def _get_historical_fundamentals(tk, alert_date) -> dict:
         bal_cols = _valid_cols(bal)
         cf_cols  = _valid_cols(cf)
 
-        # Sem histórico tão antigo: devolvemos NaN — NUNCA tk.info
         if not inc_cols or not bal_cols or not cf_cols:
             return result
 
-        # Trimestre válido mais recente face à data do alerta
         t_inc = max(inc_cols, key=pd.to_datetime)
         t_bal = max(bal_cols, key=pd.to_datetime)
         t_cf  = max(cf_cols,  key=pd.to_datetime)
 
-        # ── Gross Margin ─────────────────────────────────────────────
         gross_profit  = inc[t_inc].get("Gross Profit",  np.nan)
         total_revenue = inc[t_inc].get("Total Revenue", np.nan)
         if pd.notna(gross_profit) and pd.notna(total_revenue) and total_revenue > 0:
             result["gross_margin"] = float(gross_profit) / float(total_revenue)
 
-        # ── Revenue Growth (QoQ: trimestre actual vs mesmo trimestre do ano anterior) ──
-        # Ordena colunas inc por data desc e tenta comparar com 4 trimestres atrás
         try:
             all_inc_sorted = sorted(
                 [c for c in inc.columns if pd.to_datetime(c) <= valid_threshold],
@@ -520,28 +446,20 @@ def _get_historical_fundamentals(tk, alert_date) -> dict:
         except Exception:
             pass
 
-        # ── FCF Yield ────────────────────────────────────────────────
         try:
             op_cf  = cf[t_cf].get("Operating Cash Flow",   np.nan)
             capex  = cf[t_cf].get("Capital Expenditure",   np.nan)
-            # capex no yfinance é negativo por convenção
             if pd.notna(op_cf) and pd.notna(capex):
-                fcf_ttm = float(op_cf) + float(capex)   # capex já é negativo
-                # Market cap histórico: usamos price × shares da bal sheet como proxy
+                fcf_ttm = float(op_cf) + float(capex)
                 shares = bal[t_bal].get("Ordinary Shares Number", np.nan)
-                # fallback: Common Stock
                 if pd.isna(shares):
                     shares = bal[t_bal].get("Common Stock", np.nan)
-                # Para calcular market cap histórico aproximado, precisamos do preço
-                # nessa data — não está disponível aqui sem hist extra.
-                # Guardamos o FCF absoluto; o ratio é calculado abaixo com o preço do alerta.
-                result["_fcf_abs"] = fcf_ttm  # chave interna, removida depois
+                result["_fcf_abs"] = fcf_ttm
         except Exception:
             pass
 
-        # ── D/E Ratio ────────────────────────────────────────────────
         try:
-            total_debt   = bal[t_bal].get("Total Debt",           np.nan)
+            total_debt     = bal[t_bal].get("Total Debt",           np.nan)
             stockholder_eq = bal[t_bal].get("Stockholders Equity", np.nan)
             if pd.isna(stockholder_eq):
                 stockholder_eq = bal[t_bal].get("Total Equity Gross Minority Interest", np.nan)
@@ -551,7 +469,6 @@ def _get_historical_fundamentals(tk, alert_date) -> dict:
             pass
 
     except Exception:
-        # Erros de rede ou parsing do yfinance: modelo lida com NaNs
         pass
 
     return result
@@ -568,10 +485,6 @@ def backfill_price(
     max_per_ticker: int = 15,
     existing_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """
-    Gera alertas históricos com o vector de features completo (16 features).
-    macro_df é o DataFrame global pre-computado — zero chamadas de rede adicionais.
-    """
     import yfinance as yf
 
     existing_keys: set[tuple] = set()
@@ -599,20 +512,15 @@ def backfill_price(
             if hist.empty or len(hist) < 60:
                 continue
 
-            # ── indicadores técnicos ───────────────────────────────────
             hist["rsi"]    = calc_rsi(hist["Close"])
             hist["ret_1d"] = hist["Close"].pct_change() * 100
             hist["atr"]    = calc_atr(hist)
             hist["vol_ratio"] = calc_volume_ratio(hist)
 
-            # Drawdown 52 semanas (= drawdown_52w em ml_features)
             roll_max        = hist["Close"].rolling(252, min_periods=30).max()
             hist["ddp_52w"] = (hist["Close"] - roll_max) / roll_max * 100
-
-            # ATR ratio (= atr_ratio em ml_features)
             hist["atr_ratio"] = hist["atr"] / (hist["Close"] + 1e-9)
 
-            # Beta rolante 252d vs SPY
             spy_ret_aligned = pd.Series(
                 {pd.Timestamp(d): (spy_close_map.get(d, np.nan)) for d in spy_close_map}
             ).pct_change() * 100
@@ -651,7 +559,6 @@ def backfill_price(
 
                 entry = float(row["Close"])
 
-                # outcomes
                 p3m = get_price_near(hist_after, alert_date + timedelta(days=91))
                 p6m = get_price_near(hist_after, alert_date + timedelta(days=182))
                 if p3m is None and p6m is None:
@@ -683,21 +590,13 @@ def backfill_price(
                 if ref is None:
                     continue
 
-                # ── Lookup macro O(1) ──────────────────────────────────
                 macro = _macro_lookup(macro_df, alert_date)
 
-                # ── Construir vector com FEATURE_COLUMNS exactos ───────
-                # Nota: quality_score, fcf_yield, etc. (Stage 1) não estão
-                # disponíveis no histórico de preços — usamos fallbacks neutros.
-                # A Camada B (backfill_fund) preenche esses campos reais.
                 alert_row: dict = {
-                    # Stage 0 — Macro (4 features, valores reais históricos)
                     "macro_score":        macro["macro_score"],
                     "vix":                macro["vix"],
                     "spy_drawdown_5d":    macro["spy_drawdown_5d"],
                     "sector_drawdown_5d": macro["sector_drawdown_5d"],
-
-                    # Stage 1 — Quality / Value (fallbacks neutros na Camada A)
                     "fcf_yield":          0.04,
                     "revenue_growth":     0.05,
                     "gross_margin":       0.35,
@@ -705,31 +604,22 @@ def backfill_price(
                     "pe_vs_fair":         1.0,
                     "analyst_upside":     0.10,
                     "quality_score":      0.50,
-
-                    # Stage 2 — Timing (valores reais)
                     "drop_pct_today":     round(float(row["ret_1d"]), 3),
                     "drawdown_52w":       round(safe_float(row["ddp_52w"], -15.0), 3),
                     "rsi_14":             round(float(np.clip(safe_float(row["rsi"], 50.0), 0, 100)), 1),
                     "atr_ratio":          round(safe_float(row["atr_ratio"], 0.02), 6),
                     "volume_spike":       round(safe_float(row["vol_ratio"], 1.0), 4),
-
-                    # Metadados (não entram no modelo)
                     "symbol":             ticker,
                     "alert_date":         alert_date.isoformat(),
                     "price":              round(entry, 2),
-
-                    # Labels
                     "label_win":          label_win_binary(outcome_label_alpha(ref, spy_ref)),
                     "label_further_drop": None,
-
-                    # Labels auxiliares (para análise)
                     "outcome_label":      outcome_label_alpha(ref, spy_ref),
                     "return_3m":          round(r3m, 2) if r3m is not None else None,
                     "return_6m":          round(r6m, 2) if r6m is not None else None,
                     "spy_return_ref":     round(spy_ref, 2),
                 }
 
-                # Verificar contrato: todos os FEATURE_COLUMNS presentes
                 missing = [c for c in FEATURE_COLUMNS if c not in alert_row]
                 if missing:
                     log.warning(f"[CamadaA] {ticker} {alert_date}: features em falta {missing} — alerta ignorado")
@@ -761,12 +651,11 @@ def backfill_fund(
     """
     Camada B: enriquece com fundamentais Point-in-Time reais + macro histórico.
 
-    Preenche os campos Stage 1 (fcf_yield, revenue_growth, gross_margin, de_ratio)
-    com _get_historical_fundamentals() — rigorosamente Point-in-Time, lag SEC 45 dias.
+    EU_SUFFIXES blocklist: tickers com sufixo europeu (.DE, .PA, .L, etc.) são
+    ignorados instantaneamente — o yfinance não tem quarterly statements para
+    mercados EU, pelo que todas as chamadas devolveriam 100% NaN.
 
     NUNCA usa tk.info como fallback para dados históricos (Look-Ahead Bias).
-    tk.info é usado APENAS para dados estáticos (sector) e para quality_score/
-    pe_vs_fair que não têm série histórica gratuita (são marcados como aproximações).
     """
     import yfinance as yf
 
@@ -787,35 +676,27 @@ def backfill_fund(
 
     all_alerts: list[dict] = []
 
-    EU_SUFFIXES = {
-    ".DE", ".PA", ".L", ".AS", ".SW", ".MC", ".MI", 
-    ".ST", ".CO", ".OL", ".HE", ".BR", ".I", ".LS", 
-    ".VI", ".WA",
-}
+    for i, ticker in enumerate(tickers):
+        # ── EU BLOCKLIST ──────────────────────────────────────────────────────
+        # Blocklist (não allowlist): se o sufixo for europeu, salta.
+        # Tickers US (sem ponto, ex: AAPL) passam sempre.
+        # Tickers com sufixo desconhecido (ex: TSM sem sufixo) também passam.
+        suffix = ("." + ticker.split(".")[-1]) if "." in ticker else ""
+        if suffix in EU_SUFFIXES:
+            log.debug(f"[CamadaB] {ticker} bloqueado (mercado EU sem dados PIT gratuitos) — skip")
+            continue
+        # ─────────────────────────────────────────────────────────────────────
 
-for i, ticker in enumerate(tickers):
-    suffix = ("." + ticker.split(".")[-1]) if "." in ticker else ""
-    
-    # Se o sufixo for europeu, IGNORA e passa ao próximo (Blocklist)
-    if suffix in EU_SUFFIXES:
-        log.debug(f"[CamadaB] {ticker} bloqueado (mercado EU sem dados PIT gratuitos) — skip")
-        continue
-    
+        try:
             tk   = yf.Ticker(ticker)
             hist = tk.history(start=start_str, end=fetch_end, interval="1d")
             hist = _normalize_history_index(hist)
             if hist.empty or len(hist) < 60:
                 continue
 
-            # ── Dados estáticos de tk.info (independentes do tempo) ───
-            # ÚNICO uso válido de tk.info na Camada B: sector e quality proxies
-            # que não têm série histórica gratuita.
             info = tk.info or {}
             sector_str = info.get("sector", "Unknown") or "Unknown"
 
-            # pe_vs_fair e analyst_upside: sem série histórica no yfinance gratuito.
-            # Usamos tk.info actual mas marcamos como "aproximação estática".
-            # O modelo deve tratar estes campos com menor peso (sem PIT garantido).
             pe_raw = safe_float(info.get("trailingPE") or info.get("forwardPE"))
             _SECTOR_FAIR_PE = {
                 "Technology": 35.0, "Healthcare": 22.0, "Communication Services": 22.0,
@@ -870,27 +751,18 @@ for i, ticker in enumerate(tickers):
 
                 entry = float(row["Close"])
 
-                # ── Fundamentais Point-in-Time — NÚCLEO ANTI-LOOKAHEAD ──
-                # _get_historical_fundamentals respeita o lag SEC de 45 dias.
-                # Devolve NaN se o yfinance não tiver história suficiente.
-                # NUNCA usa tk.info como fallback — isso seria Look-Ahead Bias.
                 fund = _get_historical_fundamentals(tk, alert_date)
 
-                # FCF Yield: combinar FCF absoluto (PIT) com preço de entrada
                 fcf_yield_pit = np.nan
                 if pd.notna(fund.get("_fcf_abs")) and entry > 0:
-                    # Aproximação: FCF trimestral anualizado / market cap naquela data
-                    # market cap histórico = preço × shares (não temos shares históricas
-                    # sem custo, por isso usamos mcap actual como proxy conservador)
                     mc_actual = safe_float(info.get("marketCap"))
                     if mc_actual and mc_actual > 0:
                         fcf_annualized = float(fund["_fcf_abs"]) * 4
                         fcf_yield_pit = fcf_annualized / mc_actual
-                fund.pop("_fcf_abs", None)  # remover chave interna
+                fund.pop("_fcf_abs", None)
 
-                # quality_score proxy (derivado de métricas PIT onde disponível)
-                gm_pit  = fund.get("gross_margin",   np.nan)
-                de_pit  = fund.get("de_ratio",        np.nan)
+                gm_pit   = fund.get("gross_margin",   np.nan)
+                de_pit   = fund.get("de_ratio",        np.nan)
                 revg_pit = fund.get("revenue_growth", np.nan)
                 qs = 0.5
                 if pd.notna(fcf_yield_pit) and fcf_yield_pit > 0.06: qs += 0.15
@@ -911,7 +783,6 @@ for i, ticker in enumerate(tickers):
                 if ref is None:
                     continue
 
-                # ── SPY return para alpha (consistente com backfill_price) ──
                 spy_ref_fund = 0.0
                 spy_entry = spy_close_map.get(alert_date)
                 if spy_entry is None:
@@ -928,43 +799,30 @@ for i, ticker in enumerate(tickers):
                             spy_ref_fund = (sp - spy_entry) / spy_entry * 100
                             break
 
-                # ── Lookup macro O(1) ──────────────────────────────────
                 macro = _macro_lookup(macro_df, alert_date)
 
                 alert_row: dict = {
-                    # Stage 0 — Macro
                     "macro_score":        macro["macro_score"],
                     "vix":                macro["vix"],
                     "spy_drawdown_5d":    macro["spy_drawdown_5d"],
                     "sector_drawdown_5d": macro["sector_drawdown_5d"],
-
-                    # Stage 1 — Quality / Value (Point-in-Time via quarterly statements)
-                    # NaN onde o yfinance não tem história — o modelo lida via imputer
                     "fcf_yield":          round(float(fcf_yield_pit), 6) if pd.notna(fcf_yield_pit) else np.nan,
                     "revenue_growth":     round(float(fund["revenue_growth"]), 4) if pd.notna(fund["revenue_growth"]) else np.nan,
                     "gross_margin":       round(float(fund["gross_margin"]), 4) if pd.notna(fund["gross_margin"]) else np.nan,
                     "de_ratio":           round(float(fund["de_ratio"]), 2) if pd.notna(fund["de_ratio"]) else np.nan,
-                    # pe_vs_fair e analyst_upside: aproximação estática (tk.info actual)
-                    # sem série histórica gratuita — menor fiabilidade PIT
                     "pe_vs_fair":         round(float(pe_vs_fair), 4),
                     "analyst_upside":     round(float(analyst_upside), 4),
                     "quality_score":      quality_score,
-
-                    # Stage 2 — Timing
                     "drop_pct_today":     round(float(row["ret_1d"]), 3),
                     "drawdown_52w":       round(safe_float(row["ddp_52w"], -15.0), 3),
                     "rsi_14":             round(float(np.clip(safe_float(row["rsi"], 50.0), 0, 100)), 1),
                     "atr_ratio":          round(safe_float(row["atr_ratio"], 0.02), 6),
                     "volume_spike":       round(safe_float(row["vol_ratio"], 1.0), 4),
-
-                    # Metadados
                     "symbol":             ticker,
                     "alert_date":         alert_date.isoformat(),
                     "price":              round(entry, 2),
                     "sector":             sector_str,
                     "market_cap_b":       round(float(mcap), 2),
-
-                    # Labels (alpha vs SPY — consistente com backfill_price)
                     "label_win":          label_win_binary(outcome_label_alpha(ref, spy_ref_fund)),
                     "label_further_drop": None,
                     "outcome_label":      outcome_label_alpha(ref, spy_ref_fund),
@@ -1067,22 +925,15 @@ def _train_layer(
     algo: str,
     label: str,
 ) -> None:
-    """
-    Treina com FEATURE_COLUMNS importado de ml_features.py.
-    Usa label_win (binário) como target — alinhado com ml_features.LABEL_COLUMNS.
-    SimpleImputer(strategy='median') lida com NaNs de fundamentais PIT em falta.
-    """
     from sklearn.metrics import average_precision_score, classification_report, precision_recall_curve
 
     if df.empty:
         log.warning(f"[{label}] DataFrame vazio — treino saltado.")
         return
 
-    # Validar contrato de features
     missing_features = [c for c in FEATURE_COLUMNS if c not in df.columns]
     if missing_features:
         log.error(f"[{label}] Features em falta no Parquet: {missing_features}")
-        log.error(f"[{label}] Certifica-te de que o backfill foi gerado com esta versão do bootstrap_ml.py")
         return
 
     df2 = df[df["label_win"].notna()].copy()
@@ -1125,7 +976,7 @@ def _train_layer(
 
     bundle = {
         "model":           pipe,
-        "feature_columns": FEATURE_COLUMNS,   # contrato explícito no pkl
+        "feature_columns": FEATURE_COLUMNS,
         "n_features":      N_FEATURES,
         "threshold":       best_thresh,
         "algorithm":       algo,
@@ -1138,7 +989,6 @@ def _train_layer(
         pickle.dump(bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
     log.info(f"✅ {pkl_s1}  ({pkl_s1.stat().st_size / 1024:.0f} KB)")
 
-    # Stage 2: dentro dos wins, distinguir WIN_40 vs WIN_20
     if pkl_s2 is not None and "outcome_label" in df2.columns:
         wins_tr = train_df[train_df["label_win"] == 1].copy()
         wins_tr["target_s2"] = (wins_tr["outcome_label"] == "WIN_40").astype(int)
@@ -1184,7 +1034,6 @@ def run_auto() -> None:
 
     universe = _load_universe()
 
-    # Macro bulk fetch — 3 pedidos de rede para toda a história
     start_p, end_p = _window(YEARS_PRICE)
     macro_df = build_global_macro_df(start_p, end_p)
 
@@ -1194,7 +1043,6 @@ def run_auto() -> None:
     _train_layer(df_p, pkl_price, None, "rf", "CamadaA")
 
     start_f, end_f = _window(YEARS_FUND)
-    # Reutiliza macro_df (já cobre os 3 anos também — a janela de 20a é mais larga)
     existing_f = pd.read_parquet(parquet_fund) if parquet_fund.exists() else pd.DataFrame()
     new_f = backfill_fund(start=start_f, end=end_f, tickers=universe, macro_df=macro_df, existing_df=existing_f)
     df_f  = load_and_slide(parquet_fund, start_f, new_f, skip_exit_on_empty=True)
@@ -1267,7 +1115,6 @@ def main() -> None:
     run_price = args.layer in ("all", "price")
     run_fund  = args.layer in ("all", "fund")
 
-    # Macro bulk fetch — feito UMA VEZ independentemente de quantas camadas correm
     start_p, end_p = _window(args.years_price)
     macro_df = build_global_macro_df(start_p, end_p)
     log.info(f"[macro] Bulk fetch concluído — {len(macro_df)} dias de história macro")
