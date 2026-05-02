@@ -26,6 +26,7 @@ Comandos disponíveis:
   /mldata                  → Estatísticas da base de dados ML + forçar update de outcomes
   /admin_backfill_ml       → [ADMIN] Semear hist_backtest.csv com 5 anos de dips históricos
   /admin_train_ml          → [ADMIN] Treinar modelo ML e gerar dip_model.pkl
+  /admin_load_models <url> → [ADMIN] Descarregar pickles + ml_report do URL para /data/ (atomic)
   /health                  → Dashboard de observabilidade (RAM, CPU, latências, last scan)
   /health errors           → Log dos últimos erros críticos
   /help                    → Lista de comandos
@@ -667,6 +668,214 @@ def _handle_admin_train_ml() -> None:
     threading.Thread(target=_run, daemon=True, name="admin-train").start()
 
 
+# ── /admin_load_models ──────────────────────────────────────────────────────────
+
+_load_models_running: bool = False
+
+
+def _handle_admin_load_models(parts: list[str]) -> None:
+    """
+    /admin_load_models <url>                     → tarball (.tar.gz/.tgz/.zip) com 3 ficheiros
+    /admin_load_models <s1_url> <s2_url> <r_url> → 3 URLs individuais
+
+    Faz download dos pickles + ml_report.json para `/data/`, valida, e faz swap
+    atomic. Versão antiga vai para `/data/archive/dip_model_stageN_<ts>.pkl`. O
+    ml_predictor recarrega automaticamente quando o mtime muda — não precisa
+    reiniciar o bot.
+
+    URLs aceites: HTTPS direct download. Para Google Drive partilha pública
+    usa o formato `https://drive.google.com/uc?export=download&id=<FILE_ID>`.
+    """
+    global _load_models_running
+
+    if _load_models_running:
+        _reply("⚠️ *Load já está a correr.* _Aguarda a conclusão._")
+        return
+
+    args = [a for a in parts[1:] if a.strip()]
+    if len(args) not in (1, 3):
+        _reply(
+            "❌ *Uso incorrecto.*\n\n"
+            "*Modo tarball* (1 URL):\n"
+            "`/admin_load_models <url_tar_gz>`\n"
+            "_Ficheiro deve conter dip_model_stage1.pkl, dip_model_stage2.pkl, ml_report.json._\n\n"
+            "*Modo individual* (3 URLs):\n"
+            "`/admin_load_models <s1_url> <s2_url> <report_url>`\n\n"
+            "_Sugestão: para Google Drive usa partilha pública e o link directo `https://drive.google.com/uc?export=download&id=<ID>`._"
+        )
+        return
+
+    for u in args:
+        if not (u.startswith("https://") or u.startswith("http://")):
+            _reply(f"❌ URL inválida (precisa de http/https): `{u}`")
+            return
+
+    _reply(
+        f"📥 *A descarregar pickles...* ({len(args)} URL{'s' if len(args)>1 else ''})\n"
+        "_Validação + swap atomic em ~30s._"
+    )
+
+    def _run():
+        global _load_models_running
+        _load_models_running = True
+        from pathlib import Path
+        import shutil
+        import tempfile
+        import json
+        import pickle
+        import tarfile
+        import zipfile
+        import urllib.request
+        import urllib.parse
+
+        data_dir   = Path("/data") if Path("/data").exists() else Path("/tmp")
+        archive_dir = data_dir / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        timestamp  = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+        # Limites de segurança
+        MAX_BYTES_PER_FILE = 80 * 1024 * 1024  # 80 MB por ficheiro
+        REQUIRED_PKL_KEYS  = {"model", "feature_columns", "threshold"}
+        EXPECTED_FILES     = ["dip_model_stage1.pkl", "dip_model_stage2.pkl", "ml_report.json"]
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix="loadmodels_"))
+        try:
+            def _download(url: str, dest: Path) -> None:
+                req = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": "DipRadar-LoadModels/1.0"},
+                )
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    total = 0
+                    with open(dest, "wb") as f:
+                        while True:
+                            chunk = resp.read(64 * 1024)
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                            if total > MAX_BYTES_PER_FILE:
+                                raise ValueError(
+                                    f"ficheiro excede {MAX_BYTES_PER_FILE//1024//1024} MB"
+                                )
+                            f.write(chunk)
+                logging.info(f"[admin_load_models] download {dest.name}: {total} bytes")
+
+            # ── Modo 1: tarball (1 URL)
+            if len(args) == 1:
+                archive_path = tmp_dir / "models.archive"
+                _download(args[0], archive_path)
+                extract_dir = tmp_dir / "extracted"
+                extract_dir.mkdir()
+                if zipfile.is_zipfile(archive_path):
+                    with zipfile.ZipFile(archive_path) as zf:
+                        zf.extractall(extract_dir)
+                else:
+                    try:
+                        with tarfile.open(archive_path, "r:*") as tf:
+                            tf.extractall(extract_dir)
+                    except tarfile.TarError as e:
+                        raise ValueError(
+                            f"ficheiro não é zip nem tar reconhecido: {e}"
+                        ) from e
+
+                # Procura os 3 ficheiros (recursivo, primeira ocorrência)
+                local: dict[str, Path] = {}
+                for fname in EXPECTED_FILES:
+                    matches = list(extract_dir.rglob(fname))
+                    if not matches:
+                        raise ValueError(f"ficheiro {fname} não encontrado no archive")
+                    local[fname] = matches[0]
+            else:
+                # ── Modo 2: 3 URLs individuais (ordem: stage1, stage2, report)
+                local = {}
+                for fname, url in zip(EXPECTED_FILES, args):
+                    dest = tmp_dir / fname
+                    _download(url, dest)
+                    local[fname] = dest
+
+            # ── Validação dos pickles
+            stage1_meta: dict = {}
+            for stage in (1, 2):
+                fname  = f"dip_model_stage{stage}.pkl"
+                with open(local[fname], "rb") as f:
+                    bundle = pickle.load(f)
+                if not isinstance(bundle, dict):
+                    raise ValueError(f"{fname}: pickle não é um dict")
+                missing = REQUIRED_PKL_KEYS - set(bundle.keys())
+                if missing:
+                    raise ValueError(f"{fname}: faltam keys {missing} no bundle")
+                # Sanity check: feature_columns deve existir e ser não-vazia
+                fc = bundle.get("feature_columns") or []
+                if not fc:
+                    raise ValueError(f"{fname}: feature_columns vazia")
+                if stage == 1:
+                    stage1_meta = {
+                        "n_features": len(fc),
+                        "threshold":  bundle.get("threshold"),
+                        "algorithm":  bundle.get("algorithm")
+                            or bundle.get("algo")
+                            or "unknown",
+                    }
+
+            # Validação do report
+            with open(local["ml_report.json"]) as f:
+                report = json.load(f)
+            if not isinstance(report, dict):
+                raise ValueError("ml_report.json: top-level não é um dict")
+            s1 = report.get("stage1") or {}
+            auc_pr = s1.get("auc_pr_test") or s1.get("auc_pr")
+
+            # ── Atomic swap: archive existing, then replace
+            promoted = []
+            for fname in EXPECTED_FILES:
+                target = data_dir / fname
+                if target.exists():
+                    arch = archive_dir / f"{Path(fname).stem}_{timestamp}{Path(fname).suffix}"
+                    shutil.copy2(target, arch)
+                    logging.info(f"[admin_load_models] archived {target.name} → {arch.name}")
+                tmp_target = target.with_suffix(target.suffix + ".tmp")
+                shutil.copy2(local[fname], tmp_target)
+                tmp_target.replace(target)
+                promoted.append(fname)
+                logging.info(f"[admin_load_models] deployed → {target}")
+
+            # ── Reply com métricas
+            thr   = stage1_meta.get("threshold")
+            algo  = stage1_meta.get("algorithm")
+            n_feat = stage1_meta.get("n_features")
+            lines = [
+                "✅ *Modelos carregados com sucesso!*",
+                f"_{datetime.now().strftime('%d/%m/%Y %H:%M')} — archive ts {timestamp}_",
+                "",
+                "*📊 Stage 1 (gating):*",
+                f"  Algoritmo:  *{algo}*",
+                f"  AUC-PR:     *{auc_pr:.4f}*" if isinstance(auc_pr, (int, float)) else "  AUC-PR:     _N/D_",
+                f"  Threshold:  *{thr:.4f}*"    if isinstance(thr, (int, float))    else "  Threshold:  _N/D_",
+                f"  Features:   *{n_feat}*",
+                "",
+                f"*Files deployed*: `{', '.join(promoted)}`",
+                f"*Archive*: `/data/archive/*_{timestamp}.*`",
+                "",
+                "_O ml_predictor recarrega automaticamente no próximo `ml_score()`._",
+            ]
+            _reply("\n".join(lines))
+
+        except Exception as e:
+            logging.error(f"[admin_load_models] {e}", exc_info=True)
+            _reply(
+                f"❌ *Load falhou:*\n`{type(e).__name__}: {e}`\n\n"
+                "_Os ficheiros existentes em /data/ NÃO foram alterados._"
+            )
+        finally:
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+            _load_models_running = False
+
+    threading.Thread(target=_run, daemon=True, name="admin-load-models").start()
+
+
 # ── /health handler ─────────────────────────────────────────────────────────────
 
 def _handle_health(parts: list[str]) -> None:
@@ -1242,6 +1451,7 @@ def _handle_command(text: str) -> None:
             "`/portfolio`              → Posições activas\n"
             "`/mldata`                  → Stats da base de dados ML\n"
             "`/mldata update`           → Forçar update de outcomes\n"
+            "`/admin_load_models <url>` → [ADMIN] Carregar pickles novos para /data/\n"
             "`/health`                  → Dashboard observabilidade\n"
             "`/health errors`           → Log de erros críticos\n"
             "`/help`                    → Esta mensagem"
@@ -1419,6 +1629,9 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_train_ml":
         _handle_admin_train_ml()
+
+    elif cmd == "/admin_load_models":
+        _handle_admin_load_models(parts)
 
     elif cmd == "/health":
         if not _check_rate(cmd_key): return
