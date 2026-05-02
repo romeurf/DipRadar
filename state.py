@@ -13,6 +13,13 @@ Funções exportadas:
   add_recovery_position / mark_recovery_alerted / remove_recovery_position
   get_stale_recovery_positions / mark_stale_alerted
   record_dip_day / mark_persistent_alerted / expire_missing_streaks
+  load_dynamic_watchlist / save_dynamic_watchlist
+  add_to_dynamic_watchlist / remove_from_dynamic_watchlist
+  load_score_log / save_score_log / append_score_log
+  get_ticker_score_history / get_last_score
+  load_flip_log / save_flip_log
+  add_flip_trade / close_flip_trade / delete_flip_trade
+  get_flip_summary
 
 NOTA DE SEGURANÇA (race condition):
   _save_json usa escrita atómica via ficheiro temporário + os.replace().
@@ -314,3 +321,197 @@ def expire_missing_streaks(active_symbols: set) -> None:
     if to_remove:
         _save_streaks(streaks)
         logging.info(f"[state] Streaks expiradas: {to_remove}")
+
+
+# ── Watchlist dinâmica (gerida via /watchlist add|remove) ────────────────────
+#
+# Mantém-se o nome de ficheiro `_dipr_watchlist.json` para preservar o estado
+# já gravado no volume Railway de versões anteriores do bot.
+
+_WATCHLIST_FILE = "_dipr_watchlist.json"
+
+
+def load_dynamic_watchlist() -> list:
+    return _read(_WATCHLIST_FILE).get("tickers", [])
+
+
+def save_dynamic_watchlist(tickers: list) -> None:
+    _write(_WATCHLIST_FILE, {
+        "tickers": list(dict.fromkeys(t.upper() for t in tickers)),
+    })
+
+
+def add_to_dynamic_watchlist(ticker: str) -> bool:
+    """Adiciona ticker. Devolve True se foi adicionado, False se já existia."""
+    tickers = load_dynamic_watchlist()
+    t = ticker.upper().strip()
+    if t in tickers:
+        return False
+    tickers.append(t)
+    save_dynamic_watchlist(tickers)
+    return True
+
+
+def remove_from_dynamic_watchlist(ticker: str) -> bool:
+    """Remove ticker. Devolve True se existia e foi removido, False caso contrário."""
+    tickers = load_dynamic_watchlist()
+    t = ticker.upper().strip()
+    if t not in tickers:
+        return False
+    tickers = [x for x in tickers if x != t]
+    save_dynamic_watchlist(tickers)
+    return True
+
+
+# ── Score log (histórico de scores para /historico e upgrades) ───────────────
+
+_SCORE_LOG_FILE = "_dipr_score_log.json"
+
+
+def load_score_log() -> dict:
+    return _read(_SCORE_LOG_FILE).get("scores", {})
+
+
+def save_score_log(data: dict) -> None:
+    _write(_SCORE_LOG_FILE, {"scores": data})
+
+
+def append_score_log(
+    symbol: str,
+    score: float,
+    verdict: str,
+    change_pct: float = 0.0,
+    price: float = 0.0,
+) -> None:
+    data    = load_score_log()
+    entries = data.get(symbol, [])
+    entries.append({
+        "score":    round(score, 1),
+        "verdict":  verdict,
+        "change":   round(change_pct, 2),
+        "price":    round(price, 4) if price else None,
+        "date":     datetime.now().strftime("%d/%m/%Y"),
+        "time":     datetime.now().strftime("%H:%M"),
+        "date_iso": datetime.now().date().isoformat(),
+    })
+    data[symbol] = entries[-30:]
+    save_score_log(data)
+
+
+def get_ticker_score_history(symbol: str) -> list:
+    return load_score_log().get(symbol.upper(), [])
+
+
+def get_last_score(symbol: str):
+    history = get_ticker_score_history(symbol)
+    if history:
+        return history[-1]["score"]
+    return None
+
+
+# ── Flip Fund trade log ───────────────────────────────────────────────────────
+
+_FLIP_LOG_FILE = "_dipr_flip_log.json"
+
+
+def load_flip_log() -> list:
+    """
+    Devolve lista de todos os trades do Flip Fund.
+    Cada entrada tem:
+      id, symbol, shares, price_entry, price_exit (None se aberto),
+      date_entry, date_exit (None se aberto), pnl_eur, status ('open'|'closed'),
+      notes
+    """
+    return _read(_FLIP_LOG_FILE).get("trades", [])
+
+
+def save_flip_log(trades: list) -> None:
+    _write(_FLIP_LOG_FILE, {"trades": trades})
+
+
+def add_flip_trade(
+    symbol: str,
+    shares: float,
+    price_entry: float,
+    date_entry: str = "",
+    notes: str = "",
+) -> dict:
+    """Regista entrada num trade Flip Fund (posição aberta). Devolve o dict criado."""
+    trades   = load_flip_log()
+    trade_id = max((t["id"] for t in trades), default=0) + 1
+    trade    = {
+        "id":          trade_id,
+        "symbol":      symbol.upper().strip(),
+        "shares":      round(shares, 6),
+        "price_entry": round(price_entry, 4),
+        "price_exit":  None,
+        "date_entry":  date_entry or datetime.now().strftime("%d/%m/%Y"),
+        "date_exit":   None,
+        "pnl_eur":     None,
+        "status":      "open",
+        "notes":       notes,
+    }
+    trades.append(trade)
+    save_flip_log(trades)
+    logging.info(f"[flip_log] Trade aberto: #{trade_id} {symbol} x{shares} @ ${price_entry}")
+    return trade
+
+
+def close_flip_trade(
+    trade_id: int,
+    price_exit: float,
+    date_exit: str = "",
+):
+    """
+    Fecha um trade Flip Fund e calcula o P&L em EUR (sem conversão automática
+    de USD→EUR). Devolve o trade actualizado, ou None se o ID não existir.
+    """
+    trades = load_flip_log()
+    for t in trades:
+        if t["id"] == trade_id and t["status"] == "open":
+            t["price_exit"] = round(price_exit, 4)
+            t["date_exit"]  = date_exit or datetime.now().strftime("%d/%m/%Y")
+            t["pnl_eur"]    = round((price_exit - t["price_entry"]) * t["shares"], 2)
+            t["status"]     = "closed"
+            save_flip_log(trades)
+            logging.info(
+                f"[flip_log] Trade fechado: #{trade_id} {t['symbol']} "
+                f"P&L ${t['pnl_eur']:+.2f}"
+            )
+            return t
+    return None
+
+
+def delete_flip_trade(trade_id: int) -> bool:
+    """Remove um trade pelo ID (correcções). Devolve True se removido."""
+    trades = load_flip_log()
+    new    = [t for t in trades if t["id"] != trade_id]
+    if len(new) == len(trades):
+        return False
+    save_flip_log(new)
+    logging.info(f"[flip_log] Trade removido: #{trade_id}")
+    return True
+
+
+def get_flip_summary() -> dict:
+    """
+    Devolve resumo do Flip Fund (trades abertos/fechados, P&L total, win rate).
+    """
+    trades   = load_flip_log()
+    closed   = [t for t in trades if t["status"] == "closed"]
+    opened   = [t for t in trades if t["status"] == "open"]
+    pnl_sum  = sum((t["pnl_eur"] or 0) for t in closed)
+    winners  = [t for t in closed if (t["pnl_eur"] or 0) > 0]
+    win_rate = (len(winners) / len(closed) * 100) if closed else 0
+    best     = max(closed, key=lambda x: x["pnl_eur"] or 0, default=None)
+    worst    = min(closed, key=lambda x: x["pnl_eur"] or 0, default=None)
+    return {
+        "trades_open":   opened,
+        "trades_closed": closed,
+        "total_pnl":     round(pnl_sum, 2),
+        "best_trade":    best,
+        "worst_trade":   worst,
+        "win_rate":      round(win_rate, 1),
+        "n_open":        len(opened),
+        "n_closed":      len(closed),
+    }
