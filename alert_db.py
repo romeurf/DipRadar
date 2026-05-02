@@ -17,7 +17,6 @@ Fonte de preços: Tiingo API (via tiingo_client.py).
 
 import csv
 import logging
-import time
 from datetime import datetime, timedelta, date
 from pathlib import Path
 
@@ -387,4 +386,50 @@ def fill_db_outcomes() -> dict:
         "updated": updated,
         "skipped": skipped,
         "errors":  errors,
+    }
+
+
+def get_db_stats() -> dict:
+    """
+    Estatísticas rápidas para Telegram /admin e setup_schedule jobs.
+
+    Returns:
+        {
+          "total":    nº total de alertas registados,
+          "labeled":  nº com outcome_label preenchido,
+          "outcomes": dict {label: count} (apenas labeled),
+          "first_date": ISO date do alerta mais antigo,
+          "last_date":  ISO date do alerta mais recente,
+        }
+    """
+    if not _DB_PATH.exists():
+        return {"total": 0, "labeled": 0, "outcomes": {}, "first_date": None, "last_date": None}
+
+    try:
+        with _DB_PATH.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+    except Exception as e:
+        logging.error(f"[get_db_stats] erro a ler CSV: {e}")
+        return {"total": 0, "labeled": 0, "outcomes": {}, "error": str(e)}
+
+    total = len(rows)
+    if total == 0:
+        return {"total": 0, "labeled": 0, "outcomes": {}, "first_date": None, "last_date": None}
+
+    outcomes: dict[str, int] = {}
+    labeled = 0
+    for row in rows:
+        label = (row.get("outcome_label") or "").strip()
+        if label:
+            labeled += 1
+            outcomes[label] = outcomes.get(label, 0) + 1
+
+    dates = sorted([r.get("date_iso", "") for r in rows if r.get("date_iso")])
+    return {
+        "total":      total,
+        "labeled":    labeled,
+        "outcomes":   outcomes,
+        "first_date": dates[0] if dates else None,
+        "last_date":  dates[-1] if dates else None,
     }

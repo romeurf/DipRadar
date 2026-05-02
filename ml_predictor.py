@@ -309,6 +309,8 @@ def get_model_info() -> dict:
 def ml_score(
     features: dict,
     reload_if_stale: bool = True,
+    symbol: str | None = None,
+    log_to_file: bool = True,
 ) -> MLResult:
     """
     Pontua um dip com o score dual-layer.
@@ -415,7 +417,7 @@ def ml_score(
     else:
         confidence = "–"
 
-    return MLResult(
+    result = MLResult(
         win_prob=round(win_prob, 3),
         prob_price=round(prob_price, 3) if prob_price is not None else None,
         prob_fund=round(prob_fund, 3) if prob_fund is not None else None,
@@ -429,6 +431,16 @@ def ml_score(
         coverage=round(coverage, 3),
         low_coverage=low_coverage,
     )
+
+    # Append-only prediction log (failure-tolerant — não afecta o caller).
+    if log_to_file and symbol:
+        try:
+            from prediction_log import log_prediction
+            log_prediction(symbol=symbol, features=features or {}, result=result)
+        except Exception as e:
+            logging.debug(f"[ml_predictor] log_prediction skipped: {e}")
+
+    return result
 
 
 def ml_badge(result: MLResult) -> str:

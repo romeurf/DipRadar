@@ -144,14 +144,22 @@ def _yfinance_fetch(ticker: str, lookback_days: int) -> pd.DataFrame:
     try:
         import yfinance as yf
         start_date, end_date = _date_range(lookback_days)
-        raw = yf.download(
-            ticker,
-            start=start_date,
-            end=end_date,
-            auto_adjust=True,
-            progress=False,
-            show_errors=False,
-        )
+        # `show_errors` foi removido em yfinance ≥0.2.40 — wrap em try p/ compat ambas versões
+        try:
+            raw = yf.download(
+                ticker,
+                start=start_date,
+                end=end_date,
+                auto_adjust=True,
+                progress=False,
+            )
+        except TypeError:
+            raw = yf.download(
+                ticker,
+                start=start_date,
+                end=end_date,
+                progress=False,
+            )
         if raw is None or raw.empty:
             log.debug(f"[data_feed] yfinance devolveu dados vazios para {ticker}")
             return pd.DataFrame()
@@ -181,6 +189,58 @@ def _yfinance_fetch(ticker: str, lookback_days: int) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Stooq fallback (free, no API key, US + EU coverage)
+# ─────────────────────────────────────────────────────────────────────────
+
+def _to_stooq_ticker(ticker: str) -> str:
+    """Stooq usa lowercase + sufixo `.us` para US tickers (sem ponto). EU mantem."""
+    if "." in ticker:
+        # Já tem suffix de mercado (ALV.DE, EUNL.DE, ASML.AS) — só lowercase
+        return ticker.lower()
+    return f"{ticker.lower()}.us"
+
+
+def _stooq_fetch(ticker: str, lookback_days: int) -> pd.DataFrame:
+    """
+    Stooq: free CSV endpoint sem API key. Não tem rate limits agressivos.
+    URL: https://stooq.com/q/d/l/?s={ticker}&i=d
+    Devolve histórico completo — depois filtramos por lookback_days.
+    """
+    try:
+        import requests
+        stooq_sym = _to_stooq_ticker(ticker)
+        url = f"https://stooq.com/q/d/l/?s={stooq_sym}&i=d"
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200 or not r.text or "Data" not in r.text[:100]:
+            log.debug(f"[stooq] {ticker}: resposta inválida ({r.status_code})")
+            return pd.DataFrame()
+
+        from io import StringIO
+        df = pd.read_csv(StringIO(r.text))
+        if df.empty or "Date" not in df.columns:
+            return pd.DataFrame()
+
+        df["date"]   = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+        df["ticker"] = ticker
+        if "Adj Close" not in df.columns and "Close" in df.columns:
+            df["Adj Close"] = df["Close"]
+
+        # Filtrar últimos N dias
+        start_ts = pd.Timestamp.today() - pd.Timedelta(days=lookback_days + 7)
+        df = df[df["date"] >= start_ts]
+        cols = [c for c in ["date", "Open", "High", "Low", "Close", "Adj Close", "Volume", "ticker"] if c in df.columns]
+        result = df[cols].sort_values("date").reset_index(drop=True)
+
+        if len(result) < 2:
+            return pd.DataFrame()
+        return result
+
+    except Exception as e:
+        log.debug(f"[stooq] {ticker}: erro ({e})")
+        return pd.DataFrame()
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # API pública — EOD prices
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -191,7 +251,8 @@ def get_eod_prices(
 ) -> pd.DataFrame:
     """
     Retorna DataFrame com preços EOD para um ticker.
-    NUNCA lança excepção — devolve DataFrame vazio se ambas as fontes falharem.
+    Cadeia de fallbacks: Tiingo → yfinance → Stooq.
+    NUNCA lança excepção — devolve DataFrame vazio se todas as fontes falharem.
     """
     try:
         if not force_yfinance and TIINGO_API_KEY and ticker not in TIINGO_UNSUPPORTED:
@@ -201,7 +262,12 @@ def get_eod_prices(
             TIINGO_UNSUPPORTED.add(ticker)
             log.info(f"[data_feed] Tiingo sem dados para {ticker} — fallback yfinance")
 
-        return _yfinance_fetch(ticker, lookback_days)
+        df = _yfinance_fetch(ticker, lookback_days)
+        if not df.empty:
+            return df
+
+        log.info(f"[data_feed] yfinance sem dados para {ticker} — fallback Stooq")
+        return _stooq_fetch(ticker, lookback_days)
 
     except Exception as e:
         log.error(f"[data_feed] get_eod_prices falha total para {ticker}: {e}")
