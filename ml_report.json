@@ -1,0 +1,103 @@
+{
+  "trained_at": "2026-05-02T01:00:53.320818",
+  "stage1": {
+    "algorithm": "RandomForest",
+    "auc_pr": 0.562,
+    "threshold": 0.2305,
+    "n_samples": 17368,
+    "n_win": 5048,
+    "n_not_win": 12320,
+    "smote_used": false,
+    "feature_importance": [
+      {
+        "feature": "atr_ratio",
+        "importance": 0.143459
+      },
+      {
+        "feature": "drawdown_52w",
+        "importance": 0.137431
+      },
+      {
+        "feature": "vix",
+        "importance": 0.109049
+      },
+      {
+        "feature": "volume_spike",
+        "importance": 0.106644
+      },
+      {
+        "feature": "drop_pct_today",
+        "importance": 0.105385
+      },
+      {
+        "feature": "rsi_14",
+        "importance": 0.10255
+      },
+      {
+        "feature": "spy_drawdown_5d",
+        "importance": 0.077831
+      },
+      {
+        "feature": "sector_drawdown_5d",
+        "importance": 0.077774
+      },
+      {
+        "feature": "pe_vs_fair",
+        "importance": 0.058396
+      },
+      {
+        "feature": "analyst_upside",
+        "importance": 0.054831
+      }
+    ]
+  },
+  "stage2": {
+    "algorithm": "RandomForest",
+    "auc_pr": 0.643,
+    "n_samples": 5048,
+    "n_win40": 2243,
+    "n_win20": 2805,
+    "feature_importance": [
+      {
+        "feature": "atr_ratio",
+        "importance": 0.155788
+      },
+      {
+        "feature": "drawdown_52w",
+        "importance": 0.139783
+      },
+      {
+        "feature": "volume_spike",
+        "importance": 0.111712
+      },
+      {
+        "feature": "drop_pct_today",
+        "importance": 0.110795
+      },
+      {
+        "feature": "rsi_14",
+        "importance": 0.109138
+      },
+      {
+        "feature": "vix",
+        "importance": 0.090348
+      },
+      {
+        "feature": "sector_drawdown_5d",
+        "importance": 0.072356
+      },
+      {
+        "feature": "spy_drawdown_5d",
+        "importance": 0.071688
+      },
+      {
+        "feature": "pe_vs_fair",
+        "importance": 0.059605
+      },
+      {
+        "feature": "analyst_upside",
+        "importance": 0.053233
+      }
+    ]
+  }
+}
