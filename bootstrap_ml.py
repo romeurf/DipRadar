@@ -688,7 +688,7 @@ def backfill_fund(
         # ─────────────────────────────────────────────────────────────────────
 
         try:
-            tk   = yf.Ticker(ticker)
+            tk = yf.Ticker(ticker)
             hist = tk.history(start=start_str, end=fetch_end, interval="1d")
             hist = _normalize_history_index(hist)
             if hist.empty or len(hist) < 60:
