@@ -82,7 +82,7 @@ LABEL_COLUMNS: list[str] = [
 ]
 
 # Total feature count (used as sanity check in training)
-N_FEATURES = len(FEATURE_COLUMNS)  # 16
+N_FEATURES = len(FEATURE_COLUMNS)  # 21 (16 base + 5 engineered)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

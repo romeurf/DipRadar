@@ -150,8 +150,11 @@ def _engineer(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.copy()
     df["rsi_oversold_strength"] = (40.0 - rsi).clip(lower=0.0).round(4)
+    # NOTE: `right=False` to match `add_derived_features` (right-exclusive bins).
+    # Without it, vix=15.0 → 0.0 in training but 1.0 in inference (skew).
     df["vix_regime"] = pd.cut(
         vix, bins=[-np.inf, 15.0, 25.0, np.inf], labels=[0.0, 1.0, 2.0],
+        right=False,
     ).astype(float)
     df["pe_attractive"]   = (1.0 - pe_vf).clip(lower=0.0).round(4)
     df["drop_x_drawdown"] = (drop * dd52 / 100.0).round(4)
@@ -164,8 +167,9 @@ def _clean_dataset(
     min_year: Optional[int],
     drop_outliers: bool,
     dedup: bool,
+    exclude_years: Optional[list[int]] = None,
 ) -> pd.DataFrame:
-    """Apply data hygiene: dedup, drop synthetic rows, drop outliers."""
+    """Apply data hygiene: dedup, drop synthetic rows, drop outliers, drop years."""
     df = df.copy()
     n0 = len(df)
 
@@ -190,6 +194,16 @@ def _clean_dataset(
             logging.info(
                 f"[clean] Dropped {removed} pre-{min_year} rows "
                 f"(synthetic fundamentals = constant fallback)"
+            )
+
+    if exclude_years:
+        before = len(df)
+        df = df[~df["alert_date"].dt.year.isin(set(exclude_years))]
+        removed = before - len(df)
+        if removed > 0:
+            logging.info(
+                f"[clean] Dropped {removed} rows from excluded years "
+                f"{sorted(set(exclude_years))} (e.g. anomalous regimes)"
             )
 
     if drop_outliers and "return_3m" in df.columns:
@@ -257,6 +271,7 @@ def prepare_data(
     min_year: Optional[int] = _DEFAULT_MIN_YEAR,
     drop_outliers: bool = True,
     dedup: bool = True,
+    exclude_years: Optional[list[int]] = None,
 ) -> tuple[DataSplit, pd.DataFrame]:
     """
     Load parquet, clean, engineer features, compute weights, split chronologically.
@@ -275,7 +290,10 @@ def prepare_data(
     logging.info(f"[data] Raw rows: {len(df)} | cols: {list(df.columns)}")
 
     # Cleaning
-    df = _clean_dataset(df, min_year=min_year, drop_outliers=drop_outliers, dedup=dedup)
+    df = _clean_dataset(
+        df, min_year=min_year, drop_outliers=drop_outliers, dedup=dedup,
+        exclude_years=exclude_years,
+    )
 
     # Filter to valid outcome labels
     valid_labels = list(_WIN_LABELS | _LOSE_LABELS)
@@ -1005,6 +1023,7 @@ def train_all(
     cal_frac: float      = _DEFAULT_CAL_FRAC,
     min_year: Optional[int] = _DEFAULT_MIN_YEAR,
     drop_outliers: bool  = True,
+    exclude_years: Optional[list[int]] = None,
     dry_run: bool        = False,
 ) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1025,6 +1044,8 @@ def train_all(
         logging.info(f"  split (rows):   {train_frac:.0%}/{cal_frac:.0%}/{1-train_frac-cal_frac:.0%}")
     logging.info(f"  min_year:       {min_year}")
     logging.info(f"  drop_outliers:  {drop_outliers}")
+    if exclude_years:
+        logging.info(f"  exclude_years:  {sorted(set(exclude_years))}")
 
     split, full_df = prepare_data(
         parquet_path=parquet_path,
@@ -1036,6 +1057,7 @@ def train_all(
         pos_weight=pos_weight,
         min_year=min_year,
         drop_outliers=drop_outliers,
+        exclude_years=exclude_years,
     )
 
     if dry_run:
@@ -1204,9 +1226,9 @@ if __name__ == "__main__":
     parser.add_argument("--min-precision", type=float, default=_DEFAULT_MIN_PRECISION,
                         help=f"Precisão mínima para selecção de threshold (default {_DEFAULT_MIN_PRECISION})")
     parser.add_argument("--beta",         type=float, default=_DEFAULT_BETA,
-                        help="F-beta para selecção de threshold (default 1.0)")
+                        help=f"F-beta para selecção de threshold (default {_DEFAULT_BETA})")
     parser.add_argument("--half-life",    type=float, default=_DEFAULT_HALF_LIFE_YEARS,
-                        help="Half-life em anos para sample weights (default 3)")
+                        help=f"Half-life em anos para sample weights (default {_DEFAULT_HALF_LIFE_YEARS})")
     parser.add_argument("--pos-weight",   type=float, default=_DEFAULT_POS_WEIGHT,
                         help="Multiplicador de peso para classe positiva (default 1.5)")
     parser.add_argument("--train-end",    type=str, default=_DEFAULT_TRAIN_END,
@@ -1223,6 +1245,8 @@ if __name__ == "__main__":
                         help="Não filtra por min_year (mantém pré-2014 sintético)")
     parser.add_argument("--no-clean",     action="store_true",
                         help="Desliga limpeza (mantém duplicados, outliers e pré-2014)")
+    parser.add_argument("--exclude-years", type=str, default=None,
+                        help="Anos a excluir do treino, separados por vírgula (ex.: 2020,2021)")
     args = parser.parse_args()
 
     out_dir = args.output_dir or _DATA_DIR
@@ -1235,6 +1259,10 @@ if __name__ == "__main__":
         parser.error("--parquet is required (unless --report)")
 
     algos = [a.strip().lower() for a in args.algos.split(",") if a.strip()]
+
+    excl_years: list[int] | None = None
+    if args.exclude_years:
+        excl_years = [int(x.strip()) for x in args.exclude_years.split(",") if x.strip()]
 
     train_all(
         parquet_path=args.parquet,
@@ -1250,5 +1278,6 @@ if __name__ == "__main__":
         cal_frac=args.cal_frac,
         min_year=None if args.no_min_year or args.no_clean else args.min_year,
         drop_outliers=not args.no_clean,
+        exclude_years=excl_years,
         dry_run=args.dry_run,
     )

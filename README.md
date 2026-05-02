@@ -195,6 +195,81 @@ PPR_AVG_COST=<preco_medio>
 | `bot_commands.py` | Telegram commands: /help /status /carteira /scan /backtest /rejeitados |
 | `railway.toml` | Deploy: Railway production config |
 | `requirements.txt` | Dependencies |
+| `train_model.py` | **ML pipeline (Tier A+B+C)**: split cronológico, ensemble RF+XGB+LGBM, calibração isotónica, threshold VIX-aware |
+| `ml_features.py` | Contrato de features partilhado entre treino e inferência (`FEATURE_COLUMNS`, `add_derived_features`) |
+| `ml_ensemble.py` | Wrappers pickle-safe: `PrefittedSoftVote`, `IsotonicCalibratedVote` |
+| `ml_predictor.py` | Inferência em produção: low-coverage gating, label `LOW_COVERAGE`, threshold dinâmico VIX-aware, hot-reload |
+| `ml_walk_forward.py` | Backtest mensal expanding-window 2022-2025, métricas por janela |
+| `bootstrap_ml.py` | Backfill histórico (Camada A=preço/macro, Camada B=fundamentais PIT) + invocação de `train_model.train_all` |
+| `colab_bootstrap.ipynb` | Notebook Colab: Fase A (preços) → Fase B (fundamentais) → Fase C (treino robusto) |
+
+---
+
+### 🤖 Modelo de Machine Learning (Tier A+B+C)
+
+O pipeline ML lê o histórico backfilled (≈17k linhas, 2014-2025) e produz dois modelos em cascata:
+
+- **Stage 1** — Classificador binário `WIN` vs `NOT-WIN`
+- **Stage 2** — Grading `WIN_40` vs `WIN_20` (só corre se Stage 1 dispara)
+
+**Arquitectura honesta vs. leakage:**
+
+```
+Cronologia real (sem shuffle, sem KFold mágico):
+  T1 train     [2014-01 → 2021-01]   → fit ensemble (RF + XGB + LGBM, sample-weights por recência, half_life=1.5y)
+  T2 calib     [2021-01 → 2023-01]   → calibração isotónica + threshold-tuning (precision-tilted, F-0.5)
+  T3 test      [2023-01 → presente]  → métricas finais REAIS (out-of-sample)
+                                      + walk-forward mensal opcional (ml_walk_forward.py)
+```
+
+**Métricas baseline (test 2023+, base rate 0.149):**
+
+| Stage | Algorithm | AUC-PR test | Threshold | Lift vs random |
+| :--- | :--- | :---: | :---: | :---: |
+| 1 (WIN vs NOT-WIN) | ensemble_iso[rf,xgb,lgbm] | **0.235** | 0.229 | **1.6×** |
+| 2 (WIN_40 vs WIN_20) | ensemble_iso[rf,xgb,lgbm] | **0.752** | 0.50 | forte |
+
+**Inferência em produção** (`ml_predictor.py`):
+
+- Compute determinístico das 5 derived features (`rsi_oversold_strength`, `vix_regime`, `pe_attractive`, `drop_x_drawdown`, `vol_x_drop`) através de `ml_features.add_derived_features()` — **mesmo código no treino e na inferência**, sem skew.
+- **Threshold dinâmico por regime VIX** (low / medium / high) — em mercados calmos exige mais convicção, em pânico relaxa para apanhar mais oportunidades.
+- **Low-coverage gating**: se ≥50% dos campos fundamentais são fallback (NaN→média), o sinal recebe label `LOW_COVERAGE` em vez de `WIN_*` — melhor não disparar do que disparar com fundamentais inventados.
+- **Hot-reload**: o predictor verifica `mtime` dos `.pkl` em cada chamada e recarrega sem reiniciar o bot.
+
+**Como treinar (Colab)**:
+
+1. Abrir [`colab_bootstrap.ipynb`](colab_bootstrap.ipynb) no Google Colab
+2. Correr Fase A (5 batches de tickers para preços + macro, ≈20 min cada)
+3. Correr Fase B (4 batches de fundamentais PIT, ≈30 min cada — mais lento por causa do Tiingo rate-limit)
+4. Correr **Célula 14** (`bootstrap_ml.py --skip-backfill`) — faz merge `price+fund` e invoca `train_model.train_all`
+   - `--exclude-years 2020` (opcional) para descartar regime COVID
+   - `--legacy-train` (escape hatch) para usar o treinador antigo single-RF se necessário
+5. Correr **Célula 15** valida training-serving skew (fail-fast)
+
+**Como treinar localmente** (sem Colab, dataset já presente):
+
+```bash
+python train_model.py --parquet ml_training_merged.parquet --output-dir /tmp/dipradar_v2
+# Outputs: /tmp/dipradar_v2/dip_model_stage{1,2}.pkl + ml_report.json
+```
+
+**Tunables relevantes** (`train_model.py --help`):
+
+| Flag | Default | Significado |
+| :--- | :---: | :--- |
+| `--min-precision` | `0.40` | precision mínima exigida ao escolher threshold em T2 |
+| `--beta` | `0.5` | F-beta (β<1 = precision-tilted) |
+| `--half-life` | `1.5` | half-life em anos para sample-weights por recência |
+| `--exclude-years` | — | anos a descartar (ex.: `2020` para excluir COVID) |
+| `--algos` | `rf,xgb,lgbm` | algoritmos a incluir no ensemble |
+
+**Trade-off precision↔recall** (curva PR no test 2023+):
+
+| Threshold | Precision | Recall | Comentário |
+| :---: | :---: | :---: | :--- |
+| 0.135 | 28% | **37%** | máx wins (mais ruído) |
+| **0.229** | **34%** | 26% | balanceado (default) |
+| 0.239 | 30% | 7% | máx precision (poucos sinais) |
 
 ---
 

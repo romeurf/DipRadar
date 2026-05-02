@@ -72,7 +72,12 @@ import pandas as pd
 # ── CONTRATO ÚNICO DE FEATURES ────────────────────────────────────────────────
 # Importamos directamente de ml_features para garantir que treino == inferência.
 # Se adicionares uma feature em ml_features.py, ela aparece automaticamente aqui.
-from ml_features import FEATURE_COLUMNS, N_FEATURES
+from ml_features import FEATURE_COLUMNS, N_FEATURES, add_derived_features
+
+# Treinador robusto (Tier A+B+C) — usado para a Camada B (fundamentais).
+# A Camada A continua a usar o `_train_layer` minimalista (dataset enorme,
+# fundamentais sintéticos — não vale a pena o ensemble caro).
+from train_model import train_all as train_layer_b_robust
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(
@@ -1064,6 +1069,97 @@ def _train_layer(
             log.info(f"[{label}] Stage 2 saltado ({len(wins_tr)} wins < 30)")
 
 
+# ── Merge price + fund + treino robusto (Camada B) ─────────────────────────────
+
+def _merge_price_fund(df_price: pd.DataFrame, df_fund: pd.DataFrame) -> pd.DataFrame:
+    """
+    Concatena os dois Parquets e dedupe por (symbol, alert_date), preferindo a
+    linha do `df_fund` (fundamentais reais) sobre a do `df_price` (fallbacks).
+
+    A ordem importa: pd.concat([fund, price]).drop_duplicates(keep='first')
+    mantém o primeiro hit por (symbol, alert_date) — i.e. o do `fund`.
+    """
+    if df_fund.empty and df_price.empty:
+        return pd.DataFrame()
+    if df_fund.empty:
+        return df_price.copy()
+    if df_price.empty:
+        return df_fund.copy()
+
+    cols_common = sorted(set(df_fund.columns) & set(df_price.columns))
+    if not cols_common:
+        log.warning("[merge] Sem colunas comuns entre price e fund — usando só fund.")
+        return df_fund.copy()
+
+    merged = pd.concat([df_fund[cols_common], df_price[cols_common]], ignore_index=True)
+    if {"symbol", "alert_date"}.issubset(merged.columns):
+        before = len(merged)
+        merged = merged.drop_duplicates(subset=["symbol", "alert_date"], keep="first")
+        removed = before - len(merged)
+        if removed:
+            log.info(f"[merge] Dedup (symbol, alert_date): -{removed} linhas (price coincidente)")
+    log.info(f"[merge] Merge concluído: {len(merged)} linhas (fund={len(df_fund)} + price={len(df_price)})")
+    return merged
+
+
+def _train_layer_b_robust(
+    df_fund: pd.DataFrame,
+    df_price: pd.DataFrame,
+    data_dir: Path,
+    pkl_s1: Path,
+    pkl_s2: Path,
+    exclude_years: list[int] | None,
+) -> None:
+    """
+    Treina a Camada B com o pipeline robusto do `train_model.train_all` (Tier A+B+C):
+    chrono split, ensemble RF+XGB+LGBM, calibração isotónica, threshold por regime VIX.
+
+    Faz primeiro o merge (fund tem prioridade sobre price), grava o
+    `ml_training_merged.parquet` no `data_dir` e depois invoca `train_all`.
+    """
+    if df_fund.empty:
+        log.warning("[CamadaB] DataFrame fund vazio — treino robusto saltado.")
+        return
+
+    merged = _merge_price_fund(df_price, df_fund)
+    if merged.empty:
+        log.error("[CamadaB] Merge produziu DataFrame vazio.")
+        return
+
+    merged_path = data_dir / "ml_training_merged.parquet"
+    try:
+        merged.to_parquet(merged_path, index=False)
+        log.info(f"[CamadaB] Merged parquet gravado: {merged_path} ({len(merged)} linhas)")
+    except Exception as e:
+        log.error(f"[CamadaB] Falhou ao gravar merged parquet: {e}")
+        return
+
+    # `train_all` cria os pkl com nomes fixos `dip_model_stage{1,2}.pkl`.
+    # Usa data_dir directamente como output (ml_predictor lê de lá).
+    log.info(f"[CamadaB] A invocar train_all (Tier A+B+C) → {data_dir}")
+    try:
+        train_layer_b_robust(
+            parquet_path=merged_path,
+            output_dir=data_dir,
+            algos=["rf", "xgb", "lgbm"],
+            exclude_years=exclude_years,
+        )
+        log.info(f"✅ [CamadaB] Modelo robusto gravado em {pkl_s1} e {pkl_s2}")
+    except Exception as e:
+        # Não fazemos fallback ao _train_layer legacy aqui: ele já assume o
+        # contrato antigo de 16 features e ia falhar à mesma com as 5 derived
+        # adicionadas em ml_features.FEATURE_COLUMNS. Em vez disso reportamos
+        # o erro e deixamos o utilizador investigar o ml_training_merged.parquet.
+        log.error(
+            f"[CamadaB] train_all falhou: {e}. "
+            f"Para investigar usa: python train_model.py --parquet {merged_path} "
+            f"--output-dir {data_dir} --dry-run"
+        )
+        if "--legacy-train" in sys.argv:
+            log.info("[CamadaB] --legacy-train flag detectada: a tentar treinador interno simples.")
+            _train_layer(merged, pkl_s1, pkl_s2, "rf", "CamadaB")
+
+
 # ── Ponto de entrada público (scheduler do bot) ────────────────────────────────
 
 def run_auto() -> None:
@@ -1128,6 +1224,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--force-full",     action="store_true")
     p.add_argument("--slice", nargs=2, type=int, metavar=("START", "END"), default=None)
     p.add_argument("--drive-dir", type=str, default=None, metavar="DIR")
+    p.add_argument("--exclude-years", type=str, default=None,
+                   help="Anos a excluir do treino da Camada B, separados por vírgula (ex.: 2020).")
+    p.add_argument("--legacy-train", action="store_true",
+                   help="Usa o treinador interno antigo em vez do robusto train_model.train_all.")
     return p.parse_args()
 
 
@@ -1211,7 +1311,23 @@ def main() -> None:
             df_f = load_and_slide(parquet_fund, start_f, new_f, skip_exit_on_empty=bool(args.slice))
 
         if not df_f.empty and (args.skip_backfill or not args.slice):
-            _train_layer(df_f, pkl_s1, pkl_s2, args.algo, "CamadaB")
+            if args.legacy_train:
+                log.info("[CamadaB] --legacy-train activo: usar _train_layer interno.")
+                _train_layer(df_f, pkl_s1, pkl_s2, args.algo, "CamadaB")
+            else:
+                excl_years: list[int] | None = None
+                if args.exclude_years:
+                    excl_years = [int(x.strip()) for x in args.exclude_years.split(",") if x.strip()]
+                # Carrega a Camada A (price parquet) para enriquecer o merge.
+                df_p_for_merge = pd.read_parquet(parquet_price) if parquet_price.exists() else pd.DataFrame()
+                _train_layer_b_robust(
+                    df_fund=df_f,
+                    df_price=df_p_for_merge,
+                    data_dir=data_dir,
+                    pkl_s1=pkl_s1,
+                    pkl_s2=pkl_s2,
+                    exclude_years=excl_years,
+                )
         else:
             n = len(df_f) if not df_f.empty else 0
             log.info(f"[CamadaB] Batch concluído — Parquet: {n} registos. Treino adiado para sessão final.")
