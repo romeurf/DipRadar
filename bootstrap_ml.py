@@ -1175,7 +1175,7 @@ def run_auto() -> None:
     _train_layer(df_p, pkl_price, None, "rf", "CamadaA")
 
     start_f, end_f = _window(YEARS_FUND)
-    # Reutiliza macro_df (já cobre os 7 anos também — a janela de 20a é mais larga)
+    # Reutiliza macro_df (já cobre os 3 anos também — a janela de 20a é mais larga)
     existing_f = pd.read_parquet(parquet_fund) if parquet_fund.exists() else pd.DataFrame()
     new_f = backfill_fund(start=start_f, end=end_f, tickers=universe, macro_df=macro_df, existing_df=existing_f)
     df_f  = load_and_slide(parquet_fund, start_f, new_f, skip_exit_on_empty=True)
