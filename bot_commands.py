@@ -1516,7 +1516,7 @@ def _handle_command(text: str) -> None:
                 f"  {_e(pnl_d)} Hoje:   €{pnl_d:+,.2f}\n"
                 f"  {_e(pnl_w)} Semana: €{pnl_w:+,.2f}\n"
                 f"  {_e(pnl_m)} Mês:    €{pnl_m:+,.2f}\n"
-                f"  📊 PPR: €{snap.get('ppr_value',0):,.2f} | 💜 Pie: €{snap.get('cashback_eur',0):,.2f}"
+                f"  📊 PPR: €{snap.get('ppr_value',0):,.2f}"
             )
         except Exception as e:
             _reply(f"_Erro ao calcular carteira: {e}_")
