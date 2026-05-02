@@ -886,26 +886,66 @@ def load_and_slide(
 
 # ── Pipeline de treino ─────────────────────────────────────────────────────────
 
-def _build_pipeline(algo: str = "rf"):
+def _build_pipeline(algo: str = "rf", stage: int = 1):
+    """
+    Constrói o pipeline sklearn para treino.
+
+    stage=1 → parâmetros standard (max_depth=10, min_samples_leaf=3)
+    stage=2 → parâmetros mais conservadores para evitar overfitting
+              no subconjunto pequeno de wins (max_depth=6, min_samples_leaf=8)
+    """
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
     from sklearn.impute import SimpleImputer
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
 
     steps = [("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())]
+
     if algo == "rf":
-        clf = RandomForestClassifier(
-            n_estimators=400, max_depth=10, min_samples_leaf=3,
-            class_weight="balanced", random_state=42, n_jobs=-1,
-        )
+        if stage == 2:
+            # Stage 2: dataset pequeno (~3k wins) → regularizar mais
+            clf = RandomForestClassifier(
+                n_estimators=300,
+                max_depth=6,          # era 10 — reduz capacidade de memorização
+                min_samples_leaf=8,   # era 3  — folhas mais densas, menos overfit
+                class_weight="balanced",
+                random_state=42,
+                n_jobs=-1,
+            )
+        else:
+            clf = RandomForestClassifier(
+                n_estimators=400,
+                max_depth=10,
+                min_samples_leaf=3,
+                class_weight="balanced",
+                random_state=42,
+                n_jobs=-1,
+            )
     elif algo == "xgb":
         try:
             from xgboost import XGBClassifier
-            clf = XGBClassifier(
-                n_estimators=400, max_depth=6, learning_rate=0.05,
-                subsample=0.8, colsample_bytree=0.8, random_state=42,
-                eval_metric="logloss", verbosity=0,
-            )
+            if stage == 2:
+                clf = XGBClassifier(
+                    n_estimators=300,
+                    max_depth=4,          # mais raso no stage 2
+                    learning_rate=0.05,
+                    subsample=0.7,
+                    colsample_bytree=0.7,
+                    random_state=42,
+                    eval_metric="logloss",
+                    verbosity=0,
+                )
+            else:
+                clf = XGBClassifier(
+                    n_estimators=400,
+                    max_depth=6,
+                    learning_rate=0.05,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    random_state=42,
+                    eval_metric="logloss",
+                    verbosity=0,
+                )
         except ImportError:
             log.warning("xgboost não instalado — a usar GradientBoosting")
             clf = GradientBoostingClassifier(
@@ -931,6 +971,18 @@ def _train_layer(
         log.warning(f"[{label}] DataFrame vazio — treino saltado.")
         return
 
+    # ── Garantia de limpeza: para Camada B, só treinar com fundamentais reais ──
+    # Remove linhas onde os 4 campos fundamentais são todos NaN simultaneamente
+    # (indicador de que são defaults da Camada A misturados por engano).
+    fund_cols = ["fcf_yield", "revenue_growth", "gross_margin", "de_ratio"]
+    fund_cols_present = [c for c in fund_cols if c in df.columns]
+    if len(fund_cols_present) == 4 and label == "CamadaB":
+        before = len(df)
+        df = df[df[fund_cols_present].notna().any(axis=1)].copy()
+        removed = before - len(df)
+        if removed > 0:
+            log.info(f"[{label}] 🧹 Removidas {removed} linhas sem fundamentais reais (defaults Camada A)")
+
     missing_features = [c for c in FEATURE_COLUMNS if c not in df.columns]
     if missing_features:
         log.error(f"[{label}] Features em falta no Parquet: {missing_features}")
@@ -955,7 +1007,7 @@ def _train_layer(
 
     log.info(f"[{label}] {algo.upper()} | {N_FEATURES} features | train={len(X_tr)} test={len(X_te)} wins={y_tr.sum()}")
 
-    pipe = _build_pipeline(algo)
+    pipe = _build_pipeline(algo, stage=1)
     if algo == "xgb":
         ratio = max((y_tr == 0).sum() / max((y_tr == 1).sum(), 1), 1.0)
         pipe.named_steps["clf"].set_params(scale_pos_weight=ratio)
@@ -993,7 +1045,7 @@ def _train_layer(
         wins_tr = train_df[train_df["label_win"] == 1].copy()
         wins_tr["target_s2"] = (wins_tr["outcome_label"] == "WIN_40").astype(int)
         if len(wins_tr) >= 30:
-            pipe2 = _build_pipeline(algo)
+            pipe2 = _build_pipeline(algo, stage=2)  # ← stage=2: max_depth=6, min_samples_leaf=8
             pipe2.fit(wins_tr[FEATURE_COLUMNS].values.astype(np.float32), wins_tr["target_s2"].values)
             bundle2 = {
                 "model":           pipe2,
