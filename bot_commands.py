@@ -723,6 +723,7 @@ def _handle_admin_load_models(parts: list[str]) -> None:
         import tempfile
         import json
         import pickle
+        import joblib
         import tarfile
         import zipfile
         import urllib.request
@@ -794,11 +795,20 @@ def _handle_admin_load_models(parts: list[str]) -> None:
                     local[fname] = dest
 
             # ── Validação dos pickles
+            # train_model.py grava com joblib.dump (pickle + numpy memmap buffers
+            # separados por '\n'); por isso é necessário joblib.load, não pickle.load.
+            # Mantemos fallback para pickle.load para o caso de bundles antigos.
+            def _load_bundle(p: Path):
+                try:
+                    return joblib.load(p)
+                except Exception:
+                    with open(p, "rb") as fh:
+                        return pickle.load(fh)
+
             stage1_meta: dict = {}
             for stage in (1, 2):
                 fname  = f"dip_model_stage{stage}.pkl"
-                with open(local[fname], "rb") as f:
-                    bundle = pickle.load(f)
+                bundle = _load_bundle(local[fname])
                 if not isinstance(bundle, dict):
                     raise ValueError(f"{fname}: pickle não é um dict")
                 missing = REQUIRED_PKL_KEYS - set(bundle.keys())
