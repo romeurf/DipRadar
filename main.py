@@ -1464,7 +1464,7 @@ def run_universe_snapshot() -> None:
 def run_daily_backup() -> None:
     """
     Backup diário dos ficheiros críticos: alert_db, state JSONs,
-    parquet datasets, modelos .pkl e ml_report.json.
+    parquet datasets, dip_models_v3.pkl e ml_report_v3.json.
     Arquiva em /data/backups/YYYY-MM-DD_HH-MM.zip e mantém os últimos 30.
     """
     logging.info("[backup] A iniciar backup diário...")

@@ -6,8 +6,8 @@ Arquiva em /data/backups/YYYY-MM-DD_HH-MM.zip:
   - state/*.json     — alertas, recovery watch, weekly log, backtest, etc.
   - data/*.parquet   — snapshots do universo
   - ml_training_*.parquet — datasets de treino
-  - dip_model_stage1.pkl / dip_model_stage2.pkl — modelos em produção
-  - ml_report.json   — métricas do último treino
+  - dip_models_v3.pkl — bundle ML em produção (schema v3)
+  - ml_report_v3.json — métricas do último treino
 
 Retenção: últimos 30 backups (≈1 mês).
 Agendado em main.py: seg-sex às 23:30 Lisboa.
@@ -51,11 +51,12 @@ _BACKUP_PATTERNS: list[str] = [
     "ml_training_merged.parquet",
     "ml_training_fund.parquet",
     "ml_training_price.parquet",
-    # Modelos em produção
-    "dip_model_stage1.pkl",
-    "dip_model_stage2.pkl",
+    # Bundle ML em produção (v3 single-file)
+    "dip_models_v3.pkl",
+    "/data/dip_models_v3.pkl",
     # Relatório de métricas
-    "ml_report.json",
+    "ml_report_v3.json",
+    "/data/ml_report_v3.json",
 ]
 
 
