@@ -1,10 +1,15 @@
 """
 ml_predictor.py — Score v3: regressor dual (model_up + model_down).
 
-Champion: XGB-v2 (17 features base, rho_mean=0.18, topk_pnl=17.9% em 60d)
+Champion: XGB-v2 (17 features base, rho_up=0.36, rho_down≈-0.001, topk_pnl=17.9%/60d)
 
-Score final = model_up.predict(X) / max(|model_down.predict(X)|, epsilon)
-  → rácio upside/downside esperado nos 60 dias seguintes ao alerta.
+Score final = pred_up (predicted max_return_60d, já transformado).
+  → representa retorno máximo esperado nos 60 dias seguintes ao alerta.
+
+Nota: versões anteriores usavam `pred_up / |pred_down|`, mas como o
+model_down tem rho ≈ 0 (não prevê nada), dividir por |pred_down| era
+essencialmente dividir por ruído. Mantemos `pred_down` no MLResult para
+diagnóstico, mas não entra no score até termos rho_down < -0.10.
 
 API pública (inalterada):
   ml_score(features: dict) -> MLResult
@@ -24,12 +29,42 @@ from __future__ import annotations
 
 import logging
 import pickle
-from dataclasses import dataclass, field
+import sys
+from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
 import joblib
 import numpy as np
+
+
+# ── Compatibilidade com bundles v3 picklados em Colab ─────────────────────────────────────
+# O notebook colab_bootstrap.ipynb define a classe `DipModelsV3` em `__main__`
+# antes de fazer pickle.dump. Quando o bundle é carregado em Railway (onde
+# `__main__` é main.py, que não tem a classe), o unpickler falha com:
+#   AttributeError: Can't get attribute 'DipModelsV3' on <module '__main__'>
+# Definimos aqui e registamos em __main__ para que o unpickler a encontre.
+
+@dataclass
+class DipModelsV3:
+    model_up:         Any
+    model_down:       Any
+    feature_cols:     list
+    momentum_feats:   list
+    n_train_samples:  int
+    train_date:       str
+    champion_name:    str
+    schema_version:   int = 3
+
+
+# Registar em __main__ para o unpickler resolver `__main__.DipModelsV3`.
+# Idempotente: se já existir (e.g. re-import), não causa problemas.
+try:
+    _main_mod = sys.modules.get("__main__")
+    if _main_mod is not None and not hasattr(_main_mod, "DipModelsV3"):
+        _main_mod.DipModelsV3 = DipModelsV3
+except Exception:  # pragma: no cover
+    pass
 
 
 def _safe_load(path: Path) -> Any:
@@ -39,6 +74,33 @@ def _safe_load(path: Path) -> Any:
     except Exception:
         with open(path, "rb") as f:
             return pickle.load(f)
+
+
+def _to_dict(obj: Any) -> dict:
+    """Normalize a loaded bundle to a dict with canonical keys.
+
+    Aceita:
+      - dict (passa-through)
+      - dataclass instance (e.g. DipModelsV3)
+      - objecto com __dict__
+
+    Mapeia field names em alias canonónicos para que o resto do código
+    possa usar `bundle.get("champion")`, `bundle.get("n_samples")`, etc.
+    """
+    if isinstance(obj, dict):
+        return obj
+    if is_dataclass(obj):
+        d = {f.name: getattr(obj, f.name) for f in fields(obj)}
+    elif hasattr(obj, "__dict__"):
+        d = {k: v for k, v in vars(obj).items() if not k.startswith("_")}
+    else:
+        return {}
+    # Aliases para keys canónicas usadas pelo resto do módulo
+    if "champion_name" in d:
+        d.setdefault("champion", d["champion_name"])
+    if "n_train_samples" in d:
+        d.setdefault("n_samples", d["n_train_samples"])
+    return d
 
 
 # ── Caminhos ───────────────────────────────────────────────────────────────────
@@ -92,11 +154,11 @@ _SCALE_FUNCS: dict[str, Any] = {
     "market_cap_b": lambda v: v / 1e9 if v is not None and float(v) > 1e6 else v,
 }
 
-# Thresholds de score para labels
-# score = upside / |downside| — interpretado como rácio risco/retorno esperado
-_SCORE_HIGH   = 1.5   # upside > 1.5× o drawdown esperado → WIN_STRONG
-_SCORE_MED    = 1.0   # upside > 1.0× o drawdown esperado → WIN
-_SCORE_FLOOR  = 0.5   # abaixo → NO_WIN
+# Thresholds de score para labels (escala: pred_up = retorno previsto a 60d)
+# Ancorados na win threshold do treino (5% em 60d).
+_SCORE_HIGH   = 0.10   # pred_up > 10% → WIN_STRONG
+_SCORE_MED    = 0.05   # pred_up > 5%  → WIN  (== win threshold do treino)
+_SCORE_FLOOR  = 0.02   # pred_up > 2%  → WEAK; abaixo → NO_WIN
 
 # Cache em memória
 _bundle:    Any | None = None
@@ -163,10 +225,24 @@ def _classify_vix(vix_value: float | None) -> str:
     return "high"
 
 
-def _score_to_prob(score: float) -> float:
-    """Normaliza o rácio upside/downside para [0, 1] via sigmoide suavizada."""
-    # score=1.0 → ~0.65, score=2.0 → ~0.88, score=0.0 → 0.5
-    return float(1 / (1 + np.exp(-0.8 * (score - 0.5))))
+def _score_to_prob(score: float, calibrator: Any | None = None) -> float:
+    """Mapeia o score (= pred_up) para uma probabilidade calibrada [0, 1].
+
+    Se o bundle trouxer um `score_calibrator` (sklearn IsotonicRegression
+    ou objecto com .predict()), usa-o. Caso contrário cai para uma
+    sigmoide ancorada na win threshold de 5% (centro), que dá:
+      score=0.00 → 0.32   score=0.05 → 0.50
+      score=0.10 → 0.68   score=0.15 → 0.82
+    Steepness 15 => transição suave em torno de ±5% retorno previsto.
+    """
+    if calibrator is not None:
+        try:
+            arr = np.asarray([score], dtype=np.float64)
+            pred = calibrator.predict(arr)
+            return float(np.clip(pred[0], 0.0, 1.0))
+        except Exception as e:  # pragma: no cover — fallback robusto
+            logging.debug(f"[ml_predictor] calibrator falhou ({e}); fallback sigmoide")
+    return float(1.0 / (1.0 + np.exp(-15.0 * (score - 0.05))))
 
 
 def _inverse_transform_up(yp: float) -> float:
@@ -187,10 +263,11 @@ def _load_bundle(force: bool = False) -> bool:
     if not force and _bundle is not None and mtime == _mtime_v3:
         return True
     try:
-        _bundle   = _safe_load(_PKL_V3)
-        _mtime_v3 = mtime
-        cols      = _bundle.get("feature_cols", _FEATURE_COLS)
-        champion  = _bundle.get("champion", "XGB-v2")
+        raw_bundle = _safe_load(_PKL_V3)
+        _bundle    = _to_dict(raw_bundle)
+        _mtime_v3  = mtime
+        cols       = _bundle.get("feature_cols", _FEATURE_COLS)
+        champion   = _bundle.get("champion", "XGB-v2")
         logging.info(
             f"[ml_predictor] Bundle v3 carregado — champion={champion} "
             f"features={len(cols)} rho={_bundle.get('rho_mean', '?')}"
@@ -238,14 +315,15 @@ def ml_score(
     """
     Pontua um dip com o modelo v3 (regressor dual XGB-v2).
 
-    Score = pred_up / max(|pred_down|, 0.01)
-      → rácio upside/downside esperado nos 60 dias após o alerta.
+    Score = pred_up (retorno previsto a 60 dias, após expm1).
+      pred_down é mantido em MLResult para diagnóstico mas não entra
+      no score (rho_down ≈ 0 → não tem sinal útil).
 
-    Labels:
-      WIN_STRONG  — score > 1.5 (upside > 1.5× o drawdown esperado)
-      WIN         — score > 1.0
-      WEAK        — score > 0.5
-      NO_WIN      — score <= 0.5
+    Labels (ancorados na win threshold de 5% do treino):
+      WIN_STRONG  — score > 0.10  (retorno previsto > 10%)
+      WIN         — score > 0.05  (retorno previsto > 5%)
+      WEAK        — score > 0.02
+      NO_WIN      — score <= 0.02
     """
     if reload_if_stale:
         if not _load_bundle():
@@ -271,12 +349,14 @@ def ml_score(
         logging.error(f"[ml_predictor] Erro na inferência v3: {e}")
         return MLResult(model_ready=False, label="ERROR")
 
-    # Score: rácio upside / |downside|
-    abs_down = max(abs(pred_down), 0.01)
-    score    = pred_up / abs_down
+    # Score = pred_up directo. pred_down mantido apenas para diagnóstico.
+    # Justificação: rho_down_mean ≈ -0.001 no champion v3 (XGB-v2) — dividir
+    # por ruído distorce o score. Reverter quando rho_down < -0.10.
+    score = float(pred_up)
 
-    # Normalizar para [0,1] (compatibilidade com win_prob)
-    win_prob = _score_to_prob(score)
+    # Normalizar para [0,1] usando o calibrator do bundle (se existir)
+    score_calibrator = _bundle.get("score_calibrator") if _bundle else None
+    win_prob = _score_to_prob(score, calibrator=score_calibrator)
 
     # VIX regime (informativo)
     vix_value  = enriched.get("vix") or enriched.get("vix_value")
