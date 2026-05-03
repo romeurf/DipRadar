@@ -28,10 +28,11 @@ Error isolation:
   the loop for the remaining positions. Errors are logged and a fallback
   Telegram message is sent for the failing ticker.
 
-FIX (contract): build_feature_row(ticker, fundamentals) requires a
-  fundamentals dict as second argument. We fetch it via yfinance before
-  calling build_feature_row, falling back to an empty dict on failure so
-  the Vigilante never crashes on a stale fundamentals fetch.
+FIX (contract): a feature dict actual é produzido por
+  ml_features.build_features(ticker, fundamentals); o `build_feature_row`
+  só converte um dict para list ordenada — não aceita (ticker, fundamentals).
+  Recolhemos os fundamentais via yfinance e passamos directamente um dict
+  ao predictor (que aceita dict ou list). Erros isolados por ticker.
 
 FIX (price): current_price is now fetched via yfinance directly (no
   MarketClient dependency). MarketClient import removed entirely.
@@ -55,7 +56,7 @@ from ml_engine import (
     extract_shap_top3,
     format_shap_drivers,
 )
-from ml_features import build_feature_row
+from ml_features import build_features
 
 logger = logging.getLogger(__name__)
 
@@ -88,22 +89,52 @@ def _fetch_current_price(ticker: str, fallback: float) -> float:
     return fallback
 
 
-def _fetch_fundamentals_snapshot(ticker: str) -> dict:
+def _fetch_fundamentals_snapshot(ticker: str, current_price: float = 0.0) -> dict:
     """
-    Devolve um dict com fundamentais básicos para alimentar build_feature_row.
-    Retorna dict vazio em caso de erro — build_feature_row trata NaNs internamente.
+    Devolve um dict com fundamentais básicos para alimentar build_features.
+    Retorna dict vazio em caso de erro — build_features imputa fallbacks internamente.
+
+    Notas sobre o mapeamento yfinance → internal keys:
+      - `freeCashflow` (USD) / `marketCap` → fcf_yield (ratio)
+      - `targetMeanPrice` (USD) vs current_price → analyst_upside (ratio)
+      - `debtToEquity` mapeia para a key `debt_equity` que build_features espera
     """
     try:
         tk   = yf.Ticker(ticker)
         info = tk.info or {}
+
+        market_cap = info.get("marketCap")
+        free_cf    = info.get("freeCashflow")
+        target_pr  = info.get("targetMeanPrice")
+
+        # fcf_yield = FCF / market_cap (ratio); None se algum em falta ou inválido
+        fcf_yield: Optional[float] = None
+        if market_cap and free_cf and float(market_cap) > 0:
+            try:
+                fcf_yield = float(free_cf) / float(market_cap)
+            except (TypeError, ValueError):
+                fcf_yield = None
+
+        # analyst_upside = (target - current) / current (ratio)
+        analyst_upside: Optional[float] = None
+        if target_pr and current_price and float(current_price) > 0:
+            try:
+                analyst_upside = (float(target_pr) - float(current_price)) / float(current_price)
+            except (TypeError, ValueError):
+                analyst_upside = None
+
         return {
+            # build_features procura `pe` directo
             "pe":               info.get("trailingPE"),
-            "fcf_yield":        info.get("freeCashflow"),
+            # build_features procura `debt_equity` (não `de_ratio`)
+            "debt_equity":      info.get("debtToEquity"),
             "revenue_growth":   info.get("revenueGrowth"),
             "gross_margin":     info.get("grossMargins"),
-            "de_ratio":         info.get("debtToEquity"),
-            "analyst_upside":   info.get("targetMeanPrice"),
-            "market_cap":       info.get("marketCap"),
+            "market_cap":       market_cap,
+            "fcf_yield":        fcf_yield,
+            "analyst_upside":   analyst_upside,
+            # current_price pode entrar no dict para build_features e cair em fallback
+            "price":            current_price if current_price else None,
         }
     except Exception as e:
         logger.debug(f"[monitor] Fundamentals snapshot falhou para {ticker}: {e}")
@@ -315,11 +346,12 @@ def _monitor_one(
     # ── 1. Fetch current price (yfinance directo, sem MarketClient) ────────────
     current_price = _fetch_current_price(record.ticker, fallback=record.alert_price)
 
-    # ── 2. Fetch fundamentals snapshot para alimentar build_feature_row ────────
-    # build_feature_row(ticker, fundamentals_dict) — contrato correcto.
-    # Fallback: dict vazio → build_feature_row imputa NaNs internamente.
-    fundamentals = _fetch_fundamentals_snapshot(record.ticker)
-    feature_row_today = build_feature_row(record.ticker, fundamentals)
+    # ── 2. Fetch fundamentals snapshot e construir o dict de features ao dia ────
+    # build_features(ticker, fundamentals) → dict com 23 keys (FEATURE_COLUMNS).
+    # Sem price_history/sector → atr/volume/momentum caem em fallback determinístico,
+    # o que é aceitável para vigilância diária (não exige PIT exacto).
+    fundamentals = _fetch_fundamentals_snapshot(record.ticker, current_price=current_price)
+    feature_row_today = build_features(record.ticker, fundamentals)
 
     # ── 3. Re-run inference ───────────────────────────────────────────────────
     pred = predict_dip(
