@@ -195,86 +195,46 @@ PPR_AVG_COST=<preco_medio>
 | `bot_commands.py` | Telegram commands: /help /status /carteira /scan /backtest /rejeitados |
 | `railway.toml` | Deploy: Railway production config |
 | `requirements.txt` | Dependencies |
-| `train_model.py` | **ML pipeline (Tier A+B+C)**: split cronológico, ensemble RF+XGB+LGBM, calibração isotónica, threshold VIX-aware |
 | `ml_features.py` | Contrato de features partilhado entre treino e inferência (`FEATURE_COLUMNS`, `add_derived_features`) |
-| `ml_ensemble.py` | Wrappers pickle-safe: `PrefittedSoftVote`, `IsotonicCalibratedVote` |
-| `ml_predictor.py` | Inferência em produção: low-coverage gating, label `LOW_COVERAGE`, threshold dinâmico VIX-aware, hot-reload |
-| `ml_walk_forward.py` | Backtest mensal expanding-window 2022-2025, métricas por janela |
-| `bootstrap_ml.py` | Backfill histórico (Camada A=preço/macro, Camada B=fundamentais PIT) + invocação de `train_model.train_all` |
-| `colab_bootstrap.ipynb` | Notebook Colab: Fase A (preços) → Fase B (fundamentais) → Fase C (treino robusto) |
+| `ml_predictor.py` | Inferência em produção: bundle `dip_models_v3.pkl` (joblib), score=pred_up directo, calibrator opcional, hot-reload |
+| `ml_engine.py` | Shim de compatibilidade — delega `predict_dip` para `ml_predictor.ml_score` |
+| `experiments/ml_v2/DipRadar_v3_Training.ipynb` | **Notebook Colab v3.1** — alpha-vs-SPY target, 10 folds + purga, calibrator |
 | `universe_snapshot.py` | **Snapshot diário (~780 tickers, 22:30 Lisboa)** — alimenta o modelo com dados frescos para retreino mensal |
-| `monthly_retrain.py` | **Retreino mensal v2** com walk-forward gating ×0.95 + atomic deploy + archive |
+| `monthly_retrain.py` | Retreino mensal — **desactualizado para v3, ver `docs/auto_retrain_plan.md`** |
 | `prediction_log.py` | Log append-only de cada `ml_score()` em produção — feedback loop para drift detection |
 | `alert_db.py` | Snapshot por alerta + outcome back-fill (1m/3m/6m via Tiingo) |
 | `data_feed.py` | EOD prices: Tiingo → yfinance → **Stooq** (3-tier fallback grátis) |
 
 ---
 
-### 🤖 Modelo de Machine Learning (Tier A+B+C)
+### 🤖 Modelo de Machine Learning (v3 / v3.1)
 
-O pipeline ML lê o histórico backfilled (≈17k linhas, 2014-2025) e produz dois modelos em cascata:
+O pipeline ML actual é **regressão dupla** (`model_up` + `model_down`) que aprende **alpha** sobre o SPY em vez de retorno absoluto.
 
-- **Stage 1** — Classificador binário `WIN` vs `NOT-WIN`
-- **Stage 2** — Grading `WIN_40` vs `WIN_20` (só corre se Stage 1 dispara)
+- **Target principal**: `alpha_60d = max_return_60d − spy_max_return_60d` em janela 60d forward
+- **Modelo**: XGBRegressor — champion seleccionado por walk-forward CV (10 folds + purga 21d em v3.1)
+- **Bundle**: `dip_models_v3.pkl` (single file, joblib)
+- **Calibrator**: IsotonicRegression em out-of-fold predictions → `P(alpha > 5%)` (v3.1)
 
-**Arquitectura honesta vs. leakage:**
-
-```
-Cronologia real (sem shuffle, sem KFold mágico):
-  T1 train     [2014-01 → 2021-01]   → fit ensemble (RF + XGB + LGBM, sample-weights por recência, half_life=1.5y)
-  T2 calib     [2021-01 → 2023-01]   → calibração isotónica + threshold-tuning (precision-tilted, F-0.5)
-  T3 test      [2023-01 → presente]  → métricas finais REAIS (out-of-sample)
-                                      + walk-forward mensal opcional (ml_walk_forward.py)
-```
-
-**Métricas baseline (test 2023+, base rate 0.149):**
-
-| Stage | Algorithm | AUC-PR test | Threshold | Lift vs random |
-| :--- | :--- | :---: | :---: | :---: |
-| 1 (WIN vs NOT-WIN) | ensemble_iso[rf,xgb,lgbm] | **0.235** | 0.229 | **1.6×** |
-| 2 (WIN_40 vs WIN_20) | ensemble_iso[rf,xgb,lgbm] | **0.752** | 0.50 | forte |
-
-**Inferência em produção** (`ml_predictor.py`):
-
-- Compute determinístico das 5 derived features (`rsi_oversold_strength`, `vix_regime`, `pe_attractive`, `drop_x_drawdown`, `vol_x_drop`) através de `ml_features.add_derived_features()` — **mesmo código no treino e na inferência**, sem skew.
-- **Threshold dinâmico por regime VIX** (low / medium / high) — em mercados calmos exige mais convicção, em pânico relaxa para apanhar mais oportunidades.
-- **Low-coverage gating**: se ≥50% dos campos fundamentais são fallback (NaN→média), o sinal recebe label `LOW_COVERAGE` em vez de `WIN_*` — melhor não disparar do que disparar com fundamentais inventados.
-- **Hot-reload**: o predictor verifica `mtime` dos `.pkl` em cada chamada e recarrega sem reiniciar o bot.
+Ver:
+- [`docs/retrain_plan_v3_1.md`](docs/retrain_plan_v3_1.md) — design completo da v3.1
+- [`experiments/ml_v2/README.md`](experiments/ml_v2/README.md) — pipeline + critérios de promoção
+- [`docs/auto_retrain_plan.md`](docs/auto_retrain_plan.md) — plano de retreino automático mensal
 
 **Como treinar (Colab)**:
 
-1. Abrir [`colab_bootstrap.ipynb`](colab_bootstrap.ipynb) no Google Colab
-2. Correr Fase A (5 batches de tickers para preços + macro, ≈20 min cada)
-3. Correr Fase B (4 batches de fundamentais PIT, ≈30 min cada — mais lento por causa do Tiingo rate-limit)
-4. Correr **Célula 14** (`bootstrap_ml.py --skip-backfill`) — faz merge `price+fund` e invoca `train_model.train_all`
-   - `--exclude-years 2020` (opcional) para descartar regime COVID
-   - `--legacy-train` (escape hatch) para usar o treinador antigo single-RF se necessário
-5. Correr **Célula 15** valida training-serving skew (fail-fast)
+1. Abrir [`experiments/ml_v2/DipRadar_v3_Training.ipynb`](experiments/ml_v2/DipRadar_v3_Training.ipynb) no Google Colab
+2. Runtime → Run all (~10-20 min)
+3. No fim, escolhe o deploy:
+   - **A**: `git push` directo do `dip_models_v3.pkl` (Railway redeploy automático)
+   - **B**: Upload via GitHub API + `/admin_load_models <url>` no Telegram
 
-**Como treinar localmente** (sem Colab, dataset já presente):
+**Inferência em produção** (`ml_predictor.py`):
 
-```bash
-python train_model.py --parquet ml_training_merged.parquet --output-dir /tmp/dipradar_v2
-# Outputs: /tmp/dipradar_v2/dip_model_stage{1,2}.pkl + ml_report.json
-```
-
-**Tunables relevantes** (`train_model.py --help`):
-
-| Flag | Default | Significado |
-| :--- | :---: | :--- |
-| `--min-precision` | `0.40` | precision mínima exigida ao escolher threshold em T2 |
-| `--beta` | `0.5` | F-beta (β<1 = precision-tilted) |
-| `--half-life` | `1.5` | half-life em anos para sample-weights por recência |
-| `--exclude-years` | — | anos a descartar (ex.: `2020` para excluir COVID) |
-| `--algos` | `rf,xgb,lgbm` | algoritmos a incluir no ensemble |
-
-**Trade-off precision↔recall** (curva PR no test 2023+):
-
-| Threshold | Precision | Recall | Comentário |
-| :---: | :---: | :---: | :--- |
-| 0.135 | 28% | **37%** | máx wins (mais ruído) |
-| **0.229** | **34%** | 26% | balanceado (default) |
-| 0.239 | 30% | 7% | máx precision (poucos sinais) |
+- Carregamento via `joblib.load` (preserva memmap layout dos arrays numpy)
+- `score = pred_up` directo (modelo aprende alpha — não há divisão por `pred_down`)
+- `win_prob` via IsotonicRegression se `bundle.score_calibrator` existir, fallback para sigmoide
+- Hot-reload: o predictor verifica `mtime` do `.pkl` em cada chamada e recarrega sem reiniciar
 
 ---
 
@@ -291,16 +251,10 @@ A robustez "estática" tem o tecto que o dataset 2023+ permite (288 amostras →
 - **Telemetria**: `data_source`, `fund_age_days`, `ingest_ts` em cada linha
 - Volume estimado: ≈200k linhas/ano, ~50MB parquet
 
-**2. Retreino mensal automático** (`monthly_retrain.py`, dia 1 06:00)
-- Constrói `ml_training_input.parquet` consolidando 3 fontes:
-  - bootstrap historical (2014-2025, ≈17k linhas)
-  - `alert_db.csv` (alertas reais com outcome 1m/3m/6m)
-  - `universe_snapshot.parquet` filtrado para snapshots ≥6m maduras (resolve outcome via lookup intra-tabela + alpha vs SPY)
-- Treina **candidate** em `/data/candidate/`
-- **Walk-forward gating**: candidate só substitui produção se `AUC-PR ≥ produção × 0.95` (default; configurável via `--gating-ratio`)
-- **Atomic deploy**: candidate.pkl → `/data/dip_model_stage{1,2}.pkl` via `shutil.copy + replace`
-- **Archive**: versão antiga vai para `/data/archive/dip_model_stageN_<timestamp>.pkl`
-- Telegram: decisão (PROMOTED / KEPT / FAILED) + delta % + métricas Stage 1/2
+**2. Retreino mensal automático** (`monthly_retrain.py`, dia 1 06:00) — ⚠ **DESACTUALIZADO para v3**
+- O ficheiro existe e está agendado, mas chama `train_model.train_all` que foi removido no refactor v3.
+- O cron mensal falha actualmente. Plano de migração para v3 em [`docs/auto_retrain_plan.md`](docs/auto_retrain_plan.md).
+- Até a migração estar feita: o retreino é manual via Colab (notebook v3.1).
 
 **3. Prediction logging** (`prediction_log.py`)
 - Cada `ml_score()` em produção append a `/data/ml_predictions.csv` com timestamp + features + win_prob + threshold + label + vix_regime
@@ -330,14 +284,12 @@ python -c "from prediction_log import get_log_stats; print(get_log_stats())"
 
 | Ficheiro | Origem | Crescimento |
 | :--- | :--- | :--- |
-| `dip_model_stage{1,2}.pkl` | monthly_retrain | substituído mensalmente |
-| `ml_report.json` | train_model | substituído mensalmente |
+| `dip_models_v3.pkl` | Colab notebook v3.1 (manual, até auto-retrain ser migrado) | substituído quando re-treinares |
+| `ml_report_v3.json` | Colab notebook v3.1 | substituído quando re-treinares |
 | `universe_snapshot.parquet` | universe_snapshot | +~800 linhas/dia |
 | `universe_fund_cache.parquet` | universe_snapshot | ~780 linhas, refreshed 7d |
 | `alert_db.csv` | main.py (snapshot por alerta) | ~10 linhas/dia |
 | `ml_predictions.csv` | prediction_log | ~50-100 linhas/dia |
-| `archive/dip_model_stageN_<ts>.pkl` | gating | versionamento histórico |
-| `candidate/dip_model_stage{1,2}.pkl` | retrain (intermediário) | substituído mensalmente |
 
 ---
 

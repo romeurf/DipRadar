@@ -1,87 +1,61 @@
-# DipRadar ML v2 — XGBoost Regression Pipeline
+# DipRadar ML v3 — Dual-regressor (alpha) Pipeline
 
-> **Status:** experiment — run locally, do not deploy to Railway until validated.
+> **Status:** v3.1 (notebook em `DipRadar_v3_Training.ipynb`) é o único pipeline de treino activo.
 
-## What Changed vs. Production (v1)
+## O que é v3
 
-| | v1 (production) | v2 (this experiment) |
-|---|---|---|
-| Task | Binary classification (WIN/LOSS) | Regression (upside + downside separately) |
-| Model | RandomForest (Stage 1 + 2) | 2× XGBoost (model_up + model_down) |
-| Targets | `label_win` (0/1) | `max_return_60d`, `max_drawdown_60d` |
-| Target transform | None | `log1p` (stabilises heavy tails) |
-| Target logic | Peak in window | Sequence-aware: drawdown THEN recovery |
-| Primary metric | Accuracy | Spearman + Top-K Precision + Profit Sim |
-| Output | Probability of win | Score = upside / \|downside\|, TP, SL |
-| New features | — | `return_5d/10d/20d`, `zscore_20d`, `distance_from_ma50`, `volatility_20d`, `sp500_trend` |
+| | v3 (actual) |
+|---|---|
+| Tarefa | Regressão dupla — `model_up` prevê `alpha_60d`, `model_down` prevê drawdown |
+| Modelo | XGBRegressor (champion seleccionado por walk-forward CV) |
+| Target principal | `alpha_60d = max_return_60d − spy_max_return_60d` (60d forward window) |
+| Métrica primária | Spearman ρ_alpha (out-of-fold) |
+| Métricas secundárias | Top-20% PnL alpha, Brier score (calibrator), per-fold ρ stability |
+| Output | Score = `pred_up` (alpha estimado), prob calibrada via IsotonicRegression |
+| Bundle | `dip_models_v3.pkl` (single file, joblib) |
 
-## File Structure
+## Estrutura
 
 ```
 experiments/ml_v2/
-  pipeline.py     — build_targets(), train_v2(), predict_v2()
-  evaluation.py   — Spearman, Top-K, directional accuracy, profit sim
-  README.md       — this file
+├── README.md                       — este ficheiro
+├── DipRadar_v3_Training.ipynb      — notebook completo (Colab Run-all)
+├── pipeline.py                     — FEATURE_COLUMNS_V2 (30) + build_v2_features + build_targets
+├── build_dataset.py                — helpers para juntar parquet + price_history
+└── evaluation.py                   — Spearman, top-K, profit sim, walk-forward
 ```
 
-## Quick Start
+## Quick Start (notebook)
 
-```python
-import pandas as pd
-import numpy as np
-from experiments.ml_v2.pipeline import build_targets, train_v2, predict_v2, save_models_v2
-from experiments.ml_v2.evaluation import evaluate_v2, print_report
+1. Abre `DipRadar_v3_Training.ipynb` no Colab
+2. Runtime → Run all (~10-20 min)
+3. No fim, escolhe o deploy:
+   - **A**: `git push` directo do `dip_models_v3.pkl` (Railway redeploy automático)
+   - **B**: Upload via GitHub API → `/admin_load_models <url>` no Telegram
 
-# 1. Build feature matrix X and targets from your alert_db + price history
-#    (see build_targets() docstring for anti-leakage requirements)
+## Anti-leakage
 
-# 2. Train
-models = train_v2(X_train, y_up_train, y_down_train)
+- `build_v2_features()` só recebe `price_history` até ao `alert_date` (inclusive).
+- `build_targets()` só recebe `future_prices` (após `alert_date`).
+- `alpha_60d` é calculado entry-vs-max em `[alert_date+1, alert_date+60d]`.
+- O caller (notebook) é responsável por slice correcto.
 
-# 3. Predict on held-out validation set
-pred_df = predict_v2(X_val, models, entry_prices=entry_prices_val)
+## Critérios de promoção (v3.1)
 
-# 4. Evaluate
-report = evaluate_v2(pred_df, y_up_val, y_down_val)
-print_report(report)
+Antes de promover um candidate v3.x para `dip_models_v3.pkl` em produção:
 
-# 5. Save if results are good
-save_models_v2(models)
-```
+- [ ] `rho_alpha_mean > 0.30` (out-of-fold)
+- [ ] `topk_pnl_alpha > 0` (top-20%, alpha real, sem beta de mercado)
+- [ ] `Brier score OOF < 0.20` (calibrator)
+- [ ] Walk-forward estável: nenhum fold individual com ρ < −0.05
+- [ ] `score_calibrator` presente no bundle e callable
+- [ ] `ml_predictor._to_dict(bundle)` normaliza todos os campos sem erro
 
-## Key Design Decisions
+Ver `docs/retrain_plan_v3_1.md` § Métricas para detalhes.
 
-### Anti-Leakage
-`build_targets()` receives only `future_prices` (data **after** `alert_date`).  
-`build_v2_features()` receives only `price_history` up to and including `alert_date`.  
-The caller is responsible for slicing correctly.
+## Histórico
 
-### Sequence-Aware Targets
-Instead of measuring upside from the alert price:
-1. Find deepest price in the 60d window → `max_drawdown_60d`
-2. Measure recovery from that point → `max_return_60d`
-
-This models the real buy-the-dip scenario: stock drops further, then recovers.
-
-### Log Transform
-```python
-y_up_t   = log1p(max_return_60d)       # upside ≥ 0
-y_down_t = -log1p(abs(max_drawdown_60d))  # downside ≤ 0
-```
-Reduces impact of outliers, stabilises XGBoost training.
-
-### Evaluation Priority
-1. **Spearman > 0.25** — model ranks alerts correctly
-2. **Top-10% precision > baseline** — top picks are actually good
-3. **Profit sim win rate > 55%** — usable in practice
-
-Do NOT optimise for MSE or RMSE.
-
-## Promoting to Production
-
-Only replace `dip_model_stage1.pkl` / `dip_model_stage2.pkl` after:
-- [ ] Walk-forward validation passes (no single time window dominates)
-- [ ] Spearman ≥ 0.25 on out-of-sample data
-- [ ] Top-10% precision > random baseline by ≥ 5pp
-- [ ] Profit sim avg return > 0% at score threshold ≥ 1.5
-- [ ] `ml_predictor.py` and `monthly_retrain.py` updated to use v2 API
+- **v1**: classificação binária (RandomForest, `dip_model_stage{1,2}.pkl`) — removido em PR #14.
+- **v2**: regressão dupla XGBoost com `max_return_60d` / `max_drawdown_60d` — substituído por v3 (target alpha-vs-SPY).
+- **v3**: target = `max_return_60d`, 5 folds CV, sigmoide hardcoded para win_prob.
+- **v3.1**: target = `alpha_60d`, 10 folds + purga 21d, +4 features, IsotonicRegression calibrator, sample weights half-life 3y.
