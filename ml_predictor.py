@@ -1,22 +1,23 @@
 """
-ml_predictor.py — Score dual-layer: Camada A (preço) + Camada B (fundamentais).
+ml_predictor.py — Score v3: regressor dual (model_up + model_down).
 
-Score final: prob_final = 0.40 × prob_preço + 0.60 × prob_fundamentais
+Champion: XGB-v2 (17 features base, rho_mean=0.18, topk_pnl=17.9% em 60d)
 
-API pública:
+Score final = model_up.predict(X) / max(|model_down.predict(X)|, epsilon)
+  → rácio upside/downside esperado nos 60 dias seguintes ao alerta.
+
+API pública (inalterada):
   ml_score(features: dict) -> MLResult
   is_model_ready() -> bool
   get_model_info() -> dict
   ml_badge(result: MLResult) -> str    # linha formatada para Telegram
 
-Robustez (v2):
-  * Derived features (rsi_oversold_strength, vix_regime, pe_attractive,
-    drop_x_drawdown, vol_x_drop) computadas automaticamente se ausentes.
-  * Threshold dinâmico por regime VIX se o bundle os tiver
-    (`vix_regime_thresholds`).
-  * Gating de baixa cobertura de fundamentais: marca LOW_COVERAGE quando
-    > 50% dos fundamentais "core" são imputados a fallback (rejeita o sinal
-    em vez de palpitar).
+Features esperadas (17 base do merged):
+  macro_score, vix, spy_drawdown_5d, sector_drawdown_5d,
+  fcf_yield, revenue_growth, gross_margin, de_ratio,
+  pe_vs_fair, analyst_upside, quality_score,
+  drop_pct_today, drawdown_52w, rsi_14, atr_ratio,
+  volume_spike, market_cap_b
 """
 
 from __future__ import annotations
@@ -30,280 +31,202 @@ from typing import Any
 import joblib
 import numpy as np
 
-from ml_features import add_derived_features
-
 
 def _safe_load(path: Path) -> Any:
-    """Load a pickle/joblib bundle, trying joblib first (handles compression)."""
+    """Load a pickle/joblib bundle, trying joblib first."""
     try:
         return joblib.load(path)
     except Exception:
         with open(path, "rb") as f:
             return pickle.load(f)
 
+
 # ── Caminhos ───────────────────────────────────────────────────────────────────
 
-_DATA_DIR  = Path("/data") if Path("/data").exists() else Path("/tmp")
-_PKL_PRICE = _DATA_DIR / "dip_model_price.pkl"   # Camada A — preço
-_PKL_S1    = _DATA_DIR / "dip_model_stage1.pkl"  # Camada B — win vs no-win
-_PKL_S2    = _DATA_DIR / "dip_model_stage2.pkl"  # Camada B — win40 vs win20
+_REPO_DIR = Path(__file__).parent
+_DATA_DIR = Path("/data") if Path("/data").exists() else Path("/tmp")
 
-# Peso de cada camada no score final
-_W_PRICE = 0.40
-_W_FUND  = 0.60
-
-# ── Regime VIX para thresholds dinâmicos (deve coincidir com train_model.py) ──
-_VIX_REGIMES = {
-    "low":    (-float("inf"), 15.0),
-    "medium": (15.0,          25.0),
-    "high":   (25.0,          float("inf")),
-}
-
-# Cobertura mínima de fundamentais "core" para confiar no Stage 1.
-# Estes são os fundamentais que fund-data sources (yfinance/finnhub) costumam
-# fornecer para tickers reais. Se >50% destes estão em fallback (imputado a
-# medianas), o sinal é marcado como LOW_COVERAGE — não fiamos a um modelo
-# que está a votar a partir de medianas.
-_CORE_FUND_FIELDS = (
-    "fcf_yield", "revenue_growth", "gross_margin", "de_ratio",
-    "pe_vs_fair", "analyst_upside",
+# Bundle v3 — procura primeiro em /data (Railway volume), depois no repo
+_PKL_V3 = next(
+    (p for p in [_DATA_DIR / "dip_models_v3.pkl", _REPO_DIR / "dip_models_v3.pkl"]
+     if p.exists()),
+    _REPO_DIR / "dip_models_v3.pkl",
 )
 
-# Valores fallback típicos do _FALLBACK em ml_features.py
-_FALLBACK_VALUES: dict[str, float] = {
-    "fcf_yield":       0.04,
-    "revenue_growth":  0.05,
-    "gross_margin":    0.35,
-    "de_ratio":       80.0,
-    "pe_vs_fair":      1.0,
-    "analyst_upside":  0.10,
+# Features esperadas pelo champion XGB-v2 (17 base)
+_FEATURE_COLS: list[str] = [
+    "macro_score", "vix", "spy_drawdown_5d", "sector_drawdown_5d",
+    "fcf_yield", "revenue_growth", "gross_margin", "de_ratio",
+    "pe_vs_fair", "analyst_upside", "quality_score",
+    "drop_pct_today", "drawdown_52w", "rsi_14", "atr_ratio",
+    "volume_spike", "market_cap_b",
+]
+
+# Aliases de features — campo externo → nome interno
+_FEATURE_MAP: dict[str, str] = {
+    "rsi":                    "rsi_14",
+    "rsi_14":                 "rsi_14",
+    "drop_pct":               "drop_pct_today",
+    "change_day_pct":         "drop_pct_today",
+    "drawdown_from_high":     "drawdown_52w",
+    "drawdown_pct":           "drawdown_52w",
+    "spy_change":             "spy_drawdown_5d",
+    "sector_etf_change":      "sector_drawdown_5d",
+    "atr_pct":                "atr_ratio",
+    "volume_ratio":           "volume_spike",
+    "market_cap":             "market_cap_b",
+    "fcf_yield":              "fcf_yield",
+    "revenue_growth":         "revenue_growth",
+    "gross_margin":           "gross_margin",
+    "de_ratio":               "de_ratio",
+    "debt_to_equity":         "de_ratio",
+    "pe_vs_fair":             "pe_vs_fair",
+    "analyst_upside":         "analyst_upside",
+    "quality_score":          "quality_score",
+    "macro_score":            "macro_score",
+    "vix":                    "vix",
+    "market_cap_b":           "market_cap_b",
 }
 
-# ── Cache em memória ───────────────────────────────────────────────────────────
+_SCALE_FUNCS: dict[str, Any] = {
+    "market_cap_b": lambda v: v / 1e9 if v is not None and float(v) > 1e6 else v,
+}
 
-_model_price:    Any | None = None
-_model_s1:       Any | None = None
-_model_s2:       Any | None = None
-_mtime_price:    float      = 0.0
-_mtime_s1:       float      = 0.0
+# Thresholds de score para labels
+# score = upside / |downside| — interpretado como rácio risco/retorno esperado
+_SCORE_HIGH   = 1.5   # upside > 1.5× o drawdown esperado → WIN_STRONG
+_SCORE_MED    = 1.0   # upside > 1.0× o drawdown esperado → WIN
+_SCORE_FLOOR  = 0.5   # abaixo → NO_WIN
+
+# Cache em memória
+_bundle:    Any | None = None
+_mtime_v3: float       = 0.0
 
 
 @dataclass
 class MLResult:
-    win_prob:      float       = 0.0    # score final combinado
-    prob_price:    float | None = None  # Camada A
-    prob_fund:     float | None = None  # Camada B
-    win40_prob:    float | None = None  # Sommelier WIN40 vs WIN20
-    label:         str         = "NO_MODEL"
-    confidence:    str         = "–"
-    model_ready:   bool        = False
-    threshold:     float       = 0.50
-    features_used: list[str]   = field(default_factory=list)
-    vix_regime:    str | None  = None   # low / medium / high (None se não aplicável)
-    coverage:      float       = 1.0    # fracção de fundamentais reais (não fallback) em [0, 1]
-    low_coverage:  bool        = False  # cobertura abaixo do threshold (50% por defeito)
+    win_prob:      float        = 0.0     # score normalizado [0, 1] para compatibilidade
+    score_raw:     float        = 0.0     # rácio upside/downside (não normalizado)
+    pred_up:       float | None = None    # previsão max_return_60d
+    pred_down:     float | None = None    # previsão max_drawdown_60d (negativo)
+    prob_price:    float | None = None    # alias compatibilidade (= win_prob)
+    prob_fund:     float | None = None    # alias compatibilidade (= win_prob)
+    win40_prob:    float | None = None    # n/a em v3 — mantido para compatibilidade
+    label:         str          = "NO_MODEL"
+    confidence:    str          = "–"
+    model_ready:   bool         = False
+    threshold:     float        = _SCORE_FLOOR
+    features_used: list[str]    = field(default_factory=list)
+    vix_regime:    str | None   = None
+    coverage:      float        = 1.0
+    low_coverage:  bool         = False
+    model_version: str          = "v3"
 
 
-# ── Feature map / aliases ─────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
-_FEATURE_MAP: dict[str, str] = {
-    "rsi":                    "rsi",
-    "pe":                     "pe_ratio",
-    "pe_ratio":               "pe_ratio",
-    "pb":                     "pb_ratio",
-    "pb_ratio":               "pb_ratio",
-    "fcf_yield":              "fcf_yield",
-    "revenue_growth":         "revenue_growth",
-    "gross_margin":           "gross_margin",
-    "debt_to_equity":         "debt_to_equity",
-    "analyst_upside":         "analyst_upside",
-    "drawdown_from_high":     "drawdown_pct",
-    "drawdown_pct":           "drawdown_pct",
-    "beta":                   "beta",
-    "short_percent_of_float": "short_pct",
-    "short_pct":              "short_pct",
-    "score":                  "dip_score",
-    "dip_score":              "dip_score",
-    "spy_change":             "spy_change",
-    "sector_etf_change":      "sector_etf_change",
-    "earnings_days":          "earnings_days",
-    "change_day_pct":         "change_day_pct",
-    "market_cap":             "market_cap_b",
-    "volume_ratio":           "volume_ratio",
-    "atr_pct":                "atr_pct",
-}
-
-_SCALE_FUNCS: dict[str, Any] = {
-    "market_cap_b": lambda v: v / 1e9 if v is not None else None,
-}
+def _resolve_feature(raw: dict, col: str) -> float:
+    """Resolve uma feature com fallback via aliases e escala se necessário."""
+    val = raw.get(col)
+    if val is None:
+        for src, dst in _FEATURE_MAP.items():
+            if dst == col and src in raw:
+                val = raw[src]
+                break
+    if val is None:
+        return 0.0
+    fn = _SCALE_FUNCS.get(col)
+    if fn:
+        try:
+            val = fn(val)
+        except Exception:
+            val = 0.0
+    try:
+        return float(val) if val is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _build_feature_vector(raw: dict, columns: list[str]) -> np.ndarray:
-    vec: list[float] = []
-    for col in columns:
-        val = raw.get(col)
-        if val is None:
-            for src, dst in _FEATURE_MAP.items():
-                if dst == col and src in raw:
-                    val = raw[src]
-                    break
-        if val is None:
-            vec.append(0.0)
-            continue
-        fn = _SCALE_FUNCS.get(col)
-        if fn:
-            try:
-                val = fn(val)
-            except Exception:
-                val = 0.0
-        try:
-            vec.append(float(val) if val is not None else 0.0)
-        except (TypeError, ValueError):
-            vec.append(0.0)
+    vec = [_resolve_feature(raw, col) for col in columns]
     return np.array(vec, dtype=np.float32).reshape(1, -1)
 
 
-def _classify_vix_regime(vix_value: float | None) -> str:
+def _classify_vix(vix_value: float | None) -> str:
     if vix_value is None:
-        return "medium"  # default
-    for regime, (lo, hi) in _VIX_REGIMES.items():
-        if lo <= float(vix_value) < hi:
-            return regime
-    return "medium"
+        return "medium"
+    v = float(vix_value)
+    if v < 15:
+        return "low"
+    if v < 25:
+        return "medium"
+    return "high"
 
 
-def _resolve_threshold(bundle: dict, vix_value: float | None) -> tuple[float, str]:
-    """
-    Returns (threshold, regime_used).
-
-    Picks regime-specific threshold from `vix_regime_thresholds` if present
-    and not flagged as fallback. Otherwise falls back to the global threshold.
-    """
-    base = float(bundle.get("threshold", 0.50))
-    regime = _classify_vix_regime(vix_value)
-    rt = bundle.get("vix_regime_thresholds") or {}
-    block = rt.get(regime) if isinstance(rt, dict) else None
-    if isinstance(block, dict):
-        if not block.get("fallback") and block.get("threshold") is not None:
-            return float(block["threshold"]), regime
-    return base, regime
+def _score_to_prob(score: float) -> float:
+    """Normaliza o rácio upside/downside para [0, 1] via sigmoide suavizada."""
+    # score=1.0 → ~0.65, score=2.0 → ~0.88, score=0.0 → 0.5
+    return float(1 / (1 + np.exp(-0.8 * (score - 0.5))))
 
 
-def _fund_coverage(raw: dict) -> float:
-    """
-    Fraction of `_CORE_FUND_FIELDS` that are PRESENT and DIFFERENT from the
-    fallback value (i.e. supplied by a real data source).
+def _inverse_transform_up(yp: float) -> float:
+    return float(np.expm1(np.clip(yp, -3, 3)))
 
-    Returns a value in [0, 1]. 1.0 means all fundamentals are real.
-    """
-    if not raw:
-        return 0.0
-    real_count = 0
-    for field_name in _CORE_FUND_FIELDS:
-        val = raw.get(field_name)
-        if val is None:
-            # Try alias (e.g. debt_to_equity → de_ratio)
-            for src, dst in _FEATURE_MAP.items():
-                if dst == field_name and src in raw and raw[src] is not None:
-                    val = raw[src]
-                    break
-        if val is None:
-            continue
-        try:
-            fv = float(val)
-        except (TypeError, ValueError):
-            continue
-        fallback = _FALLBACK_VALUES.get(field_name)
-        if fallback is not None and abs(fv - fallback) < 1e-6:
-            # Likely fallback; don't count as real coverage
-            continue
-        real_count += 1
-    return real_count / len(_CORE_FUND_FIELDS)
+
+def _inverse_transform_down(yp: float) -> float:
+    return float(-np.expm1(np.clip(-yp, 0, 3)))
 
 
 # ── Carregamento lazy ─────────────────────────────────────────────────────────
 
-def _load_models(force: bool = False) -> dict[str, bool]:
-    """
-    Carrega/actualiza os modelos do disco.
-    Devolve {"price": bool, "fund": bool}.
-    """
-    global _model_price, _model_s1, _model_s2, _mtime_price, _mtime_s1
-    loaded = {"price": False, "fund": False}
-
-    # Camada A
-    if _PKL_PRICE.exists():
-        mtime = _PKL_PRICE.stat().st_mtime
-        if force or _model_price is None or mtime != _mtime_price:
-            try:
-                bundle = _safe_load(_PKL_PRICE)
-                _model_price  = bundle
-                _mtime_price  = mtime
-                logging.info(
-                    f"[ml_predictor] CamadaA carregada — "
-                    f"alg={bundle.get('algorithm','?')} "
-                    f"features={len(bundle.get('feature_columns', []))}"
-                )
-            except Exception as e:
-                logging.error(f"[ml_predictor] Erro CamadaA: {e}")
-        if _model_price is not None:
-            loaded["price"] = True
-
-    # Camada B stage 1
-    if _PKL_S1.exists():
-        mtime = _PKL_S1.stat().st_mtime
-        if force or _model_s1 is None or mtime != _mtime_s1:
-            try:
-                bundle = _safe_load(_PKL_S1)
-                _model_s1 = bundle
-                _mtime_s1 = mtime
-                logging.info(
-                    f"[ml_predictor] CamadaB stage1 carregada — "
-                    f"alg={bundle.get('algorithm','?')} "
-                    f"threshold={bundle.get('threshold',0.5):.3f}"
-                )
-            except Exception as e:
-                logging.error(f"[ml_predictor] Erro CamadaB stage1: {e}")
-        if _model_s1 is not None:
-            loaded["fund"] = True
-
-    # Camada B stage 2 (opcional)
-    _model_s2 = None
-    if _PKL_S2.exists():
-        try:
-            _model_s2 = _safe_load(_PKL_S2)
-        except Exception:
-            pass
-
-    return loaded
+def _load_bundle(force: bool = False) -> bool:
+    global _bundle, _mtime_v3
+    if not _PKL_V3.exists():
+        return False
+    mtime = _PKL_V3.stat().st_mtime
+    if not force and _bundle is not None and mtime == _mtime_v3:
+        return True
+    try:
+        _bundle   = _safe_load(_PKL_V3)
+        _mtime_v3 = mtime
+        cols      = _bundle.get("feature_cols", _FEATURE_COLS)
+        champion  = _bundle.get("champion", "XGB-v2")
+        logging.info(
+            f"[ml_predictor] Bundle v3 carregado — champion={champion} "
+            f"features={len(cols)} rho={_bundle.get('rho_mean', '?')}"
+        )
+        return True
+    except Exception as e:
+        logging.error(f"[ml_predictor] Erro ao carregar bundle v3: {e}")
+        return False
 
 
 # ── API pública ────────────────────────────────────────────────────────────────
 
 def is_model_ready() -> bool:
-    return _PKL_PRICE.exists() or _PKL_S1.exists()
+    return _PKL_V3.exists()
 
 
 def get_model_info() -> dict:
-    loaded = _load_models()
-    info: dict = {
-        "ready":       loaded["price"] or loaded["fund"],
-        "camada_a":    loaded["price"],
-        "camada_b":    loaded["fund"],
-        "stage2":      _PKL_S2.exists(),
-        "weight_price": _W_PRICE,
-        "weight_fund":  _W_FUND,
+    ready = _load_bundle()
+    if not ready or _bundle is None:
+        return {"ready": False, "model_version": "v3"}
+    cols = _bundle.get("feature_cols", _FEATURE_COLS)
+    return {
+        "ready":         True,
+        "model_version": "v3",
+        "champion":      _bundle.get("champion", "XGB-v2"),
+        "n_features":    len(cols),
+        "feature_cols":  cols,
+        "rho_mean":      _bundle.get("rho_mean"),
+        "topk_pnl":      _bundle.get("topk_pnl"),
+        "n_samples":     _bundle.get("n_samples"),
+        # Compatibilidade com código que lê camada_a/camada_b
+        "camada_a":      True,
+        "camada_b":      False,
+        "weight_price":  1.0,
+        "weight_fund":   0.0,
     }
-    if loaded["price"] and _model_price:
-        info["alg_price"]   = _model_price.get("algorithm", "?")
-        info["features_a"]  = len(_model_price.get("feature_columns", []))
-    if loaded["fund"] and _model_s1:
-        info["alg_fund"]    = _model_s1.get("algorithm", "?")
-        info["auc_pr"]      = _model_s1.get("auc_pr", 0)
-        info["threshold"]   = _model_s1.get("threshold", 0.5)
-        info["n_samples"]   = _model_s1.get("n_samples", 0)
-        info["features_b"]  = len(_model_s1.get("feature_columns", []))
-    return info
 
 
 def ml_score(
@@ -313,126 +236,85 @@ def ml_score(
     log_to_file: bool = True,
 ) -> MLResult:
     """
-    Pontua um dip com o score dual-layer.
+    Pontua um dip com o modelo v3 (regressor dual XGB-v2).
 
-    Score final = W_PRICE × prob_preço + W_FUND × prob_fundamentais
-    Se só uma camada estiver disponível, usa apenas essa.
+    Score = pred_up / max(|pred_down|, 0.01)
+      → rácio upside/downside esperado nos 60 dias após o alerta.
 
-    Robustez v2:
-      * Se faltam features derivadas (rsi_oversold_strength, vix_regime, ...),
-        são calculadas em-tempo a partir das features base.
-      * Threshold dinâmico segundo o regime VIX (low/med/high) lido do bundle.
-      * Cobertura de fundamentais — se < 50% reais, marca low_coverage e pode
-        rejeitar o sinal mesmo com prob > threshold.
+    Labels:
+      WIN_STRONG  — score > 1.5 (upside > 1.5× o drawdown esperado)
+      WIN         — score > 1.0
+      WEAK        — score > 0.5
+      NO_WIN      — score <= 0.5
     """
     if reload_if_stale:
-        loaded = _load_models()
-        if not loaded["price"] and not loaded["fund"]:
+        if not _load_bundle():
             return MLResult(model_ready=False, label="NO_MODEL")
 
-    # Compute derived features in-place if absent (idempotent)
+    if _bundle is None:
+        return MLResult(model_ready=False, label="NO_MODEL")
+
     enriched = dict(features) if features else {}
+
+    # Features a usar — bundle pode sobrepor a lista default
+    cols = _bundle.get("feature_cols", _FEATURE_COLS)
+    X    = _build_feature_vector(enriched, cols)
+
     try:
-        add_derived_features(enriched)
+        model_up   = _bundle["model_up"]
+        model_down = _bundle["model_down"]
+        pred_up_raw   = float(model_up.predict(X)[0])
+        pred_down_raw = float(model_down.predict(X)[0])
+        pred_up   = _inverse_transform_up(pred_up_raw)
+        pred_down = _inverse_transform_down(pred_down_raw)
     except Exception as e:
-        logging.debug(f"[ml_predictor] add_derived_features failed: {e}")
-
-    prob_price: float | None = None
-    prob_fund:  float | None = None
-    win40_prob: float | None = None
-    feat_used:  list[str]    = []
-    threshold   = 0.50
-    vix_value   = enriched.get("vix")
-    regime_used: str | None = None
-
-    # ── Camada A ──────────────────────────────────────────────────────────────
-    if _model_price is not None:
-        try:
-            cols_a = _model_price["feature_columns"]
-            X_a    = _build_feature_vector(enriched, cols_a)
-            p_a    = _model_price["model"].predict_proba(X_a)[0]
-            prob_price = float(p_a[1]) if len(p_a) >= 2 else float(p_a[-1])
-            feat_used  = cols_a
-        except Exception as e:
-            logging.debug(f"[ml_predictor] CamadaA score error: {e}")
-
-    # ── Camada B stage 1 (with VIX-aware threshold) ───────────────────────────
-    if _model_s1 is not None:
-        try:
-            cols_b    = _model_s1["feature_columns"]
-            threshold, regime_used = _resolve_threshold(_model_s1, vix_value)
-            X_b       = _build_feature_vector(enriched, cols_b)
-            p_b       = _model_s1["model"].predict_proba(X_b)[0]
-            prob_fund = float(p_b[1]) if len(p_b) >= 2 else float(p_b[-1])
-            feat_used = list(set(feat_used) | set(cols_b))
-        except Exception as e:
-            logging.debug(f"[ml_predictor] CamadaB score error: {e}")
-
-    # ── Score final combinado ─────────────────────────────────────────────────
-    if prob_price is not None and prob_fund is not None:
-        win_prob = _W_PRICE * prob_price + _W_FUND * prob_fund
-    elif prob_price is not None:
-        win_prob = prob_price
-        threshold = 0.50
-    elif prob_fund is not None:
-        win_prob = prob_fund
-    else:
+        logging.error(f"[ml_predictor] Erro na inferência v3: {e}")
         return MLResult(model_ready=False, label="ERROR")
 
-    # ── Coverage gating ───────────────────────────────────────────────────────
-    coverage = _fund_coverage(features or {})
-    low_coverage = coverage < 0.5
+    # Score: rácio upside / |downside|
+    abs_down = max(abs(pred_down), 0.01)
+    score    = pred_up / abs_down
 
-    # ── Stage 2 — Sommelier ───────────────────────────────────────────────────
-    if _model_s2 and win_prob >= threshold:
-        try:
-            cols2 = _model_s2.get("feature_columns", [])
-            X2    = _build_feature_vector(enriched, cols2)
-            p2    = _model_s2["model"].predict_proba(X2)[0]
-            win40_prob = float(p2[1]) if len(p2) >= 2 else float(p2[-1])
-        except Exception as e:
-            logging.debug(f"[ml_predictor] Stage 2 error: {e}")
+    # Normalizar para [0,1] (compatibilidade com win_prob)
+    win_prob = _score_to_prob(score)
 
-    # ── Label ─────────────────────────────────────────────────────────────────
-    if win_prob >= threshold:
-        if low_coverage:
-            # Refuse to claim WIN when fundamentals are mostly imputed.
-            label = "LOW_COVERAGE"
-        elif win40_prob is not None and win40_prob >= 0.55:
-            label = "WIN_40"
-        else:
-            label = "WIN"
-    else:
-        label = "NO_WIN"
+    # VIX regime (informativo)
+    vix_value  = enriched.get("vix") or enriched.get("vix_value")
+    vix_regime = _classify_vix(vix_value)
 
-    # ── Confidence ────────────────────────────────────────────────────────────
-    if low_coverage:
-        confidence = "–"
-    elif win_prob >= 0.80:
+    # Label baseado no score raw
+    if score > _SCORE_HIGH:
+        label      = "WIN_STRONG"
         confidence = "Alta"
-    elif win_prob >= 0.65:
-        confidence = "Média"
-    elif win_prob >= threshold:
+    elif score > _SCORE_MED:
+        label      = "WIN"
+        confidence = "Média" if score < 1.25 else "Alta"
+    elif score > _SCORE_FLOOR:
+        label      = "WEAK"
         confidence = "Baixa"
     else:
+        label      = "NO_WIN"
         confidence = "–"
 
     result = MLResult(
-        win_prob=round(win_prob, 3),
-        prob_price=round(prob_price, 3) if prob_price is not None else None,
-        prob_fund=round(prob_fund, 3) if prob_fund is not None else None,
-        win40_prob=round(win40_prob, 3) if win40_prob is not None else None,
-        label=label,
-        confidence=confidence,
-        model_ready=True,
-        threshold=threshold,
-        features_used=feat_used,
-        vix_regime=regime_used,
-        coverage=round(coverage, 3),
-        low_coverage=low_coverage,
+        win_prob      = round(win_prob, 3),
+        score_raw     = round(score, 3),
+        pred_up       = round(pred_up, 4),
+        pred_down     = round(pred_down, 4),
+        prob_price    = round(win_prob, 3),   # alias compatibilidade
+        prob_fund     = None,
+        win40_prob    = None,
+        label         = label,
+        confidence    = confidence,
+        model_ready   = True,
+        threshold     = _SCORE_FLOOR,
+        features_used = cols,
+        vix_regime    = vix_regime,
+        coverage      = 1.0,
+        low_coverage  = False,
+        model_version = "v3",
     )
 
-    # Append-only prediction log (failure-tolerant — não afecta o caller).
     if log_to_file and symbol:
         try:
             from prediction_log import log_prediction
@@ -448,47 +330,34 @@ def ml_badge(result: MLResult) -> str:
     Linha formatada para o alerta Telegram.
 
     Exemplos:
-      🤖 ML: 🟢 WIN_40 | prob 0.87 | P:0.82 F:0.90 | confiança Alta
-      🤖 ML: ✅ WIN    | prob 0.63 | P:0.55 F:0.68 | confiança Baixa | VIX:med
-      🤖 ML: 🔴 NO_WIN | prob 0.31
-      🤖 ML: ⚪ LOW_COVERAGE | prob 0.62 (cobertura 33% — sinal não fiável)
-      🤖 ML: modelo não treinado
+      🤖 ML v3: 🟢 WIN_STRONG | up +18.5% | dn -8.2% | score 2.25 | VIX:med
+      🤖 ML v3: ✅ WIN        | up +12.1% | dn -9.4% | score 1.29 | Alta
+      🤖 ML v3: 🟡 WEAK       | up +6.3%  | dn -10.1%| score 0.62
+      🤖 ML v3: 🔴 NO_WIN     | up +2.1%  | dn -12.3%| score 0.17
+      🤖 ML v3: modelo não treinado
     """
     if not result.model_ready:
-        return "🤖 ML: _modelo não treinado_"
+        return "🤖 ML v3: _modelo não treinado_"
 
     emoji_map = {
-        "WIN_40":       "🟢",
-        "WIN":          "✅",
-        "NO_WIN":       "🔴",
-        "LOW_COVERAGE": "⚪",
-        "ERROR":        "⚠️",
+        "WIN_STRONG": "🟢",
+        "WIN":        "✅",
+        "WEAK":       "🟡",
+        "NO_WIN":     "🔴",
+        "ERROR":      "⚠️",
+        "NO_MODEL":   "⚫",
     }
     em = emoji_map.get(result.label, "📊")
 
-    if result.label == "LOW_COVERAGE":
-        return (
-            f"🤖 *ML:* {em} `LOW_COVERAGE` | prob *{result.win_prob:.2f}* "
-            f"(cobertura {result.coverage*100:.0f}% — sinal não fiável)"
-        )
+    up_str   = f"+{result.pred_up*100:.1f}%" if result.pred_up is not None else "?"
+    down_str = f"{result.pred_down*100:.1f}%" if result.pred_down is not None else "?"
+    score_str = f"{result.score_raw:.2f}"
 
-    # Detalhe das duas camadas
-    layers_str = ""
-    if result.prob_price is not None and result.prob_fund is not None:
-        layers_str = f" | P:{result.prob_price:.2f} F:{result.prob_fund:.2f}"
-    elif result.prob_price is not None:
-        layers_str = f" | P:{result.prob_price:.2f}"
-    elif result.prob_fund is not None:
-        layers_str = f" | F:{result.prob_fund:.2f}"
-
-    win40_str = ""
-    if result.win40_prob is not None:
-        win40_str = f" | WIN40:{result.win40_prob:.2f}"
-
-    vix_str = f" | VIX:{result.vix_regime[:3]}" if result.vix_regime else ""
+    vix_str  = f" | VIX:{result.vix_regime[:3]}" if result.vix_regime else ""
     conf_str = f" | *{result.confidence}*" if result.confidence != "–" else ""
 
     return (
-        f"🤖 *ML:* {em} `{result.label}` | prob *{result.win_prob:.2f}*"
-        f"{layers_str}{win40_str}{vix_str}{conf_str}"
+        f"🤖 *ML v3:* {em} `{result.label}` "
+        f"| up *{up_str}* | dn {down_str} | score *{score_str}*"
+        f"{vix_str}{conf_str}"
     )
