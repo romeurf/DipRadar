@@ -675,12 +675,18 @@ _load_models_running: bool = False
 
 def _handle_admin_load_models(parts: list[str]) -> None:
     """
-    /admin_load_models <url>                     → tarball (.tar.gz/.tgz/.zip) com 3 ficheiros
-    /admin_load_models <s1_url> <s2_url> <r_url> → 3 URLs individuais
+    /admin_load_models <url>                     → tarball (.tar.gz/.tgz/.zip)
+    /admin_load_models <pkl_url> <report_url>    → v3 (2 URLs)
+    /admin_load_models <s1_url> <s2_url> <r_url> → legacy (3 URLs)
 
-    Faz download dos pickles + ml_report.json para `/data/`, valida, e faz swap
-    atomic. Versão antiga vai para `/data/archive/dip_model_stageN_<ts>.pkl`. O
-    ml_predictor recarrega automaticamente quando o mtime muda — não precisa
+    Suporta dois formatos:
+      • v3      (1 .pkl + 1 .json):  dip_models_v3.pkl + ml_report_v3.json
+      • legacy  (2 .pkl + 1 .json):  dip_model_stage{1,2}.pkl + ml_report.json
+
+    O formato é detectado automaticamente pelos nomes dos ficheiros (URLs
+    individuais) ou pelo conteúdo do archive (modo tarball). Faz swap atomic
+    com archive automático da versão anterior em `/data/archive/<file>_<ts>`.
+    O ml_predictor recarrega automaticamente quando o mtime muda — não precisa
     reiniciar o bot.
 
     URLs aceites: HTTPS direct download. Para Google Drive partilha pública
@@ -693,15 +699,17 @@ def _handle_admin_load_models(parts: list[str]) -> None:
         return
 
     args = [a for a in parts[1:] if a.strip()]
-    if len(args) not in (1, 3):
+    if len(args) not in (1, 2, 3):
         _reply(
             "❌ *Uso incorrecto.*\n\n"
             "*Modo tarball* (1 URL):\n"
             "`/admin_load_models <url_tar_gz>`\n"
-            "_Ficheiro deve conter dip_model_stage1.pkl, dip_model_stage2.pkl, ml_report.json._\n\n"
-            "*Modo individual* (3 URLs):\n"
+            "_Aceita v3 (1 .pkl + 1 .json) ou legacy (2 .pkl + 1 .json)._\n\n"
+            "*Modo v3* (2 URLs):\n"
+            "`/admin_load_models <dip_models_v3.pkl> <ml_report_v3.json>`\n\n"
+            "*Modo legacy* (3 URLs):\n"
             "`/admin_load_models <s1_url> <s2_url> <report_url>`\n\n"
-            "_Sugestão: para Google Drive usa partilha pública e o link directo `https://drive.google.com/uc?export=download&id=<ID>`._"
+            "_Para Google Drive: link directo `https://drive.google.com/uc?export=download&id=<ID>`._"
         )
         return
 
@@ -734,9 +742,12 @@ def _handle_admin_load_models(parts: list[str]) -> None:
         timestamp  = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
 
         # Limites de segurança
-        MAX_BYTES_PER_FILE = 80 * 1024 * 1024  # 80 MB por ficheiro
-        REQUIRED_PKL_KEYS  = {"model", "feature_columns", "threshold"}
-        EXPECTED_FILES     = ["dip_model_stage1.pkl", "dip_model_stage2.pkl", "ml_report.json"]
+        MAX_BYTES_PER_FILE      = 80 * 1024 * 1024  # 80 MB por ficheiro
+        # Formato legacy (Tier A+B+C): 2 .pkl + 1 .json
+        LEGACY_FILES            = ["dip_model_stage1.pkl", "dip_model_stage2.pkl", "ml_report.json"]
+        LEGACY_REQUIRED_KEYS    = {"model", "feature_columns", "threshold"}
+        # Formato v3: 1 .pkl + 1 .json
+        V3_FILES                = ["dip_models_v3.pkl", "ml_report_v3.json"]
 
         tmp_dir = Path(tempfile.mkdtemp(prefix="loadmodels_"))
         try:
@@ -760,7 +771,7 @@ def _handle_admin_load_models(parts: list[str]) -> None:
                             f.write(chunk)
                 logging.info(f"[admin_load_models] download {dest.name}: {total} bytes")
 
-            # ── Modo 1: tarball (1 URL)
+            # ── Modo tarball (1 URL): detecta formato pelo conteúdo do archive
             if len(args) == 1:
                 archive_path = tmp_dir / "models.archive"
                 _download(args[0], archive_path)
@@ -778,55 +789,105 @@ def _handle_admin_load_models(parts: list[str]) -> None:
                             f"ficheiro não é zip nem tar reconhecido: {e}"
                         ) from e
 
-                # Procura os 3 ficheiros (recursivo, primeira ocorrência)
+                # Detecta formato: v3 toma prioridade (single bundle moderno)
+                v3_pkl = list(extract_dir.rglob("dip_models_v3.pkl"))
+                if v3_pkl:
+                    fmt = "v3"
+                    expected = V3_FILES
+                else:
+                    fmt = "legacy"
+                    expected = LEGACY_FILES
+
                 local: dict[str, Path] = {}
-                for fname in EXPECTED_FILES:
+                for fname in expected:
                     matches = list(extract_dir.rglob(fname))
                     if not matches:
-                        raise ValueError(f"ficheiro {fname} não encontrado no archive")
+                        raise ValueError(
+                            f"formato {fmt}: ficheiro {fname} não encontrado no archive"
+                        )
                     local[fname] = matches[0]
-            else:
-                # ── Modo 2: 3 URLs individuais (ordem: stage1, stage2, report)
+
+            # ── Modo 2 URLs: v3 (pkl + report)
+            elif len(args) == 2:
+                fmt = "v3"
+                expected = V3_FILES
                 local = {}
-                for fname, url in zip(EXPECTED_FILES, args):
+                for fname, url in zip(expected, args):
                     dest = tmp_dir / fname
                     _download(url, dest)
                     local[fname] = dest
 
-            # ── Validação dos pickles
-            stage1_meta: dict = {}
-            for stage in (1, 2):
-                fname  = f"dip_model_stage{stage}.pkl"
-                bundle = joblib.load(local[fname])
-                if not isinstance(bundle, dict):
-                    raise ValueError(f"{fname}: pickle não é um dict")
-                missing = REQUIRED_PKL_KEYS - set(bundle.keys())
-                if missing:
-                    raise ValueError(f"{fname}: faltam keys {missing} no bundle")
-                # Sanity check: feature_columns deve existir e ser não-vazia
-                fc = bundle.get("feature_columns") or []
-                if not fc:
-                    raise ValueError(f"{fname}: feature_columns vazia")
-                if stage == 1:
-                    stage1_meta = {
-                        "n_features": len(fc),
-                        "threshold":  bundle.get("threshold"),
-                        "algorithm":  bundle.get("algorithm")
-                            or bundle.get("algo")
-                            or "unknown",
-                    }
+            # ── Modo 3 URLs: legacy (stage1, stage2, report)
+            else:
+                fmt = "legacy"
+                expected = LEGACY_FILES
+                local = {}
+                for fname, url in zip(expected, args):
+                    dest = tmp_dir / fname
+                    _download(url, dest)
+                    local[fname] = dest
 
-            # Validação do report
-            with open(local["ml_report.json"]) as f:
-                report = json.load(f)
-            if not isinstance(report, dict):
-                raise ValueError("ml_report.json: top-level não é um dict")
-            s1 = report.get("stage1") or {}
-            auc_pr = s1.get("auc_pr_test") or s1.get("auc_pr")
+            # ── Validação + extração de métricas específicas do formato
+            meta: dict = {}
+            if fmt == "legacy":
+                for stage in (1, 2):
+                    fname  = f"dip_model_stage{stage}.pkl"
+                    bundle = joblib.load(local[fname])
+                    if not isinstance(bundle, dict):
+                        raise ValueError(f"{fname}: pickle não é um dict")
+                    missing = LEGACY_REQUIRED_KEYS - set(bundle.keys())
+                    if missing:
+                        raise ValueError(f"{fname}: faltam keys {missing} no bundle")
+                    fc = bundle.get("feature_columns") or []
+                    if not fc:
+                        raise ValueError(f"{fname}: feature_columns vazia")
+                    if stage == 1:
+                        meta = {
+                            "n_features": len(fc),
+                            "threshold":  bundle.get("threshold"),
+                            "algorithm":  bundle.get("algorithm")
+                                or bundle.get("algo")
+                                or "unknown",
+                        }
+                with open(local["ml_report.json"]) as f:
+                    report = json.load(f)
+                if not isinstance(report, dict):
+                    raise ValueError("ml_report.json: top-level não é um dict")
+                s1 = report.get("stage1") or {}
+                meta["auc_pr"] = s1.get("auc_pr_test") or s1.get("auc_pr")
+            else:  # v3
+                # Importa o helper que normaliza dataclass → dict canonical
+                from ml_predictor import _safe_load, _to_dict
+                raw = _safe_load(local["dip_models_v3.pkl"])
+                bundle = _to_dict(raw)
+                if not bundle:
+                    raise ValueError("dip_models_v3.pkl: bundle vazio ou não reconhecido")
+                if "model_up" not in bundle or "model_down" not in bundle:
+                    raise ValueError(
+                        "dip_models_v3.pkl: faltam model_up/model_down (esperado v3)"
+                    )
+                fc = bundle.get("feature_cols") or []
+                if not fc:
+                    raise ValueError("dip_models_v3.pkl: feature_cols vazia")
+                with open(local["ml_report_v3.json"]) as f:
+                    report = json.load(f)
+                if not isinstance(report, dict):
+                    raise ValueError("ml_report_v3.json: top-level não é um dict")
+                cv = report.get("walk_forward_cv") or {}
+                meta = {
+                    "n_features": len(fc),
+                    "champion":   bundle.get("champion")
+                        or report.get("champion_model") or "unknown",
+                    "rho_up":     cv.get("rho_up_mean"),
+                    "rho_down":   cv.get("rho_down_mean"),
+                    "rho_mean":   cv.get("rho_mean"),
+                    "topk_pnl":   cv.get("topk_pnl_mean"),
+                    "trained_at": report.get("trained_at"),
+                }
 
             # ── Atomic swap: archive existing, then replace
             promoted = []
-            for fname in EXPECTED_FILES:
+            for fname in expected:
                 target = data_dir / fname
                 if target.exists():
                     arch = archive_dir / f"{Path(fname).stem}_{timestamp}{Path(fname).suffix}"
@@ -838,19 +899,39 @@ def _handle_admin_load_models(parts: list[str]) -> None:
                 promoted.append(fname)
                 logging.info(f"[admin_load_models] deployed → {target}")
 
-            # ── Reply com métricas
-            thr   = stage1_meta.get("threshold")
-            algo  = stage1_meta.get("algorithm")
-            n_feat = stage1_meta.get("n_features")
-            lines = [
-                "✅ *Modelos carregados com sucesso!*",
-                f"_{datetime.now().strftime('%d/%m/%Y %H:%M')} — archive ts {timestamp}_",
-                "",
-                "*📊 Stage 1 (gating):*",
-                f"  Algoritmo:  *{algo}*",
-                f"  AUC-PR:     *{auc_pr:.4f}*" if isinstance(auc_pr, (int, float)) else "  AUC-PR:     _N/D_",
-                f"  Threshold:  *{thr:.4f}*"    if isinstance(thr, (int, float))    else "  Threshold:  _N/D_",
-                f"  Features:   *{n_feat}*",
+            # ── Reply com métricas específicas do formato
+            if fmt == "legacy":
+                thr    = meta.get("threshold")
+                algo   = meta.get("algorithm")
+                n_feat = meta.get("n_features")
+                auc_pr = meta.get("auc_pr")
+                lines = [
+                    "✅ *Modelos carregados (legacy Tier A+B+C)*",
+                    f"_{datetime.now().strftime('%d/%m/%Y %H:%M')} — archive ts {timestamp}_",
+                    "",
+                    "*📊 Stage 1 (gating):*",
+                    f"  Algoritmo:  *{algo}*",
+                    f"  AUC-PR:     *{auc_pr:.4f}*" if isinstance(auc_pr, (int, float)) else "  AUC-PR:     _N/D_",
+                    f"  Threshold:  *{thr:.4f}*"    if isinstance(thr, (int, float))    else "  Threshold:  _N/D_",
+                    f"  Features:   *{n_feat}*",
+                ]
+            else:  # v3
+                lines = [
+                    "✅ *Modelo v3 carregado* (regressor dual XGB-v2)",
+                    f"_{datetime.now().strftime('%d/%m/%Y %H:%M')} — archive ts {timestamp}_",
+                    "",
+                    f"*Champion:*    `{meta.get('champion','unknown')}`",
+                    f"*Features:*    *{meta.get('n_features')}*",
+                ]
+                if isinstance(meta.get("rho_up"), (int, float)):
+                    lines.append(f"*rho_up:*      *{meta['rho_up']:.3f}*")
+                if isinstance(meta.get("rho_down"), (int, float)):
+                    lines.append(f"*rho_down:*    *{meta['rho_down']:.3f}*")
+                if isinstance(meta.get("topk_pnl"), (int, float)):
+                    lines.append(f"*Top-k PnL:*   *{meta['topk_pnl']*100:+.1f}%* /60d")
+                if meta.get("trained_at"):
+                    lines.append(f"*Trained:*     `{meta['trained_at']}`")
+            lines += [
                 "",
                 f"*Files deployed*: `{', '.join(promoted)}`",
                 f"*Archive*: `/data/archive/*_{timestamp}.*`",
