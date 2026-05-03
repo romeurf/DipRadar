@@ -1704,7 +1704,8 @@ def main() -> None:
 
     logging.info("Scheduler iniciado. Jobs activos:")
     for job in scheduler.get_jobs():
-        logging.info(f"  • {job.name} — próxima execução: {job.next_run_time}")
+        next_time = getattr(job, "next_run_time", "Pendente (aguarda arranque do scheduler)")
+        logging.info(f"  • {job.name} — próxima execução: {next_time}")
 
     send_telegram(
         f"🤖 *DipRadar v2 iniciado*\n"
