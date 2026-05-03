@@ -1556,8 +1556,13 @@ def _handle_command(text: str) -> None:
             except Exception:
                 pass
         from pathlib import Path
-        data_dir  = Path("/data") if Path("/data").exists() else Path("/tmp")
-        ml_status = "🟢 PKL pronto" if (data_dir / "dip_model_stage1.pkl").exists() else "🔴 Não treinado"
+        data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
+        repo_dir = Path(__file__).parent
+        ml_status = (
+            "🟢 PKL pronto"
+            if (data_dir / "dip_models_v3.pkl").exists() or (repo_dir / "dip_models_v3.pkl").exists()
+            else "🔴 Não treinado"
+        )
 
         try:
             from portfolio import get_liquidity, get_active_symbols

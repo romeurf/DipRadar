@@ -233,35 +233,43 @@ def _psi(ref_vals: np.ndarray, live_vals: np.ndarray, bins: int = _PSI_BINS) -> 
 def check_feature_drift(*, send_alert: bool = True) -> dict:
     """
     Compara a distribuição das features live (buffer) com a baseline de
-    treino guardada em ml_report.json.
+    treino guardada em ml_report_v3.json (com fallback para ml_report.json
+    legacy).
 
     Devolve um dict com PSI por feature e listas de features em cada zona.
     Envia alerta Telegram se alguma feature tiver PSI > _PSI_ALERT.
 
-    A baseline é lida de ml_report.json['feature_stats'] (escrito por
-    train_model.py). Se a chave não existir (relatório antigo), a função
-    devolve {"skipped": True} graciosamente.
+    A baseline é lida de report['feature_stats']. O notebook v3.1 actual
+    não grava feature_stats — nesse caso a função devolve
+    {"skipped": True} graciosamente.
     """
     global _last_drift_result
 
-    data_dir    = Path("/data") if Path("/data").exists() else Path("/tmp")
-    report_path = data_dir / "ml_report.json"
+    data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
+    repo_dir = Path(__file__).parent
 
-    # ─ Ler baseline do ml_report.json ─────────────────────────────────
-    if not report_path.exists():
-        logging.debug("[drift] ml_report.json não encontrado — skip")
-        return {"skipped": True, "reason": "ml_report.json ausente"}
+    # Procura em /data, depois no repo, v3 antes de legacy
+    candidates = [
+        data_dir / "ml_report_v3.json",
+        repo_dir / "ml_report_v3.json",
+        data_dir / "ml_report.json",
+        repo_dir / "ml_report.json",
+    ]
+    report_path = next((p for p in candidates if p.exists()), None)
+    if report_path is None:
+        logging.debug("[drift] ml_report_v3.json não encontrado — skip")
+        return {"skipped": True, "reason": "ml_report ausente"}
 
     try:
         with open(report_path) as f:
             report = json.load(f)
     except Exception as e:
-        logging.warning(f"[drift] Falha ao ler ml_report.json: {e}")
+        logging.warning(f"[drift] Falha ao ler {report_path.name}: {e}")
         return {"skipped": True, "reason": str(e)}
 
     feature_stats: dict | None = report.get("feature_stats")
     if not feature_stats:
-        logging.debug("[drift] ml_report.json sem 'feature_stats' — skip (relatório antigo)")
+        logging.debug(f"[drift] {report_path.name} sem 'feature_stats' — skip")
         return {"skipped": True, "reason": "feature_stats ausente no relatório"}
 
     # ─ Snapshot do buffer live ──────────────────────────────────────────
@@ -523,17 +531,22 @@ def build_health_report(*, ping_apis: bool = True) -> str:
 
         lines.append("")
 
-    # ── ML model ─────────────────────────────────────────────────────────────
-    data_dir   = Path("/data") if Path("/data").exists() else Path("/tmp")
-    pkl_s1     = data_dir / "dip_model_stage1.pkl"
-    pkl_s2     = data_dir / "dip_model_stage2.pkl"
-    ml_s1_str  = f"🟢 *pronto* (modificado {datetime.fromtimestamp(pkl_s1.stat().st_mtime).strftime('%d/%m %H:%M')})" \
-                 if pkl_s1.exists() else "🔴 _não treinado_"
-    ml_s2_str  = f"🟢 *pronto*" if pkl_s2.exists() else "⚪ _não treinado_"
+    # ── ML model (bundle v3 single-file) ────────────────────────────────────
+    data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
+    repo_dir = Path(__file__).parent
+    pkl_v3 = next(
+        (p for p in (data_dir / "dip_models_v3.pkl", repo_dir / "dip_models_v3.pkl")
+         if p.exists()),
+        None,
+    )
+    if pkl_v3 is not None:
+        mtime = datetime.fromtimestamp(pkl_v3.stat().st_mtime).strftime("%d/%m %H:%M")
+        ml_str = f"🟢 *pronto* (modificado {mtime})"
+    else:
+        ml_str = "🔴 _não treinado_"
 
-    lines.append("*🤖 Modelos ML:*")
-    lines.append(f"  Andar 1: {ml_s1_str}")
-    lines.append(f"  Andar 2: {ml_s2_str}")
+    lines.append("*🤖 Modelo ML (v3):*")
+    lines.append(f"  Bundle: {ml_str}")
     lines.append("")
 
     # ── Feature Drift ──────────────────────────────────────────────────────
