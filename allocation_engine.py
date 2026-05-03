@@ -34,8 +34,15 @@ Ver `docs/allocation_engine_design.md` para o roadmap completo (Fases 1-4).
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
+
+
+# ── Orçamento mensal (configurável via env var Railway) ───────────────────────
+# Define MONTHLY_BUDGET_EUR=<valor> no Railway para alterar sem tocar no código.
+# Fallback: 1050.0 (valor histórico).
+_MONTHLY_BUDGET_EUR: float = float(os.environ.get("MONTHLY_BUDGET_EUR", "1050.0"))
 
 
 # ── Constantes ────────────────────────────────────────────────────────────────
@@ -99,7 +106,7 @@ class AllocationContext:
     macro_regime_color:  str                  = "GREEN"  # GREEN | YELLOW | RED
     macro_multiplier:    float                = 1.0      # do macro_semaphore
     cash_available_eur:  float                = 0.0
-    monthly_budget_eur:  float                = 1050.0
+    monthly_budget_eur:  float                = field(default_factory=lambda: _MONTHLY_BUDGET_EUR)
 
 
 @dataclass
