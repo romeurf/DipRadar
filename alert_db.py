@@ -5,7 +5,7 @@ Guarda uma "fotografia" de cada alerta gerado com todas as métricas
 financeiras relevantes no momento do alerta.
 
 Fase 1 (actual): só registar (fotografar).
-Fase 2 (actual): fill_db_outcomes() preenche MFE/MAE a 1, 3, 6 meses.
+Fase 2 (actual): fill_db_outcomes() preenche MFE/MAE a 1, 3, 6 meses + return_60d.
 Fase 3 (futuro): treinar modelo sklearn/xgboost com os dados acumulados.
 
 Formato: CSV em /data/alert_db.csv (Railway Volume) ou /tmp/alert_db.csv.
@@ -25,27 +25,29 @@ _DB_PATH = Path("/data/alert_db.csv") if Path("/data").exists() else Path("/tmp/
 
 _FIELDS = [
     # Identificação
-    "date_iso",       # 2025-04-28
-    "time_iso",       # 14:32
+    "date_iso",            # 2025-04-28
+    "time_iso",            # 14:32
     "symbol",
     "name",
     "sector",
     # Classificação
-    "category",       # Hold Forever | Apartamento | Rotação
-    "verdict",        # COMPRAR | MONITORIZAR | EVITAR
-    "score",          # 0-100
+    "category",            # Hold Forever | Apartamento | Rotação
+    "verdict",             # COMPRAR | MONITORIZAR | EVITAR
+    "score",               # 0-100
     # Preço e mercado
     "price",
-    "market_cap_b",   # em billions USD
-    "drawdown_52w",   # % abaixo do máximo de 52 semanas (negativo)
-    "change_day_pct", # queda do dia que gerou o alerta
+    "market_cap_b",        # em billions USD
+    "drawdown_from_high",  # % abaixo do máximo de 52 semanas (negativo)
+                           # NOTA: era drawdown_52w — renomeado para coincidir
+                           # com o nome canónico do ml_predictor._FEATURE_COLS
+    "change_day_pct",      # queda do dia que gerou o alerta
     # Técnicos
     "rsi",
-    "volume_ratio",   # volume / average_volume (vazio se dados insuficientes)
+    "volume_ratio",        # volume / average_volume
     # Fundamentais
     "pe",
-    "pe_historical",  # P/E histórico de 5 anos
-    "pe_fair",        # P/E justo do sector
+    "pe_historical",
+    "pe_fair",
     "fcf_yield",
     "revenue_growth",
     "gross_margin",
@@ -56,17 +58,23 @@ _FIELDS = [
     # Contexto macro
     "spy_change",
     "sector_etf_change",
-    # Resultados futuros (preenchidos pelo fill_db_outcomes, inicialmente vazios)
-    "price_1m",       # preço 1 mês depois
+    # Resultados futuros — preenchidos por fill_db_outcomes()
+    "price_1m",
     "price_3m",
     "price_6m",
-    "return_1m",      # % retorno vs preço de alerta
+    "return_1m",
     "return_3m",
     "return_6m",
-    "mfe_3m",         # Maximum Favorable Excursion em 3 meses
-    "mae_3m",         # Maximum Adverse Excursion em 3 meses
-    "outcome_label",  # WIN_40 | WIN_20 | NEUTRAL | LOSS_15
+    # Target alinhado com o treino do XGB-v2 (max_return_60d)
+    "return_60d",          # retorno no dia ~60 a contar do alerta
+    "spy_return_60d",      # retorno SPY na mesma janela (para alpha_60d futuro)
+    "mfe_3m",
+    "mae_3m",
+    "outcome_label",       # WIN_40 | WIN_20 | NEUTRAL | LOSS_15
 ]
+
+# Maturidade mínima (dias) para preencher return_60d e rotular
+_MIN_DAYS_60D = 62  # 60 dias de calendário + 2 dias de buffer para fecho de mercado
 
 
 def _ensure_header() -> None:
@@ -85,10 +93,8 @@ def _ensure_header() -> None:
 def _safe_volume_ratio(vol: float | None, avg_vol: float | None) -> float | str:
     """
     Calcula volume / average_volume de forma segura para ML.
-    Retorna string vazia se qualquer valor for None, zero ou negativo
-    — um ratio inventado (ex: vol/1) seria ruído para o modelo.
-    Threshold mínimo de avg_vol: 1000 acções (exclui ETFs ilíquidos com
-    average_volume = 0 reportado pelo Yahoo Finance).
+    Retorna string vazia se qualquer valor for None, zero ou negativo.
+    Threshold mínimo de avg_vol: 1000 acções.
     """
     if not vol or not avg_vol or avg_vol < 1000:
         return ""
@@ -128,11 +134,10 @@ def log_alert_snapshot(
 ) -> None:
     """
     Regista um alerta na base de dados ML.
-    Campos de resultado (return_1m, MFE, etc.) ficam vazios para serem
-    preenchidos futuramente pelo fill_db_outcomes().
+    Campos de resultado (return_1m, MFE, return_60d, etc.) ficam vazios para
+    serem preenchidos futuramente pelo fill_db_outcomes().
 
     historical_pe pode ser um dict (de get_historical_pe) ou um float/None.
-    Extrai pe_hist_median se for dict.
     """
     _ensure_header()
     try:
@@ -144,42 +149,43 @@ def log_alert_snapshot(
             fundamentals.get("average_volume"),
         )
 
-        # historical_pe pode chegar como dict (get_historical_pe()) ou float
         if isinstance(historical_pe, dict):
             _pe_hist_val = historical_pe.get("pe_hist_median")
         else:
             _pe_hist_val = historical_pe
 
         row = {
-            "date_iso":         datetime.now().date().isoformat(),
-            "time_iso":         datetime.now().strftime("%H:%M"),
-            "symbol":           symbol,
-            "name":             (fundamentals.get("name") or "")[:40],
-            "sector":           sector,
-            "category":         category,
-            "verdict":          verdict,
-            "score":            round(score, 1),
-            "price":            fundamentals.get("price") or "",
-            "market_cap_b":     round((fundamentals.get("market_cap") or 0) / 1e9, 2),
-            "drawdown_52w":     fundamentals.get("drawdown_from_high") or "",
-            "change_day_pct":   round(change_day_pct, 2),
-            "rsi":              round(rsi_val, 1) if rsi_val is not None else "",
-            "volume_ratio":     vol_ratio,
-            "pe":               fundamentals.get("pe") or "",
-            "pe_historical":    round(_pe_hist_val, 1) if _pe_hist_val is not None else "",
-            "pe_fair":          pe_fair,
-            "fcf_yield":        round(fundamentals.get("fcf_yield") or 0, 4) if fundamentals.get("fcf_yield") is not None else "",
-            "revenue_growth":   round(fundamentals.get("revenue_growth") or 0, 4),
-            "gross_margin":     round(fundamentals.get("gross_margin") or 0, 4),
-            "debt_equity":      fundamentals.get("debt_equity") or "",
-            "dividend_yield":   round(fundamentals.get("dividend_yield") or 0, 4),
-            "beta":             fundamentals.get("beta") or "",
-            "analyst_upside":   round(fundamentals.get("analyst_upside") or 0, 1),
-            "spy_change":       round(spy_change, 2) if spy_change is not None else "",
-            "sector_etf_change": round(sector_etf_change, 2) if sector_etf_change is not None else "",
+            "date_iso":           datetime.now().date().isoformat(),
+            "time_iso":           datetime.now().strftime("%H:%M"),
+            "symbol":             symbol,
+            "name":               (fundamentals.get("name") or "")[:40],
+            "sector":             sector,
+            "category":           category,
+            "verdict":            verdict,
+            "score":              round(score, 1),
+            "price":              fundamentals.get("price") or "",
+            "market_cap_b":       round((fundamentals.get("market_cap") or 0) / 1e9, 2),
+            "drawdown_from_high": fundamentals.get("drawdown_from_high") or "",  # nome canónico
+            "change_day_pct":     round(change_day_pct, 2),
+            "rsi":                round(rsi_val, 1) if rsi_val is not None else "",
+            "volume_ratio":       vol_ratio,
+            "pe":                 fundamentals.get("pe") or "",
+            "pe_historical":      round(_pe_hist_val, 1) if _pe_hist_val is not None else "",
+            "pe_fair":            pe_fair,
+            "fcf_yield":          round(fundamentals.get("fcf_yield") or 0, 4) if fundamentals.get("fcf_yield") is not None else "",
+            "revenue_growth":     round(fundamentals.get("revenue_growth") or 0, 4),
+            "gross_margin":       round(fundamentals.get("gross_margin") or 0, 4),
+            "debt_equity":        fundamentals.get("debt_equity") or "",
+            "dividend_yield":     round(fundamentals.get("dividend_yield") or 0, 4),
+            "beta":               fundamentals.get("beta") or "",
+            "analyst_upside":     round(fundamentals.get("analyst_upside") or 0, 1),
+            "spy_change":         round(spy_change, 2) if spy_change is not None else "",
+            "sector_etf_change":  round(sector_etf_change, 2) if sector_etf_change is not None else "",
             # Resultado — a preencher pelo fill_db_outcomes
             "price_1m": "", "price_3m": "", "price_6m": "",
             "return_1m": "", "return_3m": "", "return_6m": "",
+            "return_60d": "",     # target alinhado com max_return_60d do treino
+            "spy_return_60d": "", # para alpha_60d no retreino futuro
             "mfe_3m": "", "mae_3m": "", "outcome_label": "",
         }
         with _DB_PATH.open("a", newline="", encoding="utf-8") as f:
@@ -192,27 +198,26 @@ def log_alert_snapshot(
 
 def fill_db_outcomes() -> dict:
     """
-    Fase 2 — preenche os campos de resultado (MFE/MAE/returns) para alertas
-    com pelo menos 30 dias de histórico disponível.
+    Fase 2 — preenche os campos de resultado para alertas maduros.
 
-    Fonte de preços: Tiingo API (tiingo_client.py).
-    Requer TIINGO_API_KEY no ambiente.
+    Janelas:
+      return_1m  / price_1m  : >= 30 dias
+      return_3m  / price_3m  : >= 90 dias (+ MFE/MAE)
+      return_6m  / price_6m  : >= 180 dias
+      return_60d             : >= 62 dias (alinhado com max_return_60d do treino)
+      spy_return_60d         : >= 62 dias (referência SPY para alpha futuro)
 
-    Lógica por janela:
-      - return_1m  / price_1m  : preenchido se alerta tem >= 30 dias
-      - return_3m  / price_3m  : preenchido se alerta tem >= 90 dias
-      - return_6m  / price_6m  : preenchido se alerta tem >= 180 dias
-      - mfe_3m / mae_3m        : preenchido se alerta tem >= 90 dias
-        MFE = retorno máximo intraday em qualquer dia dos 90 dias
-        MAE = drawdown máximo intraday em qualquer dia dos 90 dias
-      - outcome_label: WIN_40 | WIN_20 | NEUTRAL | LOSS_15
-        Referência por categoria:
-          Apartamento  → prioridade return_6m > return_3m > return_1m
-          Hold Forever → nunca classifica (posição sem target de saída)
-          Rotação      → prioridade return_3m > return_6m > return_1m
+    TRAVA DE MATURIDADE: return_60d só é preenchido se
+      data_actual >= alert_date + _MIN_DAYS_60D (62 dias).
+    Isto evita injectar falsos negativos no treino quando o alerta
+    tem menos de 60 dias e o retorno actual é ainda parcial.
 
+    outcome_label usa return_60d como referência primária (alinhado com
+    o target max_return_60d usado para treinar o XGB-v2 champion).
+    Fallback: return_3m -> return_6m -> return_1m (compatibilidade).
+
+    Hold Forever nunca recebe label.
     Só actualiza linhas onde os campos ainda estão vazios.
-    Retorna dict com stats do run para logging/Telegram.
     """
     from tiingo_client import get_ohlcv, get_price_at, get_mfe_mae
     from score import CATEGORY_APARTAMENTO, CATEGORY_HOLD_FOREVER
@@ -234,14 +239,14 @@ def fill_db_outcomes() -> dict:
     updated    = 0
     skipped    = 0
     errors     = 0
-    sym_cache: dict = {}  # cache de candles por símbolo — evita chamadas duplicadas
+    sym_cache: dict = {}
 
     for i, row in enumerate(rows):
-        # Só processar linhas que ainda têm campos em falta
-        needs_1m = row.get("return_1m") == ""
-        needs_3m = row.get("return_3m") == ""
-        needs_6m = row.get("return_6m") == ""
-        if not (needs_1m or needs_3m or needs_6m):
+        needs_1m  = row.get("return_1m")   == ""
+        needs_3m  = row.get("return_3m")   == ""
+        needs_6m  = row.get("return_6m")   == ""
+        needs_60d = row.get("return_60d")  == ""
+        if not (needs_1m or needs_3m or needs_6m or needs_60d):
             skipped += 1
             continue
 
@@ -263,20 +268,17 @@ def fill_db_outcomes() -> dict:
 
         days_elapsed = (today - alert_date).days
 
-        # Nada a fazer se ainda não passaram 30 dias
         if days_elapsed < 30:
             skipped += 1
             continue
 
-        # Buscar histórico via Tiingo (com cache por símbolo)
         if symbol not in sym_cache:
             try:
-                start = alert_date - timedelta(days=1)
-                end   = min(today, alert_date + timedelta(days=210))
+                start   = alert_date - timedelta(days=1)
+                end     = min(today, alert_date + timedelta(days=210))
                 candles = get_ohlcv(symbol, start, end)
                 sym_cache[symbol] = candles
             except EnvironmentError as e:
-                # TIINGO_API_KEY não definida — aborta imediatamente
                 logging.error(f"[fill_db] {e}")
                 return {
                     "total": len(rows),
@@ -298,25 +300,52 @@ def fill_db_outcomes() -> dict:
 
         changed = False
 
-        # ── T+1m ──────────────────────────────────────────────────────────────────────
+        # ── T+1m ─────────────────────────────────────────────────────────────
         if needs_1m and days_elapsed >= 30:
             p1m = get_price_at(candles, alert_date + timedelta(days=30))
             if p1m is not None and price_entry > 0:
-                r1m = (p1m - price_entry) / price_entry * 100
                 row["price_1m"]  = round(p1m, 4)
-                row["return_1m"] = round(r1m, 2)
+                row["return_1m"] = round((p1m - price_entry) / price_entry * 100, 2)
                 changed = True
 
-        # ── T+3m ──────────────────────────────────────────────────────────────────────
+        # ── T+60d (target primário — alinhado com max_return_60d do treino) ──
+        # TRAVA: só preenche se alert_date + _MIN_DAYS_60D <= hoje.
+        # Sem esta trava, um alerta com 15 dias geraria um falso negativo
+        # se o retorno actual fosse negativo mas o pico real ainda não
+        # tivesse ocorrido.
+        if needs_60d and days_elapsed >= _MIN_DAYS_60D:
+            p60d = get_price_at(candles, alert_date + timedelta(days=60))
+            if p60d is not None and price_entry > 0:
+                row["return_60d"] = round((p60d - price_entry) / price_entry * 100, 2)
+                changed = True
+            # SPY para calcular alpha no retreino futuro
+            if row.get("spy_return_60d") == "":
+                try:
+                    from tiingo_client import get_ohlcv as _get_ohlcv, get_price_at as _get_price_at
+                    spy_candles = sym_cache.get("SPY")
+                    if spy_candles is None:
+                        spy_candles = _get_ohlcv(
+                            "SPY",
+                            alert_date - timedelta(days=1),
+                            min(today, alert_date + timedelta(days=70)),
+                        )
+                        sym_cache["SPY"] = spy_candles
+                    spy_entry = _get_price_at(spy_candles, alert_date)
+                    spy_exit  = _get_price_at(spy_candles, alert_date + timedelta(days=60))
+                    if spy_entry and spy_exit and spy_entry > 0:
+                        row["spy_return_60d"] = round(
+                            (spy_exit - spy_entry) / spy_entry * 100, 2
+                        )
+                except Exception as e:
+                    logging.debug(f"[fill_db] SPY 60d para {symbol}: {e}")
+
+        # ── T+3m ─────────────────────────────────────────────────────────────
         if needs_3m and days_elapsed >= 90:
             p3m = get_price_at(candles, alert_date + timedelta(days=91))
             if p3m is not None and price_entry > 0:
-                r3m = (p3m - price_entry) / price_entry * 100
                 row["price_3m"]  = round(p3m, 4)
-                row["return_3m"] = round(r3m, 2)
+                row["return_3m"] = round((p3m - price_entry) / price_entry * 100, 2)
                 changed = True
-
-                # ── MFE / MAE nos primeiros 90 dias ─────────────────────────────
                 if row.get("mfe_3m") == "":
                     mfe, mae = get_mfe_mae(
                         candles,
@@ -329,28 +358,25 @@ def fill_db_outcomes() -> dict:
                     if mae is not None:
                         row["mae_3m"] = mae
 
-        # ── T+6m ──────────────────────────────────────────────────────────────────────
+        # ── T+6m ─────────────────────────────────────────────────────────────
         if needs_6m and days_elapsed >= 180:
             p6m = get_price_at(candles, alert_date + timedelta(days=182))
             if p6m is not None and price_entry > 0:
-                r6m = (p6m - price_entry) / price_entry * 100
                 row["price_6m"]  = round(p6m, 4)
-                row["return_6m"] = round(r6m, 2)
+                row["return_6m"] = round((p6m - price_entry) / price_entry * 100, 2)
                 changed = True
 
-        # ── outcome_label ────────────────────────────────────────────────────────────
+        # ── outcome_label ─────────────────────────────────────────────────────
+        # Referência primária: return_60d (alinhado com max_return_60d do treino).
+        # Só atribui label se a janela de 60d já estiver madura (trava acima).
+        # Hold Forever nunca recebe label.
         if changed and row.get("outcome_label") == "":
-            # Hold Forever nunca recebe label — não há target de saída
             if CATEGORY_HOLD_FOREVER in category:
-                pass
+                pass  # sem target de saída definido
             else:
-                if CATEGORY_APARTAMENTO in category:
-                    priority = ("return_6m", "return_3m", "return_1m")
-                else:
-                    priority = ("return_3m", "return_6m", "return_1m")
-
                 ref_return = None
-                for field in priority:
+                # Prioridade: return_60d > return_3m > return_6m > return_1m
+                for field in ("return_60d", "return_3m", "return_6m", "return_1m"):
                     val = row.get(field)
                     if val not in ("", None):
                         try:
@@ -358,15 +384,17 @@ def fill_db_outcomes() -> dict:
                             break
                         except ValueError:
                             pass
-
-                if ref_return is not None:
+                # Só rotula se a janela 60d estiver madura
+                if ref_return is not None and (
+                    row.get("return_60d") not in ("", None)
+                    or days_elapsed >= _MIN_DAYS_60D
+                ):
                     row["outcome_label"] = _resolve_outcome_label(ref_return)
 
         if changed:
             rows[i] = row
             updated += 1
 
-    # Reescrever o CSV completo com as actualizações
     if updated > 0:
         try:
             with _DB_PATH.open("w", newline="", encoding="utf-8") as f:
@@ -374,8 +402,8 @@ def fill_db_outcomes() -> dict:
                 writer.writeheader()
                 writer.writerows(rows)
             logging.info(
-                f"[fill_db] CSV actualizado: {updated} linhas novas "
-                f"| {skipped} ignoradas | {errors} erros"
+                f"[fill_db] CSV actualizado: {updated} linhas | "
+                f"{skipped} ignoradas | {errors} erros"
             )
         except Exception as e:
             logging.error(f"[fill_db] Erro ao reescrever CSV: {e}")
@@ -392,18 +420,9 @@ def fill_db_outcomes() -> dict:
 def get_db_stats() -> dict:
     """
     Estatísticas rápidas para Telegram /admin e setup_schedule jobs.
-
-    Returns:
-        {
-          "total":    nº total de alertas registados,
-          "labeled":  nº com outcome_label preenchido,
-          "outcomes": dict {label: count} (apenas labeled),
-          "first_date": ISO date do alerta mais antigo,
-          "last_date":  ISO date do alerta mais recente,
-        }
     """
     if not _DB_PATH.exists():
-        return {"total": 0, "labeled": 0, "outcomes": {}, "first_date": None, "last_date": None}
+        return {"total": 0, "labeled": 0, "outcomes": {}, "first_date": None, "last_date": None, "db_path": str(_DB_PATH)}
 
     try:
         with _DB_PATH.open("r", newline="", encoding="utf-8") as f:
@@ -411,11 +430,11 @@ def get_db_stats() -> dict:
             rows = list(reader)
     except Exception as e:
         logging.error(f"[get_db_stats] erro a ler CSV: {e}")
-        return {"total": 0, "labeled": 0, "outcomes": {}, "error": str(e)}
+        return {"total": 0, "labeled": 0, "outcomes": {}, "error": str(e), "db_path": str(_DB_PATH)}
 
     total = len(rows)
     if total == 0:
-        return {"total": 0, "labeled": 0, "outcomes": {}, "first_date": None, "last_date": None}
+        return {"total": 0, "labeled": 0, "outcomes": {}, "first_date": None, "last_date": None, "db_path": str(_DB_PATH)}
 
     outcomes: dict[str, int] = {}
     labeled = 0
@@ -426,10 +445,17 @@ def get_db_stats() -> dict:
             outcomes[label] = outcomes.get(label, 0) + 1
 
     dates = sorted([r.get("date_iso", "") for r in rows if r.get("date_iso")])
+    by_category: dict[str, int] = {}
+    for row in rows:
+        cat = (row.get("category") or "Unknown").strip()
+        by_category[cat] = by_category.get(cat, 0) + 1
+
     return {
-        "total":      total,
-        "labeled":    labeled,
-        "outcomes":   outcomes,
-        "first_date": dates[0] if dates else None,
-        "last_date":  dates[-1] if dates else None,
+        "total":       total,
+        "labeled":     labeled,
+        "outcomes":    outcomes,
+        "first_date":  dates[0] if dates else None,
+        "last_date":   dates[-1] if dates else None,
+        "by_category": by_category,
+        "db_path":     str(_DB_PATH),
     }
