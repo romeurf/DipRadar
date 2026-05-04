@@ -1473,40 +1473,51 @@ def run_monthly_retrain() -> None:
     """
     Corre no dia 1 de cada mês às 06:00 Lisboa.
 
-    Delega para `monthly_retrain.run_monthly_retrain_v2` que faz:
+    Delega para `monthly_retrain.run_monthly_retrain_v3` que faz:
       1. Build training input (bootstrap + alert_db + universe_snapshot)
-      2. Treina candidate em /data/candidate/
-      3. Walk-forward gating: candidate só substitui produção se
-         AUC-PR ≥ prod × 0.95
-      4. Atomic deploy + archive da versão antiga
+      2. Treina candidate via `ml_training.train_v31.run_training`
+         (regressor alpha_60d + isotonic, 10 folds purgados)
+      3. Gating ρ_α: candidate só substitui produção se
+         ρ_α(cand) ≥ ρ_α(prod) × 0.90 e ρ_α(cand) ≥ floor (default 0.20).
+         Caso contrário guardado como `dip_models_v3_pending.pkl`.
+      4. Backup automático em /data/archive/.
 
-    Telegram: status final (PROMOTED / KEPT / FAILED) + delta de AUC-PR.
+    Telegram: PROMOTED / PENDING / KEPT_FLOOR / FAILED + delta ρ_α.
     """
-    logging.info("[monthly_retrain] A iniciar retreino mensal v2...")
+    logging.info("[monthly_retrain] A iniciar retreino mensal v3...")
     now_str = datetime.now(LISBON_TZ).strftime("%d/%m/%Y %H:%M")
 
     try:
-        from monthly_retrain import run_monthly_retrain_v2
-        result = run_monthly_retrain_v2()
+        from monthly_retrain import run_monthly_retrain_v3
+        result = run_monthly_retrain_v3()
     except Exception as e:
-        logging.error(f"[monthly_retrain] v2 falhou: {e}", exc_info=True)
+        logging.error(f"[monthly_retrain] v3 falhou: {e}", exc_info=True)
         send_telegram(
             f"❌ *Retreino Mensal — Erro*\n"
             f"`{e}`\n_⏰ {now_str}_"
         )
         return
 
-    decision  = result.get("decision", "?")
-    cand_auc  = result.get("candidate_auc_pr")
-    prod_auc  = result.get("production_auc_pr")
-    reason    = result.get("reason", "")
-    elapsed   = result.get("elapsed_s", 0)
-    s1        = result.get("candidate_stage1") or {}
-    s2        = result.get("candidate_stage2") or {}
-    outcomes  = result.get("outcome_stats") or {}
+    decision   = result.get("decision", "?")
+    cand_rho   = result.get("candidate_rho_alpha")
+    prod_rho   = result.get("production_rho_alpha")
+    cand_brier = result.get("candidate_brier")
+    prod_brier = result.get("production_brier")
+    cand_pnl   = result.get("candidate_topk_pnl")
+    prod_pnl   = result.get("production_topk_pnl")
+    reason     = result.get("reason", "")
+    elapsed    = result.get("elapsed_s", 0)
+    floor      = result.get("floor_rho_alpha")
+    ratio      = result.get("gating_ratio")
+    outcomes   = result.get("outcome_stats") or {}
 
-    # Header com decisão
-    icon = {"PROMOTED": "🚀", "KEPT": "🛑", "FAILED": "❌", "DRY-RUN": "🧪"}.get(decision, "⚙️")
+    icon = {
+        "PROMOTED":   "🚀",
+        "PENDING":    "⚠️",
+        "KEPT_FLOOR": "🛑",
+        "FAILED":     "❌",
+        "DRY-RUN":    "🧪",
+    }.get(decision, "⚙️")
 
     def _fmt(v) -> str:
         if v is None:
@@ -1516,8 +1527,20 @@ def run_monthly_retrain() -> None:
         except (TypeError, ValueError):
             return str(v)
 
+    def _delta_line(cand, prod) -> str:
+        try:
+            cand_f = float(cand)
+            prod_f = float(prod)
+            if prod_f == 0:
+                return ""
+            d = (cand_f - prod_f) / prod_f * 100
+            sign = "+" if d >= 0 else ""
+            return f"  delta     : *{sign}{d:.1f}%*"
+        except (TypeError, ValueError):
+            return ""
+
     lines = [
-        f"{icon} *Retreino Mensal v2 — {decision}*",
+        f"{icon} *Retreino Mensal v3 — {decision}*",
         f"_{now_str} ({elapsed:.0f}s)_",
         "",
     ]
@@ -1525,33 +1548,36 @@ def run_monthly_retrain() -> None:
         lines.append(f"_{reason}_")
         lines.append("")
 
-    if cand_auc is not None or prod_auc is not None:
+    if cand_rho is not None or prod_rho is not None:
         lines += [
-            f"*Stage 1 AUC-PR:*",
-            f"  candidate : *{_fmt(cand_auc)}*",
-            f"  produção  : *{_fmt(prod_auc)}*",
+            "*ρ_α (Spearman alpha_60d):*",
+            f"  candidate : *{_fmt(cand_rho)}*",
+            f"  produção  : *{_fmt(prod_rho)}*",
         ]
-        if cand_auc and prod_auc:
-            delta = (cand_auc - prod_auc) / prod_auc * 100
-            sign  = "+" if delta >= 0 else ""
-            lines.append(f"  delta     : *{sign}{delta:.1f}%*")
+        d_line = _delta_line(cand_rho, prod_rho)
+        if d_line:
+            lines.append(d_line)
         lines.append("")
 
-    if s1:
+    if cand_brier is not None or prod_brier is not None:
         lines += [
-            f"*Candidate Stage 1:*",
-            f"  threshold: {s1.get('threshold', 'N/A')}",
-            f"  precision: {s1.get('test_precision', 'N/A')}",
-            f"  recall   : {s1.get('test_recall', 'N/A')}",
-            f"  n_test   : {s1.get('n_test', 'N/A')}",
+            "*Brier OOF (calibração):*",
+            f"  candidate : *{_fmt(cand_brier)}*",
+            f"  produção  : *{_fmt(prod_brier)}*",
             "",
         ]
-    if s2 and s2.get("auc_pr_test"):
+
+    if cand_pnl is not None or prod_pnl is not None:
         lines += [
-            "*Candidate Stage 2:*",
-            f"  AUC-PR: {_fmt(s2.get('auc_pr_test'))}",
+            "*Top-K PnL (mean):*",
+            f"  candidate : *{_fmt(cand_pnl)}*",
+            f"  produção  : *{_fmt(prod_pnl)}*",
             "",
         ]
+
+    if floor is not None and ratio is not None:
+        lines.append(f"_Gating: ratio={ratio} | floor ρ_α={_fmt(floor)}_")
+        lines.append("")
 
     if outcomes:
         lines += [
@@ -1560,9 +1586,15 @@ def run_monthly_retrain() -> None:
             "",
         ]
 
+    if decision == "PENDING":
+        lines.append("_Bundle guardado como `dip_models_v3_pending.pkl` — revisão manual._")
+        lines.append("")
+
     lines.append("_Próximo retreino: dia 1 do mês seguinte às 06h_")
     send_telegram("\n".join(lines))
-    logging.info(f"[monthly_retrain] decision={decision} cand={cand_auc} prod={prod_auc}")
+    logging.info(
+        f"[monthly_retrain] decision={decision} cand_rho={cand_rho} prod_rho={prod_rho}"
+    )
 
 
 # ── Daily Universe Snapshot (após fecho US) ────────────────────────────────────
