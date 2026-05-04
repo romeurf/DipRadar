@@ -295,6 +295,7 @@ def build_training_input(include_snapshot: bool = True,
     if BOOTSTRAP_PATH.exists() and not os.getenv("FORCE_BOOTSTRAP_FROM_REPO"):
         bootstrap_src = BOOTSTRAP_PATH
     elif BOOTSTRAP_FALLBACK.exists():
+        bootstrap_src = BOOTSTRAP_FALLBACK  # ← fix: assign the fallback
         log.warning(
             f"[input] {BOOTSTRAP_PATH} ausente — fallback para parquet do repo "
             f"({BOOTSTRAP_FALLBACK})."
