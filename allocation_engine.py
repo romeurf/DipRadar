@@ -1,10 +1,10 @@
 """
-allocation_engine.py — Motor read-only de sugestão de alocação (Fase 1).
+allocation_engine.py — Motor read-only de sugestão de alocação (Fase 4).
 
-Dado um sinal (ticker + dip_score + ML metrics + macro regime + liquidez),
+Dado um sinal (ticker + V2 fund_score + ML metrics + macro regime + liquidez),
 o motor sugere:
 
-  • Categoria  : ETF_CORE | HOLD_FOREVER | APARTAMENTO | GROWTH | FLIP | PASS
+  • Categoria  : CORE | HIGH_CONVICTION | GROWTH | FLIP | PASS
   • Sizing     : amount_eur (clamped à liquidez disponível e a mínimos T212)
   • Confiança  : Alta | Média | Baixa
   • Exit rule  : NEVER | THESIS_BREAK | TARGET_+15% | TARGET_+20% | TIME_60D
@@ -19,17 +19,30 @@ Para a versão "from-symbol-to-decision" (que faz o data fetching), ver
 `main.allocate_ticker()`, que orquestra a leitura de fundamentals + ML +
 macro e depois invoca `suggest_allocation()` aqui.
 
-Filosofia de design
--------------------
+Filosofia de design (Fase 4)
+----------------------------
 1. Read-only: nunca executa ordens. Só sugere.
-2. Conservador por defeito: regimes RED bloqueiam novas entradas em
-   GROWTH/FLIP; ETF_CORE e HOLD_FOREVER continuam autorizados (lógica
-   defensiva do design doc).
-3. Mínimos T212-compatíveis: floor €20 para fractional shares.
-4. Cap por nome: nunca propõe mais que `monthly_budget * MAX_SINGLE_NAME_PCT`
-   nem mais que a liquidez disponível.
+2. **Sem listas hardcoded de tickers** — HIGH_CONVICTION é derivada de
+   `is_bluechip` + `fund_score>=65` + `not is_preprofit`. A categoria
+   sai/entra automaticamente conforme a saúde fundamental da empresa.
+3. Conservador por defeito: regime RED zera GROWTH/FLIP; CORE e
+   HIGH_CONVICTION continuam autorizados (postura defensiva).
+4. Mínimos T212-compatíveis: floor €20 para fractional shares.
+5. Sizing tier-based no fund_score (V2 puro, sem ML baked-in):
+     fund≥85 + WIN_STRONG → 1.50x
+     fund≥75              → 1.00x
+     fund≥65              → 0.70x
+     fund≥55              → 0.30x
+     fund<55              → 0     (PASS)
+6. Pre-profit cap ×0.5: empresas que queimam caixa nunca recebem alocação
+   máxima, mesmo com sinal técnico forte.
+7. Sectores premium (Technology, Energy): bonus ×1.20 — convicção temática
+   na tese de IA + transição energética. Lista hardcoded (não env var).
+8. Concentration cap: HIGH_CONVICTION até 30% portfolio, restantes 12%;
+   slowdown ×0.5 quando posição actual >8% (para não saltar limites).
 
-Ver `docs/allocation_engine_design.md` para o roadmap completo (Fases 1-4).
+Backward compat: aliases CAT_ETF_CORE / CAT_HOLD_FOREVER / CAT_APARTAMENTO
+mantidos como aliases dos novos nomes para não quebrar consumers externos.
 """
 
 from __future__ import annotations
@@ -53,42 +66,62 @@ _MONTHLY_BUDGET_EUR: float = float(_raw_budget)
 
 # ── Constantes ────────────────────────────────────────────────────────────────
 
-# Categorias (strings estáveis para serialização / logs)
-CAT_ETF_CORE     = "ETF_CORE"
-CAT_HOLD_FOREVER = "HOLD_FOREVER"
-CAT_APARTAMENTO  = "APARTAMENTO"
-CAT_GROWTH       = "GROWTH"
-CAT_FLIP         = "FLIP"
-CAT_PASS         = "PASS"
+# Categorias activas (4 + PASS)
+CAT_CORE             = "CORE"             # ETFs (passive DCA)
+CAT_HIGH_CONVICTION  = "HIGH_CONVICTION"  # bluechip saudável (derivado de fundamentals)
+CAT_GROWTH           = "GROWTH"           # active stock pick (fund_score>=55)
+CAT_FLIP             = "FLIP"             # CONFLICT_TECH (fund<55 + ml bull)
+CAT_PASS             = "PASS"             # sem encaixe — esperar cash
 
-# Pesos-alvo (fracção do orçamento mensal). Soma > 100% por design — alguns
-# meses não acertam todas as categorias e o orçamento que sobra fica em cash.
+# Aliases backward-compat (não usar em código novo)
+CAT_ETF_CORE     = CAT_CORE
+CAT_HOLD_FOREVER = CAT_HIGH_CONVICTION
+CAT_APARTAMENTO  = CAT_HIGH_CONVICTION
+
+# Pesos-alvo (fracção do orçamento mensal). Soma = 100%.
 _TARGET_PCT: dict[str, float] = {
-    CAT_ETF_CORE:     0.45,   # core ETF (DCA)
-    CAT_HOLD_FOREVER: 0.12,   # blue-chip raro
-    CAT_APARTAMENTO:  0.10,   # dividend / value
-    CAT_GROWTH:       0.06,   # active stock pick
-    CAT_FLIP:         0.04,   # tactical
+    CAT_CORE:            0.20,   # €210/mês (com 1050€ budget)
+    CAT_HIGH_CONVICTION: 0.30,   # €315
+    CAT_GROWTH:          0.40,   # €420
+    CAT_FLIP:            0.10,   # €105
 }
 
-# Mínimo absoluto para uma sugestão fazer sentido (T212 fractional shares
-# trabalham bem a partir de €20). Abaixo disto, é melhor acumular cash para
-# o mês seguinte.
-_MIN_TICKET_EUR    = 20.0
-_MAX_FLIP_EUR      = 40.0     # cap absoluto para FLIP (alta rotação, single-name)
-_MAX_GROWTH_EUR    = 80.0     # cap absoluto para GROWTH (single-name risk)
+# Sectores "premium" (tese estratégica IA + transição energética).
+# Hardcoded em código, não env var — para ser auditável em git.
+HIGH_CONVICTION_SECTORS: frozenset[str] = frozenset({
+    "Technology",
+    "Energy",
+})
+_SECTOR_BONUS = 1.20
 
-# Cap por nome em fracção do orçamento mensal (qualquer categoria não-ETF)
-_MAX_SINGLE_NAME_PCT = 0.15
+# Mínimo absoluto T212 (fractional shares trabalham bem a partir de €20)
+_MIN_TICKET_EUR = 20.0
 
-# Thresholds de label do ML (em pred_up = retorno previsto a 60d)
-_ML_WIN_STRONG = 0.10   # > +10% expected → WIN_STRONG
-_ML_WIN        = 0.05   # > +5%  expected → WIN
+# Concentration caps (% do portfolio actual)
+_CAP_PCT_HIGH_CONVICTION = 0.30
+_CAP_PCT_DEFAULT         = 0.12
+_SLOWDOWN_THRESHOLD      = 0.08   # >8% no default → slowdown ×0.5
+_SLOWDOWN_MULT           = 0.5
 
-# Dip score thresholds (0-100)
-_DIP_GROWTH_MIN  = 60
-_DIP_PASS_MAX    = 40
-_DIP_HOLD_FOREVER_MIN = 70   # mesma lógica que score.classify_dip_category
+# Pre-profit cap (FCF negativo)
+_PREPROFIT_MULT = 0.5
+
+# Score multiplier tiers (segue plano da Fase 4)
+def _score_multiplier(fund_score: float, ml_label: str) -> float:
+    """Multiplicador de sizing baseado no fund_score (V2 puro).
+
+    Fase 4: tier agressivo no topo (1.50x para 85+ com WIN_STRONG),
+    nada abaixo de 55 (cai em PASS).
+    """
+    if fund_score >= 85.0 and ml_label == "WIN_STRONG":
+        return 1.50
+    if fund_score >= 75.0:
+        return 1.00
+    if fund_score >= 65.0:
+        return 0.70
+    if fund_score >= 55.0:
+        return 0.30
+    return 0.0
 
 
 # ── Dataclasses ───────────────────────────────────────────────────────────────
@@ -96,23 +129,32 @@ _DIP_HOLD_FOREVER_MIN = 70   # mesma lógica que score.classify_dip_category
 @dataclass
 class AllocationContext:
     """Tudo que o motor precisa para decidir, num único objecto."""
-    ticker:              str
-    dip_score:           float                = 0.0      # 0-100
-    is_etf:              bool                 = False
-    is_bluechip:         bool                 = False
-    sector:              str                  = ""
-    drawdown_52w:        float | None         = None     # negativo ou None
-    dividend_yield:      float | None         = None     # 0.025 = 2.5%
-    classify_category:   str | None           = None     # output de score.classify_dip_category
-    pred_up:             float | None         = None     # MLResult.pred_up
-    pred_down:           float | None         = None     # MLResult.pred_down (informativo)
-    win_prob:            float | None         = None     # MLResult.win_prob (calibrado)
-    ml_label:            str                  = "NO_MODEL"
-    model_ready:         bool                 = False
-    macro_regime_color:  str                  = "GREEN"  # GREEN | YELLOW | RED
-    macro_multiplier:    float                = 1.0      # do macro_semaphore
-    cash_available_eur:  float                = 0.0
-    monthly_budget_eur:  float                = field(default_factory=lambda: _MONTHLY_BUDGET_EUR)
+    ticker:                str
+    # Score V2 (preferir fund_only_score sem ML baked-in para sizing tiered)
+    fund_score:            float                = 0.0      # 0-100
+    is_preprofit:          bool                 = False    # FCF<0 → cap ×0.5
+    # Categorização
+    is_etf:                bool                 = False
+    is_bluechip:           bool                 = False    # is_bluechip(fund) — derivado
+    sector:                str                  = ""
+    drawdown_52w:          float | None         = None     # negativo (-0.35) ou None
+    dividend_yield:        float | None         = None     # 0.025 = 2.5%
+    classify_category:     str | None           = None     # legado — output de classify_dip_category
+    # ML
+    pred_up:               float | None         = None
+    pred_down:             float | None         = None
+    win_prob:              float | None         = None
+    ml_label:              str                  = "NO_MODEL"
+    model_ready:           bool                 = False
+    # Macro
+    macro_regime_color:    str                  = "GREEN"  # GREEN | YELLOW | RED
+    macro_multiplier:      float                = 1.0      # informativo
+    # Sizing inputs
+    cash_available_eur:    float                = 0.0
+    monthly_budget_eur:    float                = field(default_factory=lambda: _MONTHLY_BUDGET_EUR)
+    existing_position_pct: float                = 0.0      # 0.10 = 10% do portfolio actual
+    # Backward-compat — aceita callers antigos que passam dip_score
+    dip_score:             float                = 0.0
 
 
 @dataclass
@@ -121,53 +163,49 @@ class AllocationDecision:
     ticker:        str
     category:      str
     amount_eur:    float
-    confidence:    str            # "Alta" | "Média" | "Baixa"
-    rationale:     str            # 1-2 linhas
-    exit_rule:     str            # "NEVER" | "THESIS_BREAK" | "TARGET_+15%" | "TARGET_+20%" | "TIME_60D"
+    confidence:    str
+    rationale:     str
+    exit_rule:     str
     target_price:  float | None   = None
     notes:         list[str]      = field(default_factory=list)
-    raw_amount_eur: float         = 0.0  # antes de cap por liquidez (debug)
+    raw_amount_eur: float         = 0.0
 
 
 # ── Helpers internos ──────────────────────────────────────────────────────────
 
-def _ml_signal(ctx: AllocationContext) -> str:
-    """Mapeia ML state → sinal categorial usado pelas regras."""
-    if not ctx.model_ready or ctx.pred_up is None:
-        return "NONE"
-    if ctx.pred_up >= _ML_WIN_STRONG:
-        return "WIN_STRONG"
-    if ctx.pred_up >= _ML_WIN:
-        return "WIN"
-    if ctx.pred_up > 0:
-        return "WEAK"
-    return "NO_WIN"
+def _ml_label_or_derive(ctx: AllocationContext) -> str:
+    """Devolve label coerente. Quando ml_label="NO_MODEL" tenta derivar
+    via pred_up para callers antigos que só passam pred_up."""
+    if ctx.ml_label and ctx.ml_label != "NO_MODEL":
+        return ctx.ml_label
+    if ctx.model_ready and ctx.pred_up is not None:
+        if ctx.pred_up >= 0.10:
+            return "WIN_STRONG"
+        if ctx.pred_up >= 0.05:
+            return "WIN"
+        if ctx.pred_up > 0:
+            return "WEAK"
+        return "NO_WIN"
+    return "NO_MODEL"
+
+
+def _is_ml_bull(label: str) -> bool:
+    return label in ("WIN", "WIN_STRONG", "WIN_40")
 
 
 def _regime_multiplier(category: str, regime_color: str) -> float:
     """Modificador de sizing por regime macro.
 
-    ETF_CORE, HOLD_FOREVER, APARTAMENTO continuam autorizados em RED
-    (postura defensiva — quality dips são mais raros e devem ser
-    aproveitados). GROWTH e FLIP são desactivados.
+    CORE e HIGH_CONVICTION continuam autorizados em RED (postura defensiva
+    — quality dips são raros). GROWTH e FLIP são desactivados em RED e
+    halved em YELLOW.
     """
-    defensive_cats = (CAT_ETF_CORE, CAT_HOLD_FOREVER, CAT_APARTAMENTO)
+    defensive = (CAT_CORE, CAT_HIGH_CONVICTION)
     if regime_color == "RED":
-        return 1.0 if category in defensive_cats else 0.0
+        return 1.0 if category in defensive else 0.0
     if regime_color == "YELLOW":
-        return 1.0 if category in defensive_cats else 0.5
+        return 1.0 if category in defensive else 0.5
     return 1.0  # GREEN
-
-
-def _ml_confidence_multiplier(ml_signal: str) -> float:
-    """Multiplicador de sizing baseado na força do sinal ML."""
-    return {
-        "WIN_STRONG": 1.2,
-        "WIN":        1.0,
-        "WEAK":       0.6,
-        "NO_WIN":     0.0,
-        "NONE":       0.8,   # sem ML não bloqueia, mas reduz convicção
-    }.get(ml_signal, 0.0)
 
 
 def _drawdown_boost(drawdown_52w: float | None) -> float:
@@ -176,35 +214,33 @@ def _drawdown_boost(drawdown_52w: float | None) -> float:
         return 1.0
     dd = abs(float(drawdown_52w))
     if dd >= 0.50:
-        return 1.3
+        return 1.30
     if dd >= 0.40:
         return 1.15
     return 1.0
 
 
-def _confidence_label(ml_signal: str, dip_score: float, regime_color: str) -> str:
+def _confidence_label(fund_score: float, ml_label: str, regime_color: str) -> str:
     """Label de confiança humano (Alta/Média/Baixa)."""
     if regime_color == "RED":
         return "Baixa"
-    if ml_signal == "WIN_STRONG" and dip_score >= 70:
+    if fund_score >= 75 and ml_label == "WIN_STRONG":
         return "Alta"
-    if ml_signal == "WIN" and dip_score >= 60:
+    if fund_score >= 65 and _is_ml_bull(ml_label):
         return "Alta"
-    if ml_signal in ("WIN", "WIN_STRONG"):
-        return "Média"
-    if dip_score >= 70:
+    if _is_ml_bull(ml_label) or fund_score >= 65:
         return "Média"
     return "Baixa"
 
 
-def _exit_rule(category: str, ml_signal: str) -> tuple[str, float | None]:
-    """Devolve (exit_rule, target_pct). target_pct=None significa sem target."""
-    if category in (CAT_ETF_CORE, CAT_HOLD_FOREVER):
+def _exit_rule(category: str, ml_label: str) -> tuple[str, float | None]:
+    """Devolve (exit_rule, target_pct). target_pct=None → sem target."""
+    if category == CAT_CORE:
         return "NEVER", None
-    if category == CAT_APARTAMENTO:
+    if category == CAT_HIGH_CONVICTION:
         return "THESIS_BREAK", None
     if category == CAT_GROWTH:
-        target = 0.20 if ml_signal == "WIN_STRONG" else 0.15
+        target = 0.20 if ml_label == "WIN_STRONG" else 0.15
         label  = "TARGET_+20%" if target == 0.20 else "TARGET_+15%"
         return label, target
     if category == CAT_FLIP:
@@ -212,133 +248,159 @@ def _exit_rule(category: str, ml_signal: str) -> tuple[str, float | None]:
     return "NONE", None
 
 
-# ── Decisão principal ─────────────────────────────────────────────────────────
+# ── Decisão: classificação ────────────────────────────────────────────────────
 
 def _classify(ctx: AllocationContext) -> tuple[str, str]:
-    """Devolve (category, base_rationale). Não faz sizing."""
+    """Devolve (category, base_rationale). Não faz sizing.
 
-    # PASS rules (ordem importa)
+    Categorização data-driven (sem listas hardcoded de tickers):
+      is_etf                                                           → CORE
+      is_bluechip + fund_score>=65 + not is_preprofit                  → HIGH_CONVICTION
+      fund_score<55 + ml_bull                                          → FLIP
+      fund_score>=55                                                   → GROWTH
+      else                                                             → PASS
+    """
     if not ctx.ticker:
         return CAT_PASS, "Ticker vazio."
 
-    # ETF Core: tem precedência absoluta — qualquer ETF vai para core (DCA)
     if ctx.is_etf:
-        return CAT_ETF_CORE, "ETF — alimentado via DCA mensal (anchor passivo)."
+        return CAT_CORE, "ETF — alimentado via DCA mensal (anchor passivo)."
 
-    # ML signal e dip score — as decisões abaixo dependem destes
-    sig = _ml_signal(ctx)
+    label = _ml_label_or_derive(ctx)
 
-    # PASS: dip score muito baixo OU regime RED+não-defensivo+ML morto
-    if ctx.dip_score < _DIP_PASS_MAX:
-        return CAT_PASS, f"Dip score {ctx.dip_score:.0f} < {_DIP_PASS_MAX} — sem convicção."
-
-    if sig == "NO_WIN" and ctx.classify_category not in ("🏗️ Hold Forever", "🏠 Apartamento"):
-        return CAT_PASS, "ML prevê retorno negativo a 60 d e tese não é defensiva."
-
-    # HOLD_FOREVER: blue chip + score >= 70 (mesmo critério do score.classify_dip_category)
-    if ctx.is_bluechip and ctx.dip_score >= _DIP_HOLD_FOREVER_MIN:
-        return CAT_HOLD_FOREVER, (
-            f"Blue chip com dip score {ctx.dip_score:.0f} ≥ {_DIP_HOLD_FOREVER_MIN}. "
-            f"Acumular sem target de venda."
+    if ctx.is_bluechip and ctx.fund_score >= 65 and not ctx.is_preprofit:
+        return CAT_HIGH_CONVICTION, (
+            f"Blue chip saudável (fund_score {ctx.fund_score:.0f}). "
+            f"Acumular consistentemente; sair só por deterioração de tese."
         )
 
-    # APARTAMENTO: classify_dip_category já decidiu (dividendo + drawdown estrutural)
-    if ctx.classify_category and "Apartamento" in ctx.classify_category:
-        return CAT_APARTAMENTO, (
-            f"Apartamento (dividend yield + drawdown estrutural). "
-            f"Acumular em dips, sair só por deterioração de tese."
-        )
-
-    # FLIP: drawdown muito severo + ML ainda dá sinal positivo (mesmo que WEAK)
-    if ctx.drawdown_52w is not None and abs(float(ctx.drawdown_52w)) >= 0.35 and sig in ("WIN_STRONG", "WIN", "WEAK"):
+    if ctx.fund_score < 55 and _is_ml_bull(label):
         return CAT_FLIP, (
-            f"Dip severo (drawdown 52w {ctx.drawdown_52w * 100:.0f}%) com sinal ML "
-            f"{sig}. Trade táctico de 60d."
+            f"CONFLICT_TECH: ML {label} mas fundamentos fracos "
+            f"(fund_score {ctx.fund_score:.0f}). Trade táctico 60d, stop apertado."
         )
 
-    # GROWTH: ML WIN/WIN_STRONG + dip score decente
-    if sig in ("WIN_STRONG", "WIN") and ctx.dip_score >= _DIP_GROWTH_MIN:
+    if ctx.fund_score >= 55:
         return CAT_GROWTH, (
-            f"ML {sig} (pred_up {ctx.pred_up:+.1%}) + dip score "
-            f"{ctx.dip_score:.0f}. Stock pick activo."
-        )
-
-    # Fallback: dip score alto mas ML ausente / fraco → APARTAMENTO defensivo
-    # se há dividendo ou GROWTH com aviso senão PASS
-    if ctx.dip_score >= 60 and ctx.dividend_yield and ctx.dividend_yield >= 0.02:
-        return CAT_APARTAMENTO, (
-            f"Dip score {ctx.dip_score:.0f} + dividend yield {ctx.dividend_yield * 100:.1f}% — "
-            f"tratar como apartamento defensivo (sem ML claro)."
+            f"Active stock pick (fund_score {ctx.fund_score:.0f}). "
+            f"ML {label}."
         )
 
     return CAT_PASS, (
-        f"Dip score {ctx.dip_score:.0f}, ML {sig}. "
-        f"Sem encaixe limpo em nenhuma categoria — esperar sinal melhor."
+        f"Score {ctx.fund_score:.0f}/100 sem suporte fundamental nem técnico — "
+        f"esperar sinal melhor."
     )
 
 
+# ── Decisão: sizing ───────────────────────────────────────────────────────────
+
+def _flip_ml_multiplier(label: str) -> float:
+    """Modulação ML para FLIP. WIN_STRONG > WIN; WEAK reduz; NO_WIN zera."""
+    return {
+        "WIN_STRONG": 1.20,
+        "WIN":        1.00,
+        "WIN_40":     1.00,
+        "WEAK":       0.50,
+        "NO_WIN":     0.00,
+        "NO_MODEL":   0.50,
+    }.get(label, 0.50)
+
+
 def _size(ctx: AllocationContext, category: str) -> tuple[float, float, list[str]]:
-    """Devolve (amount_eur, raw_amount, notes). Aplica caps e regime."""
+    """Devolve (amount_eur, raw_amount, notes). Aplica todos os caps.
+
+    Sizing por categoria:
+      • CORE          : DCA passivo (base, sem score_multiplier)
+      • HIGH_CONVICTION / GROWTH : tiered score_multiplier (gate em fund<55)
+      • FLIP          : base × ml_mult × drawdown_boost (categoria já encoda
+                        a tese; score_multiplier não se aplica aqui)
+    """
     notes: list[str] = []
 
     if category == CAT_PASS:
         return 0.0, 0.0, notes
 
     base_pct = _TARGET_PCT.get(category, 0.0)
-    raw      = ctx.monthly_budget_eur * base_pct
-    sig      = _ml_signal(ctx)
+    raw_amount = ctx.monthly_budget_eur * base_pct
+    label = _ml_label_or_derive(ctx)
 
-    # Modificadores por categoria
+    # 1) Sizing inicial — depende da categoria
+    if category == CAT_CORE:
+        # CORE: DCA passivo, sem gate de fund_score (ETFs são tese estrutural)
+        amount = raw_amount
+
+    elif category == CAT_FLIP:
+        # FLIP: ML modulation + drawdown boost (categoria já encoda fund<55)
+        ml_mult = _flip_ml_multiplier(label)
+        if ml_mult == 0.0:
+            notes.append(f"ML {label} sem suporte → 0")
+            return 0.0, raw_amount, notes
+        amount = raw_amount * ml_mult
+        if ml_mult != 1.0:
+            notes.append(f"ML {label} ×{ml_mult:.2f}")
+        dd_mult = _drawdown_boost(ctx.drawdown_52w)
+        if dd_mult > 1.0:
+            amount *= dd_mult
+            notes.append(f"Drawdown severo ×{dd_mult:.2f}")
+
+    else:
+        # GROWTH / HIGH_CONVICTION: score_multiplier tiered (Fase 4)
+        score_mult = _score_multiplier(ctx.fund_score, label)
+        if score_mult == 0.0:
+            notes.append(f"Score {ctx.fund_score:.0f} < 55 → 0")
+            return 0.0, raw_amount, notes
+        notes.append(f"Score {ctx.fund_score:.0f} ×{score_mult:.2f}")
+        amount = raw_amount * score_mult
+
+    # 2) Regime macro (RED zera growth/flip, YELLOW halves)
     regime_mult = _regime_multiplier(category, ctx.macro_regime_color)
     if regime_mult < 1.0:
         notes.append(f"Regime {ctx.macro_regime_color} ×{regime_mult:.1f}")
     if regime_mult == 0.0:
-        # Categoria desactivada pelo regime
-        return 0.0, raw, notes
+        return 0.0, raw_amount, notes
+    amount *= regime_mult
 
-    amount = raw * regime_mult
+    # 3) Pre-profit cap ×0.5 (empresa queima caixa) — não aplica a CORE
+    if ctx.is_preprofit and category != CAT_CORE:
+        amount *= _PREPROFIT_MULT
+        notes.append(f"Pre-profit ×{_PREPROFIT_MULT:.1f}")
 
-    # ETF_CORE e HOLD_FOREVER ignoram modulação ML (são decisões de tese, não de sinal)
-    if category in (CAT_GROWTH, CAT_FLIP):
-        ml_mult = _ml_confidence_multiplier(sig)
-        amount *= ml_mult
-        if ml_mult != 1.0:
-            notes.append(f"ML {sig} ×{ml_mult:.1f}")
+    # 4) Sectores premium ×1.20 — não aplica a CORE (ETF não tem sector)
+    if ctx.sector in HIGH_CONVICTION_SECTORS and category != CAT_CORE:
+        amount *= _SECTOR_BONUS
+        notes.append(f"Sector premium ×{_SECTOR_BONUS:.2f}")
 
-    # FLIP boost por drawdown severo
-    if category == CAT_FLIP:
-        dd_mult = _drawdown_boost(ctx.drawdown_52w)
-        amount *= dd_mult
-        if dd_mult > 1.0:
-            notes.append(f"Drawdown severo ×{dd_mult:.2f}")
+    # 5) Concentration cap (% do portfolio actual) — não aplica a CORE
+    if category != CAT_CORE:
+        cap_pct = _CAP_PCT_HIGH_CONVICTION if category == CAT_HIGH_CONVICTION else _CAP_PCT_DEFAULT
+        if ctx.existing_position_pct >= cap_pct:
+            notes.append(
+                f"Cap {cap_pct*100:.0f}% atingido (actual {ctx.existing_position_pct*100:.0f}%) → 0"
+            )
+            return 0.0, raw_amount, notes
+        if (
+            ctx.existing_position_pct > _SLOWDOWN_THRESHOLD
+            and category != CAT_HIGH_CONVICTION
+        ):
+            amount *= _SLOWDOWN_MULT
+            notes.append(
+                f"Slowdown perto do cap (actual {ctx.existing_position_pct*100:.0f}%) ×{_SLOWDOWN_MULT}"
+            )
 
-    # Caps absolutos (single-name risk)
-    if category == CAT_FLIP and amount > _MAX_FLIP_EUR:
-        notes.append(f"Cap FLIP €{_MAX_FLIP_EUR:.0f}")
-        amount = _MAX_FLIP_EUR
-    if category == CAT_GROWTH and amount > _MAX_GROWTH_EUR:
-        notes.append(f"Cap GROWTH €{_MAX_GROWTH_EUR:.0f}")
-        amount = _MAX_GROWTH_EUR
-
-    # Cap por nome (qualquer categoria não-ETF)
-    if category != CAT_ETF_CORE:
-        max_single = ctx.monthly_budget_eur * _MAX_SINGLE_NAME_PCT
-        if amount > max_single:
-            notes.append(f"Cap single-name {_MAX_SINGLE_NAME_PCT * 100:.0f}% (€{max_single:.0f})")
-            amount = max_single
-
-    # Cap por liquidez disponível
+    # 6) Cap por liquidez disponível
     if ctx.cash_available_eur > 0 and amount > ctx.cash_available_eur:
         notes.append(f"Cap liquidez €{ctx.cash_available_eur:.0f}")
         amount = ctx.cash_available_eur
 
-    # Floor mínimo (T212 fractional)
+    # 7) Floor mínimo T212
     if 0 < amount < _MIN_TICKET_EUR:
         notes.append(f"Abaixo do mínimo €{_MIN_TICKET_EUR:.0f} → 0 (acumular cash)")
         amount = 0.0
 
-    return round(amount, 0), raw, notes
+    return round(amount, 0), raw_amount, notes
 
+
+# ── Função pública ────────────────────────────────────────────────────────────
 
 def suggest_allocation(ctx: AllocationContext) -> AllocationDecision:
     """Função pública principal. Recebe contexto, devolve decisão.
@@ -346,15 +408,17 @@ def suggest_allocation(ctx: AllocationContext) -> AllocationDecision:
     Sem I/O, sem efeitos secundários. Pode ser chamada em loops, testes,
     scripts ad-hoc.
     """
+    # Backward compat: se caller passou só dip_score (legado), usa-o como fund_score.
+    if ctx.fund_score == 0.0 and ctx.dip_score > 0.0:
+        ctx.fund_score = ctx.dip_score
+
     category, base_rationale = _classify(ctx)
     amount, raw, notes       = _size(ctx, category)
 
-    sig                      = _ml_signal(ctx)
-    confidence               = _confidence_label(sig, ctx.dip_score, ctx.macro_regime_color)
-    exit_rule, target_pct    = _exit_rule(category, sig)
+    label                    = _ml_label_or_derive(ctx)
+    confidence               = _confidence_label(ctx.fund_score, label, ctx.macro_regime_color)
+    exit_rule, _             = _exit_rule(category, label)
 
-    # Se sizing zero por liquidez/floor mas categoria é válida — mantem categoria
-    # mas dá nota clara de "esperar próximo mês".
     if category != CAT_PASS and amount == 0.0:
         notes.append("Sizing zerado — recomenda acumular cash até próximo mês.")
 
@@ -366,7 +430,7 @@ def suggest_allocation(ctx: AllocationContext) -> AllocationDecision:
         confidence     = confidence,
         rationale      = base_rationale,
         exit_rule      = exit_rule,
-        target_price   = None,   # preenchido pelo caller se quiser (precisa do preço actual)
+        target_price   = None,
         notes          = notes,
     )
 
@@ -374,21 +438,19 @@ def suggest_allocation(ctx: AllocationContext) -> AllocationDecision:
 # ── Formatação Telegram ───────────────────────────────────────────────────────
 
 _CATEGORY_EMOJI: dict[str, str] = {
-    CAT_ETF_CORE:     "🟦",
-    CAT_HOLD_FOREVER: "🏗️",
-    CAT_APARTAMENTO:  "🏠",
-    CAT_GROWTH:       "🚀",
-    CAT_FLIP:         "🔄",
-    CAT_PASS:         "⏸️",
+    CAT_CORE:             "🟦",
+    CAT_HIGH_CONVICTION:  "🏛️",
+    CAT_GROWTH:           "🚀",
+    CAT_FLIP:             "🔄",
+    CAT_PASS:             "⏸️",
 }
 
 _CATEGORY_LABEL: dict[str, str] = {
-    CAT_ETF_CORE:     "ETF Core (DCA)",
-    CAT_HOLD_FOREVER: "Hold Forever",
-    CAT_APARTAMENTO:  "Apartamento",
-    CAT_GROWTH:       "Growth",
-    CAT_FLIP:         "Flip",
-    CAT_PASS:         "Pass",
+    CAT_CORE:             "Core (DCA)",
+    CAT_HIGH_CONVICTION:  "High Conviction",
+    CAT_GROWTH:           "Growth",
+    CAT_FLIP:             "Flip",
+    CAT_PASS:             "Pass",
 }
 
 
@@ -407,17 +469,18 @@ def format_allocation_telegram(
         "",
     ]
 
-    # Sizing
     if decision.amount_eur > 0:
         pct_of_budget = decision.amount_eur / ctx.monthly_budget_eur * 100
-        lines.append(f"💶 *Sugestão*: €{decision.amount_eur:.0f} _({pct_of_budget:.0f}% do mensal de €{ctx.monthly_budget_eur:.0f})_")
+        lines.append(
+            f"💶 *Sugestão*: €{decision.amount_eur:.0f} "
+            f"_({pct_of_budget:.0f}% do mensal de €{ctx.monthly_budget_eur:.0f})_"
+        )
         if current_price is not None and current_price > 0:
             shares = decision.amount_eur / current_price
             lines.append(f"   _≈ {shares:.4f} shares @ ${current_price:.2f}_")
     else:
         lines.append(f"💶 *Sugestão*: €0 — _não comprar agora_")
 
-    # Exit rule
     exit_human = {
         "NEVER":         "Sem target de venda (acumular sempre)",
         "THESIS_BREAK":  "Sair só por deterioração de tese",
@@ -428,7 +491,6 @@ def format_allocation_telegram(
     }.get(decision.exit_rule, decision.exit_rule)
     lines.append(f"🎯 *Saída*: {exit_human}")
 
-    # ML metrics
     if ctx.model_ready and ctx.pred_up is not None:
         ml_line = f"🤖 *ML*: pred_up {ctx.pred_up:+.1%}"
         if ctx.win_prob is not None:
@@ -438,16 +500,13 @@ def format_allocation_telegram(
         ml_line += f" ({ctx.ml_label})"
         lines.append(ml_line)
 
-    # Confidence + regime
     regime_emoji = {"GREEN": "🟢", "YELLOW": "🟡", "RED": "🔴"}.get(ctx.macro_regime_color, "⚪")
     lines.append(f"⚖️ *Confiança*: {decision.confidence} | Regime: {regime_emoji} {ctx.macro_regime_color}")
 
-    # Notes (só se houver)
     if decision.notes:
         lines.append("")
         lines.append("_" + " · ".join(decision.notes) + "_")
 
-    # Disclaimer read-only
     lines.append("")
     lines.append("_⚠️ Sugestão informativa. Nenhuma ordem foi executada._")
 

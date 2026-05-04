@@ -1117,6 +1117,16 @@ def allocate_ticker(symbol: str) -> str:
         spy_change    = get_spy_change()
         score, _      = calculate_dip_score(fund, symbol, earnings_days, sector_change=sector_chg)
 
+        # Score V2 com fund_only_score + is_preprofit (Fases 1+4)
+        try:
+            from score import score_from_fundamentals
+            v2_result      = score_from_fundamentals(fund, earnings_days=earnings_days)
+            fund_only_v2   = float(v2_result.get("fund_only_score", v2_result.get("final_score", score)))
+            is_preprofit_v = bool(v2_result.get("is_preprofit", False))
+        except Exception as e:
+            logging.warning(f"[allocate] score_from_fundamentals falhou para {symbol}: {e}")
+            fund_only_v2, is_preprofit_v = float(score or 0.0), False
+
         bc_flag       = is_bluechip(fund)
         category_str  = classify_dip_category(fund, score, bc_flag)
 
@@ -1164,25 +1174,28 @@ def allocate_ticker(symbol: str) -> str:
         dd_pct       = fund.get("drawdown_from_high")
         drawdown_52w = (float(dd_pct) / 100.0) if dd_pct is not None else None
 
-        # 7) Construir contexto e correr motor
+        # 7) Construir contexto e correr motor (Fase 4: usa fund_only_score V2)
         ctx = AllocationContext(
-            ticker             = symbol,
-            dip_score          = float(score or 0.0),
-            is_etf             = is_etf(symbol),
-            is_bluechip        = bool(bc_flag),
-            sector             = fund.get("sector", "") or "",
-            drawdown_52w       = drawdown_52w,
-            dividend_yield     = fund.get("dividend_yield"),
-            classify_category  = category_str,
-            pred_up            = ml_result.pred_up if ml_result.model_ready else None,
-            pred_down          = ml_result.pred_down if ml_result.model_ready else None,
-            win_prob           = ml_result.win_prob if ml_result.model_ready else None,
-            ml_label           = ml_result.label,
-            model_ready        = ml_result.model_ready,
-            macro_regime_color = regime_color,
-            macro_multiplier   = regime_mult,
-            cash_available_eur = cash_eur,
-            monthly_budget_eur = float(os.environ.get("MONTHLY_BUDGET_EUR", "1050")),
+            ticker                = symbol,
+            fund_score            = fund_only_v2,
+            is_preprofit          = is_preprofit_v,
+            dip_score             = float(score or 0.0),  # backward compat
+            is_etf                = is_etf(symbol),
+            is_bluechip           = bool(bc_flag),
+            sector                = fund.get("sector", "") or "",
+            drawdown_52w          = drawdown_52w,
+            dividend_yield        = fund.get("dividend_yield"),
+            classify_category     = category_str,
+            pred_up               = ml_result.pred_up if ml_result.model_ready else None,
+            pred_down             = ml_result.pred_down if ml_result.model_ready else None,
+            win_prob              = ml_result.win_prob if ml_result.model_ready else None,
+            ml_label              = ml_result.label,
+            model_ready           = ml_result.model_ready,
+            macro_regime_color    = regime_color,
+            macro_multiplier      = regime_mult,
+            cash_available_eur    = cash_eur,
+            monthly_budget_eur    = float(os.environ.get("MONTHLY_BUDGET_EUR", "1050")),
+            existing_position_pct = 0.0,  # TODO: query portfolio for ticker concentration
         )
         decision = suggest_allocation(ctx)
 
