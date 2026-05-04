@@ -325,6 +325,67 @@ def get_active_symbols() -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Concentração — usado pelo allocation_engine para os caps 12%/30%
+# ─────────────────────────────────────────────────────────────────────────
+
+def _is_usd_ticker(symbol: str) -> bool:
+    """Heurística simples: tickers com sufixo (.DE/.L/.PA/.AS/...) → não USD.
+    Restantes (NYSE/NASDAQ/AMEX padrão) → USD.
+
+    Mais permissiva que o set USD_TICKERS hardcoded — funciona para qualquer
+    ticker novo (ex: RKLB, XPEV) sem ter de o adicionar a lista.
+    """
+    if symbol in EUR_TICKERS:
+        return False
+    if "." in symbol:
+        return False
+    return True
+
+
+def get_position_pct(symbol: str, usd_eur: float = 0.92) -> float:
+    """Devolve a % do portfolio total actualmente alocada a `symbol`.
+
+    Cálculo (cost basis):
+      • Para cada posição, soma `total_cost` convertido para EUR (USD × usd_eur).
+      • Adiciona liquidez (já em EUR).
+      • Devolve cost da posição (EUR) / total wealth (EUR).
+
+    Caveat: usa cost basis (initial investment), não mark-to-market. Estável,
+    sem necessidade de live prices. Para o efeito de concentration cap (12%/30%)
+    é suficiente — o cap é sobre quanto foi colocado, não sobre P&L.
+
+    Args:
+        symbol: ticker normalizado (será uppercased).
+        usd_eur: taxa USD→EUR (default 0.92). Passar `get_usdeur()` para precisão.
+
+    Returns:
+        Float em [0.0, 1.0]. 0.0 se o ticker não estiver no portfolio ou total=0.
+    """
+    symbol = _TICKER_ALIASES.get(symbol.upper().strip(), symbol.upper().strip())
+    pos = get_position(symbol)
+    if not pos:
+        return 0.0
+
+    fx = max(0.5, min(float(usd_eur or 0.92), 2.0))  # clamp defensivo
+
+    total_eur = float(get_liquidity() or 0.0)
+    for sym, p in get_positions().items():
+        cost = float(p.get("total_cost", 0) or 0)
+        if _is_usd_ticker(sym):
+            cost *= fx
+        total_eur += cost
+
+    if total_eur <= 0:
+        return 0.0
+
+    pos_cost = float(pos.get("total_cost", 0) or 0)
+    if _is_usd_ticker(symbol):
+        pos_cost *= fx
+
+    return max(0.0, min(pos_cost / total_eur, 1.0))
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # /buy
 # ─────────────────────────────────────────────────────────────────────────
 

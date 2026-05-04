@@ -1100,7 +1100,7 @@ def allocate_ticker(symbol: str) -> str:
         format_allocation_telegram,
     )
     from macro_semaphore import get_macro_regime
-    from portfolio import get_liquidity
+    from portfolio import get_liquidity, get_position_pct
 
     symbol = symbol.upper().strip()
     try:
@@ -1170,6 +1170,13 @@ def allocate_ticker(symbol: str) -> str:
         except Exception:
             cash_eur = 0.0
 
+        # 5b) Concentração actual deste ticker no portfolio (cost basis EUR)
+        try:
+            existing_pct = float(get_position_pct(symbol, usd_eur=get_usdeur()))
+        except Exception as e:
+            logging.warning(f"[allocate] get_position_pct falhou para {symbol}: {e}")
+            existing_pct = 0.0
+
         # 6) Drawdown 52w (em fundamentals está em pontos percentuais — converter)
         dd_pct       = fund.get("drawdown_from_high")
         drawdown_52w = (float(dd_pct) / 100.0) if dd_pct is not None else None
@@ -1195,7 +1202,7 @@ def allocate_ticker(symbol: str) -> str:
             macro_multiplier      = regime_mult,
             cash_available_eur    = cash_eur,
             monthly_budget_eur    = float(os.environ.get("MONTHLY_BUDGET_EUR", "1050")),
-            existing_position_pct = 0.0,  # TODO: query portfolio for ticker concentration
+            existing_position_pct = existing_pct,
         )
         decision = suggest_allocation(ctx)
 

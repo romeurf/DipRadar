@@ -10,7 +10,10 @@ APScheduler>=3.10.0
 pytz>=2024.1
 
 # Machine Learning (Chunk H)
-scikit-learn>=1.4.0
+# scikit-learn pinned: bundle dip_models_v3.pkl foi treinado com 1.6.x;
+# 1.7+ emite InconsistentVersionWarning ao deserializar IsotonicRegression
+# e pode mudar predições ligeiramente. Re-treinar quando subir o pin.
+scikit-learn>=1.6.0,<1.7.0
 xgboost>=2.0.0
 lightgbm>=4.3.0
 imbalanced-learn>=0.12.0
