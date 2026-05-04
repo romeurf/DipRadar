@@ -27,6 +27,7 @@ Comandos disponíveis:
   /admin_backfill_ml       → [ADMIN] Semear hist_backtest.csv com 5 anos de dips históricos
   /admin_train_ml          → [ADMIN] Treinar modelo ML e gerar dip_model.pkl
   /admin_load_models <url> → [ADMIN] Descarregar pickles + ml_report do URL para /data/ (atomic)
+  /admin_retrain [dry-run] → [ADMIN] Disparar retrain v3 ad-hoc (ou dry-run para validar input)
   /health                  → Dashboard de observabilidade (RAM, CPU, latências, last scan)
   /health errors           → Log dos últimos erros críticos
   /help                    → Lista de comandos
@@ -64,6 +65,7 @@ _bot_start_time: datetime = datetime.now()
 # Flags de segurança para operações longas
 _backfill_running: bool = False
 _train_running:    bool = False
+_retrain_running:  bool = False
 
 # Callbacks injectados pelo main.py via register_callbacks() ou poll()
 _cb_send_telegram    = None
@@ -1002,6 +1004,176 @@ def _handle_admin_load_models(parts: list[str]) -> None:
     threading.Thread(target=_run, daemon=True, name="admin-load-models").start()
 
 
+# ── /admin_retrain ──────────────────────────────────────────────────────────────
+
+def _handle_admin_retrain(parts: list[str]) -> None:
+    """
+    /admin_retrain                    → dispara retreino mensal v3 ad-hoc (full)
+    /admin_retrain dry-run            → só constrói training input (não treina)
+    /admin_retrain dry-run no-snap    → exclui universe_snapshot.parquet
+    /admin_retrain run 0.85           → retrain real com gating_ratio override
+
+    Útil para validar `/data/` no Railway sem esperar pelo cron mensal.
+    Retorna métricas (ρ_α, Brier, Top-K PnL) ou shape do training input se dry-run.
+    """
+    global _retrain_running
+
+    if _retrain_running:
+        _reply("⚠️ *Retreino já está a correr.*\n_Aguarda a conclusão._")
+        return
+
+    args = [p.lower() for p in parts[1:]]
+    dry_run          = "dry-run" in args or "dry_run" in args or "dryrun" in args
+    include_snapshot = "no-snap" not in args and "no-snapshot" not in args
+    include_alert_db = "no-alert-db" not in args and "no-alerts" not in args
+    gating_ratio     = None
+    for a in args:
+        try:
+            v = float(a)
+            if 0.5 <= v <= 1.5:
+                gating_ratio = v
+                break
+        except ValueError:
+            continue
+
+    mode_str = "DRY-RUN" if dry_run else "REAL"
+    extras = []
+    if not include_snapshot: extras.append("no-snap")
+    if not include_alert_db: extras.append("no-alert-db")
+    if gating_ratio is not None: extras.append(f"ratio={gating_ratio}")
+    extras_str = f" ({', '.join(extras)})" if extras else ""
+
+    _reply(
+        f"⚙️ *Retrain v3 — {mode_str}{extras_str}*\n"
+        f"_A iniciar... estimativa "
+        f"{'~10s (só lê parquets)' if dry_run else '2-5min (CV + champion + isotonic)'}._"
+    )
+    logging.info(f"[admin_retrain] start mode={mode_str} extras={extras_str}")
+
+    def _run() -> None:
+        global _retrain_running
+        _retrain_running = True
+        start_ts = time.time()
+        try:
+            from monthly_retrain import run_monthly_retrain_v3
+            kwargs = dict(
+                dry_run=dry_run,
+                include_snapshot=include_snapshot,
+                include_alert_db=include_alert_db,
+            )
+            if gating_ratio is not None:
+                kwargs["gating_ratio"] = gating_ratio
+            result = run_monthly_retrain_v3(**kwargs)
+        except Exception as e:
+            logging.error(f"[admin_retrain] {e}", exc_info=True)
+            _reply(f"❌ *Retrain falhou:*\n`{e}`")
+            return
+        finally:
+            _retrain_running = False
+
+        elapsed = time.time() - start_ts
+        decision = result.get("decision", "?")
+        icon = {
+            "PROMOTED":   "🚀",
+            "PENDING":    "⚠️",
+            "KEPT_FLOOR": "🛑",
+            "FAILED":     "❌",
+            "DRY-RUN":    "🧪",
+        }.get(decision, "⚙️")
+
+        lines = [
+            f"{icon} *Retrain v3 — {decision}*",
+            f"_{datetime.now().strftime('%d/%m/%Y %H:%M')} ({elapsed:.0f}s)_",
+            "",
+        ]
+        reason = result.get("reason")
+        if reason:
+            lines += [f"_{reason}_", ""]
+
+        if decision == "DRY-RUN":
+            ti_path = result.get("training_input")
+            if ti_path:
+                lines.append(f"*Training input:* `{ti_path}`")
+                try:
+                    import pandas as pd
+                    df = pd.read_parquet(ti_path)
+                    lines.append(f"*Shape:* {df.shape[0]} linhas × {df.shape[1]} colunas")
+                    if "alert_date" in df.columns:
+                        d = pd.to_datetime(df["alert_date"])
+                        lines.append(f"*Período:* {d.min().date()} → {d.max().date()}")
+                    if "symbol" in df.columns:
+                        lines.append(f"*Tickers únicos:* {df['symbol'].nunique()}")
+                    if "label_win" in df.columns:
+                        n_win = int(df["label_win"].fillna(0).sum())
+                        lines.append(f"*Labels WIN:* {n_win}/{len(df)}")
+                    if "spy_return_ref" in df.columns:
+                        n_with_target = int(df["spy_return_ref"].notna().sum())
+                        lines.append(f"*Com target resolvido:* {n_with_target}/{len(df)}")
+                except Exception as e:
+                    lines.append(f"_(Falha a ler shape: {e})_")
+            outcomes = result.get("outcome_stats") or {}
+            if outcomes:
+                lines += [
+                    "",
+                    f"*alert_db outcomes preenchidos:* {outcomes.get('updated', 0)}",
+                    f"*alert_db ignorados:* {outcomes.get('skipped', 0)}",
+                ]
+            _reply("\n".join(lines))
+            return
+
+        # Real retrain — métricas
+        cand_rho   = result.get("candidate_rho_alpha")
+        prod_rho   = result.get("production_rho_alpha")
+        cand_brier = result.get("candidate_brier")
+        prod_brier = result.get("production_brier")
+        cand_pnl   = result.get("candidate_topk_pnl")
+        prod_pnl   = result.get("production_topk_pnl")
+
+        def _fmt(v):
+            if v is None: return "N/A"
+            try: return f"{float(v):.4f}"
+            except (TypeError, ValueError): return str(v)
+
+        if cand_rho is not None or prod_rho is not None:
+            lines += [
+                "*ρ_α (Spearman alpha_60d):*",
+                f"  candidate : *{_fmt(cand_rho)}*",
+                f"  produção  : *{_fmt(prod_rho)}*",
+            ]
+            try:
+                d = (float(cand_rho) - float(prod_rho)) / float(prod_rho) * 100
+                sign = "+" if d >= 0 else ""
+                lines.append(f"  delta     : *{sign}{d:.1f}%*")
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+            lines.append("")
+
+        if cand_brier is not None:
+            lines += [
+                "*Brier OOF:*",
+                f"  candidate : *{_fmt(cand_brier)}*",
+                f"  produção  : *{_fmt(prod_brier)}*",
+                "",
+            ]
+        if cand_pnl is not None:
+            lines += [
+                "*Top-K PnL (mean):*",
+                f"  candidate : *{_fmt(cand_pnl)}*",
+                f"  produção  : *{_fmt(prod_pnl)}*",
+                "",
+            ]
+
+        if decision == "PENDING":
+            lines.append("_Bundle guardado como `dip_models_v3_pending.pkl` — revisão manual._")
+        elif decision == "PROMOTED":
+            lines.append("_Bundle promovido em `/data/`. Reinicia o bot ou força reload via_ `/admin_load_models`.")
+
+        _reply("\n".join(lines))
+        logging.info(f"[admin_retrain] decision={decision} cand_rho={cand_rho}")
+
+    threading.Thread(target=_run, daemon=True, name="admin-retrain").start()
+
+
 # ── /health handler ─────────────────────────────────────────────────────────────
 
 def _handle_health(parts: list[str]) -> None:
@@ -1609,6 +1781,7 @@ def _handle_command(text: str) -> None:
             "`/mldata`                  → Stats da base de dados ML\n"
             "`/mldata update`           → Forçar update de outcomes\n"
             "`/admin_load_models <url>` → [ADMIN] Carregar pickles novos para /data/\n"
+            "`/admin_retrain [dry-run]` → [ADMIN] Disparar retrain v3 ad-hoc\n"
             "`/health`                  → Dashboard observabilidade\n"
             "`/health errors`           → Log de erros críticos\n"
             "`/help`                    → Esta mensagem"
@@ -1798,6 +1971,9 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_load_models":
         _handle_admin_load_models(parts)
+
+    elif cmd == "/admin_retrain":
+        _handle_admin_retrain(parts)
 
     elif cmd == "/health":
         if not _check_rate(cmd_key): return
