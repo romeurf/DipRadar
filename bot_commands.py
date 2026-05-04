@@ -213,6 +213,18 @@ def _reply(text: str) -> None:
         fn(text)
 
 
+def _md_safe(s: object) -> str:
+    """Sanitiza valor dinâmico para interpolação dentro de ``...`` (code span).
+
+    Markdown V1 do Telegram trata o conteúdo dentro de backticks como literal,
+    EXCEPTO o próprio backtick. Para evitar 400 Bad Request por entidades
+    desbalanceadas (e.g. ``alert_db`` em italics ``_..._``), embrulha-se sempre
+    valores dinâmicos em backticks e remove-se backticks internos.
+    """
+    txt = str(s) if s is not None else ""
+    return txt.replace("`", "'")
+
+
 def _check_rate(cmd: str) -> bool:
     allowed, wait = is_allowed(cmd)
     if not allowed:
@@ -1066,7 +1078,7 @@ def _handle_admin_retrain(parts: list[str]) -> None:
             result = run_monthly_retrain_v3(**kwargs)
         except Exception as e:
             logging.error(f"[admin_retrain] {e}", exc_info=True)
-            _reply(f"❌ *Retrain falhou:*\n`{e}`")
+            _reply(f"❌ *Retrain falhou:*\n`{_md_safe(e)}`")
             return
         finally:
             _retrain_running = False
@@ -1088,12 +1100,15 @@ def _handle_admin_retrain(parts: list[str]) -> None:
         ]
         reason = result.get("reason")
         if reason:
-            lines += [f"_{reason}_", ""]
+            # Code span — dynamic strings com `_` (alert_db, paths) partem
+            # Markdown V1 quando wrapped em italics. Backticks tornam o
+            # conteúdo literal e evitam 400 Bad Request do Telegram.
+            lines += [f"`{_md_safe(reason)}`", ""]
 
         if decision == "DRY-RUN":
             ti_path = result.get("training_input")
             if ti_path:
-                lines.append(f"*Training input:* `{ti_path}`")
+                lines.append(f"*Training input:* `{_md_safe(ti_path)}`")
                 try:
                     import pandas as pd
                     df = pd.read_parquet(ti_path)
@@ -1110,7 +1125,7 @@ def _handle_admin_retrain(parts: list[str]) -> None:
                         n_with_target = int(df["spy_return_ref"].notna().sum())
                         lines.append(f"*Com target resolvido:* {n_with_target}/{len(df)}")
                 except Exception as e:
-                    lines.append(f"_(Falha a ler shape: {e})_")
+                    lines.append(f"(Falha a ler shape: `{_md_safe(e)}`)")
             outcomes = result.get("outcome_stats") or {}
             if outcomes:
                 lines += [

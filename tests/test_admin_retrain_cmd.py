@@ -185,5 +185,68 @@ class TestDispatcherRouting(unittest.TestCase):
         self.assertIn("/admin_retrain", source)
 
 
+class TestMarkdownSafety(unittest.TestCase):
+    """Regressão para o bug 400 Bad Request quando a `reason` continha
+    underscores (e.g. `alert_db`) — italics partia o parser do Telegram.
+
+    Fix: reason vai dentro de backticks (code span), nunca italics.
+    """
+
+    def setUp(self):
+        import bot_commands
+        self.replies: list[str] = []
+        bot_commands._reply = lambda txt: self.replies.append(txt)
+        bot_commands._retrain_running = False
+
+    def _invoke_failed_with_reason(self, reason: str) -> None:
+        import bot_commands
+
+        def fake_thread(target, daemon=None, name=None):
+            class _T:
+                def start(self_t):
+                    target()
+            return _T()
+
+        with patch("bot_commands.threading.Thread", fake_thread), \
+             patch("monthly_retrain.run_monthly_retrain_v3") as mock_v3:
+            mock_v3.return_value = {"decision": "FAILED", "reason": reason}
+            bot_commands._handle_admin_retrain(["/admin_retrain"])
+
+    def test_md_safe_strips_backticks(self):
+        from bot_commands import _md_safe
+        # Backticks na string interna partem o code span. Têm de ser
+        # substituídos para preservar a sintaxe Markdown.
+        self.assertNotIn("`", _md_safe("path with `backtick` inside"))
+        self.assertEqual(_md_safe(None), "")
+        self.assertEqual(_md_safe(123), "123")
+
+    def test_reason_with_underscores_uses_backticks_not_italics(self):
+        """O bug original: `_input build failed: ... alert_db ..._` parte o
+        parser. Garantimos que a `reason` vai sempre dentro de backticks.
+        """
+        original_bug_reason = (
+            "input build failed: Sem dados de treino — bootstrap, "
+            "alert_db e snapshot todos vazios."
+        )
+        self._invoke_failed_with_reason(original_bug_reason)
+
+        # A reason tem de aparecer dentro de backticks (code span), nunca
+        # dentro de underscores (italics) — caso contrário 400 Bad Request.
+        backtick_wrapped = f"`{original_bug_reason}`"
+        italic_wrapped = f"_{original_bug_reason}_"
+
+        joined = "\n".join(self.replies)
+        self.assertIn(backtick_wrapped, joined,
+                      "reason deve estar dentro de `...` (code span)")
+        self.assertNotIn(italic_wrapped, joined,
+                         "reason NÃO deve estar dentro de _..._ (italics)")
+
+    def test_reason_with_path_underscores_safe(self):
+        """Path com `/data/ml_training_merged.parquet` — underscores múltiplos."""
+        reason = "Cannot read /data/ml_training_merged.parquet — file missing"
+        self._invoke_failed_with_reason(reason)
+        self.assertIn(f"`{reason}`", "\n".join(self.replies))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

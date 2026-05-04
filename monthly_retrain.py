@@ -8,7 +8,9 @@ v3.1 (regressor alpha + isotonic calibrator) já em produção desde PR #11/#13.
 Fluxo:
 
   1. Build training input incremental:
-     a. bootstrap historical (`ml_training_merged.parquet`)
+     a. bootstrap historical (`/data/ml_training_merged.parquet`,
+        com fallback para o `ml_training_merged.parquet` no root do repo
+        para cold-start em volumes Railway vazios)
      b. `alert_db.csv` (alertas reais com outcomes preenchidos)
      c. `universe_snapshot.parquet` (rows com ≥6m maturados, label resolvido)
 
@@ -55,12 +57,15 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _DATA_DIR = Path("/data") if Path("/data").exists() else Path("/tmp")
+_REPO_ROOT = Path(__file__).resolve().parent
 
 PRODUCTION_DIR     = _DATA_DIR
 CANDIDATE_DIR      = _DATA_DIR / "candidate"
 ARCHIVE_DIR        = _DATA_DIR / "archive"
 SNAPSHOT_PATH      = _DATA_DIR / "universe_snapshot.parquet"
 BOOTSTRAP_PATH     = _DATA_DIR / "ml_training_merged.parquet"
+# Fallback: parquet bootstrap commitado no repo (cold-start em volumes vazios).
+BOOTSTRAP_FALLBACK = _REPO_ROOT / "ml_training_merged.parquet"
 ALERT_DB_PATH      = _DATA_DIR / "alert_db.csv"
 TRAINING_INPUT     = _DATA_DIR / "ml_training_input.parquet"
 
@@ -286,17 +291,33 @@ def build_training_input(include_snapshot: bool = True,
     """
     parts: list[pd.DataFrame] = []
 
+    bootstrap_src = None
     if BOOTSTRAP_PATH.exists():
+        bootstrap_src = BOOTSTRAP_PATH
+    elif BOOTSTRAP_FALLBACK.exists():
+        bootstrap_src = BOOTSTRAP_FALLBACK
+        log.warning(
+            f"[input] {BOOTSTRAP_PATH} ausente — fallback para parquet do repo "
+            f"({BOOTSTRAP_FALLBACK})."
+        )
+    else:
+        log.warning(
+            f"[input] Bootstrap parquet ausente em {BOOTSTRAP_PATH} "
+            f"e fallback {BOOTSTRAP_FALLBACK}."
+        )
+
+    if bootstrap_src is not None:
         try:
-            df_bs = pd.read_parquet(BOOTSTRAP_PATH)
+            df_bs = pd.read_parquet(bootstrap_src)
             if "alert_date" in df_bs.columns:
                 df_bs["alert_date"] = pd.to_datetime(df_bs["alert_date"])
-            log.info(f"[input] bootstrap historical: {len(df_bs)} rows")
+            log.info(
+                f"[input] bootstrap historical: {len(df_bs)} rows "
+                f"(source={bootstrap_src})"
+            )
             parts.append(df_bs.assign(_source="bootstrap"))
         except Exception as e:
-            log.error(f"[input] Falha a ler {BOOTSTRAP_PATH}: {e}")
-    else:
-        log.warning(f"[input] {BOOTSTRAP_PATH} não existe.")
+            log.error(f"[input] Falha a ler {bootstrap_src}: {e}")
 
     if include_alert_db:
         df_alerts = _load_alert_db_as_training()

@@ -235,6 +235,95 @@ class TestBuildTrainingInput(unittest.TestCase):
         self.assertIn("alert_date", df.columns)
 
 
+class TestBootstrapFallback(unittest.TestCase):
+    """Regressão para o bug em produção (Railway dry-run): `/data/` está vazio
+    no primeiro deploy, o `BOOTSTRAP_PATH` não existe, e o pipeline falha com
+    'Sem dados de treino'. Fallback: ler o parquet bootstrap commitado no
+    root do repo.
+    """
+
+    def setUp(self):
+        from tempfile import mkdtemp
+        import pandas as pd
+        self.tmp_data = Path(mkdtemp(prefix="dipradar_data_"))
+        self.tmp_repo = Path(mkdtemp(prefix="dipradar_repo_"))
+
+        import monthly_retrain as m
+        self._orig = {k: getattr(m, k) for k in (
+            "BOOTSTRAP_PATH", "BOOTSTRAP_FALLBACK", "ALERT_DB_PATH",
+            "SNAPSHOT_PATH", "TRAINING_INPUT")}
+        # Volume Railway vazio
+        m.BOOTSTRAP_PATH     = self.tmp_data / "ml_training_merged.parquet"
+        # Repo root tem o parquet bootstrap
+        m.BOOTSTRAP_FALLBACK = self.tmp_repo / "ml_training_merged.parquet"
+        m.ALERT_DB_PATH      = self.tmp_data / "alert_db.csv"
+        m.SNAPSHOT_PATH      = self.tmp_data / "snapshot.parquet"
+        m.TRAINING_INPUT     = self.tmp_data / "ml_training_input.parquet"
+
+        df = pd.DataFrame({
+            "symbol":         ["AAPL", "MSFT"],
+            "alert_date":     pd.to_datetime(["2023-01-01", "2023-01-02"]),
+            "drop_pct_today": [-3.5, -4.0],
+            "label_win":      [1, 0],
+            "spy_return_ref": [-1.0, -0.5],
+        })
+        df.to_parquet(m.BOOTSTRAP_FALLBACK, index=False)
+
+    def tearDown(self):
+        import monthly_retrain as m
+        for k, v in self._orig.items():
+            setattr(m, k, v)
+        import shutil
+        shutil.rmtree(self.tmp_data, ignore_errors=True)
+        shutil.rmtree(self.tmp_repo, ignore_errors=True)
+
+    def test_falls_back_to_repo_parquet_when_data_dir_empty(self):
+        """`/data/` vazio + repo root com parquet → usa fallback."""
+        from monthly_retrain import build_training_input, BOOTSTRAP_PATH
+        # Sanity: o path do volume não existe mesmo
+        self.assertFalse(BOOTSTRAP_PATH.exists())
+
+        path = build_training_input(include_snapshot=False, include_alert_db=False)
+        self.assertTrue(path.exists())
+
+        import pandas as pd
+        df = pd.read_parquet(path)
+        self.assertEqual(len(df), 2)
+        self.assertIn("AAPL", df["symbol"].tolist())
+
+    def test_prefers_data_dir_when_both_exist(self):
+        """Se `/data/ml_training_merged.parquet` existe, é usado e ignora o
+        fallback (volume é a fonte da verdade depois do primeiro retrain)."""
+        import monthly_retrain as m
+        import pandas as pd
+
+        df_data = pd.DataFrame({
+            "symbol":         ["NVDA"],
+            "alert_date":     pd.to_datetime(["2024-06-15"]),
+            "drop_pct_today": [-5.0],
+            "label_win":      [1],
+            "spy_return_ref": [-2.0],
+        })
+        df_data.to_parquet(m.BOOTSTRAP_PATH, index=False)
+
+        from monthly_retrain import build_training_input
+        path = build_training_input(include_snapshot=False, include_alert_db=False)
+        df = pd.read_parquet(path)
+        # Tem de ter NVDA (do volume), não AAPL/MSFT (do fallback)
+        self.assertIn("NVDA", df["symbol"].tolist())
+        self.assertNotIn("AAPL", df["symbol"].tolist())
+
+    def test_raises_when_neither_exists(self):
+        """Sem volume e sem repo → erro claro."""
+        import monthly_retrain as m
+        m.BOOTSTRAP_FALLBACK = self.tmp_repo / "does_not_exist.parquet"
+
+        from monthly_retrain import build_training_input
+        with self.assertRaises(RuntimeError) as ctx:
+            build_training_input(include_snapshot=False, include_alert_db=False)
+        self.assertIn("Sem dados de treino", str(ctx.exception))
+
+
 class TestMetricsRead(unittest.TestCase):
 
     def test_read_v3_metrics_canonical(self):
