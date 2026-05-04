@@ -92,12 +92,15 @@ def _load_pending(db_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
       rest:    todas as outras linhas (já resolvidas ou demasiado recentes)
 
     Devolve (pending_df, full_df) — full_df inclui todas as linhas originais.
+
+    Usa on_bad_lines='warn' para não crashar com linhas mal formadas
+    (ex: campos de texto com vírgulas em CSVs antigos sem quoting).
     """
     if not db_path.exists():
         logger.warning(f"[resolver] {db_path} não existe — nada a resolver.")
         return pd.DataFrame(), pd.DataFrame()
 
-    df = pd.read_csv(db_path, dtype=str)
+    df = pd.read_csv(db_path, dtype=str, on_bad_lines="warn", engine="python")
     if df.empty:
         return pd.DataFrame(), df
 
@@ -182,7 +185,6 @@ def _fetch_prices_yfinance(
     """
     try:
         import yfinance as yf
-        # yfinance end é exclusivo — adicionar 1 dia
         df = yf.download(
             ticker,
             start=start.isoformat(),
@@ -241,7 +243,6 @@ def _nearest_business_price(
         check_date = target_date - timedelta(days=delta)
         if check_date in series.index:
             return float(series[check_date])
-    # Tenta o dia útil seguinte (ex: feriado na segunda)
     for delta in range(1, 4):
         check_date = target_date + timedelta(days=delta)
         if check_date in series.index:
@@ -257,34 +258,20 @@ def _compute_labels(
     """
     Calcula label_win e label_further_drop para um alerta.
 
-    Lógica point-in-time:
-      - Janela: [alert_date + 1 dia útil, alert_date + 60 dias calendario]
-      - Não inclui o próprio dia do alerta (preço_alerta é o preço de fecho
-        do dia do alerta, ou o preço no momento do alerta)
-
     label_win = 1 se max(precos_janela) >= price_alert * (1 + WIN_THRESHOLD)
 
     label_further_drop:
-      Percorre os preços dia a dia na janela.
-      Se label_win == 1:
-        Para quando encontra o primeiro dia onde o preço >= target.
-        O drawdown máximo calculado é apenas sobre essa sub-janela
-        [alerta → primeiro dia >= target].
-        Isto mede o "calor" que o investidor teve de aguentar.
-      Se label_win == 0:
-        É o drawdown máximo sobre toda a janela de 60 dias.
-        Indica quão fundo a acção foi.
+      Se label_win == 1: drawdown máximo até ao primeiro dia >= target.
+      Se label_win == 0: drawdown máximo de toda a janela.
     """
     window_start = alert_date + timedelta(days=1)
     window_end   = alert_date + timedelta(days=_RESOLUTION_DAYS)
 
-    # Filtrar série para a janela
     window_prices = series[
         (series.index >= window_start) & (series.index <= window_end)
     ]
 
     if window_prices.empty or price_alert <= 0:
-        # Dados insuficientes — não resolver agora
         return -1, 0.0  # sentinela de erro
 
     target_price   = price_alert * (1.0 + _WIN_THRESHOLD)
@@ -293,9 +280,7 @@ def _compute_labels(
 
     label_win: int = 1 if max_price >= target_price else 0
 
-    # Calcular label_further_drop
     if label_win == 1:
-        # Encontrar o índice do primeiro dia >= target
         first_win_idx = next(
             (i for i, p in enumerate(prices) if p >= target_price),
             len(prices) - 1,
@@ -309,7 +294,6 @@ def _compute_labels(
     else:
         min_price          = float(np.min(sub_prices))
         label_further_drop = round((min_price / price_alert) - 1.0, 6)
-        # Garantir que é negativo ou zero (nunca positivo — só mede queda)
         label_further_drop = min(label_further_drop, 0.0)
 
     return label_win, label_further_drop
@@ -329,12 +313,6 @@ def resolve_pending_labels(
     3. Para cada alerta pendente desse ticker, calcula as labels
     4. Actualiza o CSV
     5. Devolve stats
-
-    Devolve dict:
-      resolved        int   linhas com labels preenchidas neste run
-      skipped         int   linhas ignoradas (dados de preço insuficientes)
-      errors          int   linhas com erro irrecuperável
-      total_pending   int   linhas que estavam pendentes antes do run
     """
     stats = {"resolved": 0, "skipped": 0, "errors": 0, "total_pending": 0}
 
@@ -345,15 +323,11 @@ def resolve_pending_labels(
 
     stats["total_pending"] = len(pending)
 
-    # ── Agrupar por ticker ────────────────────────────────────────────────────
-    # Para cada ticker, calcular a janela de datas que cobre todos os alertas
-    # pendentes desse ticker, e fazer UM único request.
     ticker_col = "symbol" if "symbol" in pending.columns else "ticker"
     if ticker_col not in pending.columns:
         logger.error("[resolver] alert_db.csv não tem coluna 'symbol' nem 'ticker'.")
         return stats
 
-    # Mapa: ticker -> {idx: alert_date, price_alert}
     ticker_groups: dict[str, list[dict]] = {}
     for idx, row in pending.iterrows():
         ticker = str(row.get(ticker_col, "")).strip().upper()
@@ -366,7 +340,6 @@ def resolve_pending_labels(
             stats["errors"] += 1
             continue
 
-        # Preço do alerta: coluna 'price' ou 'price_alert'
         price_raw = row.get("price") or row.get("price_alert") or row.get("close")
         try:
             price_alert = float(str(price_raw).replace(",", "."))
@@ -387,12 +360,10 @@ def resolve_pending_labels(
 
     logger.info(f"[resolver] Tickers únicos com pendentes: {len(ticker_groups)}")
 
-    # ── Processar por ticker ──────────────────────────────────────────────────
     for ticker, alerts in ticker_groups.items():
-        # Janela alargada: data mais antiga → data mais recente + 60d
         all_dates    = [a["alert_date"] for a in alerts]
-        fetch_start  = min(all_dates)  # primeiro alerta pendente
-        fetch_end    = max(all_dates) + timedelta(days=_RESOLUTION_DAYS + 5)  # +5 buffer
+        fetch_start  = min(all_dates)
+        fetch_end    = max(all_dates) + timedelta(days=_RESOLUTION_DAYS + 5)
 
         logger.info(
             f"[resolver] {ticker}: {len(alerts)} alerta(s) | "
@@ -406,13 +377,11 @@ def resolve_pending_labels(
             stats["skipped"] += len(alerts)
             continue
 
-        # Calcular labels para cada alerta deste ticker
         for alert in alerts:
             idx         = alert["idx"]
             alert_date  = alert["alert_date"]
             price_alert = alert["price_alert"]
 
-            # Verificar se temos dados suficientes para a janela deste alerta
             window_end   = alert_date + timedelta(days=_RESOLUTION_DAYS)
             window_prices = series[
                 (series.index > alert_date) & (series.index <= window_end)
@@ -430,7 +399,7 @@ def resolve_pending_labels(
                 series, alert_date, price_alert
             )
 
-            if label_win == -1:  # sentinela de erro
+            if label_win == -1:
                 stats["errors"] += 1
                 continue
 
@@ -448,7 +417,6 @@ def resolve_pending_labels(
 
     # ── Persistir CSV ─────────────────────────────────────────────────────────
     if not dry_run and stats["resolved"] > 0:
-        # Remover coluna auxiliar antes de guardar
         if "_date_parsed" in full_df.columns:
             full_df = full_df.drop(columns=["_date_parsed"])
 
@@ -465,10 +433,9 @@ def resolve_pending_labels(
         if "_date_parsed" in full_df.columns:
             full_df = full_df.drop(columns=["_date_parsed"])
 
-    # Distribuição de wins para o log
     if stats["resolved"] > 0 and not dry_run:
         try:
-            fresh = pd.read_csv(db_path, dtype=str)
+            fresh = pd.read_csv(db_path, dtype=str, on_bad_lines="warn", engine="python")
             wins  = (fresh["label_win"] == "1").sum()
             loses = (fresh["label_win"] == "0").sum()
             total = wins + loses
@@ -492,10 +459,6 @@ def run_label_resolver_job(
     """
     Wrapper síncrono chamado pelo APScheduler às 03:00.
     Executa resolve_pending_labels() e envia sumário pelo Telegram.
-
-    Parâmetros:
-      send_telegram_fn : callable opcional — send_telegram do main.py
-      telegram_chat_id : str            — não usado directamente (via send_fn)
     """
     from datetime import datetime
     import pytz
@@ -519,16 +482,14 @@ def run_label_resolver_job(
     errors        = stats["errors"]
     total_pending = stats["total_pending"]
 
-    # Só envia Telegram se houve actividade relevante
     if total_pending == 0:
         logger.info("[label_resolver] Nenhum pendente — sem notificação.")
         return
 
-    # Ler estado actual da base para win rate
     win_rate_str = ""
     try:
         if _ALERT_DB.exists():
-            df      = pd.read_csv(_ALERT_DB, dtype=str)
+            df      = pd.read_csv(_ALERT_DB, dtype=str, on_bad_lines="warn", engine="python")
             labeled = df[df["label_win"].notna() & (df["label_win"] != "") & (~df["label_win"].isin(["None", "nan"]))]
             wins    = (labeled["label_win"] == "1").sum()
             total_l = len(labeled)
@@ -554,11 +515,10 @@ def run_label_resolver_job(
     if win_rate_str:
         lines.append(win_rate_str)
 
-    # Dicas de progresso para o treino
     lines.append("")
     try:
         if _ALERT_DB.exists():
-            df      = pd.read_csv(_ALERT_DB, dtype=str)
+            df      = pd.read_csv(_ALERT_DB, dtype=str, on_bad_lines="warn", engine="python")
             labeled = df[df["label_win"].notna() & (df["label_win"] != "") & (~df["label_win"].isin(["None", "nan"]))]
             total_l = len(labeled)
             if total_l < 30:

@@ -83,7 +83,10 @@ def _ensure_header() -> None:
         try:
             _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
             with _DB_PATH.open("w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=_FIELDS)
+                writer = csv.DictWriter(
+                    f, fieldnames=_FIELDS,
+                    quoting=csv.QUOTE_NONNUMERIC,
+                )
                 writer.writeheader()
             logging.info(f"[alert_db] Criado: {_DB_PATH}")
         except Exception as e:
@@ -138,6 +141,9 @@ def log_alert_snapshot(
     serem preenchidos futuramente pelo fill_db_outcomes().
 
     historical_pe pode ser um dict (de get_historical_pe) ou um float/None.
+
+    Nota: usa csv.QUOTE_NONNUMERIC para garantir que campos de texto com
+    vírgulas (ex: nomes de empresas) ficam entre aspas e não corrompem o CSV.
     """
     _ensure_header()
     try:
@@ -165,7 +171,7 @@ def log_alert_snapshot(
             "score":              round(score, 1),
             "price":              fundamentals.get("price") or "",
             "market_cap_b":       round((fundamentals.get("market_cap") or 0) / 1e9, 2),
-            "drawdown_from_high": fundamentals.get("drawdown_from_high") or "",  # nome canónico
+            "drawdown_from_high": fundamentals.get("drawdown_from_high") or "",
             "change_day_pct":     round(change_day_pct, 2),
             "rsi":                round(rsi_val, 1) if rsi_val is not None else "",
             "volume_ratio":       vol_ratio,
@@ -184,12 +190,15 @@ def log_alert_snapshot(
             # Resultado — a preencher pelo fill_db_outcomes
             "price_1m": "", "price_3m": "", "price_6m": "",
             "return_1m": "", "return_3m": "", "return_6m": "",
-            "return_60d": "",     # target alinhado com max_return_60d do treino
-            "spy_return_60d": "", # para alpha_60d no retreino futuro
+            "return_60d": "",
+            "spy_return_60d": "",
             "mfe_3m": "", "mae_3m": "", "outcome_label": "",
         }
         with _DB_PATH.open("a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=_FIELDS)
+            writer = csv.DictWriter(
+                f, fieldnames=_FIELDS,
+                quoting=csv.QUOTE_NONNUMERIC,
+            )
             writer.writerow(row)
         logging.info(f"[alert_db] Snapshot gravado: {symbol} | cat={category} | score={score:.0f}")
     except Exception as e:
@@ -209,12 +218,9 @@ def fill_db_outcomes() -> dict:
 
     TRAVA DE MATURIDADE: return_60d só é preenchido se
       data_actual >= alert_date + _MIN_DAYS_60D (62 dias).
-    Isto evita injectar falsos negativos no treino quando o alerta
-    tem menos de 60 dias e o retorno actual é ainda parcial.
 
-    outcome_label usa return_60d como referência primária (alinhado com
-    o target max_return_60d usado para treinar o XGB-v2 champion).
-    Fallback: return_3m -> return_6m -> return_1m (compatibilidade).
+    outcome_label usa return_60d como referência primária.
+    Fallback: return_3m -> return_6m -> return_1m.
 
     Hold Forever nunca recebe label.
     Só actualiza linhas onde os campos ainda estão vazios.
@@ -308,17 +314,12 @@ def fill_db_outcomes() -> dict:
                 row["return_1m"] = round((p1m - price_entry) / price_entry * 100, 2)
                 changed = True
 
-        # ── T+60d (target primário — alinhado com max_return_60d do treino) ──
-        # TRAVA: só preenche se alert_date + _MIN_DAYS_60D <= hoje.
-        # Sem esta trava, um alerta com 15 dias geraria um falso negativo
-        # se o retorno actual fosse negativo mas o pico real ainda não
-        # tivesse ocorrido.
+        # ── T+60d ─────────────────────────────────────────────────────────────
         if needs_60d and days_elapsed >= _MIN_DAYS_60D:
             p60d = get_price_at(candles, alert_date + timedelta(days=60))
             if p60d is not None and price_entry > 0:
                 row["return_60d"] = round((p60d - price_entry) / price_entry * 100, 2)
                 changed = True
-            # SPY para calcular alpha no retreino futuro
             if row.get("spy_return_60d") == "":
                 try:
                     from tiingo_client import get_ohlcv as _get_ohlcv, get_price_at as _get_price_at
@@ -367,15 +368,11 @@ def fill_db_outcomes() -> dict:
                 changed = True
 
         # ── outcome_label ─────────────────────────────────────────────────────
-        # Referência primária: return_60d (alinhado com max_return_60d do treino).
-        # Só atribui label se a janela de 60d já estiver madura (trava acima).
-        # Hold Forever nunca recebe label.
         if changed and row.get("outcome_label") == "":
             if CATEGORY_HOLD_FOREVER in category:
-                pass  # sem target de saída definido
+                pass
             else:
                 ref_return = None
-                # Prioridade: return_60d > return_3m > return_6m > return_1m
                 for field in ("return_60d", "return_3m", "return_6m", "return_1m"):
                     val = row.get(field)
                     if val not in ("", None):
@@ -384,7 +381,6 @@ def fill_db_outcomes() -> dict:
                             break
                         except ValueError:
                             pass
-                # Só rotula se a janela 60d estiver madura
                 if ref_return is not None and (
                     row.get("return_60d") not in ("", None)
                     or days_elapsed >= _MIN_DAYS_60D
@@ -398,7 +394,10 @@ def fill_db_outcomes() -> dict:
     if updated > 0:
         try:
             with _DB_PATH.open("w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=_FIELDS)
+                writer = csv.DictWriter(
+                    f, fieldnames=_FIELDS,
+                    quoting=csv.QUOTE_NONNUMERIC,
+                )
                 writer.writeheader()
                 writer.writerows(rows)
             logging.info(
