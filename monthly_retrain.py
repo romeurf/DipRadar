@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import shutil
 import time
 from datetime import date, datetime
@@ -213,16 +214,23 @@ def _resolve_snapshot_outcomes(snap: pd.DataFrame,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Alert-DB CSV → DataFrame in training format (preservado do v2)
+# Alert-DB CSV → DataFrame in training format
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_alert_db_as_training() -> pd.DataFrame:
-    """Read alert_db.csv and convert to ml_training schema."""
+    """Read alert_db.csv and convert to ml_training schema.
+
+    Fixes aplicados:
+      - on_bad_lines='warn' para não crashar com linhas antigas mal formadas
+      - rename_map corrigido: drawdown_from_high (nome actual no CSV)
+        → drawdown_52w (nome canónico em FEATURE_COLUMNS)
+      - rename explícito symbol → ticker para alinhar com data.py/load_base_dataset
+    """
     if not ALERT_DB_PATH.exists():
         return pd.DataFrame()
 
     try:
-        df = pd.read_csv(ALERT_DB_PATH)
+        df = pd.read_csv(ALERT_DB_PATH, on_bad_lines="warn", engine="python")
     except Exception as e:
         log.warning(f"[alert_db] Falha a ler {ALERT_DB_PATH}: {e}")
         return pd.DataFrame()
@@ -234,9 +242,14 @@ def _load_alert_db_as_training() -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
+    # ── Rename: CSV column name → training schema name ────────────────────
+    # NOTA: "drawdown_from_high" é o nome actual gravado pelo alert_db.py.
+    #       "drawdown_52w" é o nome canónico que FEATURE_COLUMNS usa.
+    #       O rename antigo ("drawdown_52w": "drawdown_52w") era um no-op
+    #       e deixava a coluna ausente — causava Index(['symbol']) no concat.
     rename_map = {
         "date_iso":          "alert_date",
-        "drawdown_52w":      "drawdown_52w",
+        "drawdown_from_high": "drawdown_52w",   # ← fix: nome real no CSV
         "change_day_pct":    "drop_pct_today",
         "rsi":               "rsi_14",
         "fcf_yield":         "fcf_yield",
@@ -247,6 +260,14 @@ def _load_alert_db_as_training() -> pd.DataFrame:
         "sector_etf_change": "sector_drawdown_5d",
     }
     df = df.rename(columns=rename_map)
+
+    # ── symbol → ticker (data.py espera "ticker") ─────────────────────────
+    if "symbol" in df.columns and "ticker" not in df.columns:
+        df = df.rename(columns={"symbol": "ticker"})
+
+    if "ticker" not in df.columns:
+        log.error("[alert_db] Coluna 'ticker'/'symbol' ausente após rename — a ignorar alert_db.")
+        return pd.DataFrame()
 
     defaults = {
         "macro_score":     2,
@@ -272,9 +293,6 @@ def _load_alert_db_as_training() -> pd.DataFrame:
     df["return_6m"] = pd.to_numeric(df.get("return_6m"), errors="coerce")
     df["spy_return_ref"] = pd.to_numeric(df.get("spy_change", 0.0), errors="coerce").fillna(0.0)
 
-    if "symbol" not in df.columns:
-        return pd.DataFrame()
-
     log.info(f"[alert_db] Loaded {len(df)} alertas com outcome resolvido")
     return df
 
@@ -295,7 +313,7 @@ def build_training_input(include_snapshot: bool = True,
     if BOOTSTRAP_PATH.exists() and not os.getenv("FORCE_BOOTSTRAP_FROM_REPO"):
         bootstrap_src = BOOTSTRAP_PATH
     elif BOOTSTRAP_FALLBACK.exists():
-        bootstrap_src = BOOTSTRAP_FALLBACK  # ← fix: assign the fallback
+        bootstrap_src = BOOTSTRAP_FALLBACK
         log.warning(
             f"[input] {BOOTSTRAP_PATH} ausente — fallback para parquet do repo "
             f"({BOOTSTRAP_FALLBACK})."
@@ -342,12 +360,15 @@ def build_training_input(include_snapshot: bool = True,
     log.info(f"[input] Concat total: {len(merged)} rows from "
              f"{merged['_source'].value_counts().to_dict()}")
 
+    # Dedup por (ticker, alert_date) — preferindo snapshot > alert_db > bootstrap
+    # Usa "ticker" como chave canónica (data.py renomeia symbol→ticker)
+    dedup_col = "ticker" if "ticker" in merged.columns else "symbol"
     priority = {"bootstrap": 0, "alert_db": 1, "snapshot": 2}
     merged["_prio"] = merged["_source"].map(priority).fillna(0)
     merged = merged.sort_values("_prio").drop_duplicates(
-        subset=["symbol", "alert_date"], keep="last"
+        subset=[dedup_col, "alert_date"], keep="last"
     ).drop(columns=["_prio", "_source"])
-    log.info(f"[input] After dedup (symbol, alert_date): {len(merged)} rows")
+    log.info(f"[input] After dedup ({dedup_col}, alert_date): {len(merged)} rows")
 
     TRAINING_INPUT.parent.mkdir(parents=True, exist_ok=True)
     merged.to_parquet(TRAINING_INPUT, index=False)
@@ -436,7 +457,6 @@ def gate_and_promote_v3(
             "reason":   "candidate report missing/invalid (rho_alpha_mean ausente)",
         }
 
-    # Floor absoluto: rejeita sempre se candidate < floor
     if cand_rho < floor:
         return {
             **base_result,
@@ -444,7 +464,6 @@ def gate_and_promote_v3(
             "reason":   f"candidate ρ_α {cand_rho:.4f} < floor {floor:.4f}",
         }
 
-    # Cold start: sem produção, basta passar floor
     if prod_rho is None:
         return _do_promote({
             **base_result,
@@ -465,7 +484,6 @@ def gate_and_promote_v3(
             "delta_pct": float(delta_pct),
         })
 
-    # Não passa o gating mas passa o floor → guarda como pending
     return _save_pending({
         **base_result,
         "decision":  "PENDING",
@@ -481,7 +499,6 @@ def _do_promote(result: dict) -> dict:
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Archive produção actual (se existir)
     if PRODUCTION_BUNDLE.exists():
         archived_pkl = ARCHIVE_DIR / f"dip_models_v3_{timestamp}.pkl"
         shutil.copy2(PRODUCTION_BUNDLE, archived_pkl)
@@ -490,7 +507,6 @@ def _do_promote(result: dict) -> dict:
         archived_json = ARCHIVE_DIR / f"ml_report_v3_{timestamp}.json"
         shutil.copy2(PRODUCTION_REPORT, archived_json)
 
-    # Atomic copy candidate → production
     promoted: list[str] = []
     if CANDIDATE_BUNDLE.exists():
         tmp = PRODUCTION_BUNDLE.with_suffix(".pkl.tmp")
@@ -532,13 +548,7 @@ def run_monthly_retrain_v3(
     n_folds: Optional[int] = None,
     purge_days: Optional[int] = None,
 ) -> dict:
-    """Pipeline completo de retreino mensal v3.
-
-    Returns dict com tudo necessário para o Telegram do main.py:
-      decision, reason, candidate_rho_alpha, production_rho_alpha,
-      candidate_brier, production_brier, candidate_topk_pnl, production_topk_pnl,
-      gating_ratio, elapsed_s, outcome_stats, ...
-    """
+    """Pipeline completo de retreino mensal v3."""
     t0 = time.time()
     log.info("=" * 70)
     log.info(f"DipRadar — Monthly Retrain v3 ({datetime.utcnow().isoformat(timespec='seconds')}Z)")
@@ -627,11 +637,7 @@ def run_monthly_retrain_v3(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_monthly_retrain_v2(*args, **kwargs) -> dict:
-    """Alias retrocompatível — main.py ainda importa este nome.
-
-    Aceita os mesmos kwargs que v3 (gating_ratio, include_snapshot,
-    include_alert_db, dry_run). Argumentos legacy (algos, etc.) são ignorados.
-    """
+    """Alias retrocompatível — main.py ainda importa este nome."""
     legacy_keys = {"algos"}
     clean_kwargs = {k: v for k, v in kwargs.items() if k not in legacy_keys}
     return run_monthly_retrain_v3(*args, **clean_kwargs)
@@ -643,19 +649,12 @@ def run_monthly_retrain_v2(*args, **kwargs) -> dict:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Monthly retrain v3 with rho_alpha gating")
-    p.add_argument("--gating-ratio", type=float, default=DEFAULT_GATING_RATIO,
-                   help=f"Candidate só é promovido se ρ_α ≥ prod × ratio "
-                        f"(default {DEFAULT_GATING_RATIO})")
-    p.add_argument("--no-snapshot", action="store_true",
-                   help="Não inclui universe_snapshot.parquet no input.")
-    p.add_argument("--no-alert-db", action="store_true",
-                   help="Não inclui alert_db.csv no input.")
-    p.add_argument("--n-folds", type=int, default=None,
-                   help="Override de n_folds (default: ml_training.config.N_FOLDS)")
-    p.add_argument("--purge-days", type=int, default=None,
-                   help="Override de purge_days")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Só constrói o training input — não treina nem promove.")
+    p.add_argument("--gating-ratio", type=float, default=DEFAULT_GATING_RATIO)
+    p.add_argument("--no-snapshot", action="store_true")
+    p.add_argument("--no-alert-db", action="store_true")
+    p.add_argument("--n-folds", type=int, default=None)
+    p.add_argument("--purge-days", type=int, default=None)
+    p.add_argument("--dry-run", action="store_true")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
 
