@@ -28,6 +28,7 @@ Comandos disponíveis:
   /admin_train_ml          → [ADMIN] Treinar modelo ML e gerar dip_model.pkl
   /admin_load_models <url> → [ADMIN] Descarregar pickles + ml_report do URL para /data/ (atomic)
   /admin_retrain [dry-run] → [ADMIN] Disparar retrain v3 ad-hoc (ou dry-run para validar input)
+  /retrigger               → [ADMIN] Alias rápido de /admin_retrain (full, sem dry-run)
   /health                  → Dashboard de observabilidade (RAM, CPU, latências, last scan)
   /health errors           → Log dos últimos erros críticos
   /help                    → Lista de comandos
@@ -1188,6 +1189,16 @@ def _handle_admin_retrain(parts: list[str]) -> None:
 
     threading.Thread(target=_run, daemon=True, name="admin-retrain").start()
 
+# ── /retrigger ──────────────────────────────────────────────────────────────────
+
+def _handle_retrigger() -> None:
+    """
+    /retrigger  → alias rápido de /admin_retrain (modo REAL, sem flags extra).
+
+    Útil para disparar o pipeline mensal ad-hoc sem ter de escrever o comando
+    completo. Delega inteiramente para _handle_admin_retrain com parts=[""].
+    """
+    _handle_admin_retrain(["admin_retrain"])
 
 # ── /health handler ─────────────────────────────────────────────────────────────
 
@@ -1797,6 +1808,7 @@ def _handle_command(text: str) -> None:
             "`/mldata update`           → Forçar update de outcomes\n"
             "`/admin_load_models <url>` → [ADMIN] Carregar pickles novos para /data/\n"
             "`/admin_retrain [dry-run]` → [ADMIN] Disparar retrain v3 ad-hoc\n"
+            "`/retrigger`               → [ADMIN] Alias rápido de /admin_retrain (full)\\n"
             "`/health`                  → Dashboard observabilidade\n"
             "`/health errors`           → Log de erros críticos\n"
             "`/help`                    → Esta mensagem"
@@ -1989,6 +2001,9 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_retrain":
         _handle_admin_retrain(parts)
+    
+    elif cmd == "/retrigger":
+        _handle_admin_retrain(["admin_retrain"])
 
     elif cmd == "/health":
         if not _check_rate(cmd_key): return
