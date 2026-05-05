@@ -16,7 +16,7 @@ Penalização near-earnings (earnings_days < 14):
   Confidence multiplicada por 0.85 — zona de incerteza pré-relatório.
 
 Equação final:
-  base_score  = 0.50 * quality + 0.30 * value + 0.20 * timing
+  base_score  = 0.40 * quality + 0.20 * value + 0.20 * timing + 0.20 * divergence
   final_score = base_score * ml_prob * confidence * 100
 
 API pública (compatível com toda a base de código existente):
@@ -539,8 +539,8 @@ def _compute_divergence(features: dict) -> float:
     fcf = _safe_float(features.get("fcf_yield"), 0.0)
     rg  = _safe_float(features.get("revenue_growth"), 0.0)
 
-    fcf_prev = _safe_float(features.get("fcf_yield_previous"), fallback=None)
-    fcf_prev = None if math.isnan(fcf_prev) else fcf_prev  # type: ignore[arg-type]
+    fcf_prev_raw = features.get("fcf_yield_previous")
+    fcf_prev = _safe_float(fcf_prev_raw) if fcf_prev_raw is not None else None
 
     qd  = quality_dislocation(gm, dd, fcf)
     ud  = unjustified_drawdown(dd, gm, fcf, rg) / 100.0
