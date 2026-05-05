@@ -379,6 +379,46 @@ def _is_value_trap(features: dict) -> bool:
     )
     return bool(rev_growth < 0 and fcf < 0)
 
+# ---------------------------------------------------------------------------
+# 8a. Funções compostas — Quality Dislocation
+# ---------------------------------------------------------------------------
+
+def quality_dislocation(gross_margin: float, drawdown_52w: float, fcf_yield: float) -> float:
+    if fcf_yield < 0:
+        return 0.0
+    return gross_margin * abs(drawdown_52w) / 100.0
+
+
+def fcf_trend(fcf_yield_current: float | None, fcf_yield_previous: float | None) -> float:
+    if fcf_yield_current is not None and fcf_yield_previous is not None:
+        if fcf_yield_current > 0 and fcf_yield_previous <= 0:
+            return 0.08
+        return fcf_yield_current - fcf_yield_previous
+    return 0.0
+
+
+def peg_implicit(pe: float, revenue_growth: float) -> float:
+    if pe > 0 and revenue_growth > 0:
+        return pe / (revenue_growth * 100.0)
+    return 3.0
+
+
+def unjustified_drawdown(
+    drawdown_52w: float,
+    gross_margin: float,
+    fcf_yield: float,
+    revenue_growth: float,
+) -> float:
+    if abs(drawdown_52w) < 20:
+        return 0.0
+    health = 0
+    if gross_margin > 0.45:
+        health += 1
+    if fcf_yield > 0.02:
+        health += 1
+    if revenue_growth > 0.08:
+        health += 1
+    return abs(drawdown_52w) * (health / 3.0)
 
 # ---------------------------------------------------------------------------
 # 8b. Red Flags + Quality Multiplier  (Fase 1 — penalty pós z-score)
@@ -476,6 +516,42 @@ def _detect_red_flags(features: dict) -> tuple[float, list[str], bool]:
     quality_multiplier = max(0.10, quality_multiplier)
     return quality_multiplier, red_flags, is_preprofit
 
+# ---------------------------------------------------------------------------
+# 8c. Hemisfério D — Divergência (20%)
+# ---------------------------------------------------------------------------
+
+def _compute_divergence(features: dict) -> float:
+    """
+    Mede a dislocation entre qualidade do negócio e preço de mercado.
+
+    Componentes:
+      quality_dislocation  → 40%
+      unjustified_drawdown → 35%  (normalizado ÷ 100)
+      fcf_trend            → 25%  (clipped e escalado para [0, 1])
+
+    Devolve valor em [0, 1]:
+      0.00–0.15 → sem dislocation significativa
+      0.15–0.30 → dislocation moderada
+      0.30+     → dislocation forte (padrão PINS/NOW)
+    """
+    gm  = _safe_float(features.get("gross_margin"), 0.0)
+    dd  = _safe_float(features.get("drawdown_from_high"), 0.0)
+    fcf = _safe_float(features.get("fcf_yield"), 0.0)
+    rg  = _safe_float(features.get("revenue_growth"), 0.0)
+
+    fcf_prev = _safe_float(features.get("fcf_yield_previous"), fallback=None)
+    fcf_prev = None if math.isnan(fcf_prev) else fcf_prev  # type: ignore[arg-type]
+
+    qd  = quality_dislocation(gm, dd, fcf)
+    ud  = unjustified_drawdown(dd, gm, fcf, rg) / 100.0
+    ft  = fcf_trend(fcf if not math.isnan(fcf) else None, fcf_prev)
+
+    # Escalar fcf_trend de [-0.10, +0.10] → [0, 1]
+    ft_clipped = float(np.clip(ft, -0.10, 0.10))
+    ft_scaled  = (ft_clipped + 0.10) / 0.20
+
+    raw = 0.40 * qd + 0.35 * ud + 0.25 * ft_scaled
+    return float(np.clip(raw, 0.0, 1.0))
 
 # ---------------------------------------------------------------------------
 # 9. Motor principal
@@ -553,26 +629,61 @@ def calculate_score(
 
     # Red Flags + Quality Multiplier (Fase 1)
     quality_multiplier, red_flags, is_preprofit = _detect_red_flags(features)
-    confidence = data_coverage * quality_multiplier
+
+    # Camada 2 — Quality Confidence (nova)
+    fcf_yield_v  = _safe_float(features.get("fcf_yield"), 0.0)
+    pe_v         = _safe_float(features.get("pe"), 0.0)
+    roe_v        = _safe_float(features.get("roe"), 0.0)
+    rev_growth_v = _safe_float(features.get("revenue_growth"), 0.0)
+
+    quality_conf = 1.0
+    if fcf_yield_v < 0:
+        quality_conf -= 0.20
+    if pe_v > 200 or pe_v <= 0:
+        quality_conf -= 0.25
+    if roe_v < 0 and rev_growth_v < 0.15:
+        quality_conf -= 0.20
+    if fcf_yield_v < 0 and pe_v > 100:
+        quality_conf -= 0.15
+    quality_conf = max(0.20, quality_conf)
+
+    # Confiança final = cobertura × qualidade
+    confidence = data_coverage * quality_conf
     if red_flags:
         logging.debug(
             f"[score] quality_multiplier={quality_multiplier:.2f} "
+            f"quality_conf={quality_conf:.2f} "
             f"red_flags={red_flags} preprofit={is_preprofit}"
         )
 
-    # skip_recommended mais agressivo: confiança baixa OU empresa queima caixa
-    skip = (confidence < 0.6) or is_preprofit
+    # skip_recommended actualizado
+    qd_val = quality_dislocation(
+        _safe_float(features.get("gross_margin"), 0.0),
+        _safe_float(features.get("drawdown_from_high"), 0.0),
+        fcf_yield_v,
+    )
+    skip = (
+        confidence < 0.50
+        or (fcf_yield_v < 0 and pe_v > 200 and rev_growth_v < 0.15)
+        or (qd_val < 0.05 and (0.40 * _safe_float(features.get("quality_score_raw"), quality) + 0.20 * value + 0.20 * timing) * confidence * 100 < 45)
+    )
     if skip:
         logging.debug(
             f"[score] skip_recommended=True — confidence={confidence:.2f} "
-            f"preprofit={is_preprofit} (missing: {missing})"
+            f"preprofit={is_preprofit} qd={qd_val:.3f} (missing: {missing})"
         )
 
     # ML weight
     ml_weight = 1.0 if ml_prob is None else float(np.clip(ml_prob, 0.0, 1.0))
 
+    try:
+        divergence = _compute_divergence(features)
+    except Exception as exc:
+        logging.warning(f"[score] divergence hemisphere error: {exc}")
+        divergence = 0.0
+      
     # Score final — multiplica pelo quality_multiplier (penalty pós-zscore)
-    base_score  = (0.50 * quality) + (0.30 * value) + (0.20 * timing)
+    base_score  = (0.40 * quality) + (0.20 * value) + (0.20 * timing) + (0.20 * divergence)
     raw_final   = base_score * ml_weight * confidence * 100.0
     final_score = float(np.clip(raw_final, 0.0, 100.0))
 
@@ -587,6 +698,7 @@ def calculate_score(
         "quality_score":       round(quality,    4),
         "value_score":         round(value,      4),
         "timing_score":        round(timing,     4),
+        "divergence_score":    round(divergence, 4),
         "confidence":          round(confidence, 4),
         "data_coverage":       round(data_coverage, 4),
         "quality_multiplier":  round(quality_multiplier, 4),
