@@ -4,7 +4,9 @@ from __future__ import annotations
 
 # Alvo / cobertura
 HORIZON_DAYS: int = 60
-WINSOR_PCT: float = 0.01
+WINSOR_PCT: float = 0.005          # mais agressivo: 0.5% em vez de 1%
+WINSOR_ABS_LO: float = -0.50       # clip absoluto inferior (alpha_60d)
+WINSOR_ABS_HI: float = 2.00        # clip absoluto superior (alpha_60d)
 HALF_LIFE_DAYS: int = 365 * 3   # sample weights — half-life 3 anos
 
 # Walk-forward CV

@@ -15,6 +15,8 @@ from ml_training.config import (
     PURGE_DAYS,
     TOPK_FRAC,
     WINSOR_PCT,
+    WINSOR_ABS_LO,
+    WINSOR_ABS_HI,
 )
 
 
@@ -62,10 +64,18 @@ def build_walk_forward_folds(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def winsorize(arr: np.ndarray, pct: float = WINSOR_PCT) -> np.ndarray:
-    """Winsoriza nas caudas pct/(1-pct). Idempotente em arrays vazios."""
+    """Winsoriza nas caudas pct/(1-pct) + clip absoluto [-0.5, 2.0].
+
+    Aplica primeiro o clip absoluto (remove outliers extremos como +355x)
+    e depois o clip percentílico para suavizar as caudas restantes.
+    Idempotente em arrays vazios.
+    """
     arr = np.asarray(arr, dtype=float)
     if len(arr) == 0:
         return arr
+    # 1. Clip absoluto — remove outliers extremos independentemente da distribuição
+    arr = np.clip(arr, WINSOR_ABS_LO, WINSOR_ABS_HI)
+    # 2. Clip percentílico — suaviza caudas restantes
     finite = arr[np.isfinite(arr)]
     if len(finite) == 0:
         return arr
