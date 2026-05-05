@@ -1,7 +1,7 @@
 # Core runtime
 requests>=2.28.0
 yfinance>=0.2.61
-numpy>=1.24.0,<2.0
+numpy>=1.24.0
 pandas>=1.5.0,<3.0
 fredapi>=0.5.1
 
