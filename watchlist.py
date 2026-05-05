@@ -24,10 +24,11 @@ Critérios suportados:
   dividend_yield    : yield actual >= X %  (ex: 5.5 → 5.5%)
   price_above       : preço actual >= X  (para targets de saída)
   change_day_pct    : queda no dia >= X %
+  quality_dislocation : gross_margin × |drawdown_52w| / 100 >= X (FCF negativo penaliza para 0)
 
 Tiingo confirma apenas critérios baseados em EOD histórico:
   drawdown_52w_pct, price_below, price_above
-Critérios dividend_yield e change_day_pct ficam exclusivamente em Yahoo.
+Critérios dividend_yield, change_day_pct e quality_dislocation ficam exclusivamente em Yahoo.
 """
 
 from __future__ import annotations
@@ -292,6 +293,17 @@ def _check_criteria(data: dict, criteria: list[dict]) -> list[str]:
             triggered.append(f"🔻 Queda hoje: *{data['change_day']:.1f}%* (critério ≥{val:.0f}%)")
         elif ctype == "price_above" and data["price"] >= val:
             triggered.append(f"📈 Preço: *${data['price']:.2f}* (critério ≥${val:.0f})")
+        elif ctype == "quality_dislocation":
+            gm      = data.get("gross_margins", 0) or 0
+            dd      = data["drawdown"]
+            fcf_raw = data.get("free_cashflow") or 0
+            mc      = data.get("market_cap") or 1
+            fcf_yield = fcf_raw / mc if mc > 0 else 0
+            qd = (gm * dd / 100) if fcf_yield >= 0 else 0.0
+            if qd >= val:
+                triggered.append(
+                    f"🎯 Quality Dislocation: *{qd:.2f}* (critério ≥{val})"
+                )
     return triggered
 
 
