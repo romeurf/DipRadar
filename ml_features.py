@@ -15,6 +15,9 @@ Architecture: 4-stage pipeline
                         sector_relative, beta_60d)
                         Factor-investing literature: momentum is the most
                         predictive single feature for 3–6 month forward returns.
+  Stage 3c — Dislocation: quality_dislocation, peg_implicit, relative_drop,
+                        month_of_year — distinguem Quality Dislocation (NOW/PINS)
+                        de especulação pura (RKLB).
 
 Label schema (training only, None in production):
   label_win           int   1 if price recovered >=15% within 60 calendar days
@@ -35,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import math
+from datetime import datetime
 from typing import Any, Optional
 
 import numpy as np
@@ -46,9 +50,9 @@ from score import score_from_fundamentals, _safe_float
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 # Feature & label column order (the model sees columns in this exact order)
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 
 FEATURE_COLUMNS: list[str] = [
     # ── Stage 0: Macro (4 features) ──────────────────────────────────
@@ -57,7 +61,7 @@ FEATURE_COLUMNS: list[str] = [
     "spy_drawdown_5d",      # SPY % change last 5 trading days (negative=down)
     "sector_drawdown_5d",   # sector ETF % change last 5 trading days
 
-    # ── Stage 1: Quality / Value (5 features) ──────────────────────
+    # ── Stage 1: Quality / Value (5 features) ───────────────────────
     # NOTE: fcf_yield and revenue_growth were removed (importance=0.0 in
     # both Stage 1 and Stage 2 as of ml_report 2026-05-02). Their values
     # are still computed in build_features() for score.py / downstream use,
@@ -68,21 +72,21 @@ FEATURE_COLUMNS: list[str] = [
     "analyst_upside",       # consensus analyst upside (e.g. 0.25 = 25%)
     "quality_score",        # score.py quality hemisphere [0, 1]
 
-    # ── Stage 2: Timing (5 features) ─────────────────────────────
+    # ── Stage 2: Timing (5 features) ───────────────────────────────
     "drop_pct_today",       # % price drop that triggered the alert (e.g. -8.4)
     "drawdown_52w",         # % below 52-week high (e.g. -23.1)
     "rsi_14",               # RSI 14-period [0, 100]
     "atr_ratio",            # ATR(14) / current price — normalised volatility
     "volume_spike",         # today's volume / 20-day avg volume (e.g. 2.1)
 
-    # ── Stage 3: Engineered / Non-linear interactions (5 features) ────
+    # ── Stage 3: Engineered / Non-linear interactions (5 features) ────────
     "rsi_oversold_strength", # max(0, 40 - rsi_14): magnitude of oversold
     "vix_regime",            # 0=low (<15), 1=medium (15-25), 2=high (>25)
     "pe_attractive",         # max(0, 1 - pe_vs_fair): magnitude of undervaluation
     "drop_x_drawdown",       # drop_pct_today * drawdown_52w / 100: capitulation pressure
     "vol_x_drop",            # volume_spike * abs(drop_pct_today): capitulation volume
 
-    # ── Stage 3b: Momentum (4 features) ──────────────────────────
+    # ── Stage 3b: Momentum (4 features) ─────────────────────────────
     # Pre-alert price momentum. Literature: momentum is the most predictive
     # single factor for 3–6 month forward returns in cross-sectional studies.
     # All computed from price_history BEFORE alert_date (no leakage).
@@ -90,6 +94,15 @@ FEATURE_COLUMNS: list[str] = [
     "return_3m_pre",        # % price return over 63 trading days before alert
     "sector_relative",      # return_3m_pre minus sector ETF return over same period
     "beta_60d",             # rolling beta vs SPY over 60 trading days before alert
+
+    # ── Stage 3c: Dislocation (4 features) ───────────────────────────
+    # Distinguem Quality Dislocation (NOW/PINS) de especulação pura (RKLB).
+    # quality_dislocation e peg_implicit são versões compostas de features
+    # existentes — tornam explícito para o modelo o que o score.py já computa.
+    "quality_dislocation",  # gross_margin * |drawdown_52w| / 100 (0.0 se FCF negativo)
+    "peg_implicit",         # pe_vs_fair / (revenue_growth * 100), clip [0, 5]
+    "relative_drop",        # drop_pct_today - sector_drawdown_5d
+    "month_of_year",        # mês do ano (1–12) — sazonalidade
 ]
 
 LABEL_COLUMNS: list[str] = [
@@ -98,12 +111,12 @@ LABEL_COLUMNS: list[str] = [
 ]
 
 # Total feature count (used as sanity check in training)
-N_FEATURES = len(FEATURE_COLUMNS)  # 23 (14 base + 5 engineered + 4 momentum)
+N_FEATURES = len(FEATURE_COLUMNS)  # 27 (23 base + 4 dislocation)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 # Sector fair P/E
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 
 _SECTOR_FAIR_PE: dict[str, float] = {
     "Technology":             35.0,
@@ -150,17 +163,22 @@ _FALLBACK: dict[str, float] = {
     "return_3m_pre":     0.0,
     "sector_relative":   0.0,
     "beta_60d":          1.0,   # market-neutral assumption
+    # Stage 3c dislocation
+    "quality_dislocation": 0.08,  # empresa mediana como baseline
+    "peg_implicit":        2.0,   # PEG neutro
+    "relative_drop":       0.0,
+    "month_of_year":       6.0,   # meio do ano como fallback
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 # Stage 3 — Engineered features
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 
 def add_derived_features(features: dict) -> dict:
     """
-    Compute the 5 Stage-3 engineered features from base features.
-    Same code used at training time and at inference — guaranteed consistent.
+    Compute Stage-3 engineered features + Stage-3c dislocation features
+    from base features. Same code used at training time and at inference.
     Mutates and returns the same dict.
     """
     rsi    = float(features.get("rsi_14",         _FALLBACK["rsi_14"]))
@@ -170,18 +188,44 @@ def add_derived_features(features: dict) -> dict:
     dd52   = float(features.get("drawdown_52w",   _FALLBACK["drawdown_52w"]))
     volsp  = float(features.get("volume_spike",   _FALLBACK["volume_spike"]))
 
+    # ── Stage 3: non-linear interactions ──────────────────────────────────
     features["rsi_oversold_strength"] = round(max(0.0, 40.0 - rsi), 4)
     features["vix_regime"] = 0.0 if vix < 15.0 else (1.0 if vix < 25.0 else 2.0)
     features["pe_attractive"]   = round(max(0.0, 1.0 - pe_vf), 4)
     features["drop_x_drawdown"] = round(drop * dd52 / 100.0, 4)
     features["vol_x_drop"]      = round(volsp * abs(drop), 4)
 
+    # ── Stage 3c: dislocation features ─────────────────────────────────
+    gm  = float(features.get("gross_margin",   _FALLBACK["gross_margin"]))
+    fcf = float(features.get("fcf_yield",       _FALLBACK["fcf_yield"]))
+    rg  = float(features.get("revenue_growth",  _FALLBACK["revenue_growth"]))
+
+    # quality_dislocation: gross_margin * |drawdown_52w| / 100
+    # penalizado para 0.0 se FCF yield negativo (empresa queima caixa não qualifica)
+    features["quality_dislocation"] = (
+        round(gm * abs(dd52) / 100.0, 4) if fcf >= 0 else 0.0
+    )
+
+    # peg_implicit: pe_vs_fair / (revenue_growth * 100), clip [0, 5]
+    # fallback 3.0 se crescimento negativo ou P/E inaplicável
+    if rg > 0 and pe_vf > 0:
+        features["peg_implicit"] = round(min(pe_vf / (rg * 100.0), 5.0), 4)
+    else:
+        features["peg_implicit"] = 3.0
+
+    # relative_drop: drop_pct_today - sector_drawdown_5d
+    sec_dd = float(features.get("sector_drawdown_5d", _FALLBACK["sector_drawdown_5d"]))
+    features["relative_drop"] = round(drop - sec_dd, 4)
+
+    # month_of_year: sazonalidade (1–12)
+    features["month_of_year"] = float(datetime.now().month)
+
     return features
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 # Stage 3b — Momentum features
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 
 def _pct_return(prices: np.ndarray, lookback: int) -> float:
     """
@@ -222,7 +266,7 @@ def add_momentum_features(
 
     Returns the mutated dict.
     """
-    # ── return_1m: 21 trading days ────────────────────────────────────
+    # ── return_1m: 21 trading days ──────────────────────────────────
     if price_history is not None and "Close" in price_history.columns:
         try:
             closes = price_history["Close"].dropna().values
@@ -289,9 +333,9 @@ def add_momentum_features(
     return features
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 # Internal helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 
 def _sf(val: Any, key: str) -> float:
     """
@@ -351,9 +395,9 @@ def _compute_volume_spike(price_history: Optional[pd.DataFrame], fund: dict) -> 
     return _FALLBACK["volume_spike"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 # Public API
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 
 def build_features(
     ticker: str,
@@ -391,7 +435,7 @@ def build_features(
     """
     fund = fundamentals
 
-    # ── Stage 0: Macro ─────────────────────────────────────────────────
+    # ── Stage 0: Macro ────────────────────────────────────────────────────
     if macro_context is None:
         macro_context = get_macro_context(sector=sector)
 
@@ -400,7 +444,7 @@ def build_features(
     spy_drawdown_5d    = float(macro_context.get("spy_drawdown_5d",    _FALLBACK["spy_drawdown_5d"]))
     sector_drawdown_5d = float(macro_context.get("sector_drawdown_5d", _FALLBACK["sector_drawdown_5d"]))
 
-    # ── Stage 1: Quality / Value ─────────────────────────────────────
+    # ── Stage 1: Quality / Value ───────────────────────────────────────
     fcf_yield      = _sf(fund.get("fcf_yield"),      "fcf_yield")
     revenue_growth = _sf(fund.get("revenue_growth"), "revenue_growth")
     gross_margin   = _sf(fund.get("gross_margin"),   "gross_margin")
@@ -424,7 +468,7 @@ def build_features(
         logger.warning(f"ml_features [{ticker}]: score_from_fundamentals failed: {e}")
         quality_score = _FALLBACK["quality_score"]
 
-    # ── Stage 2: Timing ────────────────────────────────────────────────
+    # ── Stage 2: Timing ─────────────────────────────────────────────────
     if drop_pct_today is None:
         drop_pct_today = _sf(
             fund.get("change_pct") or fund.get("drop_pct") or fund.get("changePercent"),
@@ -452,7 +496,7 @@ def build_features(
     atr_ratio    = _compute_atr_ratio(price_history, current_price)
     volume_spike = _compute_volume_spike(price_history, fund)
 
-    # ── Assemble base vector ────────────────────────────────────────────
+    # ── Assemble base vector ───────────────────────────────────────────────
     feature_vector = {
         # Stage 0
         "macro_score":          macro_score,
@@ -471,12 +515,12 @@ def build_features(
         "rsi_14":               rsi_14,
         "atr_ratio":            atr_ratio,
         "volume_spike":         volume_spike,
-        # Downstream-only
+        # Downstream-only (não entram no modelo mas necessários para Stage 3c)
         "fcf_yield":            fcf_yield,
         "revenue_growth":       revenue_growth,
     }
 
-    # ── Stage 3: Engineered features ───────────────────────────────────
+    # ── Stage 3: Engineered + 3c Dislocation features ───────────────────
     add_derived_features(feature_vector)
 
     # ── Stage 3b: Momentum features ────────────────────────────────────
@@ -486,7 +530,7 @@ def build_features(
     feature_vector["label_win"]          = label_win
     feature_vector["label_further_drop"] = label_further_drop
 
-    # ── Sanity check ─────────────────────────────────────────────────
+    # ── Sanity check ────────────────────────────────────────────────────
     for col in FEATURE_COLUMNS:
         val = feature_vector[col]
         if not math.isfinite(float(val)):
@@ -503,7 +547,9 @@ def build_features(
         f"rsi={rsi_14:.0f} "
         f"drop={drop_pct_today:.1f}% "
         f"ret1m={feature_vector['return_1m']:.1f}% "
-        f"beta={feature_vector['beta_60d']:.2f}"
+        f"beta={feature_vector['beta_60d']:.2f} "
+        f"qd={feature_vector['quality_dislocation']:.3f} "
+        f"peg={feature_vector['peg_implicit']:.2f}"
     )
 
     return feature_vector
@@ -525,13 +571,12 @@ def build_feature_df(rows: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=all_cols)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 # CLI smoke test  (python ml_features.py)
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import json
-    import datetime
     logging.basicConfig(level=logging.DEBUG)
 
     print(f"FEATURE_COLUMNS ({N_FEATURES}): {FEATURE_COLUMNS}")
@@ -598,4 +643,14 @@ if __name__ == "__main__":
     row = build_feature_row(fv)
     print(f"Flat row ({len(row)} values): {row}")
     assert len(row) == N_FEATURES, f"Expected {N_FEATURES}, got {len(row)}"
-    print(f"\nAssert OK — {N_FEATURES} features.")
+
+    # Verifica dislocation features
+    assert "quality_dislocation" in fv, "quality_dislocation ausente"
+    assert "peg_implicit"        in fv, "peg_implicit ausente"
+    assert "relative_drop"       in fv, "relative_drop ausente"
+    assert "month_of_year"       in fv, "month_of_year ausente"
+    print(f"\nAssert OK — {N_FEATURES} features (incl. 4 dislocation).")
+    print(f"  quality_dislocation = {fv['quality_dislocation']:.4f}")
+    print(f"  peg_implicit        = {fv['peg_implicit']:.4f}")
+    print(f"  relative_drop       = {fv['relative_drop']:.4f}")
+    print(f"  month_of_year       = {fv['month_of_year']}")
