@@ -692,23 +692,41 @@ def calculate_score(
     raw_fund_only = base_score * confidence * 100.0
     fund_only_score = float(np.clip(raw_fund_only, 0.0, 100.0))
 
-    return {
-        "final_score":         round(final_score, 2),
-        "fund_only_score":     round(fund_only_score, 2),
-        "quality_score":       round(quality,    4),
-        "value_score":         round(value,      4),
-        "timing_score":        round(timing,     4),
-        "divergence_score":    round(divergence, 4),
-        "confidence":          round(confidence, 4),
-        "data_coverage":       round(data_coverage, 4),
-        "quality_multiplier":  round(quality_multiplier, 4),
-        "is_value_trap":       vt,
-        "is_preprofit":        is_preprofit,
-        "red_flags":           red_flags,
-        "skip_recommended":    skip,
-        "missing_fields":      missing,
-    }
+    # Flag is_preprofit_growth — distingue "a falir" de "a investir antes de monetizar"
+    is_preprofit_growth = (fcf_yield_v < 0) and (rev_growth_v > 0.20)
 
+    # Valores compostos para o breakdown
+    qd_val = quality_dislocation(
+        _safe_float(features.get("gross_margin"), 0.0),
+        _safe_float(features.get("drawdown_from_high"), 0.0),
+        fcf_yield_v,
+    )
+    ud_val = unjustified_drawdown(
+        _safe_float(features.get("drawdown_from_high"), 0.0),
+        _safe_float(features.get("gross_margin"), 0.0),
+        fcf_yield_v,
+        rev_growth_v,
+    )
+
+    return {
+        "final_score":           round(final_score, 2),
+        "fund_only_score":       round(fund_only_score, 2),
+        "quality_score":         round(quality,    4),
+        "value_score":           round(value,      4),
+        "timing_score":          round(timing,     4),
+        "divergence_score":      round(divergence, 4),
+        "confidence":            round(confidence, 4),
+        "data_coverage":         round(data_coverage, 4),
+        "quality_multiplier":    round(quality_multiplier, 4),
+        "quality_dislocation":   round(qd_val, 4),
+        "unjustified_drawdown":  round(ud_val, 4),
+        "is_value_trap":         vt,
+        "is_preprofit":          is_preprofit,
+        "is_preprofit_growth":   is_preprofit_growth,
+        "red_flags":             red_flags,
+        "skip_recommended":      skip,
+        "missing_fields":        missing,
+    }
 
 # ---------------------------------------------------------------------------
 # 10. Bridge de compatibilidade — adaptador para o dicionário do market_client
@@ -757,34 +775,44 @@ def format_score_v2_breakdown(
     conflict_state: object | None = None,
     conflict_msg: str | None = None,
 ) -> str:
-    """
-    Gera um bloco de texto legível para o Telegram a partir do resultado
-    de calculate_score() / score_from_fundamentals().
-
-    Se `conflict_state` (ConflictState) e `conflict_msg` forem passados,
-    inclui um veredicto final cruzando ML × fundamentais (Fase 2).
-    """
     fs   = result["final_score"]
     q    = result["quality_score"]
     v    = result["value_score"]
     t    = result["timing_score"]
+    d    = result.get("divergence_score", 0.0)
     conf = result["confidence"]
+    data_cov = result.get("data_coverage", conf)
+    qual_conf = round(conf / data_cov, 2) if data_cov > 0 else 1.0
     vt   = result["is_value_trap"]
     skip = result["skip_recommended"]
     miss = result["missing_fields"]
-    red_flags     = result.get("red_flags") or []
-    is_preprofit  = result.get("is_preprofit", False)
+    red_flags    = result.get("red_flags") or []
+    is_preprofit = result.get("is_preprofit", False)
 
     badge = "🔥" if fs >= 80 else ("⭐" if fs >= 55 else "📊")
     lines = [
         f"{badge} *Score V2: {fs:.1f}/100*",
-        f"  🏗️  Quality *{q*100:.0f}%*  \u00b7  💰 Value *{v*100:.0f}%*  \u00b7  ⏱️ Timing *{t*100:.0f}%*",
-        f"  📊 Confiança: *{conf*100:.0f}%*" + (" — dados insuficientes ⚠️" if skip else ""),
+        f"  🏗️  Quality *{q*100:.0f}%*  ·  💰 Value *{v*100:.0f}%*  ·  ⏱️ Timing *{t*100:.0f}%*  ·  🎯 Divergência *{d*100:.0f}%*",
+        f"  📊 Confiança: *{conf*100:.0f}%* (cobertura: {data_cov*100:.0f}% × qualidade: {qual_conf*100:.0f}%)" + (" ⚠️" if skip else ""),
     ]
 
-    # Aviso quando Value é estruturalmente baixo (pre-profit + métricas distorcidas)
-    if v < 0.20 and is_preprofit:
-        lines.append("  ⚠️ _Valorização inaplicável (empresa pre-profit)._")
+    # Flags de dislocation
+    qd_val = result.get("quality_dislocation", 0.0)
+    ud_val = result.get("unjustified_drawdown", 0.0)
+
+    if qd_val > 0.30:
+        lines.append("  🎯 _Quality Dislocation detectada — padrão histórico de reversão significativa_")
+
+    if ud_val > 40:
+        lines.append("  📉 _Drawdown severo com fundamentos intactos — gap percepção/realidade elevado_")
+
+    # Avisos estruturais
+    if is_preprofit and v < 0.20:
+        lines.append("  ⚠️ _Empresa pré-lucro — métricas de valorização tradicionais inaplicáveis. Framework de crescimento puro._")
+
+    # Verificar combinação FCF negativo + PE > 100 directamente das red flags
+    if "Letal: FCF Neg + PE>100" in red_flags:
+        lines.append("  ⚠️ _Empresa pré-lucro — métricas de valorização tradicionais inaplicáveis. Framework de crescimento puro._")
 
     if vt:
         lines.append("  🔴 *Value Trap detectada* — quality penalizada em 50%")
@@ -798,12 +826,11 @@ def format_score_v2_breakdown(
             "(métricas de valor distorcidas)._"
         )
 
-    # Remove volume_spike dos campos em falta (é bonus, não obrigatório)
     reportable_miss = [m for m in miss if m != "volume_spike"]
     if reportable_miss:
         lines.append(f"  _Em falta: {', '.join(reportable_miss)}_")
 
-    # Veredicto final cruzando ML × fundamentais
+    # Veredicto final
     if conflict_state is not None and conflict_msg is not None:
         verdict_label = getattr(conflict_state, "value", str(conflict_state))
         lines.append("")
@@ -811,7 +838,6 @@ def format_score_v2_breakdown(
         lines.append(f"💡 _{conflict_msg}_")
 
     return "\n".join(lines)
-
 
 # ---------------------------------------------------------------------------
 # 12. is_bluechip — mantido sem alterações
