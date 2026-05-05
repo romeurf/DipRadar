@@ -225,6 +225,10 @@ def _load_alert_db_as_training() -> pd.DataFrame:
       - rename_map corrigido: drawdown_from_high (nome actual no CSV)
         → drawdown_52w (nome canónico em FEATURE_COLUMNS)
       - rename explícito symbol → ticker para alinhar com data.py/load_base_dataset
+      - defaults Stage 3c: rows anteriores ao commit 2026-05-05 não têm
+        quality_dislocation, peg_implicit, relative_drop, month_of_year —
+        sem default chegam como NaN ao train_v31 e causam KeyError ou
+        degradação silenciosa do modelo.
     """
     if not ALERT_DB_PATH.exists():
         return pd.DataFrame()
@@ -277,6 +281,14 @@ def _load_alert_db_as_training() -> pd.DataFrame:
         "pe_vs_fair":      1.0,
         "analyst_upside":  df.get("analyst_upside", 0.10),
         "quality_score":   0.5,
+        # ── Stage 3c: dislocation features (adicionadas em 2026-05-05) ──────
+        # Rows do alert_db.csv geradas antes deste commit não têm estas colunas.
+        # Sem default chegam como NaN ao train_v31 → KeyError ou degradação
+        # silenciosa. Valores escolhidos de ml_features._FALLBACK.
+        "quality_dislocation": 0.08,   # empresa mediana como baseline
+        "peg_implicit":        2.0,    # PEG neutro
+        "relative_drop":       0.0,    # sem queda idiossincrática
+        "month_of_year":       float(datetime.now().month),  # mês actual como proxy
     }
     for k, v in defaults.items():
         if k not in df.columns:
