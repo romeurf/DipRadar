@@ -1,0 +1,113 @@
+{
+  "schema_version": 3,
+  "trained_at": "2026-05-06T11:00:26Z",
+  "champion": "Ridge-alpha-v31",
+  "n_features": 29,
+  "feature_cols": [
+    "macro_score",
+    "vix",
+    "spy_drawdown_5d",
+    "sector_drawdown_5d",
+    "gross_margin",
+    "de_ratio",
+    "pe_vs_fair",
+    "analyst_upside",
+    "quality_score",
+    "drop_pct_today",
+    "drawdown_52w",
+    "rsi_14",
+    "atr_ratio",
+    "volume_spike",
+    "rsi_oversold_strength",
+    "vix_regime",
+    "pe_attractive",
+    "drop_x_drawdown",
+    "vol_x_drop",
+    "return_1m",
+    "return_3m_pre",
+    "sector_relative",
+    "beta_60d",
+    "quality_dislocation",
+    "peg_implicit",
+    "relative_drop",
+    "month_of_year",
+    "sector_alert_count_7d",
+    "days_since_52w_high"
+  ],
+  "momentum_feats": [
+    "return_1m",
+    "return_3m_pre",
+    "sector_relative",
+    "beta_60d"
+  ],
+  "new_features_v31": [
+    "sector_alert_count_7d",
+    "days_since_52w_high"
+  ],
+  "n_train": 32736,
+  "horizon_days": 60,
+  "cv": {
+    "kind": "walk_forward_purged_expanding",
+    "n_folds": 10,
+    "purge_days": 21
+  },
+  "metrics": {
+    "rho_alpha_mean": 0.08322890609455921,
+    "rho_down_mean": 0.20694596168820417,
+    "topk_pnl_mean": 0.03167872217126346,
+    "brier_oof": 0.21984252936456491,
+    "win_rate_alpha": 0.3281934466444717
+  },
+  "comparison": [
+    {
+      "model": "Ridge-alpha-v31",
+      "rho_alpha_mean": 0.0832,
+      "rho_alpha_std": 0.0809,
+      "rho_down_mean": 0.2069,
+      "topk_pnl_mean": 0.0317,
+      "topk_pnl_std": 0.0325,
+      "n_folds": 10
+    },
+    {
+      "model": "RF-alpha-v31",
+      "rho_alpha_mean": 0.0579,
+      "rho_alpha_std": 0.086,
+      "rho_down_mean": 0.1841,
+      "topk_pnl_mean": 0.0303,
+      "topk_pnl_std": 0.0325,
+      "n_folds": 10
+    },
+    {
+      "model": "XGB-alpha-v31",
+      "rho_alpha_mean": 0.0467,
+      "rho_alpha_std": 0.0794,
+      "rho_down_mean": 0.1749,
+      "topk_pnl_mean": 0.0244,
+      "topk_pnl_std": 0.0294,
+      "n_folds": 10
+    },
+    {
+      "model": "XGB-alpha-baseline",
+      "rho_alpha_mean": 0.0439,
+      "rho_alpha_std": 0.0627,
+      "rho_down_mean": 0.164,
+      "topk_pnl_mean": 0.0186,
+      "topk_pnl_std": 0.0298,
+      "n_folds": 10
+    },
+    {
+      "model": "LGBM-alpha-v31",
+      "rho_alpha_mean": 0.0389,
+      "rho_alpha_std": 0.0746,
+      "rho_down_mean": 0.1644,
+      "topk_pnl_mean": 0.0172,
+      "topk_pnl_std": 0.0314,
+      "n_folds": 10
+    }
+  ],
+  "target": {
+    "name": "alpha_60d",
+    "formula": "max_return_60d - spy_max_return_60d",
+    "horizon_days": 60
+  }
+}
