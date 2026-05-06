@@ -18,6 +18,8 @@ Architecture: 4-stage pipeline
   Stage 3c — Dislocation: quality_dislocation, peg_implicit, relative_drop,
                         month_of_year — distinguem Quality Dislocation (NOW/PINS)
                         de especulação pura (RKLB).
+  Stage 3d — Context: sector_alert_count_7d, days_since_52w_high — market
+                        breadth and timing context added in v3.2.
 
 Label schema (training only, None in production):
   label_win           int   1 if price recovered >=15% within 60 calendar days
@@ -97,12 +99,17 @@ FEATURE_COLUMNS: list[str] = [
 
     # ── Stage 3c: Dislocation (4 features) ───────────────────────────
     # Distinguem Quality Dislocation (NOW/PINS) de especulação pura (RKLB).
-    # quality_dislocation e peg_implicit são versões compostas de features
-    # existentes — tornam explícito para o modelo o que o score.py já computa.
     "quality_dislocation",  # gross_margin * |drawdown_52w| / 100 (0.0 se FCF negativo)
     "peg_implicit",         # pe_vs_fair / (revenue_growth * 100), clip [0, 5]
     "relative_drop",        # drop_pct_today - sector_drawdown_5d
     "month_of_year",        # mês do ano (1–12) — sazonalidade
+
+    # ── Stage 3d: Context (2 features) — v3.2 ────────────────────────
+    # Market breadth + timing context. Capture contagion / panic breadth.
+    "sector_alert_count_7d", # nº de alertas no mesmo sector nos últimos 7 dias
+                              # (0 = stock-specific dip; alto = sector-wide selloff)
+    "days_since_52w_high",   # dias desde o máximo de 52 semanas (via price_history)
+                              # fallback: 180 (aprox. metade do ano)
 ]
 
 LABEL_COLUMNS: list[str] = [
@@ -111,7 +118,7 @@ LABEL_COLUMNS: list[str] = [
 ]
 
 # Total feature count (used as sanity check in training)
-N_FEATURES = len(FEATURE_COLUMNS)  # 27 (23 base + 4 dislocation)
+N_FEATURES = len(FEATURE_COLUMNS)  # 29
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -168,6 +175,9 @@ _FALLBACK: dict[str, float] = {
     "peg_implicit":        2.0,   # PEG neutro
     "relative_drop":       0.0,
     "month_of_year":       6.0,   # meio do ano como fallback
+    # Stage 3d context (v3.2)
+    "sector_alert_count_7d": 0.0,  # fallback: sem alertas recentes no sector
+    "days_since_52w_high":  180.0,  # fallback: ~6 meses — metade do ano
 }
 
 
@@ -219,6 +229,63 @@ def add_derived_features(features: dict) -> dict:
 
     # month_of_year: sazonalidade (1–12)
     features["month_of_year"] = float(datetime.now().month)
+
+    return features
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Stage 3d — Context features (v3.2)
+# ────────────────────────────────────────────────────────────────────────────────
+
+def add_context_features(
+    features: dict,
+    price_history: Optional[pd.DataFrame] = None,
+    sector_alert_count_7d: Optional[float] = None,
+) -> dict:
+    """
+    Compute Stage-3d context features (v3.2):
+      - sector_alert_count_7d: market breadth / contagion signal
+      - days_since_52w_high: timing — how long since peak (computed from price_history)
+
+    Parameters
+    ----------
+    features              : dict  Feature dict (mutated in place)
+    price_history         : DataFrame  OHLCV daily, ending at alert_date (exclusive)
+    sector_alert_count_7d : float|None  Number of dip alerts in the same sector
+                            in the past 7 calendar days. Pass from bot state.
+                            None → fallback 0.0 (no sector-wide panic signal).
+
+    Anti-leakage:
+      days_since_52w_high is computed from price_history rows only (no future data).
+      In training the parquet builder slices df.loc[:alert_date - 1 day].
+    """
+    # ── sector_alert_count_7d ────────────────────────────────────────
+    if sector_alert_count_7d is not None:
+        v = float(sector_alert_count_7d)
+        features["sector_alert_count_7d"] = v if math.isfinite(v) else _FALLBACK["sector_alert_count_7d"]
+    else:
+        features["sector_alert_count_7d"] = _FALLBACK["sector_alert_count_7d"]
+
+    # ── days_since_52w_high ──────────────────────────────────────────
+    # Strategy: find the row with the highest Close in the last 252 trading days
+    # and count how many bars ago that was.
+    if price_history is not None and "Close" in price_history.columns:
+        try:
+            closes = price_history["Close"].dropna()
+            lookback = closes.tail(252)  # ~1 trading year
+            if len(lookback) >= 5:
+                idx_max = lookback.values.argmax()          # position of max in tail window
+                days_ago = len(lookback) - 1 - idx_max      # bars since that peak
+                # Convert trading days to calendar days (approx ×1.4)
+                cal_days = round(days_ago * 1.4)
+                features["days_since_52w_high"] = float(max(0, cal_days))
+            else:
+                features["days_since_52w_high"] = _FALLBACK["days_since_52w_high"]
+        except Exception as e:
+            logger.debug(f"add_context_features: days_since_52w_high failed: {e}")
+            features["days_since_52w_high"] = _FALLBACK["days_since_52w_high"]
+    else:
+        features["days_since_52w_high"] = _FALLBACK["days_since_52w_high"]
 
     return features
 
@@ -410,24 +477,28 @@ def build_features(
     macro_context: Optional[dict] = None,
     sector_history: Optional[pd.DataFrame] = None,
     spy_history: Optional[pd.DataFrame] = None,
+    sector_alert_count_7d: Optional[float] = None,
 ) -> dict:
     """
     Build the complete feature vector for one stock at one point in time.
 
     Parameters
     ----------
-    ticker          : str       Stock ticker (used only for logging)
-    fundamentals    : dict      Output of market_client.get_fundamentals()
-    price_history   : DataFrame Optional OHLCV DataFrame (daily, OHLCV columns)
-                                Required for ATR, volume_spike, and momentum features.
-                                Must contain only rows BEFORE alert_date (no leakage).
-    sector          : str       GICS sector string (e.g. "Technology")
-    drop_pct_today  : float     % price change that triggered the dip alert (negative)
-    label_win       : int|None  Training label only.
-    label_further_drop: float|None  Training label only.
-    macro_context   : dict|None Pre-computed macro dict.
-    sector_history  : DataFrame Optional OHLCV for the sector ETF (for sector_relative).
-    spy_history     : DataFrame Optional OHLCV for SPY (for beta_60d).
+    ticker                : str       Stock ticker (used only for logging)
+    fundamentals          : dict      Output of market_client.get_fundamentals()
+    price_history         : DataFrame Optional OHLCV DataFrame (daily, OHLCV columns)
+                                      Required for ATR, volume_spike, momentum, and
+                                      days_since_52w_high features.
+                                      Must contain only rows BEFORE alert_date (no leakage).
+    sector                : str       GICS sector string (e.g. "Technology")
+    drop_pct_today        : float     % price change that triggered the dip alert (negative)
+    label_win             : int|None  Training label only.
+    label_further_drop    : float|None  Training label only.
+    macro_context         : dict|None Pre-computed macro dict.
+    sector_history        : DataFrame Optional OHLCV for the sector ETF (for sector_relative).
+    spy_history           : DataFrame Optional OHLCV for SPY (for beta_60d).
+    sector_alert_count_7d : float|None Number of dip alerts in the same sector in the
+                                      past 7 calendar days. Pass from bot/state. Default 0.
 
     Returns
     -------
@@ -526,6 +597,9 @@ def build_features(
     # ── Stage 3b: Momentum features ────────────────────────────────────
     add_momentum_features(feature_vector, price_history, sector_history, spy_history)
 
+    # ── Stage 3d: Context features (v3.2) ──────────────────────────────
+    add_context_features(feature_vector, price_history, sector_alert_count_7d)
+
     # Labels
     feature_vector["label_win"]          = label_win
     feature_vector["label_further_drop"] = label_further_drop
@@ -549,7 +623,9 @@ def build_features(
         f"ret1m={feature_vector['return_1m']:.1f}% "
         f"beta={feature_vector['beta_60d']:.2f} "
         f"qd={feature_vector['quality_dislocation']:.3f} "
-        f"peg={feature_vector['peg_implicit']:.2f}"
+        f"peg={feature_vector['peg_implicit']:.2f} "
+        f"sec_alerts={feature_vector['sector_alert_count_7d']:.0f} "
+        f"d52h={feature_vector['days_since_52w_high']:.0f}d"
     )
 
     return feature_vector
@@ -606,7 +682,7 @@ if __name__ == "__main__":
         "sector_drawdown_5d": -2.8,
     }
 
-    # Mock 90-day OHLCV history for momentum features
+    # Mock 90-day OHLCV history for momentum + context features
     np.random.seed(42)
     dates  = pd.date_range(end="2026-01-13", periods=90, freq="B")
     prices = 400.0 * np.cumprod(1 + np.random.normal(0, 0.01, 90))
@@ -633,24 +709,29 @@ if __name__ == "__main__":
         label_win=1,
         label_further_drop=-4.2,
         spy_history=mock_spy,
+        sector_alert_count_7d=3.0,
     )
 
     print("Feature vector:")
     for k, v in fv.items():
-        print(f"  {k:25s}: {v}")
+        print(f"  {k:28s}: {v}")
 
     print()
     row = build_feature_row(fv)
     print(f"Flat row ({len(row)} values): {row}")
     assert len(row) == N_FEATURES, f"Expected {N_FEATURES}, got {len(row)}"
 
-    # Verifica dislocation features
-    assert "quality_dislocation" in fv, "quality_dislocation ausente"
-    assert "peg_implicit"        in fv, "peg_implicit ausente"
-    assert "relative_drop"       in fv, "relative_drop ausente"
-    assert "month_of_year"       in fv, "month_of_year ausente"
-    print(f"\nAssert OK — {N_FEATURES} features (incl. 4 dislocation).")
-    print(f"  quality_dislocation = {fv['quality_dislocation']:.4f}")
-    print(f"  peg_implicit        = {fv['peg_implicit']:.4f}")
-    print(f"  relative_drop       = {fv['relative_drop']:.4f}")
-    print(f"  month_of_year       = {fv['month_of_year']}")
+    # Verifica todas as features novas
+    assert "quality_dislocation"    in fv, "quality_dislocation ausente"
+    assert "peg_implicit"           in fv, "peg_implicit ausente"
+    assert "relative_drop"          in fv, "relative_drop ausente"
+    assert "month_of_year"          in fv, "month_of_year ausente"
+    assert "sector_alert_count_7d"  in fv, "sector_alert_count_7d ausente"
+    assert "days_since_52w_high"    in fv, "days_since_52w_high ausente"
+    print(f"\nAssert OK — {N_FEATURES} features (27 base + 2 context v3.2).")
+    print(f"  quality_dislocation   = {fv['quality_dislocation']:.4f}")
+    print(f"  peg_implicit          = {fv['peg_implicit']:.4f}")
+    print(f"  relative_drop         = {fv['relative_drop']:.4f}")
+    print(f"  month_of_year         = {fv['month_of_year']}")
+    print(f"  sector_alert_count_7d = {fv['sector_alert_count_7d']}")
+    print(f"  days_since_52w_high   = {fv['days_since_52w_high']} dias")
