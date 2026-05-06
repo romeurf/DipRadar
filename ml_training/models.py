@@ -54,12 +54,14 @@ def rf_factory() -> "object":
 
 def ridge_factory() -> "object":
     from sklearn.linear_model import Ridge
-    return Ridge(alpha=1.0, random_state=42)
+    # alpha=10.0: resolve LinAlgWarning e suaviza regime shifts
+    # (vs alpha=1.0 no v3.1 que gerava instabilidade no Fold 10)
+    return Ridge(alpha=10.0)
 
 
 # Mapping name → (factory_callable, feats_kind)
 # feats_kind:
-#   "v31"      → FEATURE_COLUMNS_V31 (v2 + momentum + 4 NEW)
+#   "v31"      → FEATURE_COLUMNS_V31 (v2 + momentum + NEW)
 #   "baseline" → FEATURE_COLUMNS_V2 + MOMENTUM_FEATURES (sem as NEW)
 def build_model_configs(
     feature_cols_v31: list[str],
@@ -80,7 +82,7 @@ def build_feature_lists() -> tuple[list[str], list[str]]:
 
     A definição replica cell 12 do notebook:
       v31 = unique(FEATURE_COLUMNS_V2 + MOMENTUM_FEATURES + NEW_FEATURES_V31)
-      baseline = FEATURE_COLUMNS_V2 + MOMENTUM_FEATURES (sem as 4 NEW)
+      baseline = FEATURE_COLUMNS_V2 + MOMENTUM_FEATURES (sem as NEW)
     """
     from experiments.ml_v2.pipeline import FEATURE_COLUMNS_V2
     from ml_training.config import MOMENTUM_FEATURES, NEW_FEATURES_V31
