@@ -1,4 +1,4 @@
-"""Construção do dataset v3.1 — extraído do notebook (cells 6, 13, 14)."""
+"""Construção do dataset v3.2 — extraído do notebook (cells 6, 13, 14)."""
 
 from __future__ import annotations
 
@@ -13,6 +13,10 @@ import pandas as pd
 from ml_training.config import DEFAULT_ETF, HORIZON_DAYS, SECTOR_ETF
 
 log = logging.getLogger(__name__)
+
+# Tickers macro necessários para get_macro_context_historical.
+# Descarrega uma vez no início do Colab e passa como macro_price_cache.
+MACRO_TICKERS: list[str] = ["^VIX", "SPY", "^TNX", "^IRX", "HYG", "LQD", "IYT", "XLI"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -134,7 +138,7 @@ def days_since_52w_high(hist: pd.DataFrame, alert_date: pd.Timestamp) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Build dataset v31 (cell 14)
+# Build dataset v3.2 (cell 14)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_dataset_v31(
@@ -143,31 +147,55 @@ def build_dataset_v31(
     etf_cache: dict[str, pd.DataFrame],
     feature_cols_v31: list[str],
     horizon_days: int = HORIZON_DAYS,
+    macro_price_cache: Optional[dict[str, pd.DataFrame]] = None,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
-    """Constrói dataset v3.1 linha-a-linha (replica cell 14 do notebook).
+    """Constrói dataset v3.2 linha-a-linha (replica cell 14 do notebook).
 
     Para cada alerta em ``base_df``:
-      1. Carrega features v1/v2 (com fallback ``ml_features._FALLBACK``)
-      2. Adiciona derived features (``add_derived_features``)
-      3. Adiciona v2 features price-based (``build_v2_features``)
-      4. Adiciona momentum features (``add_momentum_features``)
-      5. Adiciona 4 NEW features (relative_drop, sector_alert_count_7d,
-         days_since_52w_high, month_of_year)
-      6. Calcula targets ``max_return_60d``, ``max_drawdown_60d``,
-         ``spy_max_return_60d``, ``alpha_60d = max_return - spy_max_return``
+      1. Computa macro point-in-time via get_macro_context_historical()
+         (Stage 0: macro_score, vix, spy_drawdown_5d, sector_drawdown_5d)
+      2. Carrega features v1/v2 do parquet + fallback _FALLBACK
+         para features de qualidade (Stage 1: gross_margin, de_ratio, etc.)
+      3. Adiciona derived features (add_derived_features)
+      4. Adiciona v2 features price-based (build_v2_features)
+      5. Adiciona momentum features (add_momentum_features)
+      6. Adiciona context features v3.2 (add_context_features)
+      7. Calcula targets max_return_60d, max_drawdown_60d,
+         spy_max_return_60d, alpha_60d
 
-    Devolve (df_v31, skipped_dict).
+    Parameters
+    ----------
+    base_df            : DataFrame   Alertas subsampled (output da Célula 3)
+    price_cache        : dict        {ticker: OHLCV DataFrame}
+    etf_cache          : dict        {etf_ticker: OHLCV DataFrame} — inclui SPY e sector ETFs
+    feature_cols_v31   : list[str]   FEATURE_COLUMNS de ml_features.py (29 features)
+    horizon_days       : int         Janela forward para targets (default: HORIZON_DAYS)
+    macro_price_cache  : dict|None   {macro_ticker: OHLCV DataFrame} para macro histórico.
+                                     Tickers necessários: MACRO_TICKERS (^VIX, SPY, ^TNX,
+                                     ^IRX, HYG, LQD, IYT, XLI) + sector ETFs.
+                                     Se None, as features macro ficam com fallback.
+
+    Devolve (df_v32, skipped_dict).
     """
     from ml_features import (
         FEATURE_COLUMNS,
         _FALLBACK,
         add_derived_features,
         add_momentum_features,
+        add_context_features,
     )
+    from macro_data import get_macro_context_historical
     from experiments.ml_v2.pipeline import build_targets, build_v2_features
 
     sector_count_lookup = compute_sector_alert_count_7d(base_df)
     spy_hist = etf_cache.get(DEFAULT_ETF)
+
+    # Merge macro_price_cache com etf_cache para ter sector ETFs disponíveis
+    # no get_macro_context_historical sem duplicar memória.
+    combined_macro_cache: dict[str, pd.DataFrame] = {}
+    if macro_price_cache:
+        combined_macro_cache.update(macro_price_cache)
+    combined_macro_cache.update(etf_cache)  # sector ETFs sobrepõem se duplicados
 
     rows_v31: list[dict] = []
     skipped = {"no_price": 0, "short_history": 0, "no_target": 0, "no_spy_target": 0}
@@ -188,33 +216,51 @@ def build_dataset_v31(
             skipped["short_history"] += 1
             continue
 
-        # Features v1 (do parquet, com fallback)
+        # ── Stage 0: Macro point-in-time ─────────────────────────────────────
+        macro_ctx = get_macro_context_historical(
+            as_of_date=alert_date,
+            sector=sector,
+            macro_price_cache=combined_macro_cache if combined_macro_cache else None,
+        )
+
+        # ── Features: parquet → fv (com fallback para tudo) ──────────────────
         fv: dict[str, float] = {}
         for c in FEATURE_COLUMNS:
             v = row.get(c) if c in row.index else None
             fv[c] = float(v) if (v is not None and pd.notna(v)) else _FALLBACK.get(c, 0.0)
+
+        # Sobrepõe Stage 0 com valores macro point-in-time reais
+        fv["macro_score"]        = float(macro_ctx["macro_score"])
+        fv["vix"]                = float(macro_ctx["vix"])
+        fv["spy_drawdown_5d"]    = float(macro_ctx["spy_drawdown_5d"])
+        fv["sector_drawdown_5d"] = float(macro_ctx["sector_drawdown_5d"])
+
+        # ── Stage 1: Quality — parquet tem os valores históricos se disponíveis
+        # (gross_margin, de_ratio, pe_vs_fair, analyst_upside, quality_score)
+        # O loop já os leu do parquet acima via _FALLBACK se em falta.
+        # Nada a fazer aqui — os fundamentals são point-in-time no parquet.
+
         add_derived_features(fv)
 
-        # Features v2 extras (price-based)
+        # ── Features v2 extras (price-based) ─────────────────────────────────
         fv.update(build_v2_features(row, hist))
 
-        # Features v3 (momentum)
+        # ── Stage 3b: Momentum ────────────────────────────────────────────────
         sec_hist = etf_cache.get(etf)
         sec_slice = sec_hist[sec_hist.index <= alert_date] if sec_hist is not None else None
         spy_slice = spy_hist[spy_hist.index <= alert_date] if spy_hist is not None else None
         add_momentum_features(fv, hist, sec_slice, spy_slice)
 
-        # Features v3.1 NEW
-        fv["relative_drop"] = float(
-            fv.get("drop_pct_today", 0.0) - fv.get("sector_drawdown_5d", 0.0)
+        # ── Stage 3d: Context features v3.2 ──────────────────────────────────
+        add_context_features(
+            fv,
+            price_history=hist,
+            sector_alert_count_7d=float(
+                sector_count_lookup.get((ticker, alert_date), 0)
+            ),
         )
-        fv["sector_alert_count_7d"] = float(
-            sector_count_lookup.get((ticker, alert_date), 0)
-        )
-        fv["days_since_52w_high"] = days_since_52w_high(ohlcv, alert_date)
-        fv["month_of_year"] = float(alert_date.month)
 
-        # Target real do parquet (se disponível) — caso contrário recalcular
+        # ── Targets ───────────────────────────────────────────────────────────
         if "max_return_60d" in row.index and pd.notna(row.get("max_return_60d")):
             max_ret = float(row["max_return_60d"])
             max_draw = float(row.get("max_drawdown_60d", 0.0))
@@ -257,5 +303,5 @@ def build_dataset_v31(
         rows_v31.append(rec)
 
     df_v31 = pd.DataFrame(rows_v31)
-    log.info(f"[data] dataset v3.1: shape={df_v31.shape} | skipped={skipped}")
+    log.info(f"[data] dataset v3.2: shape={df_v31.shape} | skipped={skipped}")
     return df_v31, skipped
