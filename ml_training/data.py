@@ -8,16 +8,16 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from ml_training.config import DEFAULT_ETF, HORIZON_DAYS, SECTOR_ETF
+from ml_training.config import DEFAULT_ETF, FEATURE_COLS, HORIZON_DAYS, SECTOR_ETF
 
 log = logging.getLogger(__name__)
 
 MACRO_TICKERS: list[str] = ["^VIX", "SPY", "^TNX", "^IRX", "HYG", "LQD", "IYT", "XLI"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 # load_base_dataset
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 
 def load_base_dataset(parquet_path: Path) -> pd.DataFrame:
     if not Path(parquet_path).exists():
@@ -34,9 +34,9 @@ def load_base_dataset(parquet_path: Path) -> pd.DataFrame:
     return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers inline (antes em experiments.ml_v2.pipeline)
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
+# Helpers inline
+# ────────────────────────────────────────────────────────────────────────────────
 
 def _build_targets(
     alert_date: pd.Timestamp,
@@ -60,10 +60,7 @@ def _build_targets(
 
 
 def _build_v2_features(row: pd.Series, hist: pd.DataFrame) -> dict:
-    """Features price-based que o parquet v1 não tem.
-    Replica build_v2_features() que estava em experiments.ml_v2.pipeline.
-    Serve de fallback para campos que porventura faltem no row.
-    """
+    """Features price-based que o parquet v1 não tem."""
     from ml_features import _FALLBACK
     if hist.empty:
         return {}
@@ -75,7 +72,6 @@ def _build_v2_features(row: pd.Series, hist: pd.DataFrame) -> dict:
     drop_today   = (last_close / prev_close - 1.0) if prev_close > 0 else 0.0
     drawdown_52w = (last_close / high_52w - 1.0)   if high_52w   > 0 else 0.0
 
-    # RSI-14
     delta = close.diff().dropna()
     gain  = delta.clip(lower=0).rolling(14).mean()
     loss  = (-delta.clip(upper=0)).rolling(14).mean()
@@ -90,9 +86,9 @@ def _build_v2_features(row: pd.Series, hist: pd.DataFrame) -> dict:
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 # compute_sector_alert_count_7d
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 
 def compute_sector_alert_count_7d(
     df: pd.DataFrame,
@@ -117,16 +113,16 @@ def compute_sector_alert_count_7d(
     return lookup
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 # spy_close_return_forward / days_since_52w_high
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 
 def spy_close_return_forward(
     spy_hist: Optional[pd.DataFrame],
     alert_date: pd.Timestamp,
     horizon: int = HORIZON_DAYS,
 ) -> float:
-    """Retorno close-to-close do SPY no horizonte forward — consistente com close_60d do ticker."""
+    """Retorno close-to-close do SPY no horizonte forward."""
     if spy_hist is None:
         return float("nan")
     entry_slice = spy_hist[spy_hist.index <= alert_date]
@@ -144,13 +140,12 @@ def spy_close_return_forward(
     return float(fwd["Close"].iloc[-1] / spy_entry - 1.0)
 
 
-# Mantido por retrocompatibilidade — usar spy_close_return_forward em código novo
 def spy_max_return_forward(
     spy_hist: Optional[pd.DataFrame],
     alert_date: pd.Timestamp,
     horizon: int = HORIZON_DAYS,
 ) -> float:
-    """Deprecated: usava .max() em vez de close-to-close. Usar spy_close_return_forward."""
+    """Deprecated: usar spy_close_return_forward."""
     return spy_close_return_forward(spy_hist, alert_date, horizon)
 
 
@@ -166,9 +161,9 @@ def days_since_52w_high(hist: pd.DataFrame, alert_date: pd.Timestamp) -> float:
     return float((alert_date - high_idx).days)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# generate_historical_alerts  (Notebook Célula 3)
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
+# generate_historical_alerts
+# ────────────────────────────────────────────────────────────────────────────────
 
 def generate_historical_alerts(
     all_tickers: list[str],
@@ -180,24 +175,6 @@ def generate_historical_alerts(
     max_per_year: Optional[int] = None,
     seed: int = 42,
 ) -> pd.DataFrame:
-    """Gera alertas históricos de dip a partir do price_cache.
-
-    Para cada ticker e cada dia de troca com queda >= dip_threshold (e.g. -5%),
-    cria uma linha de alerta com: ticker, alert_date, sector, drop_pct_today.
-
-    Parâmetros
-    ----------
-    all_tickers       : lista de tickers a processar
-    price_cache       : {ticker: OHLCV DataFrame} com index DatetimeIndex
-    sector_fn         : callable(ticker) -> str  (get_ticker_sector do notebook)
-    dip_threshold     : queda mínima para gerar alerta (default -5%)
-    min_history_days  : mínimo de candles antes do alerta para ser válido
-    subsample_years   : lista de anos a considerar (None = todos)
-    max_per_year      : máximo de alertas por ano após subsample (None = sem limite)
-    seed              : seed para reproducibilidade do subsample
-
-    Devolve DataFrame com colunas: ticker, alert_date, sector, drop_pct_today
-    """
     rng = np.random.default_rng(seed)
     records: list[dict] = []
 
@@ -250,19 +227,22 @@ def generate_historical_alerts(
     return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 # build_dataset_v31
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
 
 def build_dataset_v31(
     base_df: pd.DataFrame,
     price_cache: dict[str, pd.DataFrame],
     etf_cache: dict[str, pd.DataFrame],
-    feature_cols_v31: list[str],
     horizon_days: int = HORIZON_DAYS,
     macro_price_cache: Optional[dict[str, pd.DataFrame]] = None,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
-    """Constrói dataset v3.2 linha-a-linha."""
+    """Constrói dataset linha-a-linha usando FEATURE_COLS do config.
+
+    Não recebe feature_cols como argumento — usa sempre FEATURE_COLS
+    importado de ml_training.config, que é a única fonte de verdade.
+    """
     from ml_features import (
         FEATURE_COLUMNS,
         _FALLBACK,
@@ -273,6 +253,16 @@ def build_dataset_v31(
         add_short_earnings_features,
     )
     from macro_data import get_macro_context_historical
+
+    # Sanity check: FEATURE_COLS (config) deve ser igual a FEATURE_COLUMNS (ml_features)
+    if FEATURE_COLS != FEATURE_COLUMNS:
+        missing = set(FEATURE_COLUMNS) - set(FEATURE_COLS)
+        extra   = set(FEATURE_COLS) - set(FEATURE_COLUMNS)
+        raise ValueError(
+            f"FEATURE_COLS (config) != FEATURE_COLUMNS (ml_features)!\n"
+            f"  em ml_features mas não no config: {missing}\n"
+            f"  no config mas não em ml_features: {extra}"
+        )
 
     sector_count_lookup = compute_sector_alert_count_7d(base_df)
     spy_hist = etf_cache.get(DEFAULT_ETF)
@@ -301,14 +291,12 @@ def build_dataset_v31(
             skipped["short_history"] += 1
             continue
 
-        # Stage 0: Macro point-in-time
         macro_ctx = get_macro_context_historical(
             as_of_date=alert_date,
             sector=sector,
             macro_price_cache=combined_macro_cache if combined_macro_cache else None,
         )
 
-        # Feature vector com fallbacks
         fv: dict[str, float] = {}
         for c in FEATURE_COLUMNS:
             v = row.get(c) if c in row.index else None
@@ -319,14 +307,11 @@ def build_dataset_v31(
         fv["spy_drawdown_5d"]    = float(macro_ctx["spy_drawdown_5d"])
         fv["sector_drawdown_5d"] = float(macro_ctx["sector_drawdown_5d"])
 
-        # Features price-based (fallback para campos em falta no parquet)
         price_feats = _build_v2_features(row, hist)
         for k, v in price_feats.items():
             if not pd.notna(fv.get(k)) or fv.get(k) == _FALLBACK.get(k, 0.0):
                 fv[k] = v
 
-        # FIX (Gap 2): pass alert_date so month_of_year uses the correct
-        # historical month instead of datetime.now().month (look-ahead).
         add_derived_features(fv, alert_date=alert_date)
 
         sec_hist  = etf_cache.get(etf)
@@ -342,25 +327,17 @@ def build_dataset_v31(
             ),
         )
 
-        # FIX (Gap 1): call add_short_earnings_features so short_interest_ratio
-        # and earnings_surprise_avg are populated from parquet row data when
-        # available, instead of always using fallback values during training.
-        # ticker_info is reconstructed from row columns that yfinance .info
-        # fields may have been stored as (shortRatio, earningsHistory).
-        # If not present in the parquet, None is passed and fallbacks apply.
         ticker_info: Optional[dict] = None
-        short_ratio = row.get("shortRatio") if "shortRatio" in row.index else None
+        short_ratio   = row.get("shortRatio")     if "shortRatio"     in row.index else None
         earnings_hist = row.get("earningsHistory") if "earningsHistory" in row.index else None
         if short_ratio is not None or earnings_hist is not None:
             ticker_info = {}
-            if short_ratio is not None:
-                ticker_info["shortRatio"] = short_ratio
-            if earnings_hist is not None:
-                ticker_info["earningsHistory"] = earnings_hist
+            if short_ratio   is not None: ticker_info["shortRatio"]     = short_ratio
+            if earnings_hist is not None: ticker_info["earningsHistory"] = earnings_hist
         add_short_earnings_features(fv, ticker_info)
 
-        tnx_hist  = combined_macro_cache.get("^TNX")
-        vix_hist  = combined_macro_cache.get("^VIX")
+        tnx_hist = combined_macro_cache.get("^TNX")
+        vix_hist = combined_macro_cache.get("^VIX")
         add_regime_features(fv, spy_slice, tnx_hist, alert_date, vix_hist)
 
         # Targets
@@ -385,7 +362,6 @@ def build_dataset_v31(
             max_ret  = tgt["max_return_60d"]
             max_draw = tgt["max_drawdown_60d"]
 
-        # close_60d: close-to-close do ticker
         future_close_slice = ohlcv[
             (ohlcv.index > alert_date)
             & (ohlcv.index <= alert_date + pd.Timedelta(days=horizon_days))
@@ -400,7 +376,6 @@ def build_dataset_v31(
         else:
             close_60d = max_ret
 
-        # spy_close_60d: close-to-close do SPY (consistente com close_60d)
         spy_close_60d = spy_close_return_forward(spy_hist, alert_date, horizon_days)
         if not np.isfinite(spy_close_60d) or abs(spy_close_60d) > 2.0:
             skipped["no_spy_target"] += 1
@@ -409,14 +384,14 @@ def build_dataset_v31(
         alpha_60d = (
             math.log1p(close_60d) - math.log1p(spy_close_60d)
             if (close_60d > -1.0 and spy_close_60d > -1.0)
-            else close_60d - spy_close_60d  # fallback aritmético
+            else close_60d - spy_close_60d
         )
 
         rec = {
             "ticker":     ticker,
             "alert_date": alert_date,
             "sector":     sector,
-            **{c: fv[c] for c in feature_cols_v31 if c in fv},
+            **{c: fv[c] for c in FEATURE_COLS if c in fv},
             "max_return_60d":   max_ret,
             "max_drawdown_60d": max_draw,
             "close_60d":        close_60d,
@@ -426,5 +401,5 @@ def build_dataset_v31(
         rows_v31.append(rec)
 
     df_out = pd.DataFrame(rows_v31)
-    log.info(f"[data] dataset v3.2: shape={df_out.shape} | skipped={skipped}")
+    log.info(f"[data] dataset: shape={df_out.shape} | skipped={skipped}")
     return df_out, skipped
