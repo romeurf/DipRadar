@@ -7,7 +7,7 @@ orquestra o pipeline completo:
   1. Carregar dataset base (parquet com features v1/v2)
   2. Fetch yfinance (SPY + ETFs sectoriais + stocks)
   3. Construir dataset v3.1 (34 features + target alpha_60d)
-  4. Walk-forward CV (10 folds expanding-window, purge 21d)
+  4. Walk-forward CV (10 folds expanding-window, purge 60d)
   5. Seleccionar champion (rho_alpha_mean máximo com PnL > 0)
   6. Treinar champion no dataset completo + calibrator isotónico
   7. Empacotar ``DipModelsV3`` + escrever ``ml_report_v3.json``
@@ -24,8 +24,7 @@ from ml_training.config import (
     PURGE_DAYS,
     TOPK_FRAC,
     WINSOR_PCT,
-    MOMENTUM_FEATURES,
-    NEW_FEATURES_V31,
+    FEATURE_COLS,
 )
 
 __all__ = [
@@ -35,6 +34,5 @@ __all__ = [
     "PURGE_DAYS",
     "TOPK_FRAC",
     "WINSOR_PCT",
-    "MOMENTUM_FEATURES",
-    "NEW_FEATURES_V31",
+    "FEATURE_COLS",
 ]
