@@ -120,14 +120,15 @@ def compute_sector_alert_count_7d(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# spy_max_return_forward / days_since_52w_high
+# spy_close_return_forward / days_since_52w_high
 # ─────────────────────────────────────────────────────────────────────────────
 
-def spy_max_return_forward(
+def spy_close_return_forward(
     spy_hist: Optional[pd.DataFrame],
     alert_date: pd.Timestamp,
     horizon: int = HORIZON_DAYS,
 ) -> float:
+    """Retorno close-to-close do SPY no horizonte forward — consistente com close_60d do ticker."""
     if spy_hist is None:
         return float("nan")
     entry_slice = spy_hist[spy_hist.index <= alert_date]
@@ -142,7 +143,17 @@ def spy_max_return_forward(
     ]
     if len(fwd) < 5:
         return float("nan")
-    return float(fwd["Close"].max() / spy_entry - 1.0)
+    return float(fwd["Close"].iloc[-1] / spy_entry - 1.0)
+
+
+# Mantido por retrocompatibilidade — usar spy_close_return_forward em código novo
+def spy_max_return_forward(
+    spy_hist: Optional[pd.DataFrame],
+    alert_date: pd.Timestamp,
+    horizon: int = HORIZON_DAYS,
+) -> float:
+    """Deprecated: usava .max() em vez de close-to-close. Usar spy_close_return_forward."""
+    return spy_close_return_forward(spy_hist, alert_date, horizon)
 
 
 def days_since_52w_high(hist: pd.DataFrame, alert_date: pd.Timestamp) -> float:
@@ -351,7 +362,7 @@ def build_dataset_v31(
             max_ret  = tgt["max_return_60d"]
             max_draw = tgt["max_drawdown_60d"]
 
-        # close_60d: close-to-close
+        # close_60d: close-to-close do ticker
         future_close_slice = ohlcv[
             (ohlcv.index > alert_date)
             & (ohlcv.index <= alert_date + pd.Timedelta(days=horizon_days))
@@ -362,23 +373,24 @@ def build_dataset_v31(
         else:
             close_60d = max_ret
 
-        spy_max_ret = spy_max_return_forward(spy_hist, alert_date, horizon_days)
-        if math.isnan(spy_max_ret):
+        # spy_close_60d: close-to-close do SPY (consistente com close_60d)
+        spy_close_60d = spy_close_return_forward(spy_hist, alert_date, horizon_days)
+        if math.isnan(spy_close_60d):
             skipped["no_spy_target"] += 1
             continue
 
-        alpha_60d = close_60d - spy_max_ret
+        alpha_60d = close_60d - spy_close_60d
 
         rec = {
             "ticker":     ticker,
             "alert_date": alert_date,
             "sector":     sector,
             **{c: fv[c] for c in feature_cols_v31 if c in fv},
-            "max_return_60d":     max_ret,
-            "max_drawdown_60d":   max_draw,
-            "close_60d":          close_60d,
-            "spy_max_return_60d": spy_max_ret,
-            "alpha_60d":          alpha_60d,
+            "max_return_60d":   max_ret,
+            "max_drawdown_60d": max_draw,
+            "close_60d":        close_60d,
+            "spy_close_60d":    spy_close_60d,
+            "alpha_60d":        alpha_60d,
         }
         rows_v31.append(rec)
 
