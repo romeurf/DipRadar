@@ -1,5 +1,3 @@
-"""Construção do dataset v3.2 — extraído do notebook."""
-
 from __future__ import annotations
 
 import logging
@@ -367,18 +365,22 @@ def build_dataset_v31(
             (ohlcv.index > alert_date)
             & (ohlcv.index <= alert_date + pd.Timedelta(days=horizon_days))
         ]["Close"]
+        
         entry_px = float(hist["Close"].iloc[-1])
         if len(future_close_slice) >= 5 and entry_px > 0:
             close_60d = float(future_close_slice.iloc[-1] / entry_px - 1.0)
+            if not np.isfinite(close_60d) or abs(close_60d) > 2.0:
+                skipped["no_target"] += 1
+                continue
         else:
             close_60d = max_ret
 
         # spy_close_60d: close-to-close do SPY (consistente com close_60d)
         spy_close_60d = spy_close_return_forward(spy_hist, alert_date, horizon_days)
-        if math.isnan(spy_close_60d):
+        if not np.isfinite(spy_close_60d) or abs(spy_close_60d) > 2.0:
             skipped["no_spy_target"] += 1
             continue
-
+        
         alpha_60d = close_60d - spy_close_60d
 
         rec = {
