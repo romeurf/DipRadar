@@ -1,5 +1,3 @@
-"""Constantes do treino v3.2."""
-
 from __future__ import annotations
 from typing import Optional
 
@@ -42,7 +40,7 @@ ALL_NEW_FEATURES: list[str] = NEW_FEATURES_V31 + NEW_FEATURES_V32
 # MAX_ALERTS_PER_YEAR limita anos de pico extremo (e.g. 2020, 2022)
 # para não distorcer os pesos temporais — 5000/ano dá equilíbrio suficiente.
 SUBSAMPLE_YEARS: Optional[list[int]] = None
-MAX_ALERTS_PER_YEAR: int = 5_000
+MAX_ALERTS_PER_YEAR: int = 2_000
 SUBSAMPLE_SEED: int = 42
 
 SECTOR_ETF: dict[str, str] = {
