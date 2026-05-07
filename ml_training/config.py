@@ -40,21 +40,19 @@ NEW_FEATURES_V33: list[str] = [
     "earnings_surprise_avg",  # média dos últimos 2 EPS surprises (%)
 ]
 
-# v3.4 — point-in-time market regime signals
-# Distinguish dips in stressed markets (high VIX percentile, oversold SPY,
-# rising yields) from dips in calm markets — recovery probability differs.
-# Implemented in ml_features.add_regime_features(); called in data.build_dataset_v31().
-NEW_FEATURES_V34: list[str] = [
-    "vix_percentile_1y",    # VIX rank in trailing 252 sessions [0, 1]
-    "spy_rsi_14",           # SPY RSI-14 at alert_date [0, 100]
-    "yield_10y_change_5d",  # 5-day change in 10Y US Treasury yield (^TNX, %)
-]
+# NOTE: v3.4 regime features (vix_percentile_1y, spy_rsi_14,
+# yield_10y_change_5d) are already the last 3 entries of FEATURE_COLUMNS
+# in ml_features.py (Stage 3f). They are canonical base features —
+# NOT add-ons — so they must NOT appear here in ALL_NEW_FEATURES.
+# Adding them here would cause silent duplication when train.py builds:
+#   FEATURE_COLS_V31 = FEATURE_COLUMNS + ALL_NEW_FEATURES
+# The full 37-feature vector is: FEATURE_COLUMNS (37) + ALL_NEW_FEATURES (14)
+# = 51 columns passed to the model (with regime features counted once).
 
 ALL_NEW_FEATURES: list[str] = (
     NEW_FEATURES_V31
     + NEW_FEATURES_V32
     + NEW_FEATURES_V33
-    + NEW_FEATURES_V34       # regime features now included in model input
 )
 
 # Subsample: None = todos os anos disponíveis (2015-2026+).
