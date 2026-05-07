@@ -270,6 +270,7 @@ def build_dataset_v31(
         add_momentum_features,
         add_context_features,
         add_regime_features,
+        add_short_earnings_features,
     )
     from macro_data import get_macro_context_historical
 
@@ -324,7 +325,9 @@ def build_dataset_v31(
             if not pd.notna(fv.get(k)) or fv.get(k) == _FALLBACK.get(k, 0.0):
                 fv[k] = v
 
-        add_derived_features(fv)
+        # FIX (Gap 2): pass alert_date so month_of_year uses the correct
+        # historical month instead of datetime.now().month (look-ahead).
+        add_derived_features(fv, alert_date=alert_date)
 
         sec_hist  = etf_cache.get(etf)
         sec_slice = sec_hist[sec_hist.index <= alert_date] if sec_hist is not None else None
@@ -338,6 +341,23 @@ def build_dataset_v31(
                 sector_count_lookup.get((ticker, alert_date), 0)
             ),
         )
+
+        # FIX (Gap 1): call add_short_earnings_features so short_interest_ratio
+        # and earnings_surprise_avg are populated from parquet row data when
+        # available, instead of always using fallback values during training.
+        # ticker_info is reconstructed from row columns that yfinance .info
+        # fields may have been stored as (shortRatio, earningsHistory).
+        # If not present in the parquet, None is passed and fallbacks apply.
+        ticker_info: Optional[dict] = None
+        short_ratio = row.get("shortRatio") if "shortRatio" in row.index else None
+        earnings_hist = row.get("earningsHistory") if "earningsHistory" in row.index else None
+        if short_ratio is not None or earnings_hist is not None:
+            ticker_info = {}
+            if short_ratio is not None:
+                ticker_info["shortRatio"] = short_ratio
+            if earnings_hist is not None:
+                ticker_info["earningsHistory"] = earnings_hist
+        add_short_earnings_features(fv, ticker_info)
 
         tnx_hist  = combined_macro_cache.get("^TNX")
         vix_hist  = combined_macro_cache.get("^VIX")
@@ -370,7 +390,7 @@ def build_dataset_v31(
             (ohlcv.index > alert_date)
             & (ohlcv.index <= alert_date + pd.Timedelta(days=horizon_days))
         ]["Close"]
-        
+
         entry_px = float(hist["Close"].iloc[-1])
         if len(future_close_slice) >= 5 and entry_px > 0:
             close_60d = float(future_close_slice.iloc[-1] / entry_px - 1.0)
@@ -385,7 +405,7 @@ def build_dataset_v31(
         if not np.isfinite(spy_close_60d) or abs(spy_close_60d) > 2.0:
             skipped["no_spy_target"] += 1
             continue
-        
+
         alpha_60d = (
             math.log1p(close_60d) - math.log1p(spy_close_60d)
             if (close_60d > -1.0 and spy_close_60d > -1.0)
