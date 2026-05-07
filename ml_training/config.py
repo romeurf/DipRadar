@@ -6,14 +6,14 @@ HORIZON_DAYS: int = 60
 WINSOR_PCT: float = 0.005
 WINSOR_ABS_LO: float = -0.50
 WINSOR_ABS_HI: float = 2.00
-HALF_LIFE_DAYS: int = 548
+HALF_LIFE_DAYS: int = 548          # 18 meses — foca nos regimes recentes
 
 # Walk-forward CV
 N_FOLDS: int = 10
-PURGE_DAYS: int = 60
-TOPK_FRAC: float = 0.20
+PURGE_DAYS: int = 60               # horizonte completo — elimina label overlap
+TOPK_FRAC: float = 0.12            # top 12% → mais selectivo, mais alpha real
 
-# Features v3 (momentum), v3.1 (dislocation) e v3.2 (context)
+# Features v3 (momentum), v3.1 (dislocation), v3.2 (context), v3.3 (short/earnings)
 MOMENTUM_FEATURES: list[str] = [
     "return_1m",
     "return_3m_pre",
@@ -34,7 +34,13 @@ NEW_FEATURES_V32: list[str] = [
     "days_since_52w_high",
 ]
 
-ALL_NEW_FEATURES: list[str] = NEW_FEATURES_V31 + NEW_FEATURES_V32
+# v3.3 — short interest + earnings surprise (dois sinais de alta convicção)
+NEW_FEATURES_V33: list[str] = [
+    "short_interest_ratio",   # dias para cobrir o short (yfinance shortRatio)
+    "earnings_surprise_avg",  # média dos últimos 2 EPS surprises (%)
+]
+
+ALL_NEW_FEATURES: list[str] = NEW_FEATURES_V31 + NEW_FEATURES_V32 + NEW_FEATURES_V33
 
 # Subsample: None = todos os anos disponíveis (2015-2026+).
 # MAX_ALERTS_PER_YEAR limita anos de pico extremo (e.g. 2020, 2022)
