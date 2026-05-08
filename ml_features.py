@@ -8,45 +8,30 @@ Architecture: 4-stage pipeline
   Stage 0 — Macro:    macro regime, VIX, SPY/sector drawdown, FRED recession prob
   Stage 1 — Quality:  gross margin, D/E, P/E vs sector fair
                        analyst upside, ROIC — sourced from score.py hemispheres
-                       (fcf_yield and revenue_growth removed: importance=0.0)
   Stage 2 — Timing:   drop today, drawdown 52w, RSI, ATR ratio, volume spike
   Stage 3 — Engineered: non-linear interactions (rsi_oversold_strength, etc.)
-  Stage 3b — Momentum: pre-alert price momentum (return_1m, return_3m_pre,
-                        sector_relative, beta_60d)
-                        Factor-investing literature: momentum is the most
-                        predictive single feature for 3–6 month forward returns.
+  Stage 3b — Momentum (v4.0): multi-window momentum (1m, 3m, 6m, 12m),
+                        sector-relative (3m and 6m), beta_60d, vol_of_vol
   Stage 3c — Dislocation: quality_dislocation, peg_implicit, relative_drop,
-                        month_of_year — distinguem Quality Dislocation (NOW/PINS)
-                        de especulação pura (RKLB).
-  Stage 3d — Context: sector_alert_count_7d, days_since_52w_high — market
-                        breadth and timing context added in v3.2.
-  Stage 3e — Short/Earnings: short_interest_ratio, earnings_surprise_avg —
-                        short squeeze signal + earnings quality (v3.3).
-  Stage 3f — Regime:  vix_percentile_1y, spy_rsi_14, yield_10y_change_5d —
-                        point-in-time market regime signals (v3.4).
-                        Distinguish dips in stressed markets vs normal conditions.
+                        month_of_year
+  Stage 3d — Context: sector_alert_count_7d, days_since_52w_high
+  Stage 3e — Short/Earnings: short_interest_ratio, earnings_surprise_avg
+  Stage 3f — Regime:  vix_percentile_1y, spy_rsi_14, yield_10y_change_5d
 
-Label schema (training only, None in production):
-  label_win           int   1 if price recovered >=15% within 60 calendar days
-  label_further_drop  float max additional % drop observed before recovery (Model B target)
+v4.0 changes (2026-05-08):
+  - Target cross-sectional rank computed in data.py (alpha_60d_rank).
+  - Momentum expanded: return_6m_pre, return_12m_pre added.
+  - sector_relative_6m added (stock 6m minus sector 6m).
+  - vol_of_vol added: 20-day rolling std of 5-day realised vol (last 60 bars).
+  - All fallbacks updated.
 
 NaN contract:
   Every feature has an explicit fallback. No raw NaN reaches the model.
-  Features that cannot be computed get their sector/global median as fallback,
-  logged at DEBUG level. This makes the vector walk-forward safe.
 
 Public API:
   build_features(ticker, fundamentals, price_history, sector) -> dict
   FEATURE_COLUMNS: list[str]   ordered feature names (model input columns)
   LABEL_COLUMNS:   list[str]   label names
-
-Fix (2026-05-08):
-  add_regime_features() — vix_percentile_1y was always falling back to 0.5
-  (no variance). Root cause: timezone mismatch between vix_history.index
-  (tz-naive, from yfinance) and alert_ts (tz-aware pd.Timestamp in some paths).
-  Fix: _tz_normalize() helper strips/normalises timezone on both sides before
-  any datetime comparison. Same fix applied to tnx_history and spy_history
-  slices for consistency.
 """
 
 from __future__ import annotations
@@ -77,10 +62,6 @@ FEATURE_COLUMNS: list[str] = [
     "sector_drawdown_5d",   # sector ETF % change last 5 trading days
 
     # ── Stage 1: Quality / Value (5 features) ───────────────────────
-    # NOTE: fcf_yield and revenue_growth were removed (importance=0.0 in
-    # both Stage 1 and Stage 2 as of ml_report 2026-05-02). Their values
-    # are still computed in build_features() for score.py / downstream use,
-    # but they are no longer model input columns.
     "gross_margin",         # Gross margin ratio (e.g. 0.65)
     "de_ratio",             # Debt-to-Equity ratio (yfinance scale, e.g. 45)
     "pe_vs_fair",           # P/E actual / sector fair P/E (< 1 = cheap)
@@ -94,42 +75,42 @@ FEATURE_COLUMNS: list[str] = [
     "atr_ratio",            # ATR(14) / current price — normalised volatility
     "volume_spike",         # today's volume / 20-day avg volume (e.g. 2.1)
 
-    # ── Stage 3: Engineered / Non-linear interactions (5 features) ────────
-    "rsi_oversold_strength", # max(0, 40 - rsi_14): magnitude of oversold
+    # ── Stage 3: Engineered / Non-linear interactions (5 features) ──
+    "rsi_oversold_strength", # max(0, 40 - rsi_14)
     "vix_regime",            # 0=low (<15), 1=medium (15-25), 2=high (>25)
-    "pe_attractive",         # max(0, 1 - pe_vs_fair): magnitude of undervaluation
-    "drop_x_drawdown",       # drop_pct_today * drawdown_52w / 100: capitulation pressure
-    "vol_x_drop",            # volume_spike * abs(drop_pct_today): capitulation volume
+    "pe_attractive",         # max(0, 1 - pe_vs_fair)
+    "drop_x_drawdown",       # drop_pct_today * drawdown_52w / 100
+    "vol_x_drop",            # volume_spike * abs(drop_pct_today)
 
-    # ── Stage 3b: Momentum (4 features) ─────────────────────────────
-    # Pre-alert price momentum. Literature: momentum is the most predictive
-    # single factor for 3–6 month forward returns in cross-sectional studies.
-    # All computed from price_history BEFORE alert_date (no leakage).
-    "return_1m",            # % price return over 21 trading days before alert
-    "return_3m_pre",        # % price return over 63 trading days before alert
-    "sector_relative",      # return_3m_pre minus sector ETF return over same period
-    "beta_60d",             # rolling beta vs SPY over 60 trading days before alert
+    # ── Stage 3b: Momentum (v4.0 — 8 features) ──────────────────────
+    # Multi-window momentum + sector-relative (6m added) + vol-of-vol.
+    # Literature: momentum at multiple horizons reduces single-window noise.
+    "return_1m",            # % return 21 trading days before alert
+    "return_3m_pre",        # % return 63 trading days before alert
+    "return_6m_pre",        # % return 126 trading days before alert  [NEW v4.0]
+    "return_12m_pre",       # % return 252 trading days before alert  [NEW v4.0]
+    "sector_relative",      # return_3m_pre minus sector 3m return
+    "sector_relative_6m",   # return_6m_pre minus sector 6m return   [NEW v4.0]
+    "beta_60d",             # rolling beta vs SPY over 60 trading days
+    "vol_of_vol",           # std of 5-day realised vol over last 60 bars  [NEW v4.0]
 
     # ── Stage 3c: Dislocation (4 features) ───────────────────────────
-    # Distinguem Quality Dislocation (NOW/PINS) de especulação pura (RKLB).
-    "quality_dislocation",  # gross_margin * |drawdown_52w| / 100 (0.0 se FCF negativo)
+    "quality_dislocation",  # gross_margin * |drawdown_52w| / 100
     "peg_implicit",         # pe_vs_fair / (revenue_growth * 100), clip [0, 5]
     "relative_drop",        # drop_pct_today - sector_drawdown_5d
-    "month_of_year",        # mês do alerta (1–12) — sazonalidade point-in-time
+    "month_of_year",        # mês do alerta (1–12)
 
     # ── Stage 3d: Context (2 features) — v3.2 ────────────────────────
-    # Market breadth + timing context. Capture contagion / panic breadth.
-    "sector_alert_count_7d", # nº de alertas no mesmo sector nos últimos 7 dias
+    "sector_alert_count_7d", # nº alertas no mesmo sector nos últimos 7 dias
     "days_since_52w_high",   # dias desde o máximo de 52 semanas
 
-    # ── Stage 3e: Short Interest + Earnings Surprise (v3.3) ──────────────
-    "short_interest_ratio",   # dias para cobrir o short (yfinance shortRatio) — clip [0, 30]
-    "earnings_surprise_avg",  # média dos últimos 2 EPS surprises (%) — clip [-50, 50]
+    # ── Stage 3e: Short Interest + Earnings Surprise (v3.3) ──────────
+    "short_interest_ratio",   # dias para cobrir o short, clip [0, 30]
+    "earnings_surprise_avg",  # média dos últimos 2 EPS surprises (%), clip [-50, 50]
 
     # ── Stage 3f: Regime (3 features) — v3.4 ────────────────────────
-    # Point-in-time market regime signals.
-    "vix_percentile_1y",    # VIX rank in trailing 252 sessions [0, 1]
-    "spy_rsi_14",           # SPY RSI-14 at alert_date [0, 100]
+    "vix_percentile_1y",    # VIX rank nos últimos 252 sessões [0, 1]
+    "spy_rsi_14",           # SPY RSI-14 na alert_date [0, 100]
     "yield_10y_change_5d",  # 5-day change in 10Y US Treasury yield (^TNX, %)
 ]
 
@@ -139,7 +120,7 @@ LABEL_COLUMNS: list[str] = [
 ]
 
 # Total feature count
-N_FEATURES = len(FEATURE_COLUMNS)  # 37
+N_FEATURES = len(FEATURE_COLUMNS)  # 41
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -164,12 +145,12 @@ _SECTOR_FAIR_PE: dict[str, float] = {
 
 # Global median fallbacks (used when a feature cannot be computed)
 _FALLBACK: dict[str, float] = {
-    "macro_score":        2.0,   # NEUTRAL
+    "macro_score":        2.0,
     "vix":               20.0,
     "spy_drawdown_5d":    0.0,
     "sector_drawdown_5d": 0.0,
-    "fcf_yield":          0.04,  # kept for score.py / downstream, not a model column
-    "revenue_growth":     0.05,  # kept for score.py / downstream, not a model column
+    "fcf_yield":          0.04,
+    "revenue_growth":     0.05,
     "gross_margin":       0.35,
     "de_ratio":          80.0,
     "pe_vs_fair":         1.0,
@@ -186,16 +167,20 @@ _FALLBACK: dict[str, float] = {
     "pe_attractive":         0.0,
     "drop_x_drawdown":       1.2,
     "vol_x_drop":            8.0,
-    # Stage 3b momentum — neutral/zero: no pre-alert momentum info
-    "return_1m":         0.0,
-    "return_3m_pre":     0.0,
-    "sector_relative":   0.0,
-    "beta_60d":          1.0,   # market-neutral assumption
+    # Stage 3b momentum (v4.0)
+    "return_1m":          0.0,
+    "return_3m_pre":      0.0,
+    "return_6m_pre":      0.0,
+    "return_12m_pre":     0.0,
+    "sector_relative":    0.0,
+    "sector_relative_6m": 0.0,
+    "beta_60d":           1.0,
+    "vol_of_vol":         0.01,  # ~1% daily vol-of-vol as neutral baseline
     # Stage 3c dislocation
-    "quality_dislocation": 0.08,  # empresa mediana como baseline
-    "peg_implicit":        2.0,   # PEG neutro
+    "quality_dislocation": 0.08,
+    "peg_implicit":        2.0,
     "relative_drop":       0.0,
-    "month_of_year":       6.0,   # meio do ano como fallback
+    "month_of_year":       6.0,
     # Stage 3d context (v3.2)
     "sector_alert_count_7d": 0.0,
     "days_since_52w_high":  180.0,
@@ -203,33 +188,18 @@ _FALLBACK: dict[str, float] = {
     "short_interest_ratio":  3.5,
     "earnings_surprise_avg": 0.0,
     # Stage 3f regime (v3.4)
-    "vix_percentile_1y":    0.5,   # neutro: VIX no percentil mediano
-    "spy_rsi_14":           50.0,  # neutro: SPY nem sobrecomprado nem sobrevendido
-    "yield_10y_change_5d":   0.0,  # neutro: yields estáveis
+    "vix_percentile_1y":    0.5,
+    "spy_rsi_14":           50.0,
+    "yield_10y_change_5d":   0.0,
 }
 
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Timezone normalisation helper (fix for Stage 3f)
+# Timezone normalisation helper
 # ────────────────────────────────────────────────────────────────────────────────
 
 def _tz_normalize(ts: Any) -> pd.Timestamp:
-    """Return a tz-naive UTC pd.Timestamp from any datetime-like input.
-
-    Problem (2026-05-08):
-      yfinance returns DataFrames with tz-naive DatetimeIndex (UTC midnight).
-      pd.Timestamp(alert_date) can be tz-aware (e.g. America/New_York) when
-      the alert originates from the live bot. Comparing tz-aware vs tz-naive
-      raises TypeError in pandas >= 2.0, or silently returns an empty boolean
-      mask in older versions — both cause add_regime_features() to skip the
-      computation and fall back to _FALLBACK, making vix_percentile_1y,
-      spy_rsi_14, and yield_10y_change_5d constant (no variance).
-
-    Fix:
-      Convert both sides to tz-naive before any comparison:
-        - If tz-aware: convert to UTC, then strip timezone.
-        - If tz-naive: use as-is.
-    """
+    """Return a tz-naive UTC pd.Timestamp from any datetime-like input."""
     t = pd.Timestamp(ts)
     if t.tzinfo is not None:
         t = t.tz_convert("UTC").tz_localize(None)
@@ -237,12 +207,7 @@ def _tz_normalize(ts: Any) -> pd.Timestamp:
 
 
 def _normalize_index(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy of df with a tz-naive DatetimeIndex.
-
-    Strips timezone info from the index if present, so that comparisons
-    with _tz_normalize(alert_date) always work regardless of yfinance version.
-    Only copies the index — the data is not duplicated (view semantics).
-    """
+    """Return a copy of df with a tz-naive DatetimeIndex."""
     if df is None:
         return df
     if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
@@ -257,8 +222,7 @@ def _normalize_index(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_derived_features(features: dict, alert_date: Optional[Any] = None) -> dict:
     """
-    Compute Stage-3 engineered features + Stage-3c dislocation features
-    from base features. Same code used at training time and at inference.
+    Compute Stage-3 engineered features + Stage-3c dislocation features.
     Mutates and returns the same dict.
     """
     rsi    = float(features.get("rsi_14",         _FALLBACK["rsi_14"]))
@@ -268,14 +232,14 @@ def add_derived_features(features: dict, alert_date: Optional[Any] = None) -> di
     dd52   = float(features.get("drawdown_52w",   _FALLBACK["drawdown_52w"]))
     volsp  = float(features.get("volume_spike",   _FALLBACK["volume_spike"]))
 
-    # ── Stage 3: non-linear interactions ──────────────────────────────────
+    # ── Stage 3: non-linear interactions ─────────────────────────────
     features["rsi_oversold_strength"] = round(max(0.0, 40.0 - rsi), 4)
     features["vix_regime"] = 0.0 if vix < 15.0 else (1.0 if vix < 25.0 else 2.0)
     features["pe_attractive"]   = round(max(0.0, 1.0 - pe_vf), 4)
     features["drop_x_drawdown"] = round(drop * dd52 / 100.0, 4)
     features["vol_x_drop"]      = round(volsp * abs(drop), 4)
 
-    # ── Stage 3c: dislocation features ─────────────────────────────────
+    # ── Stage 3c: dislocation features ──────────────────────────────
     gm  = float(features.get("gross_margin",   _FALLBACK["gross_margin"]))
     fcf = float(features.get("fcf_yield",       _FALLBACK["fcf_yield"]))
     rg  = float(features.get("revenue_growth",  _FALLBACK["revenue_growth"]))
@@ -312,11 +276,7 @@ def add_context_features(
     price_history: Optional[pd.DataFrame] = None,
     sector_alert_count_7d: Optional[float] = None,
 ) -> dict:
-    """
-    Compute Stage-3d context features (v3.2):
-      - sector_alert_count_7d: market breadth / contagion signal
-      - days_since_52w_high: timing — how long since peak
-    """
+    """Stage-3d context features (v3.2)."""
     if sector_alert_count_7d is not None:
         v = float(sector_alert_count_7d)
         features["sector_alert_count_7d"] = v if math.isfinite(v) else _FALLBACK["sector_alert_count_7d"]
@@ -382,7 +342,7 @@ def add_short_earnings_features(
 
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Stage 3f — Regime features (v3.4)  [fix: timezone mismatch 2026-05-08]
+# Stage 3f — Regime features (v3.4)
 # ────────────────────────────────────────────────────────────────────────────────
 
 def add_regime_features(
@@ -392,30 +352,16 @@ def add_regime_features(
     alert_date: Any,
     vix_history: Optional[pd.DataFrame] = None,
 ) -> dict:
-    """Stage-3f: point-in-time market regime signals (v3.4).
-
-    Fix (2026-05-08): timezone mismatch between yfinance tz-naive index and
-    tz-aware alert_ts caused all three features to fall back to their median
-    defaults (vix_percentile_1y=0.5, spy_rsi_14=50, yield_10y_change_5d=0),
-    making them constant — i.e., zero variance, zero importance for the model.
-
-    Resolution: _tz_normalize(alert_date) and _normalize_index(df) ensure
-    both sides of every datetime comparison are tz-naive UTC.
-    """
-    # Normalise alert timestamp to tz-naive so comparisons with yfinance
-    # tz-naive DatetimeIndex always succeed.
+    """Stage-3f: point-in-time market regime signals (v3.4)."""
     alert_ts = _tz_normalize(alert_date)
-
-    # Normalise all history DataFrames once upfront.
     vix_hist = _normalize_index(vix_history)
     spy_hist = _normalize_index(spy_history)
     tnx_hist = _normalize_index(tnx_history)
 
-    # ── vix_percentile_1y ────────────────────────────────────────────────
+    # vix_percentile_1y
     try:
         vix_val = float(features.get("vix", _FALLBACK["vix"]))
         pct = _FALLBACK["vix_percentile_1y"]
-
         if vix_hist is not None and "Close" in vix_hist.columns:
             vix_slice = vix_hist[vix_hist.index <= alert_ts]
             window = vix_slice["Close"].dropna().tail(252)
@@ -424,7 +370,6 @@ def add_regime_features(
                 rank = float(np.sum(arr <= vix_val)) / len(arr)
                 pct  = float(np.clip(rank, 0.0, 1.0))
         elif spy_hist is not None and "Close" in spy_hist.columns:
-            # Fallback: derive stress rank from SPY realised vol when ^VIX unavailable
             rets = spy_hist[spy_hist.index <= alert_ts]["Close"].pct_change().dropna().tail(252)
             if len(rets) >= 20:
                 rv_window = rets.rolling(5).std().dropna()
@@ -433,16 +378,14 @@ def add_regime_features(
                     pct = float(np.clip(
                         np.sum(rv_window.values <= cur_rv) / len(rv_window), 0.0, 1.0
                     ))
-
         features["vix_percentile_1y"] = round(pct, 4)
     except Exception as e:
         logger.debug(f"add_regime_features: vix_percentile_1y failed: {e}")
         features["vix_percentile_1y"] = _FALLBACK["vix_percentile_1y"]
 
-    # ── spy_rsi_14 ───────────────────────────────────────────────────────
+    # spy_rsi_14
     try:
         rsi_val = _FALLBACK["spy_rsi_14"]
-
         if spy_hist is not None and "Close" in spy_hist.columns:
             closes = spy_hist[spy_hist.index <= alert_ts]["Close"].dropna()
             if len(closes) >= 16:
@@ -453,23 +396,20 @@ def add_regime_features(
                 rsi_s = (100 - 100 / (1 + rs)).iloc[-1]
                 if pd.notna(rsi_s):
                     rsi_val = float(np.clip(rsi_s, 0.0, 100.0))
-
         features["spy_rsi_14"] = round(rsi_val, 2)
     except Exception as e:
         logger.debug(f"add_regime_features: spy_rsi_14 failed: {e}")
         features["spy_rsi_14"] = _FALLBACK["spy_rsi_14"]
 
-    # ── yield_10y_change_5d ──────────────────────────────────────────────
+    # yield_10y_change_5d
     try:
         chg = _FALLBACK["yield_10y_change_5d"]
-
         if tnx_hist is not None and "Close" in tnx_hist.columns:
             tnx_slice = tnx_hist[tnx_hist.index <= alert_ts]["Close"].dropna()
             if len(tnx_slice) >= 6:
                 chg = float(tnx_slice.iloc[-1] - tnx_slice.iloc[-6])
                 if not math.isfinite(chg) or abs(chg) > 5.0:
                     chg = _FALLBACK["yield_10y_change_5d"]
-
         features["yield_10y_change_5d"] = round(chg, 4)
     except Exception as e:
         logger.debug(f"add_regime_features: yield_10y_change_5d failed: {e}")
@@ -479,15 +419,14 @@ def add_regime_features(
 
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Stage 3b — Momentum features
+# Stage 3b — Momentum features (v4.0 — multi-window + vol-of-vol)
 # ────────────────────────────────────────────────────────────────────────────────
 
 def _pct_return(prices: np.ndarray, lookback: int) -> float:
     """
     % return over the last `lookback` bars.
     Returns 0.0 if insufficient data or division by zero.
-    Anti-leakage: uses prices[-1] as the last point BEFORE the alert
-    (caller must pass history up to alert_date exclusive).
+    Anti-leakage: uses prices[-1] as the last point BEFORE the alert.
     """
     if len(prices) < lookback + 1:
         return 0.0
@@ -498,6 +437,31 @@ def _pct_return(prices: np.ndarray, lookback: int) -> float:
     return round((p_end / p_start - 1.0) * 100.0, 4)
 
 
+def _vol_of_vol(prices: np.ndarray, rv_window: int = 5, vov_window: int = 60) -> float:
+    """
+    Vol-of-vol: std of 5-day realised volatility over the last `vov_window` bars.
+    Captures whether volatility itself is accelerating — a leading indicator of
+    tail-risk and price instability that the single-window ATR misses.
+    Returns value in the same scale as ATR ratio (daily %/price).
+    """
+    min_needed = rv_window + vov_window
+    if len(prices) < min_needed:
+        return _FALLBACK["vol_of_vol"]
+    try:
+        returns = np.diff(prices[-min_needed:]) / prices[-min_needed:-1]
+        # rolling std of returns over rv_window
+        rvs = np.array([
+            float(np.std(returns[i:i + rv_window], ddof=1))
+            for i in range(len(returns) - rv_window + 1)
+        ])
+        if len(rvs) < 10:
+            return _FALLBACK["vol_of_vol"]
+        vov = float(np.std(rvs[-vov_window:], ddof=1))
+        return round(float(np.clip(vov, 0.0, 0.1)), 6)  # cap at 10%
+    except Exception:
+        return _FALLBACK["vol_of_vol"]
+
+
 def add_momentum_features(
     features: dict,
     price_history: Optional[pd.DataFrame],
@@ -505,29 +469,45 @@ def add_momentum_features(
     spy_history: Optional[pd.DataFrame] = None,
 ) -> dict:
     """
-    Stage-3b: pre-alert momentum features.
+    Stage-3b: pre-alert momentum features (v4.0).
+
+    v4.0 additions:
+      - return_6m_pre   (126-bar return)
+      - return_12m_pre  (252-bar return)
+      - sector_relative_6m (stock 6m minus sector 6m)
+      - vol_of_vol      (std of 5-day realised vol over last 60 bars)
 
     All computed from price_history rows up to (and including) alert_date.
     The caller (data.py build_dataset_v31) slices to alert_date before
-    calling this function — no leakage.
+    calling — no leakage.
     """
+    NEW_KEYS = [
+        "return_1m", "return_3m_pre", "return_6m_pre", "return_12m_pre",
+        "sector_relative", "sector_relative_6m", "beta_60d", "vol_of_vol",
+    ]
+
     if price_history is None or price_history.empty:
-        for k in ["return_1m", "return_3m_pre", "sector_relative", "beta_60d"]:
+        for k in NEW_KEYS:
             features.setdefault(k, _FALLBACK[k])
         return features
 
     closes = price_history["Close"].dropna().values
 
-    features["return_1m"]    = _pct_return(closes, 21)
+    features["return_1m"]     = _pct_return(closes, 21)
     features["return_3m_pre"] = _pct_return(closes, 63)
+    features["return_6m_pre"] = _pct_return(closes, 126)
+    features["return_12m_pre"] = _pct_return(closes, 252)
 
     # sector_relative: stock 3m return minus sector ETF 3m return
     if sector_history is not None and not sector_history.empty:
         sec_closes = sector_history["Close"].dropna().values
-        sec_ret    = _pct_return(sec_closes, 63)
-        features["sector_relative"] = round(features["return_3m_pre"] - sec_ret, 4)
+        sec_ret_3m = _pct_return(sec_closes, 63)
+        sec_ret_6m = _pct_return(sec_closes, 126)
+        features["sector_relative"]    = round(features["return_3m_pre"] - sec_ret_3m, 4)
+        features["sector_relative_6m"] = round(features["return_6m_pre"] - sec_ret_6m, 4)
     else:
-        features["sector_relative"] = _FALLBACK["sector_relative"]
+        features["sector_relative"]    = _FALLBACK["sector_relative"]
+        features["sector_relative_6m"] = _FALLBACK["sector_relative_6m"]
 
     # beta_60d: rolling beta of stock vs SPY over 60 bars
     features["beta_60d"] = _FALLBACK["beta_60d"]
@@ -547,5 +527,8 @@ def add_momentum_features(
                     features["beta_60d"] = round(float(cov[0, 1]) / var_spy, 4)
         except Exception as e:
             logger.debug(f"add_momentum_features: beta_60d failed: {e}")
+
+    # vol_of_vol: std of 5-day realised vol over last 60 bars
+    features["vol_of_vol"] = _vol_of_vol(closes)
 
     return features
