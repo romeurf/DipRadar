@@ -741,7 +741,8 @@ def _handle_admin_load_models(parts: list[str]) -> None:
     /admin_load_models <s1_url> <s2_url> <r_url> → legacy (3 URLs)
 
     Suporta dois formatos:
-      • v3      (1 .pkl + 1 .json):  dip_models_v3.pkl + ml_report_v3.json
+      • v3      (1 .pkl + 1 .json):  dip_models.pkl + ml_report.json
+        (aceita também nomes legacy dip_models_v3.pkl/ml_report_v3.json)
       • legacy  (2 .pkl + 1 .json):  dip_model_stage{1,2}.pkl + ml_report.json
 
     O formato é detectado automaticamente pelos nomes dos ficheiros (URLs
@@ -767,7 +768,7 @@ def _handle_admin_load_models(parts: list[str]) -> None:
             "`/admin_load_models <url_tar_gz>`\n"
             "_Aceita v3 (1 .pkl + 1 .json) ou legacy (2 .pkl + 1 .json)._\n\n"
             "*Modo v3* (2 URLs):\n"
-            "`/admin_load_models <dip_models_v3.pkl> <ml_report_v3.json>`\n\n"
+            "`/admin_load_models <dip_models.pkl> <ml_report.json>`\n\n"
             "*Modo legacy* (3 URLs):\n"
             "`/admin_load_models <s1_url> <s2_url> <report_url>`\n\n"
             "_Para Google Drive: link directo `https://drive.google.com/uc?export=download&id=<ID>`._"
@@ -804,11 +805,19 @@ def _handle_admin_load_models(parts: list[str]) -> None:
 
         # Limites de segurança
         MAX_BYTES_PER_FILE      = 80 * 1024 * 1024  # 80 MB por ficheiro
-        # Formato legacy (Tier A+B+C): 2 .pkl + 1 .json
+        # Formato legacy Tier A+B+C: 2 .pkl + 1 .json
+        # NOTA: o ml_report.json conflitua com o canonical v3 actual; detecta
+        # primeiro a presença de dip_model_stage*.pkl para distinguir.
         LEGACY_FILES            = ["dip_model_stage1.pkl", "dip_model_stage2.pkl", "ml_report.json"]
         LEGACY_REQUIRED_KEYS    = {"model", "feature_columns", "threshold"}
-        # Formato v3: 1 .pkl + 1 .json
-        V3_FILES                = ["dip_models_v3.pkl", "ml_report_v3.json"]
+        # Formato v3 (canonical actual): 1 .pkl + 1 .json
+        V3_FILES                = ["dip_models.pkl", "ml_report.json"]
+        # Nomes legacy v3 (PR robustez 2026-05 renomeou): mantidos para aceitar
+        # archives antigos. Detecção mapeia legacy_name → canonical_name.
+        V3_LEGACY_ALIASES       = {
+            "dip_models_v3.pkl":  "dip_models.pkl",
+            "ml_report_v3.json": "ml_report.json",
+        }
 
         tmp_dir = Path(tempfile.mkdtemp(prefix="loadmodels_"))
         try:
@@ -850,9 +859,11 @@ def _handle_admin_load_models(parts: list[str]) -> None:
                             f"ficheiro não é zip nem tar reconhecido: {e}"
                         ) from e
 
-                # Detecta formato: v3 toma prioridade (single bundle moderno)
-                v3_pkl = list(extract_dir.rglob("dip_models_v3.pkl"))
-                if v3_pkl:
+                # Detecta formato: v3 toma prioridade (single bundle moderno).
+                # Aceita nomes legacy (dip_models_v3.pkl) ou canonical (dip_models.pkl).
+                v3_pkl_modern = list(extract_dir.rglob("dip_models.pkl"))
+                v3_pkl_legacy = list(extract_dir.rglob("dip_models_v3.pkl"))
+                if v3_pkl_modern or v3_pkl_legacy:
                     fmt = "v3"
                     expected = V3_FILES
                 else:
@@ -860,13 +871,30 @@ def _handle_admin_load_models(parts: list[str]) -> None:
                     expected = LEGACY_FILES
 
                 local: dict[str, Path] = {}
-                for fname in expected:
-                    matches = list(extract_dir.rglob(fname))
-                    if not matches:
-                        raise ValueError(
-                            f"formato {fmt}: ficheiro {fname} não encontrado no archive"
-                        )
-                    local[fname] = matches[0]
+                if fmt == "v3":
+                    # Mapeia legacy_name → canonical_name nos casos em que só
+                    # o nome antigo está presente no archive.
+                    legacy_to_canonical = {v: k for k, v in V3_LEGACY_ALIASES.items()}
+                    for fname in expected:
+                        matches = list(extract_dir.rglob(fname))
+                        if not matches:
+                            legacy_name = legacy_to_canonical.get(fname)
+                            if legacy_name:
+                                matches = list(extract_dir.rglob(legacy_name))
+                        if not matches:
+                            raise ValueError(
+                                f"formato v3: ficheiro {fname} (nem alias legacy) "
+                                f"encontrado no archive"
+                            )
+                        local[fname] = matches[0]
+                else:
+                    for fname in expected:
+                        matches = list(extract_dir.rglob(fname))
+                        if not matches:
+                            raise ValueError(
+                                f"formato {fmt}: ficheiro {fname} não encontrado no archive"
+                            )
+                        local[fname] = matches[0]
 
             # ── Modo 2 URLs: v3 (pkl + report)
             elif len(args) == 2:
@@ -919,21 +947,21 @@ def _handle_admin_load_models(parts: list[str]) -> None:
             else:  # v3
                 # Importa o helper que normaliza dataclass → dict canonical
                 from ml_predictor import _safe_load, _to_dict
-                raw = _safe_load(local["dip_models_v3.pkl"])
+                raw = _safe_load(local["dip_models.pkl"])
                 bundle = _to_dict(raw)
                 if not bundle:
-                    raise ValueError("dip_models_v3.pkl: bundle vazio ou não reconhecido")
+                    raise ValueError("dip_models.pkl: bundle vazio ou não reconhecido")
                 if "model_up" not in bundle or "model_down" not in bundle:
                     raise ValueError(
-                        "dip_models_v3.pkl: faltam model_up/model_down (esperado v3)"
+                        "dip_models.pkl: faltam model_up/model_down (esperado v3)"
                     )
                 fc = bundle.get("feature_cols") or []
                 if not fc:
-                    raise ValueError("dip_models_v3.pkl: feature_cols vazia")
-                with open(local["ml_report_v3.json"]) as f:
+                    raise ValueError("dip_models.pkl: feature_cols vazia")
+                with open(local["ml_report.json"]) as f:
                     report = json.load(f)
                 if not isinstance(report, dict):
-                    raise ValueError("ml_report_v3.json: top-level não é um dict")
+                    raise ValueError("ml_report.json: top-level não é um dict")
                 cv = report.get("walk_forward_cv") or {}
                 meta = {
                     "n_features": len(fc),
@@ -1180,7 +1208,7 @@ def _handle_admin_retrain(parts: list[str]) -> None:
             ]
 
         if decision == "PENDING":
-            lines.append("_Bundle guardado como `dip_models_v3_pending.pkl` — revisão manual._")
+            lines.append("_Bundle guardado como `dip_models_pending.pkl` — revisão manual._")
         elif decision == "PROMOTED":
             lines.append("_Bundle promovido em `/data/`. Reinicia o bot ou força reload via_ `/admin_load_models`.")
 
@@ -1835,9 +1863,15 @@ def _handle_command(text: str) -> None:
         from pathlib import Path
         data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
         repo_dir = Path(__file__).parent
+        bundle_paths = [
+            data_dir / "dip_models.pkl",
+            repo_dir / "ml_training" / "dip_models.pkl",
+            data_dir / "dip_models_v3.pkl",
+            repo_dir / "dip_models_v3.pkl",
+        ]
         ml_status = (
             "🟢 PKL pronto"
-            if (data_dir / "dip_models_v3.pkl").exists() or (repo_dir / "dip_models_v3.pkl").exists()
+            if any(p.exists() for p in bundle_paths)
             else "🔴 Não treinado"
         )
 

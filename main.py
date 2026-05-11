@@ -1475,11 +1475,11 @@ def run_monthly_retrain() -> None:
 
     Delega para `monthly_retrain.run_monthly_retrain_v3` que faz:
       1. Build training input (bootstrap + alert_db + universe_snapshot)
-      2. Treina candidate via `ml_training.train_v31.run_training`
+      2. Treina candidate via `ml_training.train.run_training`
          (regressor alpha_60d + isotonic, 10 folds purgados)
       3. Gating ρ_α: candidate só substitui produção se
          ρ_α(cand) ≥ ρ_α(prod) × 0.90 e ρ_α(cand) ≥ floor (default 0.20).
-         Caso contrário guardado como `dip_models_v3_pending.pkl`.
+         Caso contrário guardado como `dip_models_pending.pkl`.
       4. Backup automático em /data/archive/.
 
     Telegram: PROMOTED / PENDING / KEPT_FLOOR / FAILED + delta ρ_α.
@@ -1587,7 +1587,7 @@ def run_monthly_retrain() -> None:
         ]
 
     if decision == "PENDING":
-        lines.append("_Bundle guardado como `dip_models_v3_pending.pkl` — revisão manual._")
+        lines.append("_Bundle guardado como `dip_models_pending.pkl` — revisão manual._")
         lines.append("")
 
     lines.append("_Próximo retreino: dia 1 do mês seguinte às 06h_")
@@ -1634,7 +1634,7 @@ def run_universe_snapshot() -> None:
 def run_daily_backup() -> None:
     """
     Backup diário dos ficheiros críticos: alert_db, state JSONs,
-    parquet datasets, dip_models_v3.pkl e ml_report_v3.json.
+    parquet datasets, dip_models.pkl e ml_report.json.
     Arquiva em /data/backups/YYYY-MM-DD_HH-MM.zip e mantém os últimos 30.
     """
     logging.info("[backup] A iniciar backup diário...")

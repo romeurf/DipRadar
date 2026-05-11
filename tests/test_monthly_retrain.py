@@ -45,12 +45,12 @@ class TestGateAndPromote(unittest.TestCase):
         m.PRODUCTION_DIR    = self.tmp
         m.CANDIDATE_DIR     = self.tmp / "candidate"
         m.ARCHIVE_DIR       = self.tmp / "archive"
-        m.PRODUCTION_BUNDLE = self.tmp / "dip_models_v3.pkl"
-        m.PRODUCTION_REPORT = self.tmp / "ml_report_v3.json"
-        m.CANDIDATE_BUNDLE  = m.CANDIDATE_DIR / "dip_models_v3.pkl"
-        m.CANDIDATE_REPORT  = m.CANDIDATE_DIR / "ml_report_v3.json"
-        m.PENDING_BUNDLE    = self.tmp / "dip_models_v3_pending.pkl"
-        m.PENDING_REPORT    = self.tmp / "ml_report_v3_pending.json"
+        m.PRODUCTION_BUNDLE = self.tmp / "dip_models.pkl"
+        m.PRODUCTION_REPORT = self.tmp / "ml_report.json"
+        m.CANDIDATE_BUNDLE  = m.CANDIDATE_DIR / "dip_models.pkl"
+        m.CANDIDATE_REPORT  = m.CANDIDATE_DIR / "ml_report.json"
+        m.PENDING_BUNDLE    = self.tmp / "dip_models_pending.pkl"
+        m.PENDING_REPORT    = self.tmp / "ml_report_pending.json"
         m.FLOOR_PATH        = self.tmp / "ml_floor_rho_alpha.json"
 
         m.CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -155,7 +155,7 @@ class TestGateAndPromote(unittest.TestCase):
             prod_metrics={"rho_alpha_mean": 0.35},
         )
         import monthly_retrain as m
-        archives = list(m.ARCHIVE_DIR.glob("dip_models_v3_*.pkl"))
+        archives = list(m.ARCHIVE_DIR.glob("dip_models_*.pkl"))
         self.assertEqual(len(archives), 1, "Deve criar exactamente 1 archive da prod anterior")
 
     def test_floor_file_created_with_default(self):
@@ -253,9 +253,9 @@ class TestBootstrapFallback(unittest.TestCase):
             "BOOTSTRAP_PATH", "BOOTSTRAP_FALLBACK", "ALERT_DB_PATH",
             "SNAPSHOT_PATH", "TRAINING_INPUT")}
         # Volume Railway vazio
-        m.BOOTSTRAP_PATH     = self.tmp_data / "ml_training_merged.parquet"
+        m.BOOTSTRAP_PATH     = self.tmp_data / "ml_training_base.parquet"
         # Repo root tem o parquet bootstrap
-        m.BOOTSTRAP_FALLBACK = self.tmp_repo / "ml_training_merged.parquet"
+        m.BOOTSTRAP_FALLBACK = self.tmp_repo / "ml_training_base.parquet"
         m.ALERT_DB_PATH      = self.tmp_data / "alert_db.csv"
         m.SNAPSHOT_PATH      = self.tmp_data / "snapshot.parquet"
         m.TRAINING_INPUT     = self.tmp_data / "ml_training_input.parquet"
@@ -292,7 +292,7 @@ class TestBootstrapFallback(unittest.TestCase):
         self.assertIn("AAPL", df["symbol"].tolist())
 
     def test_prefers_data_dir_when_both_exist(self):
-        """Se `/data/ml_training_merged.parquet` existe, é usado e ignora o
+        """Se `/data/ml_training_base.parquet` existe, é usado e ignora o
         fallback (volume é a fonte da verdade depois do primeiro retrain)."""
         import monthly_retrain as m
         import pandas as pd

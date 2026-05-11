@@ -118,12 +118,17 @@ def _to_dict(obj: Any) -> dict:
 _REPO_DIR = Path(__file__).parent
 _DATA_DIR = Path("/data") if Path("/data").exists() else Path("/tmp")
 
-# Bundle v3 — procura primeiro em /data (Railway volume), depois no repo
-_PKL_V3 = next(
-    (p for p in [_DATA_DIR / "dip_models_v3.pkl", _REPO_DIR / "dip_models_v3.pkl"]
-     if p.exists()),
+# Bundle ML v3 — procura em ordem (Railway volume / repo / legacy v3 names).
+# Após PR de robustez 2026-05, o nome canónico é `dip_models.pkl` em /data ou
+# no sub-package `ml_training/`. Os nomes legacy `dip_models_v3.pkl` são lidos
+# como fallback durante a migração para não quebrar volumes antigos.
+_BUNDLE_CANDIDATES = [
+    _DATA_DIR / "dip_models.pkl",
+    _REPO_DIR / "ml_training" / "dip_models.pkl",
+    _DATA_DIR / "dip_models_v3.pkl",
     _REPO_DIR / "dip_models_v3.pkl",
-)
+]
+_PKL_V3 = next((p for p in _BUNDLE_CANDIDATES if p.exists()), _BUNDLE_CANDIDATES[0])
 
 # Features esperadas pelo champion v3 (37 features — FEATURE_COLUMNS de ml_features.py)
 # Usado como fallback se o bundle não trouxer feature_cols.

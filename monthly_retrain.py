@@ -8,23 +8,23 @@ v3.1 (regressor alpha + isotonic calibrator) já em produção desde PR #11/#13.
 Fluxo:
 
   1. Build training input incremental:
-     a. bootstrap historical (`/data/ml_training_merged.parquet`,
-        com fallback para o `ml_training_merged.parquet` no root do repo
+     a. bootstrap historical (`/data/ml_training_base.parquet`,
+        com fallback para `ml_training_base.parquet` no root do repo
         para cold-start em volumes Railway vazios)
      b. `alert_db.csv` (alertas reais com outcomes preenchidos)
      c. `universe_snapshot.parquet` (rows com ≥6m maturados, label resolvido)
 
-  2. Treino candidate via `ml_training.train_v31.run_training`:
+  2. Treino candidate via `ml_training.train.run_training`:
      - 10 folds expanding-window, purge gap 21 dias
-     - 34 features, target alpha_60d (max_return − spy_max_return)
-     - Champion = melhor ρ_α com PnL > 0
+     - target alpha_60d_rank cross-section + sector-neutralizado
+     - Champion ensemble Ridge+XGB+LGBM ponderado por IC
      - Isotonic calibrator em OOF predictions
 
   3. **Gating** baseado em ρ_α (rho_alpha_mean):
      - Promove só se ρ_α candidate ≥ ρ_α produção × `gating_ratio` (default 0.90)
      - Floor absoluto ρ_α ≥ `FLOOR_RHO_ALPHA` (default 0.20)
      - Se candidate cai > 10% mas ainda passa o floor → guarda como
-       `dip_models_v3_pending.pkl` para revisão manual (não promove)
+       `dip_models_pending.pkl` para revisão manual (não promove)
 
   4. **Atomic deploy** via shutil.move + archive em `/data/archive/`.
 
@@ -64,18 +64,24 @@ PRODUCTION_DIR     = _DATA_DIR
 CANDIDATE_DIR      = _DATA_DIR / "candidate"
 ARCHIVE_DIR        = _DATA_DIR / "archive"
 SNAPSHOT_PATH      = _DATA_DIR / "universe_snapshot.parquet"
-BOOTSTRAP_PATH     = _DATA_DIR / "ml_training_merged.parquet"
+BOOTSTRAP_PATH     = _DATA_DIR / "ml_training_base.parquet"
 # Fallback: parquet bootstrap commitado no repo (cold-start em volumes vazios).
-BOOTSTRAP_FALLBACK = _REPO_ROOT / "ml_training_merged.parquet"
+BOOTSTRAP_FALLBACK = _REPO_ROOT / "ml_training_base.parquet"
+# Legacy bootstrap name (compat com volumes Railway que ainda tenham o antigo).
+LEGACY_BOOTSTRAP_PATH = _DATA_DIR / "ml_training_merged.parquet"
+LEGACY_BOOTSTRAP_FALLBACK = _REPO_ROOT / "ml_training_merged.parquet"
 ALERT_DB_PATH      = _DATA_DIR / "alert_db.csv"
 TRAINING_INPUT     = _DATA_DIR / "ml_training_input.parquet"
 
-PRODUCTION_BUNDLE  = PRODUCTION_DIR / "dip_models_v3.pkl"
-PRODUCTION_REPORT  = PRODUCTION_DIR / "ml_report_v3.json"
-CANDIDATE_BUNDLE   = CANDIDATE_DIR / "dip_models_v3.pkl"
-CANDIDATE_REPORT   = CANDIDATE_DIR / "ml_report_v3.json"
-PENDING_BUNDLE     = PRODUCTION_DIR / "dip_models_v3_pending.pkl"
-PENDING_REPORT     = PRODUCTION_DIR / "ml_report_v3_pending.json"
+PRODUCTION_BUNDLE  = PRODUCTION_DIR / "dip_models.pkl"
+PRODUCTION_REPORT  = PRODUCTION_DIR / "ml_report.json"
+CANDIDATE_BUNDLE   = CANDIDATE_DIR / "dip_models.pkl"
+CANDIDATE_REPORT   = CANDIDATE_DIR / "ml_report.json"
+PENDING_BUNDLE     = PRODUCTION_DIR / "dip_models_pending.pkl"
+PENDING_REPORT     = PRODUCTION_DIR / "ml_report_pending.json"
+# Legacy v3 names (mantidos para ler bundles antigos durante migração)
+LEGACY_PRODUCTION_BUNDLE = PRODUCTION_DIR / "dip_models_v3.pkl"
+LEGACY_PRODUCTION_REPORT = PRODUCTION_DIR / "ml_report_v3.json"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gating constants
@@ -227,7 +233,7 @@ def _load_alert_db_as_training() -> pd.DataFrame:
       - rename explícito symbol → ticker para alinhar com data.py/load_base_dataset
       - defaults Stage 3c: rows anteriores ao commit 2026-05-05 não têm
         quality_dislocation, peg_implicit, relative_drop, month_of_year —
-        sem default chegam como NaN ao train_v31 e causam KeyError ou
+        sem default chegam como NaN ao train e causam KeyError ou
         degradação silenciosa do modelo.
     """
     if not ALERT_DB_PATH.exists():
@@ -283,7 +289,7 @@ def _load_alert_db_as_training() -> pd.DataFrame:
         "quality_score":   0.5,
         # ── Stage 3c: dislocation features (adicionadas em 2026-05-05) ──────
         # Rows do alert_db.csv geradas antes deste commit não têm estas colunas.
-        # Sem default chegam como NaN ao train_v31 → KeyError ou degradação
+        # Sem default chegam como NaN ao train → KeyError ou degradação
         # silenciosa. Valores escolhidos de ml_features._FALLBACK.
         "quality_dislocation": 0.08,   # empresa mediana como baseline
         "peg_implicit":        2.0,    # PEG neutro
@@ -330,10 +336,22 @@ def build_training_input(include_snapshot: bool = True,
             f"[input] {BOOTSTRAP_PATH} ausente — fallback para parquet do repo "
             f"({BOOTSTRAP_FALLBACK})."
         )
+    elif LEGACY_BOOTSTRAP_PATH.exists():
+        bootstrap_src = LEGACY_BOOTSTRAP_PATH
+        log.warning(
+            f"[input] Usar bootstrap legacy {LEGACY_BOOTSTRAP_PATH} — considera "
+            f"renomear para ml_training_base.parquet."
+        )
+    elif LEGACY_BOOTSTRAP_FALLBACK.exists():
+        bootstrap_src = LEGACY_BOOTSTRAP_FALLBACK
+        log.warning(
+            f"[input] Usar bootstrap legacy {LEGACY_BOOTSTRAP_FALLBACK} (repo) — considera "
+            f"renomear para ml_training_base.parquet."
+        )
     else:
         log.warning(
             f"[input] Bootstrap parquet ausente em {BOOTSTRAP_PATH} "
-            f"e fallback {BOOTSTRAP_FALLBACK}."
+            f"e fallback {BOOTSTRAP_FALLBACK} (legacy também não encontrado)."
         )
 
     if bootstrap_src is not None:
@@ -436,7 +454,7 @@ def gate_and_promote_v3(
       - PROMOTED (cold start): produção vazia, candidate ≥ floor
       - PROMOTED: candidate ≥ produção × gating_ratio
       - PENDING: candidate ≥ floor mas < produção × gating_ratio →
-          guarda como `dip_models_v3_pending.pkl` para revisão manual
+          guarda como `dip_models_pending.pkl` para revisão manual
     """
     cand_rho  = cand_metrics.get("rho_alpha_mean")
     prod_rho  = prod_metrics.get("rho_alpha_mean")
@@ -512,11 +530,11 @@ def _do_promote(result: dict) -> dict:
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
 
     if PRODUCTION_BUNDLE.exists():
-        archived_pkl = ARCHIVE_DIR / f"dip_models_v3_{timestamp}.pkl"
+        archived_pkl = ARCHIVE_DIR / f"dip_models_{timestamp}.pkl"
         shutil.copy2(PRODUCTION_BUNDLE, archived_pkl)
         log.info(f"[gating] Archived production bundle → {archived_pkl.name}")
     if PRODUCTION_REPORT.exists():
-        archived_json = ARCHIVE_DIR / f"ml_report_v3_{timestamp}.json"
+        archived_json = ARCHIVE_DIR / f"ml_report_{timestamp}.json"
         shutil.copy2(PRODUCTION_REPORT, archived_json)
 
     promoted: list[str] = []
@@ -537,7 +555,7 @@ def _do_promote(result: dict) -> dict:
 
 
 def _save_pending(result: dict) -> dict:
-    """Guarda candidate como `dip_models_v3_pending.pkl` (não promove)."""
+    """Guarda candidate como `dip_models_pending.pkl` (não promove)."""
     if CANDIDATE_BUNDLE.exists():
         shutil.copy2(CANDIDATE_BUNDLE, PENDING_BUNDLE)
         log.info(f"[gating] Pending bundle: {PENDING_BUNDLE}")
@@ -602,11 +620,11 @@ def run_monthly_retrain_v3(
             "elapsed_s":      round(time.time() - t0, 1),
         }
 
-    # 3. Treinar candidate via ml_training.train_v31
+    # 3. Treinar candidate via ml_training.train.run_training
     CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
     try:
         from ml_training.config import N_FOLDS, PURGE_DAYS
-        from ml_training.train_v31 import run_training
+        from ml_training.train import run_training
 
         log.info(f"[retrain] A treinar candidate em {CANDIDATE_DIR}...")
         run_training(
@@ -620,7 +638,7 @@ def run_monthly_retrain_v3(
         log.error(f"[retrain] Treino falhou: {e}", exc_info=True)
         return {
             "decision":      "FAILED",
-            "reason":        f"train_v31 failed: {e}",
+            "reason":        f"train failed: {e}",
             "elapsed_s":     round(time.time() - t0, 1),
             "outcome_stats": outcome_stats,
         }

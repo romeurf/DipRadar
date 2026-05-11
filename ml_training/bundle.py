@@ -1,4 +1,4 @@
-"""DipModelsV3 dataclass + save/load + ml_report_v3.json — cells 32, 33."""
+"""DipModelsV3 dataclass + save/load + ml_report.json — cells 32, 33."""
 
 from __future__ import annotations
 
@@ -29,7 +29,8 @@ log = logging.getLogger(__name__)
 class DipModelsV3:
     """Bundle ML v3 com calibrator e métricas completas.
 
-    Picklado em produção como ``dip_models_v3.pkl``. Carregado em runtime
+    Picklado em produção como ``dip_models.pkl`` (nome canonical após PR
+    robustez 2026-05; legacy era ``dip_models_v3.pkl``). Carregado em runtime
     por ``ml_predictor.py`` (que regista um shim com ``__main__.DipModelsV3``).
     """
     model_up:         Any
@@ -106,7 +107,7 @@ def build_report(
     horizon_days: int,
     new_features: list[str],
 ) -> dict:
-    """Constrói o dict do ``ml_report_v3.json``.
+    """Constrói o dict do ``ml_report.json`` (legacy ``ml_report_v3.json``).
 
     Replica cell 33 com tipos JSON-safe (floats nativos, listas de dicts).
     """
@@ -165,7 +166,8 @@ def save_report(report: dict, path: Path) -> Path:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def metrics_from_report(report_path: Path) -> dict[str, Optional[float]]:
-    """Lê ``ml_report_v3.json`` e devolve só o dict ``metrics``.
+    """Lê ``ml_report.json`` (ou legacy ``ml_report_v3.json``) e devolve
+    só o dict ``metrics``.
 
     Devolve dict com chaves vazias se o ficheiro não existe / é inválido.
     """

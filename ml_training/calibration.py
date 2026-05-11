@@ -23,7 +23,7 @@ Uso no notebook de treino (colab_bootstrap.ipynb):
 
   # Guardar no bundle:
   bundle['calibrator'] = calibrator
-  joblib.dump(bundle, 'dip_models_v3.pkl')
+  joblib.dump(bundle, 'dip_models.pkl')
 """
 
 from __future__ import annotations

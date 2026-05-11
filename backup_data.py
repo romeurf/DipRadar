@@ -48,13 +48,21 @@ _BACKUP_PATTERNS: list[str] = [
     # Universe snapshots (parquet)
     "/data/universe_snapshot*.parquet",
     # Datasets de treino ML (raiz do repo)
-    "ml_training_merged.parquet",
-    "ml_training_fund.parquet",
-    "ml_training_price.parquet",
-    # Bundle ML em produção (v3 single-file)
+    "ml_training_base.parquet",
+    "ml_training_merged.parquet",   # legacy nome
+    "ml_training_fund.parquet",     # legacy nome
+    "ml_training_price.parquet",    # legacy nome
+    # Bundle ML em produção (nome canónico após PR robustez 2026-05)
+    "dip_models.pkl",
+    "/data/dip_models.pkl",
+    "ml_training/dip_models.pkl",
+    # Legacy v3 names (mantidos para snapshots antigos durante migração)
     "dip_models_v3.pkl",
     "/data/dip_models_v3.pkl",
-    # Relatório de métricas
+    # Relatório de métricas (nome canónico + legacy)
+    "ml_report.json",
+    "/data/ml_report.json",
+    "ml_training/ml_report.json",
     "ml_report_v3.json",
     "/data/ml_report_v3.json",
 ]

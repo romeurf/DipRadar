@@ -233,8 +233,8 @@ def _psi(ref_vals: np.ndarray, live_vals: np.ndarray, bins: int = _PSI_BINS) -> 
 def check_feature_drift(*, send_alert: bool = True) -> dict:
     """
     Compara a distribuição das features live (buffer) com a baseline de
-    treino guardada em ml_report_v3.json (com fallback para ml_report.json
-    legacy).
+    treino guardada em ml_report.json (procura em /data/, ml_training/ e
+    repo root; nomes legacy ml_report_v3.json também são aceites).
 
     Devolve um dict com PSI por feature e listas de features em cada zona.
     Envia alerta Telegram se alguma feature tiver PSI > _PSI_ALERT.
@@ -248,16 +248,18 @@ def check_feature_drift(*, send_alert: bool = True) -> dict:
     data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
     repo_dir = Path(__file__).parent
 
-    # Procura em /data, depois no repo, v3 antes de legacy
+    # Procura em /data, depois no sub-package ml_training/, depois repo root.
+    # Nome canónico após PR robustez 2026-05: ml_report.json. Legacy v3 mantido.
     candidates = [
+        data_dir / "ml_report.json",
+        repo_dir / "ml_training" / "ml_report.json",
+        repo_dir / "ml_report.json",
         data_dir / "ml_report_v3.json",
         repo_dir / "ml_report_v3.json",
-        data_dir / "ml_report.json",
-        repo_dir / "ml_report.json",
     ]
     report_path = next((p for p in candidates if p.exists()), None)
     if report_path is None:
-        logging.debug("[drift] ml_report_v3.json não encontrado — skip")
+        logging.debug("[drift] ml_report.json não encontrado — skip")
         return {"skipped": True, "reason": "ml_report ausente"}
 
     try:
@@ -535,8 +537,12 @@ def build_health_report(*, ping_apis: bool = True) -> str:
     data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
     repo_dir = Path(__file__).parent
     pkl_v3 = next(
-        (p for p in (data_dir / "dip_models_v3.pkl", repo_dir / "dip_models_v3.pkl")
-         if p.exists()),
+        (p for p in (
+            data_dir / "dip_models.pkl",
+            repo_dir / "ml_training" / "dip_models.pkl",
+            data_dir / "dip_models_v3.pkl",
+            repo_dir / "dip_models_v3.pkl",
+        ) if p.exists()),
         None,
     )
     if pkl_v3 is not None:
