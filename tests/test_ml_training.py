@@ -124,27 +124,29 @@ class TestModels(unittest.TestCase):
         rf_factory()
         ridge_factory()
 
-    def test_feature_lists_v31_has_34(self):
+    def test_feature_lists_full_matches_FEATURE_COLUMNS(self):
+        """Após PR robustez 2026-05: FEATURE_COLUMNS = 41 features (8 novas
+        adicionadas para multi-window momentum, vol-of-vol, regime). Baseline
+        exclui as features Stage-3* + Stage-3b multi-window novas."""
         from ml_training.models import build_feature_lists
-        v31, baseline = build_feature_lists()
-        self.assertEqual(len(v31), 34, "v31 deve ter 34 features (notebook cell 12)")
-        # Deve incluir as 4 NEW
-        for new_feat in ["relative_drop", "sector_alert_count_7d",
-                         "days_since_52w_high", "month_of_year"]:
-            self.assertIn(new_feat, v31)
-        # Baseline NÃO inclui as 4 NEW
-        for new_feat in ["relative_drop", "sector_alert_count_7d",
-                         "days_since_52w_high", "month_of_year"]:
+        from ml_features import FEATURE_COLUMNS
+        full, baseline = build_feature_lists()
+        self.assertEqual(len(full), len(FEATURE_COLUMNS))
+        self.assertGreater(len(full), len(baseline))
+        # As features novas Stage-3b devem estar no full mas não no baseline
+        for new_feat in ["return_6m_pre", "return_12m_pre", "vol_of_vol",
+                         "sector_relative_6m"]:
+            self.assertIn(new_feat, full)
             self.assertNotIn(new_feat, baseline)
-        # Baseline tem 4 features a menos que v31
-        self.assertEqual(len(v31) - len(baseline), 4)
 
-    def test_model_configs_5_models(self):
+    def test_model_configs_has_multiple_models(self):
+        """Refactor 2026-04 expandiu MODEL_CONFIGS para XGB/LGBM families
+        (DART, GOSS) + Ridge-Strong + baseline. Total >= 5 modelos."""
         from ml_training.models import build_feature_lists, build_model_configs
-        v31, baseline = build_feature_lists()
-        cfg = build_model_configs(v31, baseline)
-        self.assertEqual(len(cfg), 5)
-        self.assertIn("XGB-alpha-v31", cfg)
+        full, baseline = build_feature_lists()
+        cfg = build_model_configs(full, baseline)
+        self.assertGreaterEqual(len(cfg), 5)
+        # Baseline existe e usa lista de features mais curta
         self.assertIn("XGB-alpha-baseline", cfg)
         self.assertEqual(cfg["XGB-alpha-baseline"]["feats"], baseline)
 

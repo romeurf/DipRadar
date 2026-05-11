@@ -1,15 +1,29 @@
-"""Walk-forward CV + champion training + calibrator + stacking ensemble."""
+"""Walk-forward CV + champion training + calibrator + stacking ensemble.
+
+Inclui também ``run_training()`` — orchestrator end-to-end usado por
+``monthly_retrain.py`` (drop-in para o legacy ``train_v31.run_training``):
+
+  1. Carregar parquet base (já com features e targets pré-computados)
+  2. Adicionar alpha_60d_rank (cross-section por data) — target robusto
+  3. (opcional) Neutralizar target por sector
+  4. Walk-forward CV
+  5. Seleccionar champion (IC máximo com PnL>0)
+  6. Treinar champion full + isotonic calibrator OOF
+  7. Empacotar DipModelsV3 + escrever ml_report.json
+"""
 
 from __future__ import annotations
 
 import logging
 import math
-from typing import Optional
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, Any
 
 import numpy as np
 import pandas as pd
 
-from ml_training.config import HORIZON_DAYS
+from ml_training.config import HORIZON_DAYS, N_FOLDS, PURGE_DAYS
 from ml_training.cv import (
     build_walk_forward_folds,
     fold_metric_record,
@@ -282,6 +296,20 @@ def select_champion(summary: pd.DataFrame) -> tuple[str, pd.Series]:
 # Calibrator
 # ─────────────────────────────────────────────────────────────────────────────
 
+class PlattCalibrator:
+    """Wrapper picklable para Platt Scaling (logistic regression sobre score).
+
+    Definido em módulo (não closure) para joblib/pickle funcionarem.
+    """
+    def __init__(self, scaler, lr):
+        self.scaler = scaler
+        self.lr = lr
+
+    def predict(self, x):
+        X = self.scaler.transform(np.asarray(x).reshape(-1, 1))
+        return self.lr.predict_proba(X)[:, 1]
+
+
 def fit_isotonic_calibrator(
     oof_pred_champion: np.ndarray,
     alpha_true: np.ndarray,
@@ -311,16 +339,6 @@ def fit_isotonic_calibrator(
         X_cal  = scaler.fit_transform(y_oof.reshape(-1, 1))
         lr     = LogisticRegression(C=1.0, max_iter=500)
         lr.fit(X_cal, y_bin)
-
-        class PlattCalibrator:
-            def __init__(self, scaler, lr):
-                self.scaler = scaler
-                self.lr = lr
-            def predict(self, x):
-                import numpy as _np
-                X = self.scaler.transform(_np.asarray(x).reshape(-1, 1))
-                return self.lr.predict_proba(X)[:, 1]
-
         cal = PlattCalibrator(scaler, lr)
     else:
         log.info(f"Calibrator: Isotónico (n_oof={n_oof})")
@@ -366,3 +384,262 @@ def train_full_champion(
         f"Champion treinado em {len(X_full)} amostras com {len(feats)} features"
     )
     return champ_alpha, champ_down, feats, len(X_full)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Orchestrator end-to-end (drop-in para train_v31.run_training)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _maybe_apply_rank_target(df: pd.DataFrame, *, enable: bool = True) -> pd.DataFrame:
+    """Adiciona ``alpha_60d_rank`` cross-section por data."""
+    if not enable:
+        return df
+    from ml_training.cv_robust import add_crosssection_rank
+    return add_crosssection_rank(df, raw_col="alpha_60d", date_col="alert_date")
+
+
+def _maybe_apply_sector_neutral(df: pd.DataFrame, *, enable: bool = True) -> pd.DataFrame:
+    """Adiciona ``alpha_60d_neutral`` e ``alpha_60d_neutral_rank``.
+
+    Subtrai mediana de sector por data antes de re-rankear. Útil para o
+    modelo aprender "compra dip dentro do sector" em vez de "compra tech".
+    """
+    if not enable or "sector" not in df.columns:
+        return df
+    from ml_training.target_engineering import neutralize_target_by_sector
+    return neutralize_target_by_sector(
+        df,
+        target_col="alpha_60d",
+        sector_col="sector",
+        date_col="alert_date",
+    )
+
+
+def run_training(
+    input_parquet: "str | Path",
+    output_bundle: "Optional[str | Path]" = None,
+    output_report: "Optional[str | Path]" = None,
+    *,
+    n_folds: int = N_FOLDS,
+    purge_days: int = PURGE_DAYS,
+    horizon_days: int = HORIZON_DAYS,
+    min_train: int = 100,
+    min_test: int = 20,
+    use_rank_target: bool = True,
+    use_sector_neutral: bool = True,
+    max_rows: Optional[int] = None,
+    log_summary: bool = True,
+) -> dict:
+    """Pipeline completo de treino (drop-in para o legacy ``train_v31.run_training``).
+
+    Parameters
+    ----------
+    input_parquet : Path
+        Parquet com features + targets já computados. Esquema esperado:
+        - Colunas FEATURE_COLUMNS (ml_features.py)
+        - Targets: ``alpha_60d``, ``max_drawdown_60d``
+        - Metadados: ``alert_date``, ``ticker``, ``sector``
+    output_bundle : Path | None
+        Onde escrever o ``dip_models.pkl``. ``None`` = não escreve.
+    output_report : Path | None
+        Onde escrever o ``ml_report.json``. ``None`` = não escreve.
+    n_folds, purge_days, horizon_days : int
+        Parâmetros do walk-forward CV.
+    use_rank_target : bool
+        Se True, adiciona ``alpha_60d_rank`` para diagnóstico (sempre treina
+        em ``alpha_60d`` bruto para compatibilidade com o pipeline produção).
+    use_sector_neutral : bool
+        Se True, adiciona ``alpha_60d_neutral`` ao DataFrame (apenas
+        diagnóstico — modelo continua a treinar em ``alpha_60d`` directo).
+    max_rows : int | None
+        Slicing para smoke tests.
+    log_summary : bool
+        Se True, loga o summary table com IC/PnL por modelo.
+
+    Returns
+    -------
+    dict com chaves:
+      - ``bundle``         : DipModelsV3
+      - ``report``         : dict (conteúdo do ml_report.json)
+      - ``summary``        : pd.DataFrame com IC/PnL por modelo
+      - ``oof_pred``       : dict[name, np.ndarray]
+      - ``champion_name``  : str
+      - ``brier_oof``      : float
+      - ``n_oof``          : int
+    """
+    from ml_training.bundle import DipModelsV3, build_report, save_bundle, save_report
+    from ml_training.data import load_base_dataset
+    from ml_training.models import build_feature_lists, build_model_configs
+
+    input_parquet = Path(input_parquet)
+    log.info(f"[run_training] Loading {input_parquet}")
+    df = load_base_dataset(input_parquet)
+
+    # Smoke test slicing
+    if max_rows is not None and max_rows < len(df):
+        df = df.head(max_rows).reset_index(drop=True)
+        log.info(f"[run_training] max_rows={max_rows} → {len(df)} rows")
+
+    # Filtrar linhas com alpha_60d resolvido
+    if "alpha_60d" not in df.columns:
+        raise KeyError("parquet sem coluna alpha_60d — targets não resolvidos")
+    n_pre = len(df)
+    df = df[df["alpha_60d"].notna()].reset_index(drop=True)
+    log.info(f"[run_training] Alpha_60d resolvido: {len(df)}/{n_pre}")
+
+    if "max_drawdown_60d" not in df.columns:
+        # Para compat antiga: cria coluna com NaN (depois é winsorizada)
+        log.warning("[run_training] coluna max_drawdown_60d ausente — usar zeros")
+        df["max_drawdown_60d"] = 0.0
+
+    # Robustness: target rank cross-section + sector-neutral (diagnóstico)
+    df = _maybe_apply_rank_target(df, enable=use_rank_target)
+    df = _maybe_apply_sector_neutral(df, enable=use_sector_neutral)
+
+    # Verificar features
+    feats_full, feats_baseline = build_feature_lists()
+    missing = [c for c in feats_full if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"FEATURE_COLUMNS em falta no parquet: {missing}. "
+            f"Regenera o parquet via scripts/regenerate_training_base.py."
+        )
+
+    # Walk-forward CV
+    log.info(
+        f"[run_training] CV: {n_folds} folds | purge={purge_days}d | "
+        f"min_train={min_train} min_test={min_test}"
+    )
+    model_configs = build_model_configs(feats_full, feats_baseline)
+    results, oof_pred, fold_specs = run_walk_forward_cv(
+        df_v31=df,
+        model_configs=model_configs,
+        n_folds=n_folds,
+        purge_days=purge_days,
+        min_train=min_train,
+        min_test=min_test,
+    )
+
+    summary = summarize_results(results)
+    if summary.empty:
+        raise RuntimeError(
+            f"Walk-forward CV vazio — todos os folds caíram abaixo de "
+            f"min_train={min_train}/min_test={min_test}."
+        )
+    if log_summary:
+        log.info("[run_training] Summary:\n" + summary.round(4).to_string(index=False))
+
+    # Champion + ensemble (diagnóstico)
+    champion_name, champion_row = select_champion(summary)
+    try:
+        from ml_training.cv_robust import build_champion_ensemble
+        cv_df = _make_cv_df(results)
+        ensemble_models, ensemble_weights = build_champion_ensemble(
+            cv_df, n_folds=n_folds, ic_threshold=0.02, ic_min_floor=-0.05,
+        )
+        log.info(
+            f"[run_training] Ensemble (diagnóstico): models={ensemble_models} | "
+            f"weights={ {k: round(v,3) for k,v in ensemble_weights.items()} }"
+        )
+    except Exception as e:
+        log.warning(f"[run_training] build_champion_ensemble falhou: {e}")
+        ensemble_models, ensemble_weights = [], {}
+
+    # Isotonic calibrator OOF
+    iso, brier, n_oof = fit_isotonic_calibrator(
+        oof_pred[champion_name],
+        df["alpha_60d"].values,
+        alpha_threshold=0.05,
+    )
+    log.info(
+        f"[run_training] Calibrator: brier_oof={brier:.4f} | n_oof={n_oof}"
+    )
+
+    # Treino full champion
+    champ_alpha, champ_down, feats_used, n_train = train_full_champion(
+        df_v31=df,
+        champion_cfg=model_configs[champion_name],
+    )
+
+    # Bundle
+    bundle = DipModelsV3(
+        model_up=champ_alpha,
+        model_down=champ_down,
+        feature_cols=feats_used,
+        score_calibrator=iso,
+        n_train_samples=int(n_train),
+        train_date=datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        champion_name=champion_name,
+        schema_version=3,
+        momentum_feats=[
+            f for f in (
+                "return_1m", "return_3m_pre", "return_6m_pre",
+                "return_12m_pre", "beta_60d",
+            ) if f in feats_used
+        ],
+        rho_mean=float(champion_row["rho_alpha_mean"]),
+        rho_alpha=float(champion_row["rho_alpha_mean"]),
+        rho_down=float(champion_row["rho_down_mean"]),
+        topk_pnl=float(champion_row["topk_pnl_mean"]),
+        fold_metrics=results[champion_name],
+    )
+
+    # Report
+    win_rate_alpha = float((df["alpha_60d"] > 0.05).mean())
+    report = build_report(
+        bundle=bundle,
+        summary_df=summary,
+        brier_oof=brier,
+        win_rate_alpha=win_rate_alpha,
+        n_folds_used=len(fold_specs),
+        purge_days=purge_days,
+        horizon_days=horizon_days,
+        new_features=[
+            "return_6m_pre", "return_12m_pre", "sector_relative_6m",
+            "vol_of_vol", "bb_width", "vix_percentile_1y",
+            "spy_rsi_14", "yield_10y_change_5d",
+        ],
+    )
+    # Robustness diagnostic fields (sem quebrar o schema legacy)
+    report.setdefault("robustness", {})
+    report["robustness"]["use_rank_target"]    = use_rank_target
+    report["robustness"]["use_sector_neutral"] = use_sector_neutral
+    report["robustness"]["ensemble_models"]    = ensemble_models
+    report["robustness"]["ensemble_weights"]   = ensemble_weights
+
+    # Persist
+    if output_bundle is not None:
+        save_bundle(bundle, Path(output_bundle))
+    if output_report is not None:
+        save_report(report, Path(output_report))
+
+    return {
+        "bundle":         bundle,
+        "report":         report,
+        "summary":        summary,
+        "oof_pred":       oof_pred,
+        "champion_name":  champion_name,
+        "brier_oof":      brier,
+        "n_oof":          n_oof,
+        "ensemble_models":  ensemble_models,
+        "ensemble_weights": ensemble_weights,
+    }
+
+
+def _make_cv_df(results: dict[str, list[dict]]) -> pd.DataFrame:
+    """Converte ``results`` (dict model→list[fold record]) em DataFrame plano.
+
+    Schema esperado por ``cv_robust.build_champion_ensemble``:
+      ``model, fold, ic, topk_alpha, hit_rate``
+    """
+    rows = []
+    for name, hist in results.items():
+        for h in hist:
+            rows.append({
+                "model":      name,
+                "fold":       h.get("fold"),
+                "ic":         h.get("rho_alpha"),
+                "topk_alpha": h.get("topk_pnl"),
+                "hit_rate":   h.get("hit_rate", 0.5),
+            })
+    return pd.DataFrame(rows)
