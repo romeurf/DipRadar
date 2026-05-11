@@ -47,7 +47,6 @@ FEATURE_COLUMNS: list[str] = [
     "pe_vs_fair",
     "analyst_upside",
     "quality_score",
-    "fcf_yield",
     "drop_pct_today",
     "drawdown_52w",
     "rsi_14",
@@ -62,9 +61,7 @@ FEATURE_COLUMNS: list[str] = [
     "return_1m",
     "return_3m_pre",
     "return_6m_pre",
-    "return_12m_pre",
     "sector_relative",
-    "sector_relative_6m",
     "beta_60d",
     "vol_of_vol",
     "quality_dislocation",
@@ -73,13 +70,12 @@ FEATURE_COLUMNS: list[str] = [
     "month_of_year",
     "sector_alert_count_7d",
     "days_since_52w_high",
-    "short_interest_ratio",
-    "earnings_surprise_avg",
-    "earnings_distance_days",
     "vix_percentile_1y",
     "spy_rsi_14",
-    "yield_10y_change_5d",
 ]
+# Veja ml_training/config.py para nota sobre features removidas (4 constantes
+# + 3 ruidosas com IC<0.01). _FALLBACK abaixo retém as 7 entradas para
+# inference compat (cálculos que ainda lêem os keys herdados não rebentam).
 
 LABEL_COLUMNS: list[str] = [
     "label_win",

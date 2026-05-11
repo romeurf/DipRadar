@@ -125,19 +125,26 @@ class TestModels(unittest.TestCase):
         ridge_factory()
 
     def test_feature_lists_full_matches_FEATURE_COLUMNS(self):
-        """Após PR robustez 2026-05: FEATURE_COLUMNS = 41 features (8 novas
-        adicionadas para multi-window momentum, vol-of-vol, regime). Baseline
-        exclui as features Stage-3* + Stage-3b multi-window novas."""
+        """Após PR refinamento 2026-05: 7 features ruidosas (4 constantes
+        fcf_yield/short_interest_ratio/earnings_* + 3 zero-info
+        return_12m_pre/sector_relative_6m/yield_10y_change_5d) removidas.
+        FEATURE_COLUMNS = 34 features. Baseline exclui as features
+        Stage-3* + Stage-3b multi-window novas mantidas."""
         from ml_training.models import build_feature_lists
         from ml_features import FEATURE_COLUMNS
         full, baseline = build_feature_lists()
         self.assertEqual(len(full), len(FEATURE_COLUMNS))
         self.assertGreater(len(full), len(baseline))
-        # As features novas Stage-3b devem estar no full mas não no baseline
-        for new_feat in ["return_6m_pre", "return_12m_pre", "vol_of_vol",
-                         "sector_relative_6m"]:
+        # As features novas Stage-3b mantidas (top-5 IC) devem estar no full
+        for new_feat in ["return_6m_pre", "vol_of_vol", "bb_width",
+                         "vix_percentile_1y"]:
             self.assertIn(new_feat, full)
-            self.assertNotIn(new_feat, baseline)
+        # As features removidas NÃO devem estar no full
+        for removed in ["fcf_yield", "short_interest_ratio",
+                        "earnings_surprise_avg", "earnings_distance_days",
+                        "return_12m_pre", "sector_relative_6m",
+                        "yield_10y_change_5d"]:
+            self.assertNotIn(removed, full)
 
     def test_model_configs_has_multiple_models(self):
         """Refactor 2026-04 expandiu MODEL_CONFIGS para XGB/LGBM families

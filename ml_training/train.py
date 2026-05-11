@@ -101,8 +101,17 @@ def run_walk_forward_cv(
     purge_days: int,
     min_train: int = 100,
     min_test: int = 20,
+    train_target: str = "alpha_60d",
 ) -> tuple[dict[str, list[dict]], dict[str, np.ndarray], list[tuple]]:
     """Walk-forward CV em todos os modelos candidatos.
+
+    Parameters
+    ----------
+    train_target : str
+        Coluna usada como Y para fit dos modelos. Use ``"alpha_60d_rank"``
+        para treino sobre rank cross-section (mais estável). Avaliação
+        (IC, top-K PnL) usa sempre ``alpha_60d`` bruto para
+        comparabilidade entre experiências.
 
     Devolve:
       - results: ``{model_name: [fold_metric_records]}``
@@ -112,6 +121,12 @@ def run_walk_forward_cv(
     df_v31 = df_v31.sort_values("alert_date").reset_index(drop=True)
     df_v31["alert_date"] = pd.to_datetime(df_v31["alert_date"])
     max_date = df_v31["alert_date"].max()
+
+    if train_target not in df_v31.columns:
+        raise KeyError(
+            f"train_target='{train_target}' não está no DataFrame "
+            f"(colunas: {list(df_v31.columns)[:10]}...)"
+        )
 
     fold_specs = build_walk_forward_folds(df_v31, n_folds=n_folds, purge_days=purge_days)
     results: dict[str, list[dict]] = {name: [] for name in model_configs}
@@ -128,7 +143,15 @@ def run_walk_forward_cv(
             log.info(f"Fold {k}: insuficiente (tr={len(df_tr)}, te={len(df_te)}) — saltar")
             continue
 
-        y_alpha_tr = winsorize(df_tr["alpha_60d"].values)
+        # Training Y: rank cross-section ou bruto (winsorizado só para o bruto).
+        # Rank já está em [0, 1] então winsorize seria no-op + pode rebentar.
+        if train_target == "alpha_60d":
+            y_alpha_tr = winsorize(df_tr["alpha_60d"].values)
+        else:
+            y_alpha_tr = df_tr[train_target].values.astype(float)
+        # Evaluation Y: sempre alpha_60d bruto (Spearman é rank-invariant entre
+        # pred e y_te, então comparar previsões em rank-space vs raw alpha
+        # produz o mesmo IC). Mantemos raw para comparabilidade entre runs.
         y_alpha_te = df_te["alpha_60d"].values
         y_down_tr  = winsorize(df_tr["max_drawdown_60d"].values)
         y_down_te  = df_te["max_drawdown_60d"].values
@@ -310,6 +333,71 @@ class PlattCalibrator:
         return self.lr.predict_proba(X)[:, 1]
 
 
+class EnsembleRegressor:
+    """Wrapper picklable que expõe `.predict()` como soma ponderada de N modelos.
+
+    Drop-in para `model_up` / `model_down` em `DipModelsV3`. Cada base
+    model é treinado no MESMO feature set (validado pelo orchestrator)
+    com early stopping. As previsões são combinadas via weights >= 0
+    que somam 1.0 (proporcionais ao IC de cada modelo em walk-forward CV).
+
+    Definido em módulo (não closure) para joblib/pickle funcionarem.
+    """
+
+    def __init__(self, models: "list", weights: "list[float]", names: "list[str] | None" = None):
+        if len(models) != len(weights):
+            raise ValueError(f"models ({len(models)}) != weights ({len(weights)})")
+        self.models = list(models)
+        self.weights = np.asarray(weights, dtype=float)
+        self.names = list(names) if names is not None else [f"m{i}" for i in range(len(models))]
+        s = float(self.weights.sum())
+        if s <= 0:
+            self.weights = np.full(len(models), 1.0 / len(models))
+        else:
+            self.weights = self.weights / s
+
+    def predict(self, X) -> np.ndarray:
+        preds = np.zeros(len(X), dtype=float)
+        for w, m in zip(self.weights, self.models):
+            preds = preds + w * np.asarray(m.predict(X), dtype=float)
+        return preds
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature winsorization (training-time, não modifica o parquet)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Features prone a outliers extremos (yfinance retorna 5000%+ em casos como
+# AXON.PA 2003-2004, ATO.PA 2024 reverse split, etc.). Clipamos a ±200%
+# antes do treino para que linear models e GBMs não overfittem aos outliers.
+# Aplicado apenas em runtime — o parquet mantém os valores brutos.
+_FEATURE_WINSOR_CLIPS: dict[str, tuple[float, float]] = {
+    "return_1m":      (-99.0,  200.0),
+    "return_3m_pre":  (-99.0,  200.0),
+    "return_6m_pre":  (-99.0,  200.0),
+    "sector_relative":(-200.0, 200.0),
+}
+
+
+def _winsorize_outlier_features(df: pd.DataFrame, *, log_changes: bool = True) -> pd.DataFrame:
+    """Clipa colunas com outliers extremos in-place no DataFrame.
+
+    Não modifica o parquet em disco — apenas a cópia em memória para CV.
+    """
+    df = df.copy()
+    for col, (lo, hi) in _FEATURE_WINSOR_CLIPS.items():
+        if col not in df.columns:
+            continue
+        before = df[col].copy()
+        df[col] = df[col].clip(lower=lo, upper=hi)
+        n_clipped = int(((before != df[col]) & before.notna()).sum())
+        if log_changes and n_clipped > 0:
+            log.info(
+                f"[winsor_features] {col}: clipped {n_clipped} rows to [{lo}, {hi}]"
+            )
+    return df
+
+
 def fit_isotonic_calibrator(
     oof_pred_champion: np.ndarray,
     alpha_true: np.ndarray,
@@ -357,8 +445,16 @@ def fit_isotonic_calibrator(
 def train_full_champion(
     df_v31: pd.DataFrame,
     champion_cfg: dict,
+    *,
+    train_target: str = "alpha_60d",
 ) -> tuple[object, object, list[str], int]:
     """Treina (model_up, model_down) no dataset COMPLETO com early stopping.
+
+    Parameters
+    ----------
+    train_target : str
+        Coluna usada como Y para fit do model_up. Default ``alpha_60d``.
+        Use ``alpha_60d_rank`` para treino sobre rank cross-section.
 
     Devolve (champ_alpha, champ_down, feats_used, n_train).
     """
@@ -367,7 +463,10 @@ def train_full_champion(
     feats    = [f for f in champion_cfg["feats"] if f in df_v31.columns]
 
     X_full        = df_v31[feats].fillna(0).values.astype(np.float32)
-    y_alpha_full  = winsorize(df_v31["alpha_60d"].values)
+    if train_target == "alpha_60d":
+        y_alpha_full  = winsorize(df_v31["alpha_60d"].values)
+    else:
+        y_alpha_full  = df_v31[train_target].values.astype(float)
     y_down_full   = winsorize(df_v31["max_drawdown_60d"].values)
     sw_full       = temporal_weights(df_v31["alert_date"], max_date)
 
@@ -384,6 +483,72 @@ def train_full_champion(
         f"Champion treinado em {len(X_full)} amostras com {len(feats)} features"
     )
     return champ_alpha, champ_down, feats, len(X_full)
+
+
+def train_full_ensemble(
+    df_v31: pd.DataFrame,
+    model_configs: dict[str, dict],
+    ensemble_names: list[str],
+    ensemble_weights: dict[str, float],
+    *,
+    train_target: str = "alpha_60d",
+) -> tuple["EnsembleRegressor", "EnsembleRegressor", list[str], int]:
+    """Treina ensemble (model_up + model_down) no dataset COMPLETO.
+
+    Cada modelo do ensemble usa o seu próprio feature set declarado em
+    ``model_configs[name]["feats"]``. Para o wrapper EnsembleRegressor
+    funcionar com uma única matriz X em inference time, todos os modelos
+    do ensemble DEVEM partilhar o mesmo feature set. Esta função valida
+    essa condição e levanta ValueError se houver divergência.
+
+    Devolve (ensemble_alpha, ensemble_down, feats_used, n_train).
+    """
+    df_v31   = df_v31.sort_values("alert_date").reset_index(drop=True)
+    max_date = pd.to_datetime(df_v31["alert_date"]).max()
+
+    # Validar que os modelos partilham o mesmo feature set
+    feat_sets = {
+        name: tuple(f for f in model_configs[name]["feats"] if f in df_v31.columns)
+        for name in ensemble_names
+    }
+    unique_sets = set(feat_sets.values())
+    if len(unique_sets) > 1:
+        raise ValueError(
+            "Ensemble requer modelos com mesmo feature set. Encontrados: "
+            + ", ".join(f"{n}={len(feat_sets[n])}" for n in ensemble_names)
+        )
+    feats = list(unique_sets.pop())
+
+    X_full        = df_v31[feats].fillna(0).values.astype(np.float32)
+    if train_target == "alpha_60d":
+        y_alpha_full  = winsorize(df_v31["alpha_60d"].values)
+    else:
+        y_alpha_full  = df_v31[train_target].values.astype(float)
+    y_down_full   = winsorize(df_v31["max_drawdown_60d"].values)
+    sw_full       = temporal_weights(df_v31["alert_date"], max_date)
+
+    X_t, y_t_a, sw_t, X_v, y_v_a = _split_val(X_full, y_alpha_full, sw_full, val_frac=0.07)
+    _, y_t_d, _, _, y_v_d         = _split_val(X_full, y_down_full,  sw_full, val_frac=0.07)
+
+    alpha_models: list = []
+    down_models: list = []
+    weight_list: list[float] = []
+    for name in ensemble_names:
+        cfg = model_configs[name]
+        m_alpha = _fit_model(cfg["factory"](), X_t, y_t_a, sw_t, X_v, y_v_a)
+        m_down  = _fit_model(cfg["factory"](), X_t, y_t_d, sw_t, X_v, y_v_d)
+        alpha_models.append(m_alpha)
+        down_models.append(m_down)
+        weight_list.append(float(ensemble_weights.get(name, 0.0)))
+
+    ensemble_alpha = EnsembleRegressor(alpha_models, weight_list, names=list(ensemble_names))
+    ensemble_down  = EnsembleRegressor(down_models,  weight_list, names=list(ensemble_names))
+
+    log.info(
+        f"Ensemble treinado em {len(X_full)} amostras com {len(feats)} features | "
+        f"members={ensemble_names} | weights={[round(w, 3) for w in ensemble_alpha.weights]}"
+    )
+    return ensemble_alpha, ensemble_down, feats, len(X_full)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -427,6 +592,11 @@ def run_training(
     min_test: int = 20,
     use_rank_target: bool = True,
     use_sector_neutral: bool = True,
+    use_rank_target_train: bool = True,
+    use_ensemble_champion: bool = True,
+    winsorize_features: bool = True,
+    ensemble_ic_threshold: float = 0.04,
+    ensemble_ic_min_floor: float = -0.05,
     max_rows: Optional[int] = None,
     log_summary: bool = True,
 ) -> dict:
@@ -446,11 +616,28 @@ def run_training(
     n_folds, purge_days, horizon_days : int
         Parâmetros do walk-forward CV.
     use_rank_target : bool
-        Se True, adiciona ``alpha_60d_rank`` para diagnóstico (sempre treina
-        em ``alpha_60d`` bruto para compatibilidade com o pipeline produção).
+        Se True, computa ``alpha_60d_rank`` para uso pelo CV/full train
+        (também útil como coluna de diagnóstico). Default True.
     use_sector_neutral : bool
         Se True, adiciona ``alpha_60d_neutral`` ao DataFrame (apenas
-        diagnóstico — modelo continua a treinar em ``alpha_60d`` directo).
+        diagnóstico — modelo nunca treina sobre este target).
+    use_rank_target_train : bool
+        Se True E ``use_rank_target=True``, modelos são treinados sobre
+        ``alpha_60d_rank`` em vez do bruto. Evaluation continua em
+        ``alpha_60d`` para comparabilidade. Default True.
+    use_ensemble_champion : bool
+        Se True, constrói ensemble IC-weighted dos top-N modelos
+        robustos e usa como champion final SE o seu OOF IC for >= ao
+        single best model. Caso contrário, single champion. Default True.
+    winsorize_features : bool
+        Se True, clipa features prone a outliers extremos (return_1m,
+        return_3m_pre, return_6m_pre, sector_relative) a ±200% antes do
+        treino. Default True.
+    ensemble_ic_threshold : float
+        IC mínimo para entrar no ensemble (default 0.04).
+    ensemble_ic_min_floor : float
+        IC mínimo por fold (default -0.05; rejeita modelos com folds
+        catastróficos).
     max_rows : int | None
         Slicing para smoke tests.
     log_summary : bool
@@ -464,6 +651,7 @@ def run_training(
       - ``summary``        : pd.DataFrame com IC/PnL por modelo
       - ``oof_pred``       : dict[name, np.ndarray]
       - ``champion_name``  : str
+      - ``champion_kind``  : "single" ou "ensemble"
       - ``brier_oof``      : float
       - ``n_oof``          : int
     """
@@ -492,9 +680,22 @@ def run_training(
         log.warning("[run_training] coluna max_drawdown_60d ausente — usar zeros")
         df["max_drawdown_60d"] = 0.0
 
-    # Robustness: target rank cross-section + sector-neutral (diagnóstico)
+    # Robustness: target rank cross-section + sector-neutral
     df = _maybe_apply_rank_target(df, enable=use_rank_target)
     df = _maybe_apply_sector_neutral(df, enable=use_sector_neutral)
+
+    # Feature winsorization (clipa return_1m/3m/6m a ±200% para tratar
+    # outliers tipo AXON.PA 5000% / ATO.PA 9549%)
+    if winsorize_features:
+        df = _winsorize_outlier_features(df)
+
+    # Resolve training target (rank se ambos os flags activos + coluna existe)
+    train_target_col = "alpha_60d"
+    if use_rank_target_train and use_rank_target and "alpha_60d_rank" in df.columns:
+        train_target_col = "alpha_60d_rank"
+        log.info(f"[run_training] Training target: {train_target_col} (cross-section rank)")
+    else:
+        log.info(f"[run_training] Training target: {train_target_col} (raw alpha)")
 
     # Verificar features
     feats_full, feats_baseline = build_feature_lists()
@@ -518,6 +719,7 @@ def run_training(
         purge_days=purge_days,
         min_train=min_train,
         min_test=min_test,
+        train_target=train_target_col,
     )
 
     summary = summarize_results(results)
@@ -529,25 +731,112 @@ def run_training(
     if log_summary:
         log.info("[run_training] Summary:\n" + summary.round(4).to_string(index=False))
 
-    # Champion + ensemble (diagnóstico)
-    champion_name, champion_row = select_champion(summary)
+    # Single best champion (para fallback e comparação com ensemble)
+    single_champion_name, single_champion_row = select_champion(summary)
+    log.info(
+        f"[run_training] Single best: {single_champion_name} "
+        f"(rho_alpha={float(single_champion_row['rho_alpha_mean']):.4f})"
+    )
+
+    # Construção do ensemble (selecciona top modelos robustos)
+    ensemble_names: list[str] = []
+    ensemble_weights: dict[str, float] = {}
     try:
         from ml_training.cv_robust import build_champion_ensemble
         cv_df = _make_cv_df(results)
-        ensemble_models, ensemble_weights = build_champion_ensemble(
-            cv_df, n_folds=n_folds, ic_threshold=0.02, ic_min_floor=-0.05,
+        ensemble_names, ensemble_weights = build_champion_ensemble(
+            cv_df,
+            n_folds=n_folds,
+            ic_threshold=ensemble_ic_threshold,
+            ic_min_floor=ensemble_ic_min_floor,
         )
         log.info(
-            f"[run_training] Ensemble (diagnóstico): models={ensemble_models} | "
+            f"[run_training] Ensemble candidato: members={ensemble_names} | "
             f"weights={ {k: round(v,3) for k,v in ensemble_weights.items()} }"
         )
     except Exception as e:
         log.warning(f"[run_training] build_champion_ensemble falhou: {e}")
-        ensemble_models, ensemble_weights = [], {}
 
-    # Isotonic calibrator OOF
+    # Validar que os modelos do ensemble partilham features (necessário
+    # para o EnsembleRegressor com matriz X única em inference time)
+    if use_ensemble_champion and ensemble_names:
+        feat_sets = {
+            name: tuple(f for f in model_configs[name]["feats"] if f in df.columns)
+            for name in ensemble_names
+        }
+        if len(set(feat_sets.values())) > 1:
+            log.warning(
+                "[run_training] Ensemble candidates têm feature sets diferentes — "
+                "filtrando para o mais frequente"
+            )
+            from collections import Counter
+            most_common = Counter(feat_sets.values()).most_common(1)[0][0]
+            ensemble_names = [n for n in ensemble_names if feat_sets[n] == most_common]
+            # Renormalizar pesos
+            total = sum(ensemble_weights.get(n, 0.0) for n in ensemble_names)
+            if total > 0:
+                ensemble_weights = {n: ensemble_weights[n] / total for n in ensemble_names}
+            log.info(
+                f"[run_training] Ensemble filtrado: members={ensemble_names} | "
+                f"weights={ {k: round(v,3) for k,v in ensemble_weights.items()} }"
+            )
+
+    # Decidir champion final: ensemble vs single
+    use_ensemble = (
+        use_ensemble_champion
+        and len(ensemble_names) >= 2  # 1 modelo não é ensemble
+    )
+    ensemble_oof: Optional[np.ndarray] = None
+    ensemble_ic_oof: Optional[float] = None
+    if use_ensemble:
+        ensemble_oof = np.full(len(df), np.nan)
+        valid_mask = np.zeros(len(df), dtype=bool)
+        for name in ensemble_names:
+            if name not in oof_pred:
+                continue
+            w = ensemble_weights.get(name, 0.0)
+            arr = oof_pred[name]
+            local_mask = np.isfinite(arr)
+            if not valid_mask.any():
+                valid_mask = local_mask.copy()
+                ensemble_oof[local_mask] = 0.0
+            else:
+                valid_mask = valid_mask & local_mask
+            ensemble_oof[valid_mask] += w * arr[valid_mask]
+        # Mascarar onde não há predição válida para todos os membros
+        ensemble_oof = np.where(valid_mask, ensemble_oof, np.nan)
+        # Computar IC OOF do ensemble vs alpha_60d
+        try:
+            ensemble_ic_oof = float(
+                spearman_safe(ensemble_oof[valid_mask], df["alpha_60d"].values[valid_mask])
+            )
+        except Exception:
+            ensemble_ic_oof = None
+        single_ic = float(single_champion_row["rho_alpha_mean"])
+        log.info(
+            f"[run_training] Ensemble OOF IC = {ensemble_ic_oof} vs "
+            f"single best mean IC = {single_ic:.4f}"
+        )
+        # Critério: ensemble vence se OOF IC >= single's mean IC (margem zero)
+        if ensemble_ic_oof is None or ensemble_ic_oof < single_ic:
+            log.info(
+                "[run_training] Ensemble não bate single → champion = single"
+            )
+            use_ensemble = False
+
+    champion_kind = "ensemble" if use_ensemble else "single"
+    if use_ensemble:
+        champion_name = "Ensemble(" + "+".join(ensemble_names) + ")"
+        # OOF predictions do champion = ensemble OOF (para calibrator)
+        champion_oof_pred = ensemble_oof
+    else:
+        champion_name = single_champion_name
+        champion_oof_pred = oof_pred[single_champion_name]
+    log.info(f"[run_training] Champion final: {champion_kind}={champion_name}")
+
+    # Isotonic calibrator OOF (usa champion_oof_pred, seja single ou ensemble)
     iso, brier, n_oof = fit_isotonic_calibrator(
-        oof_pred[champion_name],
+        champion_oof_pred,
         df["alpha_60d"].values,
         alpha_threshold=0.05,
     )
@@ -555,11 +844,29 @@ def run_training(
         f"[run_training] Calibrator: brier_oof={brier:.4f} | n_oof={n_oof}"
     )
 
-    # Treino full champion
-    champ_alpha, champ_down, feats_used, n_train = train_full_champion(
-        df_v31=df,
-        champion_cfg=model_configs[champion_name],
-    )
+    # Treino full do champion (single ou ensemble)
+    if use_ensemble:
+        champ_alpha, champ_down, feats_used, n_train = train_full_ensemble(
+            df_v31=df,
+            model_configs=model_configs,
+            ensemble_names=ensemble_names,
+            ensemble_weights=ensemble_weights,
+            train_target=train_target_col,
+        )
+    else:
+        champ_alpha, champ_down, feats_used, n_train = train_full_champion(
+            df_v31=df,
+            champion_cfg=model_configs[single_champion_name],
+            train_target=train_target_col,
+        )
+
+    # Métricas para o report (usa OOF IC do ensemble se ensemble, ou single CV mean)
+    if use_ensemble and ensemble_ic_oof is not None:
+        rho_alpha_final = ensemble_ic_oof
+    else:
+        rho_alpha_final = float(single_champion_row["rho_alpha_mean"])
+    rho_down_final = float(single_champion_row["rho_down_mean"])
+    topk_pnl_final = float(single_champion_row["topk_pnl_mean"])
 
     # Bundle
     bundle = DipModelsV3(
@@ -574,14 +881,14 @@ def run_training(
         momentum_feats=[
             f for f in (
                 "return_1m", "return_3m_pre", "return_6m_pre",
-                "return_12m_pre", "beta_60d",
+                "beta_60d",
             ) if f in feats_used
         ],
-        rho_mean=float(champion_row["rho_alpha_mean"]),
-        rho_alpha=float(champion_row["rho_alpha_mean"]),
-        rho_down=float(champion_row["rho_down_mean"]),
-        topk_pnl=float(champion_row["topk_pnl_mean"]),
-        fold_metrics=results[champion_name],
+        rho_mean=rho_alpha_final,
+        rho_alpha=rho_alpha_final,
+        rho_down=rho_down_final,
+        topk_pnl=topk_pnl_final,
+        fold_metrics=results.get(single_champion_name, []),
     )
 
     # Report
@@ -595,17 +902,23 @@ def run_training(
         purge_days=purge_days,
         horizon_days=horizon_days,
         new_features=[
-            "return_6m_pre", "return_12m_pre", "sector_relative_6m",
-            "vol_of_vol", "bb_width", "vix_percentile_1y",
-            "spy_rsi_14", "yield_10y_change_5d",
+            "return_6m_pre", "vol_of_vol", "bb_width",
+            "vix_percentile_1y", "spy_rsi_14",
         ],
     )
     # Robustness diagnostic fields (sem quebrar o schema legacy)
     report.setdefault("robustness", {})
-    report["robustness"]["use_rank_target"]    = use_rank_target
-    report["robustness"]["use_sector_neutral"] = use_sector_neutral
-    report["robustness"]["ensemble_models"]    = ensemble_models
-    report["robustness"]["ensemble_weights"]   = ensemble_weights
+    report["robustness"]["use_rank_target"]        = use_rank_target
+    report["robustness"]["use_rank_target_train"]  = use_rank_target_train and train_target_col == "alpha_60d_rank"
+    report["robustness"]["use_sector_neutral"]     = use_sector_neutral
+    report["robustness"]["train_target_column"]    = train_target_col
+    report["robustness"]["winsorize_features"]     = winsorize_features
+    report["robustness"]["champion_kind"]          = champion_kind
+    report["robustness"]["ensemble_models"]        = ensemble_names
+    report["robustness"]["ensemble_weights"]       = ensemble_weights
+    report["robustness"]["ensemble_ic_oof"]        = ensemble_ic_oof
+    report["robustness"]["single_best_name"]       = single_champion_name
+    report["robustness"]["single_best_rho_alpha"]  = float(single_champion_row["rho_alpha_mean"])
 
     # Persist
     if output_bundle is not None:
@@ -614,15 +927,17 @@ def run_training(
         save_report(report, Path(output_report))
 
     return {
-        "bundle":         bundle,
-        "report":         report,
-        "summary":        summary,
-        "oof_pred":       oof_pred,
-        "champion_name":  champion_name,
-        "brier_oof":      brier,
-        "n_oof":          n_oof,
-        "ensemble_models":  ensemble_models,
+        "bundle":          bundle,
+        "report":          report,
+        "summary":         summary,
+        "oof_pred":        oof_pred,
+        "champion_name":   champion_name,
+        "champion_kind":   champion_kind,
+        "brier_oof":       brier,
+        "n_oof":           n_oof,
+        "ensemble_models":  ensemble_names,
         "ensemble_weights": ensemble_weights,
+        "ensemble_ic_oof":  ensemble_ic_oof,
     }
 
 
