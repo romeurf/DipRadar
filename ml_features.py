@@ -192,6 +192,115 @@ def add_derived_features(features: dict, alert_date: Optional[Any] = None) -> di
         features["month_of_year"] = float(datetime.now().month)
     return features
 
+
+# ────────────────────────────────────────────────────────────────────────────────
+# build_features — thin orchestrator usado pelo position_monitor para
+# re-scoring diário das posições activas. Replica o contrato antigo:
+#   build_features(ticker, fundamentals) → dict com todas as FEATURE_COLUMNS.
+# Sem price_history/sector → as features técnicas e momentum caem para
+# _FALLBACK determinístico (aceitável para vigilância diária).
+# ────────────────────────────────────────────────────────────────────────────────
+def build_features(
+    ticker: str,
+    fundamentals: dict,
+    *,
+    sector: str = "Unknown",
+    macro_context: Optional[dict] = None,
+    alert_date: Optional[Any] = None,
+) -> dict:
+    """Constrói um dict de features para inference (predict_dip / ml_score).
+
+    Designed for **position_monitor** path — re-scoring diário das posições
+    activas sem price_history nem sector ETF disponíveis. Para training
+    histórico ou snapshot do universo, usar ``ml_training.data.build_dataset``
+    ou ``universe_snapshot._build_snapshot_row`` (que constroem o dict
+    manualmente e chamam apenas ``add_derived_features``).
+
+    Parameters
+    ----------
+    ticker         : str   identificador (apenas para logs).
+    fundamentals   : dict  output de ``_fetch_fundamentals_snapshot`` ou
+                           equivalente. Chaves opcionais: ``pe``, ``debt_equity``,
+                           ``revenue_growth``, ``gross_margin``, ``fcf_yield``,
+                           ``analyst_upside``, ``price``, ``market_cap``.
+    sector         : str   GICS sector (defaults "Unknown" → fair PE 22.0).
+    macro_context  : dict  ``get_macro_context`` pre-calculado (evita API call
+                           extra). ``None`` = chama ``get_macro_context``.
+    alert_date     : Any   timestamp do alerta (usado para ``month_of_year``).
+                           ``None`` = hoje.
+
+    Returns
+    -------
+    dict com todas as FEATURE_COLUMNS preenchidas (valores fundamentais
+    vindos do dict, técnicos/momentum/regime em fallback).
+    """
+    fund = fundamentals or {}
+
+    # Stage 0 — Macro
+    if macro_context is None:
+        try:
+            macro_context = get_macro_context(sector=sector)
+        except Exception as e:
+            logger.debug(f"build_features[{ticker}]: get_macro_context falhou: {e}")
+            macro_context = {}
+    macro_context = macro_context or {}
+
+    features: dict = {col: _FALLBACK[col] for col in FEATURE_COLUMNS}
+
+    # Macro overrides
+    for k in ("macro_score", "vix", "spy_drawdown_5d", "sector_drawdown_5d"):
+        if k in macro_context and macro_context[k] is not None:
+            try:
+                features[k] = float(macro_context[k])
+            except (TypeError, ValueError):
+                pass
+
+    # Stage 1 — Quality / Value (do dict de fundamentais)
+    def _set(col: str, val: Any) -> None:
+        if val is None:
+            return
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            return
+        if math.isfinite(f):
+            features[col] = f
+
+    _set("gross_margin",   fund.get("gross_margin"))
+    _set("de_ratio",       fund.get("debt_equity") or fund.get("de_ratio"))
+    _set("analyst_upside", fund.get("analyst_upside") or fund.get("upside"))
+    _set("fcf_yield",      fund.get("fcf_yield"))
+
+    # pe_vs_fair = pe / fair_pe_sector (ratio > 1 = overvalued)
+    pe_raw = _safe_float(fund.get("pe"))
+    fair_pe = _SECTOR_FAIR_PE.get(sector, 22.0)
+    if not math.isnan(pe_raw) and pe_raw > 0 and fair_pe > 0:
+        features["pe_vs_fair"] = round(pe_raw / fair_pe, 4)
+
+    # Quality score via score.py (hemisphere A normalizado [0,1])
+    try:
+        sr = score_from_fundamentals(fund)
+        if isinstance(sr, dict) and "quality_score" in sr:
+            features["quality_score"] = float(sr["quality_score"])
+        elif isinstance(sr, (int, float)):
+            features["quality_score"] = float(sr)
+    except Exception as e:
+        logger.debug(f"build_features[{ticker}]: score_from_fundamentals falhou: {e}")
+
+    # Stage 2 — Timing (do dict; sem price_history → fallback)
+    _set("drop_pct_today", fund.get("drop_pct_today") or fund.get("change_pct"))
+    _set("drawdown_52w",   fund.get("drawdown_52w"))
+    _set("rsi_14",         fund.get("rsi_14") or fund.get("rsi"))
+    _set("atr_ratio",      fund.get("atr_ratio"))
+    _set("volume_spike",   fund.get("volume_spike"))
+
+    # Stage 3 — Derived (interactions). Sobrescreve os 7 derivados a partir
+    # do dict actual; o resto fica em fallback.
+    add_derived_features(features, alert_date=alert_date)
+
+    return features
+
+
 def add_context_features(features: dict, price_history: Optional[pd.DataFrame] = None, sector_alert_count_7d: Optional[float] = None) -> dict:
     if sector_alert_count_7d is not None:
         v = float(sector_alert_count_7d)
