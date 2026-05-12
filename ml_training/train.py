@@ -592,8 +592,19 @@ def run_training(
     min_test: int = 20,
     use_rank_target: bool = True,
     use_sector_neutral: bool = True,
-    use_rank_target_train: bool = True,
-    use_ensemble_champion: bool = True,
+    # PR #25 activou rank target training + ensemble champion como defaults
+    # mas o run real (11/05/2026, 36929 rows × 10 folds) retornou
+    # rho_alpha=-0.0130 (vs 0.0820 com PR #23 baseline). Causa raiz:
+    #   1. rank target treina o modelo a prever rank WITHIN alert_date,
+    #      mas avaliação Spearman é sobre o test fold inteiro (multi-data).
+    #      Modelo perde a capacidade de distinguir entre datas.
+    #   2. ensemble pode juntar modelos com feature sets diferentes em CV
+    #      mas o full train filtra para shared set — OOF IC vs prod IC
+    #      medem coisas diferentes, gating é unsound.
+    # Defaults reverted to False. Flags ficam disponíveis para experimentar
+    # (e.g. avaliar IC rank-within-date em vez de IC global).
+    use_rank_target_train: bool = False,
+    use_ensemble_champion: bool = False,
     winsorize_features: bool = True,
     ensemble_ic_threshold: float = 0.04,
     ensemble_ic_min_floor: float = -0.05,
@@ -624,11 +635,18 @@ def run_training(
     use_rank_target_train : bool
         Se True E ``use_rank_target=True``, modelos são treinados sobre
         ``alpha_60d_rank`` em vez do bruto. Evaluation continua em
-        ``alpha_60d`` para comparabilidade. Default True.
+        ``alpha_60d`` para comparabilidade. **Default False** (PR #25
+        descobriu que rank-within-date training degrada IC cross-date
+        global — flag mantido para experimentação futura, e.g. quando
+        avaliação for também rank-within-date).
     use_ensemble_champion : bool
         Se True, constrói ensemble IC-weighted dos top-N modelos
         robustos e usa como champion final SE o seu OOF IC for >= ao
-        single best model. Caso contrário, single champion. Default True.
+        single best model. **Default False** (PR #25 descobriu bug:
+        modelos em CV têm feature sets diferentes, mas full train filtra
+        para shared set — OOF IC do ensemble não reflecte o ensemble
+        que vai para produção. Fix possível: forçar shared feature set
+        em todos os candidatos do ensemble desde CV).
     winsorize_features : bool
         Se True, clipa features prone a outliers extremos (return_1m,
         return_3m_pre, return_6m_pre, sector_relative) a ±200% antes do
