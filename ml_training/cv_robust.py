@@ -48,6 +48,7 @@ def build_champion_ensemble(
     n_folds: int,
     ic_threshold: float = 0.04,
     ic_min_floor: float = -0.01,
+    top_n: int = 4,
 ) -> tuple[list[str], dict[str, float]]:
     """Selecciona modelos robustos e calcula pesos proporcionais ao IC_mean.
 
@@ -55,8 +56,12 @@ def build_champion_ensemble(
       1. IC_mean >= ic_threshold (sinal mínimo aceitável)
       2. IC_min >= ic_min_floor (nenhum fold catastrófico)
       3. Pelo menos N_FOLDS-1 folds com resultado válido
+      4. Apenas os top_n modelos passam (default 4) — diluição de
+         sinal acima disto, já que modelos similares no zoo correlacionam
+         predições e averaging não ajuda.
 
-    Pesos: proporcionais a IC_mean clipado a 0 (modelos negativos = peso 0).
+    Pesos: proporcionais a IC_mean^2 (favorece modelos top sobre medianos)
+    clipado a 0 (modelos negativos = peso 0).
     Fallback: se nenhum passa, usa top 3 por IC_mean.
     """
     agg = (
@@ -79,14 +84,21 @@ def build_champion_ensemble(
     ].copy()
 
     if robust.empty:
-        robust = agg.head(3).copy()
+        robust = agg.head(min(3, len(agg))).copy()
 
-    robust["weight"] = robust["ic_mean"].clip(lower=0)
-    total_w = robust["weight"].sum()
-    robust["weight"] = (
-        robust["weight"] / total_w if total_w > 0
-        else pd.Series(1.0 / len(robust), index=robust.index)
-    )
+    # Limitar a top_n para evitar diluição por modelos similares.
+    if top_n is not None and top_n > 0 and len(robust) > top_n:
+        robust = robust.head(top_n).copy()
+
+    # Pesos: ic_mean^2 (favorece top sobre mediano). Cap em 0 para excluir
+    # modelos com IC negativo.
+    pos = robust["ic_mean"].clip(lower=0.0)
+    sq = pos ** 2
+    total_w = sq.sum()
+    if total_w > 0:
+        robust["weight"] = sq / total_w
+    else:
+        robust["weight"] = pd.Series(1.0 / len(robust), index=robust.index)
 
     champion_models = robust.index.tolist()
     champion_weights = robust["weight"].to_dict()

@@ -598,16 +598,20 @@ def run_training(
     #   1. rank target treina o modelo a prever rank WITHIN alert_date,
     #      mas avaliação Spearman é sobre o test fold inteiro (multi-data).
     #      Modelo perde a capacidade de distinguir entre datas.
-    #   2. ensemble pode juntar modelos com feature sets diferentes em CV
-    #      mas o full train filtra para shared set — OOF IC vs prod IC
-    #      medem coisas diferentes, gating é unsound.
-    # Defaults reverted to False. Flags ficam disponíveis para experimentar
-    # (e.g. avaliar IC rank-within-date em vez de IC global).
+    #      → Continua False (PR #27): activação requer alterar gating
+    #         para rank-within-date evaluation também.
+    #   2. ensemble juntava modelos com feature sets diferentes em CV mas
+    #      filtrava após build_champion_ensemble, deixando subset sub-óptimo.
+    #      OOF IC pooled vs single's per-fold mean IC — métricas
+    #      não-comparáveis. → Fixed em PR #27 (eligibility filter
+    #      pre-selecciona shared feature set; gating per-fold mean IC;
+    #      top_n=4 truncation). Default True activado.
     use_rank_target_train: bool = False,
-    use_ensemble_champion: bool = False,
+    use_ensemble_champion: bool = True,
     winsorize_features: bool = True,
     ensemble_ic_threshold: float = 0.04,
     ensemble_ic_min_floor: float = -0.05,
+    ensemble_top_n: int = 4,
     max_rows: Optional[int] = None,
     log_summary: bool = True,
 ) -> dict:
@@ -640,13 +644,15 @@ def run_training(
         global — flag mantido para experimentação futura, e.g. quando
         avaliação for também rank-within-date).
     use_ensemble_champion : bool
-        Se True, constrói ensemble IC-weighted dos top-N modelos
-        robustos e usa como champion final SE o seu OOF IC for >= ao
-        single best model. **Default False** (PR #25 descobriu bug:
-        modelos em CV têm feature sets diferentes, mas full train filtra
-        para shared set — OOF IC do ensemble não reflecte o ensemble
-        que vai para produção. Fix possível: forçar shared feature set
-        em todos os candidatos do ensemble desde CV).
+        Se True, constrói ensemble IC^2-weighted dos top_N modelos
+        robustos (sharing feature set) e usa como champion final SE o
+        seu IC per-fold mean for >= ao single best per-fold mean IC.
+        **Default True** (PR #27 corrigiu os bugs do PR #25 que
+        causaram regressão: 1. eligibility filter pré-selecciona apenas
+        modelos partilhando feature set dominante; 2. gating usa IC
+        per-fold mean comparable com single best; 3. top_n truncation
+        evita diluição por modelos similares. Se ensemble não vencer,
+        fallback automático para single).
     winsorize_features : bool
         Se True, clipa features prone a outliers extremos (return_1m,
         return_3m_pre, return_6m_pre, sector_relative) a ±200% antes do
@@ -656,6 +662,9 @@ def run_training(
     ensemble_ic_min_floor : float
         IC mínimo por fold (default -0.05; rejeita modelos com folds
         catastróficos).
+    ensemble_top_n : int
+        Número máximo de modelos no ensemble (default 4). Reduzir diluição
+        de sinal por modelos similares com predições correlacionadas.
     max_rows : int | None
         Slicing para smoke tests.
     log_summary : bool
@@ -757,16 +766,40 @@ def run_training(
     )
 
     # Construção do ensemble (selecciona top modelos robustos)
+    # Pré-filtramos os candidatos para apenas os que partilham o feature set
+    # mais comum entre todos os modelos. Razão: o ensemble produção (matriz
+    # X única) só funciona com modelos a partilharem features; se incluirmos
+    # candidatos com feature sets diferentes, a OOF IC estimada não
+    # corresponde ao ensemble que vai para produção (gating unsound).
+    from collections import Counter
+    all_feat_sets = {
+        name: tuple(f for f in cfg["feats"] if f in df.columns)
+        for name, cfg in model_configs.items()
+    }
+    dominant_feat_set = Counter(all_feat_sets.values()).most_common(1)[0][0]
+    eligible_models = [
+        name for name, fs in all_feat_sets.items() if fs == dominant_feat_set
+    ]
+    excluded_for_features = sorted(set(model_configs) - set(eligible_models))
+    if excluded_for_features:
+        log.info(
+            f"[run_training] Ensemble eligibility filter: {len(eligible_models)} "
+            f"models share dominant feature set ({len(dominant_feat_set)} features); "
+            f"excluded (non-shared feats): {excluded_for_features}"
+        )
+
     ensemble_names: list[str] = []
     ensemble_weights: dict[str, float] = {}
     try:
         from ml_training.cv_robust import build_champion_ensemble
-        cv_df = _make_cv_df(results)
+        cv_df_all = _make_cv_df(results)
+        cv_df = cv_df_all[cv_df_all["model"].isin(eligible_models)].copy()
         ensemble_names, ensemble_weights = build_champion_ensemble(
             cv_df,
             n_folds=n_folds,
             ic_threshold=ensemble_ic_threshold,
             ic_min_floor=ensemble_ic_min_floor,
+            top_n=ensemble_top_n,
         )
         log.info(
             f"[run_training] Ensemble candidato: members={ensemble_names} | "
@@ -775,29 +808,16 @@ def run_training(
     except Exception as e:
         log.warning(f"[run_training] build_champion_ensemble falhou: {e}")
 
-    # Validar que os modelos do ensemble partilham features (necessário
-    # para o EnsembleRegressor com matriz X única em inference time)
+    # Defensive guard: confirmar que todos os ensemble_names partilham
+    # feature set (deve ser sempre verdade após o eligibility filter).
     if use_ensemble_champion and ensemble_names:
-        feat_sets = {
-            name: tuple(f for f in model_configs[name]["feats"] if f in df.columns)
-            for name in ensemble_names
-        }
+        feat_sets = {name: all_feat_sets[name] for name in ensemble_names}
         if len(set(feat_sets.values())) > 1:
-            log.warning(
-                "[run_training] Ensemble candidates têm feature sets diferentes — "
-                "filtrando para o mais frequente"
+            log.error(
+                "[run_training] BUG: ensemble candidates não partilham feature set "
+                "após eligibility filter — fallback para single champion"
             )
-            from collections import Counter
-            most_common = Counter(feat_sets.values()).most_common(1)[0][0]
-            ensemble_names = [n for n in ensemble_names if feat_sets[n] == most_common]
-            # Renormalizar pesos
-            total = sum(ensemble_weights.get(n, 0.0) for n in ensemble_names)
-            if total > 0:
-                ensemble_weights = {n: ensemble_weights[n] / total for n in ensemble_names}
-            log.info(
-                f"[run_training] Ensemble filtrado: members={ensemble_names} | "
-                f"weights={ {k: round(v,3) for k,v in ensemble_weights.items()} }"
-            )
+            ensemble_names = []
 
     # Decidir champion final: ensemble vs single
     use_ensemble = (
@@ -806,6 +826,7 @@ def run_training(
     )
     ensemble_oof: Optional[np.ndarray] = None
     ensemble_ic_oof: Optional[float] = None
+    ensemble_ic_per_fold_mean: Optional[float] = None
     if use_ensemble:
         ensemble_oof = np.full(len(df), np.nan)
         valid_mask = np.zeros(len(df), dtype=bool)
@@ -823,22 +844,43 @@ def run_training(
             ensemble_oof[valid_mask] += w * arr[valid_mask]
         # Mascarar onde não há predição válida para todos os membros
         ensemble_oof = np.where(valid_mask, ensemble_oof, np.nan)
-        # Computar IC OOF do ensemble vs alpha_60d
+        # IC OOF pooled (diagnóstico — não compara com per-fold mean)
         try:
             ensemble_ic_oof = float(
                 spearman_safe(ensemble_oof[valid_mask], df["alpha_60d"].values[valid_mask])
             )
         except Exception:
             ensemble_ic_oof = None
+        # IC per-fold mean — métrica COMPARÁVEL com single best (que usa
+        # também per-fold mean). Reconstroi-se test masks por fold a partir
+        # de fold_specs e calcula-se Spearman dentro de cada fold.
+        per_fold_ics: list[float] = []
+        y_alpha_all = df["alpha_60d"].values
+        for k_idx, train_end, purge_end, test_end in fold_specs:
+            te_mask = (df["alert_date"] > purge_end) & (df["alert_date"] <= test_end)
+            fold_mask = te_mask.values & valid_mask
+            if int(fold_mask.sum()) < 10:
+                continue
+            try:
+                ic_fold = float(spearman_safe(
+                    ensemble_oof[fold_mask], y_alpha_all[fold_mask]
+                ))
+                if np.isfinite(ic_fold):
+                    per_fold_ics.append(ic_fold)
+            except Exception:
+                pass
+        if per_fold_ics:
+            ensemble_ic_per_fold_mean = float(np.mean(per_fold_ics))
         single_ic = float(single_champion_row["rho_alpha_mean"])
         log.info(
-            f"[run_training] Ensemble OOF IC = {ensemble_ic_oof} vs "
-            f"single best mean IC = {single_ic:.4f}"
+            f"[run_training] Ensemble IC (per-fold mean) = {ensemble_ic_per_fold_mean} "
+            f"| pooled OOF = {ensemble_ic_oof} | single best (per-fold mean) = {single_ic:.4f}"
         )
-        # Critério: ensemble vence se OOF IC >= single's mean IC (margem zero)
-        if ensemble_ic_oof is None or ensemble_ic_oof < single_ic:
+        # Critério: ensemble vence se IC per-fold mean >= single's per-fold mean IC
+        # (margem zero, comparação fair com a mesma métrica)
+        if ensemble_ic_per_fold_mean is None or ensemble_ic_per_fold_mean < single_ic:
             log.info(
-                "[run_training] Ensemble não bate single → champion = single"
+                "[run_training] Ensemble não bate single (per-fold mean) → champion = single"
             )
             use_ensemble = False
 
@@ -878,9 +920,10 @@ def run_training(
             train_target=train_target_col,
         )
 
-    # Métricas para o report (usa OOF IC do ensemble se ensemble, ou single CV mean)
-    if use_ensemble and ensemble_ic_oof is not None:
-        rho_alpha_final = ensemble_ic_oof
+    # Métricas para o report. Usamos sempre métrica per-fold mean para
+    # comparabilidade entre runs e com floor gating em monthly_retrain.
+    if use_ensemble and ensemble_ic_per_fold_mean is not None:
+        rho_alpha_final = ensemble_ic_per_fold_mean
     else:
         rho_alpha_final = float(single_champion_row["rho_alpha_mean"])
     rho_down_final = float(single_champion_row["rho_down_mean"])
@@ -935,6 +978,7 @@ def run_training(
     report["robustness"]["ensemble_models"]        = ensemble_names
     report["robustness"]["ensemble_weights"]       = ensemble_weights
     report["robustness"]["ensemble_ic_oof"]        = ensemble_ic_oof
+    report["robustness"]["ensemble_ic_per_fold_mean"] = ensemble_ic_per_fold_mean
     report["robustness"]["single_best_name"]       = single_champion_name
     report["robustness"]["single_best_rho_alpha"]  = float(single_champion_row["rho_alpha_mean"])
 
