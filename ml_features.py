@@ -58,6 +58,15 @@ FEATURE_COLUMNS: list[str] = [
     "sector_alert_count_7d",
     "vix_percentile_1y",
     "spy_rsi_14",
+    # PR #30 (Phase B): 4 raw-OHLCV features ortogonais aos existentes
+    # (vol_of_vol, bb_width já cobrem volatilidade close-to-close).
+    # Profiling IC sobre o parquet completo eliminou 3 candidatos iniciais
+    # (realized_vol_20d ρ=0.81 com vol_of_vol → redundante; mom_5d_slope
+    # ρ=0.0; gap_pct_5d ρ=0.0). Estas 4 capturam dimensões diferentes:
+    "volume_zscore_20d",   # (today_vol − mean_20d) / std_20d  — flow institucional
+    "close_in_range_20d",  # mean((C−L)/(H−L)) last 20 — fecho perto de high/low
+    "up_days_pct_20d",     # % de dias com retorno positivo nos últimos 20
+    "true_range_pct_20d",  # mean(TR_d / Close_d) últimos 20 — intraday vol
 ]
 # PR #28 (Phase A): drop 14 dead features after IC profiling on full parquet:
 #   • 9 CONSTANTES (std=0, IC indefinida — _FALLBACK em todas as linhas):
@@ -144,6 +153,11 @@ _FALLBACK: dict[str, float] = {
     "vix_percentile_1y": 0.5,
     "spy_rsi_14": 50.0,
     "yield_10y_change_5d": 0.0,
+    # PR #30 (Phase B): raw OHLCV features (sliced point-in-time <= alert_date)
+    "volume_zscore_20d": 0.0,    # neutral volume vs baseline
+    "close_in_range_20d": 0.5,   # 0.5 = neutral (closing mid-range)
+    "up_days_pct_20d": 0.5,      # 50% — random walk baseline
+    "true_range_pct_20d": 0.02,  # 2% intraday — typical equity
 }
 
 def _tz_normalize(ts: Any) -> pd.Timestamp:
@@ -203,6 +217,7 @@ def build_features(
     sector: str = "Unknown",
     macro_context: Optional[dict] = None,
     alert_date: Optional[Any] = None,
+    price_history: Optional[pd.DataFrame] = None,
 ) -> dict:
     """Constrói um dict de features para inference (predict_dip / ml_score).
 
@@ -294,6 +309,11 @@ def build_features(
     # do dict actual; o resto fica em fallback.
     add_derived_features(features, alert_date=alert_date)
 
+    # Stage 4 — Raw OHLCV (PR #30). Opt-in: só corre se o caller passar
+    # price_history; caso contrário cai nos fallbacks neutros.
+    if price_history is not None:
+        add_raw_ohlcv_features(features, price_history)
+
     return features
 
 
@@ -352,6 +372,107 @@ def add_short_earnings_features(features: dict, ticker_info: Optional[dict] = No
         features["earnings_surprise_avg"] = _FALLBACK["earnings_surprise_avg"]
         features["earnings_distance_days"] = _FALLBACK["earnings_distance_days"]
     return features
+
+def add_raw_ohlcv_features(features: dict, price_history: Optional[pd.DataFrame]) -> dict:
+    """Compute 4 raw-OHLCV features from a point-in-time price slice.
+
+    All features assume ``price_history`` is already sliced to dates
+    ``<= alert_date`` (no look-ahead) and indexed by date in ascending order.
+    Falls back to neutral defaults if the slice is too short.
+
+    Features chosen for orthogonality to the existing top features
+    (vol_of_vol, bb_width, drawdown_52w, return_1m/3m/6m):
+
+      • ``volume_zscore_20d`` — z-score of today's volume against the prior
+        20 sessions. Institutional flow / capitulation. Bounded to ±10.
+      • ``close_in_range_20d`` — mean of ``(Close − Low) / (High − Low)``
+        across the last 20 sessions. Captures *where* in the daily range
+        the stock typically closes (>0.5 → strong closes; <0.5 → weak).
+        Orthogonal to close-to-close vol.
+      • ``up_days_pct_20d`` — fraction of the last 20 sessions with strictly
+        positive daily return. Captures trend *persistence* (regular up-days
+        vs occasional big rallies). Bounded [0, 1].
+      • ``true_range_pct_20d`` — mean ATR-like intraday range as a percent
+        of close. Captures intraday volatility (different from close-to-close).
+    """
+    out_keys = ("volume_zscore_20d", "close_in_range_20d", "up_days_pct_20d", "true_range_pct_20d")
+    for k in out_keys:
+        features.setdefault(k, _FALLBACK[k])
+
+    if price_history is None or price_history.empty:
+        return features
+    hist = _normalize_index(price_history)
+    if "Close" not in hist.columns or len(hist) < 6:
+        return features
+
+    close = hist["Close"].astype(float)
+
+    # volume_zscore_20d
+    try:
+        if "Volume" in hist.columns:
+            vol = hist["Volume"].astype(float).tail(21)
+            if len(vol) == 21:
+                today_v = float(vol.iloc[-1])
+                window = vol.iloc[:-1]
+                mu = float(window.mean())
+                sd = float(window.std())
+                if sd > 0 and math.isfinite(today_v) and math.isfinite(mu):
+                    z = (today_v - mu) / sd
+                    if math.isfinite(z):
+                        features["volume_zscore_20d"] = float(np.clip(z, -10.0, 10.0))
+    except Exception:
+        pass
+
+    # close_in_range_20d: requer High e Low
+    try:
+        if "High" in hist.columns and "Low" in hist.columns:
+            tail = hist.tail(20)
+            high = tail["High"].astype(float)
+            low = tail["Low"].astype(float)
+            close_t = tail["Close"].astype(float)
+            rng = high - low
+            mask = (rng > 0) & np.isfinite(rng) & np.isfinite(close_t)
+            if mask.sum() >= 5:
+                cir = (close_t[mask] - low[mask]) / rng[mask]
+                v = float(cir.mean())
+                if math.isfinite(v):
+                    features["close_in_range_20d"] = float(np.clip(v, 0.0, 1.0))
+    except Exception:
+        pass
+
+    # up_days_pct_20d
+    try:
+        rets = close.pct_change().tail(20).dropna()
+        if len(rets) >= 5:
+            features["up_days_pct_20d"] = float((rets > 0).mean())
+    except Exception:
+        pass
+
+    # true_range_pct_20d
+    try:
+        if "High" in hist.columns and "Low" in hist.columns:
+            tail = hist.tail(21)  # need prev close → 21 rows for 20 TR values
+            high = tail["High"].astype(float)
+            low = tail["Low"].astype(float)
+            close_t = tail["Close"].astype(float)
+            prev_close = close_t.shift(1)
+            tr1 = high - low
+            tr2 = (high - prev_close).abs()
+            tr3 = (low - prev_close).abs()
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).iloc[1:]  # drop first NaN
+            close_for_div = close_t.iloc[1:]
+            mask = (close_for_div > 0) & np.isfinite(tr) & np.isfinite(close_for_div)
+            if mask.sum() >= 5:
+                tr_pct = (tr[mask] / close_for_div[mask])
+                v = float(tr_pct.mean())
+                if math.isfinite(v):
+                    # Clip a 100% intraday range (extremo absoluto).
+                    features["true_range_pct_20d"] = float(np.clip(v, 0.0, 1.0))
+    except Exception:
+        pass
+
+    return features
+
 
 def add_regime_features(features: dict, spy_history: Optional[pd.DataFrame], tnx_history: Optional[pd.DataFrame], alert_date: Any, vix_history: Optional[pd.DataFrame] = None) -> dict:
     alert_ts = _tz_normalize(alert_date)

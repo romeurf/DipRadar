@@ -156,7 +156,7 @@ def add_cross_sectional_rank(df: pd.DataFrame, target_col: str = "alpha_60d", ra
 
 
 def build_dataset(base_df: pd.DataFrame, price_cache: dict[str, pd.DataFrame], etf_cache: dict[str, pd.DataFrame], horizon_days: int = HORIZON_DAYS, macro_price_cache: Optional[dict[str, pd.DataFrame]] = None) -> tuple[pd.DataFrame, dict[str, int]]:
-    from ml_features import FEATURE_COLUMNS, _FALLBACK, add_derived_features, add_momentum_features, add_context_features, add_regime_features, add_short_earnings_features
+    from ml_features import FEATURE_COLUMNS, _FALLBACK, add_derived_features, add_momentum_features, add_context_features, add_raw_ohlcv_features, add_regime_features, add_short_earnings_features
     from macro_data import get_macro_context_historical
     if FEATURE_COLS != FEATURE_COLUMNS:
         missing = set(FEATURE_COLUMNS) - set(FEATURE_COLS)
@@ -202,6 +202,10 @@ def build_dataset(base_df: pd.DataFrame, price_cache: dict[str, pd.DataFrame], e
         spy_slice = spy_hist[spy_hist.index <= alert_date] if spy_hist is not None else None
         add_momentum_features(fv, hist, sec_slice, spy_slice)
         add_context_features(fv, price_history=hist, sector_alert_count_7d=float(sector_count_lookup.get((ticker, alert_date), 0)))
+        # PR #30: raw OHLCV features (realized_vol_20d, mom_5d_slope,
+        # volume_zscore_20d, gap_pct_5d). Computadas a partir do slice
+        # point-in-time já existente (`hist`); zero custo extra de fetching.
+        add_raw_ohlcv_features(fv, hist)
         ticker_info: Optional[dict] = None
         short_ratio = row.get("shortRatio") if "shortRatio" in row.index else None
         earnings_hist = row.get("earningsHistory") if "earningsHistory" in row.index else None

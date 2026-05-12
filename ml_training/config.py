@@ -34,6 +34,12 @@ FEATURE_COLS: list[str] = [
     "sector_alert_count_7d",
     "vix_percentile_1y",
     "spy_rsi_14",
+    # PR #30 (Phase B): 4 raw-OHLCV features computadas point-in-time
+    # (slice <= alert_date). Sincronizadas com FEATURE_COLUMNS em ml_features.py.
+    "volume_zscore_20d",
+    "close_in_range_20d",
+    "up_days_pct_20d",
+    "true_range_pct_20d",
 ]
 # Features removidas vs PR #25 (Spearman IC profiling sobre o parquet completo
 # 36929 rows confirmou 14 features inúteis):

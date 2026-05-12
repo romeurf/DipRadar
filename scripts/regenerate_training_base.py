@@ -93,6 +93,14 @@ NEW_FEATURE_COLS: list[str] = [
     "vix_percentile_1y",
     "spy_rsi_14",
     "yield_10y_change_5d",
+    # PR #30 (Phase B): 4 raw-OHLCV features. Calculadas a partir do mesmo
+    # slice point-in-time já fetchado para os outros features — zero custo
+    # extra de yfinance. Veja scripts/add_ohlcv_features.py para
+    # backfill-only de parquets existentes sem re-rodar tudo.
+    "volume_zscore_20d",
+    "close_in_range_20d",
+    "up_days_pct_20d",
+    "true_range_pct_20d",
 ]
 
 
@@ -209,10 +217,11 @@ def _compute_row_features(
     sector_etf_cache: dict[str, pd.DataFrame],
     macro_cache: dict[str, pd.DataFrame],
 ) -> dict[str, float]:
-    """Compute the 7 new features for one alert row."""
+    """Compute the new features (8 momentum/regime + 4 raw-OHLCV)."""
     from ml_features import (
         _FALLBACK,
         add_momentum_features,
+        add_raw_ohlcv_features,
         add_regime_features,
     )
 
@@ -247,7 +256,16 @@ def _compute_row_features(
     for k in ("vix_percentile_1y", "spy_rsi_14", "yield_10y_change_5d"):
         fv.setdefault(k, _FALLBACK.get(k, 0.0))
 
-    # Devolver só as 8 colunas de interesse
+    # Raw OHLCV (PR #30) — usa o mesmo slice já fetchado, sem custo extra
+    if hist is not None:
+        try:
+            add_raw_ohlcv_features(fv, hist)
+        except Exception as e:
+            log.debug(f"  raw_ohlcv failed {ticker}@{alert_date.date()}: {e}")
+    for k in ("volume_zscore_20d", "close_in_range_20d", "up_days_pct_20d", "true_range_pct_20d"):
+        fv.setdefault(k, _FALLBACK.get(k, 0.0))
+
+    # Devolver só as colunas de interesse
     return {k: float(fv.get(k, _FALLBACK.get(k, 0.0))) for k in NEW_FEATURE_COLS}
 
 
