@@ -328,8 +328,9 @@ def _build_deterioration_alert(
 
     return "\n".join([
         f"🔴 *DETERIORAÇÃO — {record.ticker}*  [Dia {record.days_held}/{record.current_hold_days}]",
+        f"_A tese para *{record.ticker}* está a enfraquecer — o modelo perdeu confiança {delta_prob*100:.0f}pp. Revê o stop-loss._",
         "",
-        f"📉 *Win prob caiu {delta_prob*100:.0f} pontos*",
+        f"📉 *Confiança caiu {delta_prob*100:.0f} pontos*",
         f"  Alerta: {record.alert_win_prob*100:.0f}%  →  Hoje: {new_win_prob*100:.0f}%",
         "",
         "🔍 *Top 3 culpados (SHAP Δ)*",
@@ -353,6 +354,7 @@ def _build_take_profit_alert(
     pnl_pct = (current_price / record.alert_price - 1) * 100
     return "\n".join([
         f"✅ *TAKE PROFIT — {record.ticker}*  [Dia {record.days_held}]",
+        f"_*{record.ticker}* atingiu o target com {_pct(pnl_pct)} de ganho em {record.days_held} dias. Está na hora de fechar e rodar o capital._",
         "",
         f"🎯 Preço actual ${current_price:.2f} atingiu o target ${record.current_sell_target:.2f}",
         f"📈 P&L estimado: *{_pct(pnl_pct)}* desde alerta (${record.alert_price:.2f})",
@@ -368,20 +370,17 @@ def _build_time_decay_alert(
     new_win_prob: float,
 ) -> str:
     pnl_pct = (current_price / record.alert_price - 1) * 100
+    _acao = (
+        "O modelo ainda acredita na tese — considera dar mais alguns dias."
+        if new_win_prob >= 0.55 else
+        "O modelo perdeu convicção — pondera fechar e realocar o capital."
+    )
     return "\n".join([
-        f"⏰ *TIME DECAY — {record.ticker}*  [Dia {record.days_held}/{record.initial_hold_days}]",
+        f"⏰ *TEMPO ESGOTADO — {record.ticker}*  [Dia {record.days_held}/{record.initial_hold_days}]",
+        f"_{record.ticker} chegou ao fim do período de holding sem atingir o target ({_pct(pnl_pct)} desde entrada). {_acao}_",
         "",
-        f"⚠️ Período de holding expirou sem atingir o target.",
-        f"  Target original: ${record.initial_sell_target:.2f}",
-        f"  Preço actual:    ${current_price:.2f}  ({_pct(pnl_pct)})",
-        "",
-        f"🤖 *Win prob actual:* {new_win_prob*100:.0f}%  (alerta: {record.alert_win_prob*100:.0f}%)",
-        "",
-        "💡 *Ação sugerida:* " + (
-            "Win prob ainda razoável — considera estender o holding mais alguns dias."
-            if new_win_prob >= 0.55 else
-            "Win prob degradada — pondera fechar e realocar capital."
-        ),
+        f"⚠️ Target original: ${record.initial_sell_target:.2f} | Preço actual: ${current_price:.2f}",
+        f"🤖 *Confiança actual:* {new_win_prob*100:.0f}%  (na entrada: {record.alert_win_prob*100:.0f}%)",
     ])
 
 
@@ -396,19 +395,12 @@ def _build_improvement_alert(
     delta_sell = new_sell_target - record.current_sell_target
     pnl_pct    = (current_price / record.alert_price - 1) * 100
     return "\n".join([
-        f"📈 *MELHORIA DE TESE — {record.ticker}*  [Dia {record.days_held}/{new_hold_days}]",
+        f"📈 *TESE A MELHORAR — {record.ticker}*  [Dia {record.days_held}/{new_hold_days}]",
+        f"_A tese para *{record.ticker}* ficou mais forte desde que entraste. O modelo está mais confiante — mantém e considera reforçar._",
         "",
-        f"✅ *Win prob subiu {abs(delta_prob)*100:.0f} pontos*",
-        f"  Alerta: {record.alert_win_prob*100:.0f}%  →  Hoje: {new_win_prob*100:.0f}%",
-        "",
-        "📊 *Targets revistos em alta*",
-        f"  🎯 Venda:   ${record.current_sell_target:.2f} → ${new_sell_target:.2f}  ({_pct(delta_sell/record.current_sell_target*100 if record.current_sell_target else 0)})",
-        f"  ⏳ Holding: {record.current_hold_days}d → {new_hold_days}d",
-        "",
-        f"💰 *Posição actual:*  ${current_price:.2f}  ({_pct(pnl_pct)} desde entrada)",
-        "",
-        "💡 *Ação sugerida:* Mantém. Considera aumentar posição.",
-        f"_Tese em IMPROVING — o modelo está cada vez mais confiante_",
+        f"✅ Confiança subiu {abs(delta_prob)*100:.0f}pp: {record.alert_win_prob*100:.0f}% → *{new_win_prob*100:.0f}%*",
+        f"💰 Posição actual: ${current_price:.2f}  ({_pct(pnl_pct)} desde entrada a ${record.alert_price:.2f})",
+        f"🎯 Novo target: ${new_sell_target:.2f}  |  Prazo estendido: {new_hold_days}d",
     ])
 
 
@@ -419,14 +411,11 @@ def _build_routine_update(
 ) -> str:
     pnl_pct  = (current_price / record.alert_price - 1) * 100
     delta_p  = new_win_prob - record.alert_win_prob
+    pnl_sign = "em ganho" if pnl_pct >= 0 else "em perda"
     return "\n".join([
-        f"📡 *Monitor diário — {record.ticker}*  [Dia {record.days_held}/{record.current_hold_days}]",
-        "",
-        f"🟢 Tese estável",
-        f"  Win prob: {new_win_prob*100:.0f}%  ({delta_p:+.0%} vs alerta)",
-        f"  Preço actual: ${current_price:.2f}  ({_pct(pnl_pct)})",
-        f"  Target venda: ${record.current_sell_target:.2f}  |  {record.days_remaining}d restantes",
-        f"_Nenhuma acção necessária_",
+        f"📡 *{record.ticker}* — Dia {record.days_held}/{record.current_hold_days}",
+        f"_Tese intacta. {_pct(pnl_pct)} {pnl_sign}. Nenhuma acção necessária._",
+        f"  Confiança: {new_win_prob*100:.0f}% ({delta_p:+.0%} vs entrada)  |  Target: ${record.current_sell_target:.2f}  |  {record.days_remaining}d restantes",
     ])
 
 

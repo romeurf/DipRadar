@@ -1123,8 +1123,18 @@ def _handle_admin_retrain(parts: list[str]) -> None:
             "DRY-RUN":    "🧪",
         }.get(decision, "⚙️")
 
+        # ── Resumo em linguagem simples ────────────────────────────────────
+        plain = {
+            "PROMOTED":   "✅ Modelo actualizado — o candidato é melhor e já está em produção.",
+            "PENDING":    "⚠️ Modelo candidato ficou guardado mas não foi para produção — não melhorou o suficiente.",
+            "KEPT_FLOOR": "🛑 Modelo candidato recusado — qualidade preditiva abaixo do mínimo aceitável.",
+            "FAILED":     "❌ Treino falhou — verifica os logs para perceber o que correu mal.",
+            "DRY-RUN":    "🧪 Simulação concluída — dados carregados, nenhum modelo foi treinado.",
+        }.get(decision, "⚙️ Treino concluído.")
+
         lines = [
-            f"{icon} *Retrain v3 — {decision}*",
+            f"{icon} *Retrain — {decision}*",
+            f"_{plain}_",
             f"_{datetime.now().strftime('%d/%m/%Y %H:%M')} ({elapsed:.0f}s)_",
             "",
         ]
@@ -1180,31 +1190,43 @@ def _handle_admin_retrain(parts: list[str]) -> None:
             except (TypeError, ValueError): return str(v)
 
         if cand_rho is not None or prod_rho is not None:
-            lines += [
-                "*ρ_α (Spearman alpha_60d):*",
-                f"  candidate : *{_fmt(cand_rho)}*",
-                f"  produção  : *{_fmt(prod_rho)}*",
-            ]
+            # Explicação amigável: IC mede quão bem o modelo ordena os stocks
+            # por retorno futuro. Quanto maior, melhor. 0.15+ é bom sinal.
             try:
-                d = (float(cand_rho) - float(prod_rho)) / float(prod_rho) * 100
-                sign = "+" if d >= 0 else ""
-                lines.append(f"  delta     : *{sign}{d:.1f}%*")
+                delta_pct = (float(cand_rho) - float(prod_rho)) / float(prod_rho) * 100
+                sign = "+" if delta_pct >= 0 else ""
+                quality_note = (
+                    "📈 Melhor que o anterior" if delta_pct > 0
+                    else "📉 Ligeiramente inferior ao anterior"
+                )
+                lines += [
+                    f"*Qualidade preditiva (IC):* {quality_note}",
+                    f"  Novo modelo : *{_fmt(cand_rho)}*   Anterior: {_fmt(prod_rho)}   ({sign}{delta_pct:.1f}%)",
+                    f"  _(IC mede quão bem o modelo prevê quais stocks vão superar o SPY)_",
+                    "",
+                ]
             except (TypeError, ValueError, ZeroDivisionError):
-                pass
-            lines.append("")
+                lines += [
+                    f"*Qualidade preditiva (IC):* candidato *{_fmt(cand_rho)}* / produção *{_fmt(prod_rho)}*",
+                    "",
+                ]
+
+        if cand_pnl is not None:
+            try:
+                pnl_delta = (float(cand_pnl) - float(prod_pnl)) / abs(float(prod_pnl)) * 100
+                sign = "+" if pnl_delta >= 0 else ""
+                lines += [
+                    f"*Retorno simulado top stocks:* candidato *{float(cand_pnl)*100:.1f}%* / anterior *{float(prod_pnl or 0)*100:.1f}%* ({sign}{pnl_delta:.1f}%)",
+                    f"  _(média de retorno dos 12% stocks melhor pontuados pelo modelo)_",
+                    "",
+                ]
+            except (TypeError, ValueError, ZeroDivisionError):
+                lines += [f"*Top-K PnL:* candidato *{_fmt(cand_pnl)}* / produção *{_fmt(prod_pnl)}*", ""]
 
         if cand_brier is not None:
             lines += [
-                "*Brier OOF:*",
-                f"  candidate : *{_fmt(cand_brier)}*",
-                f"  produção  : *{_fmt(prod_brier)}*",
-                "",
-            ]
-        if cand_pnl is not None:
-            lines += [
-                "*Top-K PnL (mean):*",
-                f"  candidate : *{_fmt(cand_pnl)}*",
-                f"  produção  : *{_fmt(prod_pnl)}*",
+                f"*Calibração de probabilidades (Brier):* candidato *{_fmt(cand_brier)}* / anterior *{_fmt(prod_brier)}*",
+                f"  _(quanto mais baixo, mais fiáveis são os % de confiança mostrados nos alertas)_",
                 "",
             ]
 

@@ -907,6 +907,61 @@ def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None, exc
 
 # ── Alerta individual ─────────────────────────────────────────────────────────
 
+def _build_plain_summary(
+    name: str,
+    symbol: str,
+    change: float,
+    verdict: str,
+    dip_score: float,
+    ml_result: "MLResult | None",
+    category: str,
+) -> str:
+    """Gera 1-2 frases em linguagem simples para o topo do alerta.
+
+    Objectivo: qualquer pessoa percebe imediatamente o que está a acontecer
+    e o que deve fazer, sem ter de decifrar os números abaixo.
+    """
+    # Frase 1 — o que aconteceu
+    abs_change = abs(change)
+    if abs_change >= 10:
+        queda = f"desabou {abs_change:.0f}%"
+    elif abs_change >= 5:
+        queda = f"caiu {abs_change:.0f}%"
+    else:
+        queda = f"caiu {abs_change:.1f}%"
+
+    frase1 = f"*{name}* {queda} hoje."
+
+    # Frase 2 — o que fazer
+    if verdict == "COMPRAR" and ml_result is not None and ml_result.model_ready:
+        wp = ml_result.win_prob
+        hold = {"LONG_TERM": "longo prazo", "6M": "~6 meses", "90D": "~90 dias"}.get(
+            ml_result.recommended_hold, "90 dias"
+        )
+        if ml_result.position_size_pct > 0:
+            sz = f"Sugiro alocar ~{ml_result.position_size_pct*100:.0f}% do portefólio, hold {hold}."
+        else:
+            sz = f"Hold {hold}."
+        frase2 = f"_Modelo vê {wp:.0%} de probabilidade de bater o mercado. {sz}_"
+
+    elif verdict == "COMPRAR":
+        if dip_score >= 85:
+            frase2 = f"_Score fundamental muito forte ({dip_score:.0f}/100) — oportunidade de compra clara._"
+        else:
+            frase2 = f"_Score {dip_score:.0f}/100 — queda com suporte fundamental._"
+
+    elif verdict == "MONITORIZAR":
+        if ml_result is not None and ml_result.model_ready and ml_result.win_prob > 0.55:
+            frase2 = f"_Score intermédio ({dip_score:.0f}/100) mas ML optimista ({ml_result.win_prob:.0%}). Monitorizar._"
+        else:
+            frase2 = f"_Score {dip_score:.0f}/100 — ainda não reúne todos os critérios. Aguardar._"
+
+    else:  # EVITAR
+        frase2 = f"_Score fraco ({dip_score:.0f}/100) — sem suporte fundamental. Evitar._"
+
+    return f"{frase1}\n{frase2}"
+
+
 def build_alert(
     stock, fundamentals, historical_pe, news,
     verdict, emoji, reasons, dip_score, rsi_str,
@@ -985,8 +1040,16 @@ def build_alert(
     if ml_result is not None:
         ml_line = f"\n{ml_badge(ml_result)}"
 
+    # ── Resumo em linguagem simples (1-2 frases no topo) ─────────────────────
+    plain_summary = _build_plain_summary(
+        name=name, symbol=symbol, change=change,
+        verdict=verdict, dip_score=dip_score,
+        ml_result=ml_result, category=category,
+    )
+
     body = (
         f"{emoji} *{name} ({symbol})*{region_part}{in_portfolio}\n"
+        f"{plain_summary}\n"
         f"Sector: {sector_cfg.get('label', sector)} | ≈{mc_b:.1f}B\n"
         f"Hoje: *{change:+.1f}%* — ${price}{drawdown_str}{vol_flag}{insider_flag}{short_flag}{rsi_part}{sector_warn}\n"
         f"{earn_warn}"
