@@ -57,14 +57,27 @@ import numpy as np
 
 @dataclass
 class DipModelsV3:
+    """Stub de compatibilidade para bundles picklados com __main__.DipModelsV3.
+
+    BUG FIX v4.1: alinhado com ml_training/bundle.py (14 campos) para que
+    score_calibrator, rho_alpha, topk_pnl não sejam perdidos ao carregar bundles
+    gerados pelo training pipeline. Se __main__.DipModelsV3 tiver menos campos
+    que o bundle, joblib.load falha silenciosamente e o calibrador não é usado.
+    """
     model_up:         Any
     model_down:       Any
     feature_cols:     list
-    momentum_feats:   list
-    n_train_samples:  int
-    train_date:       str
-    champion_name:    str
+    score_calibrator: Any = None
+    n_train_samples:  int = 0
+    train_date:       str = ""
+    champion_name:    str = ""
     schema_version:   int = 3
+    momentum_feats:   list = field(default_factory=list)
+    rho_mean:         Any  = None
+    rho_alpha:        Any  = None
+    rho_down:         Any  = None
+    topk_pnl:         Any  = None
+    fold_metrics:     list = field(default_factory=list)
 
 
 # Registar em __main__ para o unpickler resolver `__main__.DipModelsV3`.
@@ -214,22 +227,27 @@ _mtime_v3: float       = 0.0
 
 @dataclass
 class MLResult:
-    win_prob:      float        = 0.0     # score normalizado [0, 1] para compatibilidade
-    score_raw:     float        = 0.0     # alpha_60d previsto (log-return excess)
-    pred_up:       float | None = None    # previsão alpha_60d (= score_raw)
-    pred_down:     float | None = None    # previsão max_drawdown_60d (diagnóstico)
-    prob_price:    float | None = None    # alias compatibilidade (= win_prob)
-    prob_fund:     float | None = None    # alias compatibilidade (= win_prob)
-    win40_prob:    float | None = None    # n/a em v3 — mantido para compatibilidade
-    label:         str          = "NO_MODEL"
-    confidence:    str          = "–"
-    model_ready:   bool         = False
-    threshold:     float        = _SCORE_FLOOR
-    features_used: list[str]    = field(default_factory=list)
-    vix_regime:    str | None   = None
-    coverage:      float        = 1.0
-    low_coverage:  bool         = False
-    model_version: str          = "v3"
+    win_prob:           float        = 0.0     # P(alpha_90d > threshold), calibrado [0,1]
+    score_raw:          float        = 0.0     # alpha_90d previsto (log-return excess SPY)
+    pred_up:            float | None = None    # previsão alpha_90d (= score_raw)
+    pred_down:          float | None = None    # previsão max_drawdown_60d (risco)
+    prob_price:         float | None = None    # alias compatibilidade (= win_prob)
+    prob_fund:          float | None = None    # alias compatibilidade (= win_prob)
+    win40_prob:         float | None = None    # n/a em v3 — mantido para compatibilidade
+    label:              str          = "NO_MODEL"
+    confidence:         str          = "–"
+    model_ready:        bool         = False
+    threshold:          float        = _SCORE_FLOOR
+    features_used:      list[str]    = field(default_factory=list)
+    vix_regime:         str | None   = None
+    coverage:           float        = 1.0
+    low_coverage:       bool         = False
+    model_version:      str          = "v3"
+    # ── Novos campos v4.1 ────────────────────────────────────────────────────
+    stock_type:         str          = "SPECULATIVE"  # BLUE_CHIP | QUALITY | SPECULATIVE
+    recommended_hold:   str          = "90D"          # 90D | 6M | LONG_TERM
+    position_size_pct:  float        = 0.0            # % do portfolio sugerida pelo modelo
+    risk_reward_ratio:  float        = 0.0            # |alpha_90d| / |max_drawdown_60d|
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -302,12 +320,105 @@ def _score_to_prob(score: float, calibrator: Any | None = None) -> float:
 
 
 def _inverse_transform_up(yp: float) -> float:
-    """Inverte a transformação log1p aplicada ao alpha_60d durante o treino."""
-    return float(np.expm1(np.clip(yp, -3, 3)))
+    """Devolve a previsão de alpha_90d tal como o modelo a produz.
+
+    BUG FIX v4.1: a versão anterior aplicava expm1() erradamente — o modelo
+    prediz alpha_90d directamente (sem log-transform adicional ao target).
+    expm1(0.06) ≈ 0.0618, o que inflacionava ligeiramente os scores exibidos
+    e desalinhava os thresholds de label.
+    """
+    return float(np.clip(yp, -3.0, 3.0))
 
 
 def _inverse_transform_down(yp: float) -> float:
-    return float(-np.expm1(np.clip(-yp, 0, 3)))
+    """Devolve a previsão de max_drawdown_60d tal como o modelo a produz.
+
+    BUG FIX v4.1: idem — sem expm1(). Valores negativos = drawdown esperado.
+    """
+    return float(np.clip(yp, -3.0, 3.0))
+
+
+# ── Classificação de stock e sizing ───────────────────────────────────────────
+
+def classify_stock_type(market_cap_b: float, quality_score: float) -> str:
+    """Classifica o stock como BLUE_CHIP, QUALITY ou SPECULATIVE.
+
+    Critérios (configuráveis em ml_training/config.py):
+      BLUE_CHIP   : cap > 100B + quality ≥ 0.65 → acumular, hold longo prazo
+      QUALITY     : cap > 25B  + quality ≥ 0.55 → hold 6M se alpha forte
+      SPECULATIVE : resto       → dip-and-flip, 90d
+    """
+    try:
+        from ml_training.config import (
+            BLUE_CHIP_MARKET_CAP_B, BLUE_CHIP_QUALITY_SCORE,
+            QUALITY_MARKET_CAP_B, QUALITY_SCORE_MIN,
+        )
+    except ImportError:
+        BLUE_CHIP_MARKET_CAP_B, BLUE_CHIP_QUALITY_SCORE = 100.0, 0.65
+        QUALITY_MARKET_CAP_B, QUALITY_SCORE_MIN = 25.0, 0.55
+
+    cap = float(market_cap_b) if market_cap_b else 0.0
+    qs  = float(quality_score) if quality_score else 0.0
+    if cap >= BLUE_CHIP_MARKET_CAP_B and qs >= BLUE_CHIP_QUALITY_SCORE:
+        return "BLUE_CHIP"
+    if cap >= QUALITY_MARKET_CAP_B and qs >= QUALITY_SCORE_MIN:
+        return "QUALITY"
+    return "SPECULATIVE"
+
+
+def recommend_hold_period(stock_type: str, pred_alpha_90d: float) -> str:
+    """Recomenda período de holding com base no tipo de stock e sinal do modelo.
+
+    BLUE_CHIP   → LONG_TERM (acumular; só sair por deterioração estrutural)
+    QUALITY + alpha forte → 6M (segurar; pode bater muito mais que 90d)
+    Resto       → 90D (rotação de capital)
+    """
+    try:
+        from ml_training.config import EXTEND_HOLD_ALPHA_THRESHOLD
+    except ImportError:
+        EXTEND_HOLD_ALPHA_THRESHOLD = 0.08
+
+    if stock_type == "BLUE_CHIP":
+        return "LONG_TERM"
+    if stock_type == "QUALITY" and pred_alpha_90d >= EXTEND_HOLD_ALPHA_THRESHOLD:
+        return "6M"
+    return "90D"
+
+
+def compute_position_size(
+    pred_alpha_90d: float,
+    pred_max_drawdown: float,
+    win_prob: float,
+    max_position: float = 0.25,
+) -> float:
+    """Dimensiona a posição com base nas previsões do modelo (risk-adjusted).
+
+    Formula: edge × rr_score × max_position
+      edge     = 2 × win_prob − 1   (0 sem vantagem, 1 com certeza absoluta)
+      rr_score = alpha / (alpha + |drawdown|)   (0..1, penaliza alto risco)
+
+    Interpretação:
+      win_prob 50% → sem vantagem → 0% (nunca aloca sem edge)
+      win_prob 70%, alpha 8%, drawdown 10% → rr=0.44 → pos=0.40×0.44×25%=4.4%
+      win_prob 80%, alpha 12%, drawdown 8% → rr=0.60 → pos=0.60×0.60×25%=9.0%
+
+    max_position é um cap de segurança (default 25%) não um valor hardcoded de
+    alocação — o tamanho real depende do alpha e drawdown previstos.
+    """
+    if win_prob <= 0.50 or pred_alpha_90d <= 0.0:
+        return 0.0
+    edge   = 2.0 * win_prob - 1.0
+    dd     = abs(pred_max_drawdown) if pred_max_drawdown < 0 else 0.10
+    alpha  = max(1e-4, pred_alpha_90d)
+    rr_score = alpha / (alpha + dd)
+    return float(min(max_position, edge * rr_score * max_position))
+
+
+def compute_risk_reward(pred_alpha_90d: float, pred_max_drawdown: float) -> float:
+    """Rácio simples |alpha_90d| / |max_drawdown_60d|. 0 se inválido."""
+    if pred_max_drawdown >= 0 or pred_alpha_90d <= 0:
+        return 0.0
+    return round(float(pred_alpha_90d / abs(pred_max_drawdown)), 2)
 
 
 # ── Carregamento lazy ─────────────────────────────────────────────────────────
@@ -411,10 +522,12 @@ def ml_score(
         logging.error(f"[ml_predictor] Erro na inferência v3: {e}")
         return MLResult(model_ready=False, label="ERROR")
 
-    # Score = alpha_60d previsto. pred_down mantido apenas para diagnóstico.
+    # Score = alpha_90d previsto (log-return excess sobre SPY).
     score = float(pred_up)
 
-    # Normalizar para [0,1] usando o calibrator do bundle (se existir)
+    # Normalizar para [0,1] usando o calibrator do bundle (se existir).
+    # BUG FIX v4.1: DipModelsV3 stub agora tem score_calibrator → calibrador
+    # é efectivamente usado (antes estava a ser descartado por campo em falta).
     score_calibrator = _bundle.get("score_calibrator") if _bundle else None
     win_prob = _score_to_prob(score, calibrator=score_calibrator)
 
@@ -422,37 +535,50 @@ def ml_score(
     vix_value  = enriched.get("vix") or enriched.get("vix_value")
     vix_regime = _classify_vix(vix_value)
 
-    # Label baseado no alpha_60d previsto
-    if score > _SCORE_HIGH:
+    # Labels baseados em win_prob (mais estáveis e independentes do threshold bruto)
+    if win_prob > 0.70:
         label      = "WIN_STRONG"
         confidence = "Alta"
-    elif score > _SCORE_MED:
+    elif win_prob > 0.55:
         label      = "WIN"
-        confidence = "Média" if score < _SCORE_HIGH * 1.25 else "Alta"
-    elif score > _SCORE_FLOOR:
+        confidence = "Alta" if win_prob > 0.65 else "Média"
+    elif win_prob > 0.40:
         label      = "WEAK"
         confidence = "Baixa"
     else:
         label      = "NO_WIN"
         confidence = "–"
 
+    # Classificação de stock e sizing — requerem market_cap e quality_score
+    # das features (se disponíveis; fallback neutro se não estiverem).
+    mkt_cap_b    = float(enriched.get("market_cap", 0.0) or 0.0) / 1e9
+    quality_sc   = float(enriched.get("quality_score", 0.0) or 0.0)
+    stock_type   = classify_stock_type(mkt_cap_b, quality_sc)
+    hold_period  = recommend_hold_period(stock_type, score)
+    pos_size     = compute_position_size(score, pred_down, win_prob)
+    rr_ratio     = compute_risk_reward(score, pred_down)
+
     result = MLResult(
-        win_prob      = round(win_prob, 3),
-        score_raw     = round(score, 3),
-        pred_up       = round(pred_up, 4),
-        pred_down     = round(pred_down, 4),
-        prob_price    = round(win_prob, 3),
-        prob_fund     = None,
-        win40_prob    = None,
-        label         = label,
-        confidence    = confidence,
-        model_ready   = True,
-        threshold     = _SCORE_FLOOR,
-        features_used = cols,
-        vix_regime    = vix_regime,
-        coverage      = 1.0,
-        low_coverage  = False,
-        model_version = "v3",
+        win_prob          = round(win_prob, 3),
+        score_raw         = round(score, 3),
+        pred_up           = round(pred_up, 4),
+        pred_down         = round(pred_down, 4),
+        prob_price        = round(win_prob, 3),
+        prob_fund         = None,
+        win40_prob        = None,
+        label             = label,
+        confidence        = confidence,
+        model_ready       = True,
+        threshold         = _SCORE_FLOOR,
+        features_used     = cols,
+        vix_regime        = vix_regime,
+        coverage          = 1.0,
+        low_coverage      = False,
+        model_version     = "v3",
+        stock_type        = stock_type,
+        recommended_hold  = hold_period,
+        position_size_pct = round(pos_size, 3),
+        risk_reward_ratio = rr_ratio,
     )
 
     if log_to_file and symbol:
@@ -466,14 +592,12 @@ def ml_score(
 
 
 def ml_badge(result: MLResult) -> str:
-    """
-    Linha formatada para o alerta Telegram.
+    """Linha formatada para o alerta Telegram (v4.1).
 
     Exemplos:
-      🤖 ML v3: 🟢 WIN_STRONG | α +8.2% | dn -6.1% | score 0.082 | VIX:med
-      🤖 ML v3: ✅ WIN        | α +4.3% | dn -7.2% | score 0.043 | Alta
-      🤖 ML v3: 🟡 WEAK       | α +1.8% | dn -9.4% | score 0.018
-      🤖 ML v3: 🔴 NO_WIN     | α -1.2% | dn -11.3%| score -0.012
+      🤖 ML v3: 🟢 WIN_STRONG 💎 | α₉₀ +8.2% | dn -6.1% | P(win) 76% | R:R 1.37 | Hold: Longo prazo
+      🤖 ML v3: ✅ WIN ⭐ | α₉₀ +5.1% | dn -9.2% | P(win) 62% | Size: 4% | Hold: ~6 meses
+      🤖 ML v3: 🔄 WEAK | α₉₀ +2.1% | dn -14% | P(win) 45% | Hold: ~90 dias
       🤖 ML v3: modelo não treinado
     """
     if not result.model_ready:
@@ -487,20 +611,30 @@ def ml_badge(result: MLResult) -> str:
         "ERROR":      "⚠️",
         "NO_MODEL":   "⚫",
     }
-    em = emoji_map.get(result.label, "📊")
-
-    # Mostra alpha (excesso sobre SPY) em vez de up bruto
-    alpha_str = f"+{result.pred_up*100:.1f}%" if result.pred_up is not None and result.pred_up >= 0 else (
-        f"{result.pred_up*100:.1f}%" if result.pred_up is not None else "?"
+    type_emoji = {"BLUE_CHIP": "💎", "QUALITY": "⭐", "SPECULATIVE": "🔄"}.get(result.stock_type, "")
+    hold_label = {"LONG_TERM": "Longo prazo", "6M": "~6 meses", "90D": "~90 dias"}.get(
+        result.recommended_hold, result.recommended_hold
     )
-    down_str  = f"{result.pred_down*100:.1f}%" if result.pred_down is not None else "?"
-    score_str = f"{result.score_raw:.3f}"
 
-    vix_str  = f" | VIX:{result.vix_regime[:3]}" if result.vix_regime else ""
-    conf_str = f" | *{result.confidence}*" if result.confidence != "–" else ""
+    em   = emoji_map.get(result.label, "📊")
+    sign = "+" if (result.pred_up or 0.0) >= 0 else ""
+    alpha_str = f"{sign}{(result.pred_up or 0.0)*100:.1f}%" if result.pred_up is not None else "?"
+    down_str  = f"{(result.pred_down or 0.0)*100:.1f}%" if result.pred_down is not None else "?"
+    prob_str  = f"{result.win_prob:.0%}"
 
-    return (
-        f"🤖 *ML v3:* {em} `{result.label}` "
-        f"| α *{alpha_str}* | dn {down_str} | score *{score_str}*"
-        f"{vix_str}{conf_str}"
-    )
+    parts = [
+        f"🤖 *ML v3:* {em} `{result.label}` {type_emoji}",
+        f"| α₉₀ *{alpha_str}* | dn {down_str} | P(win) *{prob_str}*",
+    ]
+
+    if result.position_size_pct > 0:
+        parts.append(f"| Size: *{result.position_size_pct*100:.0f}%*")
+    if result.risk_reward_ratio > 0:
+        parts.append(f"| R:R *{result.risk_reward_ratio:.2f}*")
+
+    parts.append(f"| Hold: {hold_label}")
+
+    if result.vix_regime:
+        parts.append(f"| VIX:{result.vix_regime[:3]}")
+
+    return " ".join(parts)

@@ -123,6 +123,22 @@ def _fetch_fundamentals_snapshot(ticker: str, current_price: float = 0.0) -> dic
             except (TypeError, ValueError):
                 analyst_upside = None
 
+        # Computar quality_score via score.py para detecção de deterioração estrutural.
+        # Guardado em fundamentals_snap["entry_quality_score"] quando o record é criado.
+        try:
+            from score import score_from_fundamentals
+            _fund_for_score = {
+                "pe": info.get("trailingPE"),
+                "debt_equity": info.get("debtToEquity"),
+                "revenue_growth": info.get("revenueGrowth"),
+                "gross_margin": info.get("grossMargins"),
+                "fcf_yield": fcf_yield,
+            }
+            _score_result = score_from_fundamentals(_fund_for_score)
+            quality_score = float(_score_result.get("quality_score", 0.5)) if isinstance(_score_result, dict) else 0.5
+        except Exception:
+            quality_score = None
+
         return {
             # build_features procura `pe` directo
             "pe":               info.get("trailingPE"),
@@ -135,6 +151,8 @@ def _fetch_fundamentals_snapshot(ticker: str, current_price: float = 0.0) -> dic
             "analyst_upside":   analyst_upside,
             # current_price pode entrar no dict para build_features e cair em fallback
             "price":            current_price if current_price else None,
+            # Para detecção de deterioração estrutural (guardado na entry se disponível)
+            "quality_score":    quality_score,
         }
     except Exception as e:
         logger.debug(f"[monitor] Fundamentals snapshot falhou para {ticker}: {e}")
@@ -145,39 +163,100 @@ def _fetch_fundamentals_snapshot(ticker: str, current_price: float = 0.0) -> dic
 # Trigger classification
 # ─────────────────────────────────────────────────────────────────────────────
 
-TRIGGER_TAKE_PROFIT   = "TAKE_PROFIT"
-TRIGGER_DETERIORATION = "DETERIORATION"
-TRIGGER_TIME_DECAY    = "TIME_DECAY"
-TRIGGER_IMPROVEMENT   = "IMPROVEMENT"
-TRIGGER_ROUTINE       = "ROUTINE"
+TRIGGER_TAKE_PROFIT        = "TAKE_PROFIT"
+TRIGGER_STRUCTURAL_DECLINE = "STRUCTURAL_DECLINE"   # dip virou queda estrutural
+TRIGGER_DETERIORATION      = "DETERIORATION"
+TRIGGER_TIME_DECAY         = "TIME_DECAY"
+TRIGGER_IMPROVEMENT        = "IMPROVEMENT"
+TRIGGER_ROUTINE            = "ROUTINE"
+
+
+def _detect_structural_decline(
+    record: PositionRecord,
+    current_price: float,
+    new_win_prob: float,
+    feature_row_today: dict,
+) -> tuple[bool, str]:
+    """Detecta se o dip se transformou numa queda estrutural.
+
+    A Cisco, a IBM dos anos 2000, o WeWork — todas pareciam dips mas eram
+    colapsos estruturais. Este detector usa múltiplos critérios:
+
+    1. Win prob colapso severo (≥ 30pp): o modelo perdeu completamente
+       a confiança na tese
+    2. ML score invertido: previsão actual < -3% de alpha (território de VENDER)
+    3. Recovery estagnada: > 45 dias com P&L ≤ -15%  (não está a recuperar)
+    4. Deterioração de qualidade fundamental: quality_score actual caiu ≥ 15pp
+       em relação ao valor na entrada (guardado em fundamentals_snap)
+
+    Trigger quando ≥ 2 critérios (1 pode ser ruído de mercado):
+    """
+    reasons: list[str] = []
+    delta = record.alert_win_prob - new_win_prob
+
+    # 1. Win prob colapso severo
+    if delta >= 0.30:
+        reasons.append(f"Win prob colapsou {delta*100:.0f}pp (entrada → {record.alert_win_prob*100:.0f}%, hoje → {new_win_prob*100:.0f}%)")
+
+    # 2. ML score territory invertido (abaixo de -3%)
+    score_today = float(feature_row_today.get("ml_score_raw", float("nan")))
+    if not __import__("math").isnan(score_today) and score_today < -0.03:
+        reasons.append(f"Modelo prevê alpha negativo ({score_today*100:.1f}%) — tese invertida")
+
+    # 3. Recovery estagnada: dias ≥ 45 e P&L ≤ -15%
+    pnl = (current_price / record.alert_price - 1) if record.alert_price > 0 else 0.0
+    if record.days_held >= 45 and pnl <= -0.15:
+        reasons.append(f"Sem recuperação: {pnl*100:.0f}% após {record.days_held}d (limite 45d)")
+
+    # 4. Deterioração de qualidade fundamental (guardada na entrada)
+    snap = record.fundamentals_snap or {}
+    entry_quality = snap.get("entry_quality_score")
+    if entry_quality is not None:
+        current_quality = feature_row_today.get("quality_score")
+        if current_quality is not None:
+            quality_drop = float(entry_quality) - float(current_quality)
+            if quality_drop >= 0.15:
+                reasons.append(f"Qualidade fundamental caiu {quality_drop*100:.0f}pp — deterioração operacional")
+
+    is_structural = len(reasons) >= 2
+    return is_structural, " | ".join(reasons)
 
 
 def _classify_trigger(
     record: PositionRecord,
     current_price: float,
     new_win_prob: float,
+    feature_row_today: dict | None = None,
 ) -> str:
-    """
-    Evaluate triggers in severity order. Return the highest-priority trigger.
-    Δwin_prob is defined as (alert_win_prob - new_win_prob):
-      positive → model became less confident → deterioration
-      negative → model became more confident → improvement
-    """
-    delta = record.alert_win_prob - new_win_prob  # positive = deterioration
+    """Avalia triggers por ordem de severidade. Devolve o trigger de maior prioridade.
 
-    # 1. Price hit the sell target — take profit
+    Δwin_prob = alert_win_prob - new_win_prob:
+      positivo → modelo perdeu confiança → deterioração
+      negativo → modelo ganhou confiança → melhoria
+    """
+    delta = record.alert_win_prob - new_win_prob
+
+    # 1. Preço atingiu o target → realizar lucro
     if current_price >= record.current_sell_target:
         return TRIGGER_TAKE_PROFIT
 
-    # 2. Win prob dropped ≥ threshold — thesis deteriorating
+    # 2. Deterioração estrutural (multi-critério) — mais severo que deterioração simples
+    if feature_row_today is not None:
+        is_structural, _ = _detect_structural_decline(
+            record, current_price, new_win_prob, feature_row_today
+        )
+        if is_structural:
+            return TRIGGER_STRUCTURAL_DECLINE
+
+    # 3. Win prob desceu ≥ threshold → tese deteriorando
     if delta >= DETERIORATION_THRESHOLD:
         return TRIGGER_DETERIORATION
 
-    # 3. Hold period expired without hitting target
+    # 4. Período de holding expirou sem atingir target
     if record.days_held >= record.current_hold_days:
         return TRIGGER_TIME_DECAY
 
-    # 4. Win prob improved ≥ threshold — good news
+    # 5. Win prob subiu ≥ threshold → boas notícias
     if delta <= -IMPROVEMENT_THRESHOLD:
         return TRIGGER_IMPROVEMENT
 
@@ -186,11 +265,12 @@ def _classify_trigger(
 
 def _resolve_thesis_health(trigger: str, delta: float) -> str:
     mapping = {
-        TRIGGER_TAKE_PROFIT:   "STRONG",
-        TRIGGER_IMPROVEMENT:   "IMPROVING",
-        TRIGGER_ROUTINE:       "STRONG" if delta < 0.05 else "WEAKENING",
-        TRIGGER_DETERIORATION: "DETERIORATING",
-        TRIGGER_TIME_DECAY:    "WEAKENING",
+        TRIGGER_TAKE_PROFIT:        "STRONG",
+        TRIGGER_IMPROVEMENT:        "IMPROVING",
+        TRIGGER_ROUTINE:            "STRONG" if delta < 0.05 else "WEAKENING",
+        TRIGGER_DETERIORATION:      "DETERIORATING",
+        TRIGGER_STRUCTURAL_DECLINE: "STRUCTURAL_DECLINE",
+        TRIGGER_TIME_DECAY:         "WEAKENING",
     }
     return mapping.get(trigger, "WEAKENING")
 
@@ -198,6 +278,30 @@ def _resolve_thesis_health(trigger: str, delta: float) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # Telegram message builders
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _build_structural_decline_alert(
+    record: PositionRecord,
+    current_price: float,
+    new_win_prob: float,
+    reasons: str,
+) -> str:
+    pnl_pct = (current_price / record.alert_price - 1) * 100
+    return "\n".join([
+        f"🚨 *DETERIORAÇÃO ESTRUTURAL — {record.ticker}*  [Dia {record.days_held}/{record.current_hold_days}]",
+        "",
+        f"⚠️ *O que parecia um dip pode ser uma queda estrutural.*",
+        f"",
+        f"🔍 *Critérios activados:*",
+        *[f"  • {r}" for r in reasons.split(" | ") if r],
+        "",
+        f"💰 *Posição actual:* ${current_price:.2f}  ({_pct(pnl_pct)} desde entrada ${record.alert_price:.2f})",
+        f"🤖 *Win prob actual:* {new_win_prob*100:.0f}%  (entrada: {record.alert_win_prob*100:.0f}%)",
+        "",
+        "💡 *Ação sugerida:* Revê a tese. Considera sair ou cortar a posição.",
+        "_A história está cheia de casos (Cisco, Nokia, GE) onde o 'dip' era início de queda secular._",
+        f"_Monitorização diária activa — próxima verificação amanhã._",
+    ])
+
 
 def _pct(v, decimals=1) -> str:
     if v is None:
@@ -365,7 +469,8 @@ def _monitor_one(
     new_hold_days   = max(record.days_held + pred.hold_days, record.current_hold_days)
 
     # ── 4. Classify trigger ───────────────────────────────────────────────────
-    trigger = _classify_trigger(record, current_price, new_win_prob)
+    # Passa feature_row_today para a detecção de deterioração estrutural.
+    trigger = _classify_trigger(record, current_price, new_win_prob, feature_row_today)
     delta   = record.alert_win_prob - new_win_prob
 
     # ── 5. Update record ─────────────────────────────────────────────────────
@@ -403,6 +508,12 @@ def _monitor_one(
 
     if trigger == TRIGGER_TAKE_PROFIT:
         msg = _build_take_profit_alert(record, current_price)
+
+    elif trigger == TRIGGER_STRUCTURAL_DECLINE:
+        _, reasons_str = _detect_structural_decline(
+            record, current_price, new_win_prob, feature_row_today
+        )
+        msg = _build_structural_decline_alert(record, current_price, new_win_prob, reasons_str)
 
     elif trigger == TRIGGER_DETERIORATION:
         drivers = extract_shap_top3(

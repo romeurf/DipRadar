@@ -158,17 +158,53 @@ class AllocationContext:
 
 
 @dataclass
+class PyramidStrategy:
+    """Estratégia de entrada faseada (pyramiding).
+
+    Para dips de qualidade aprovados, o motor não gasta a alocação toda
+    de uma vez. Entra com `entry_now_eur` imediatamente e reserva
+    `entry_limit_eur` para uma ordem limite caso o preço caia mais
+    `limit_trigger_pct` (ex: -8% adicional).
+    """
+    entry_now_eur:     float   # comprar agora
+    entry_limit_eur:   float   # reservar para limit order
+    limit_trigger_pct: float   # ex: -0.08 → entrar se cair mais 8%
+    rationale:         str
+
+
+@dataclass
+class ScaleOutRule:
+    """Regra de Scale Out / Moonbag.
+
+    Quando o activo bate `first_target_pct` de lucro, o motor sugere
+    vender `sell_pct` para realizar lucro e manter `moonbag_pct` a rolar.
+
+    Inspirado no caso PINS (comprado a $14.45, saída a +60%):
+    manter uma "moonbag" garante participação em upside adicional
+    sem arriscar o lucro já realizado.
+    """
+    first_target_pct:  float   # ex: 0.30 → alvo de +30% para 1ª venda parcial
+    sell_pct:          float   # fracção da posição a vender (ex: 0.50 = 50%)
+    moonbag_pct:       float   # fracção que fica a rolar (ex: 0.50 = 50%)
+    second_target_pct: float   # alvo para a moonbag (ex: 0.80 = +80%)
+    rationale:         str
+
+
+@dataclass
 class AllocationDecision:
     """Resultado read-only do motor. Nada aqui executa nada."""
-    ticker:        str
-    category:      str
-    amount_eur:    float
-    confidence:    str
-    rationale:     str
-    exit_rule:     str
-    target_price:  float | None   = None
-    notes:         list[str]      = field(default_factory=list)
-    raw_amount_eur: float         = 0.0
+    ticker:          str
+    category:        str
+    amount_eur:      float
+    confidence:      str
+    rationale:       str
+    exit_rule:       str
+    target_price:    float | None         = None
+    notes:           list[str]            = field(default_factory=list)
+    raw_amount_eur:  float                = 0.0
+    # ── Estratégias avançadas ─────────────────────────────────────────────
+    pyramid:         PyramidStrategy | None = None   # entrada faseada
+    scale_out:       ScaleOutRule | None    = None   # venda parcial + moonbag
 
 
 # ── Helpers internos ──────────────────────────────────────────────────────────
@@ -400,6 +436,103 @@ def _size(ctx: AllocationContext, category: str) -> tuple[float, float, list[str
     return round(amount, 0), raw_amount, notes
 
 
+# ── Estratégias avançadas ─────────────────────────────────────────────────────
+
+def _build_pyramid(
+    amount_eur: float,
+    category: str,
+    drawdown_52w: float | None,
+    fund_score: float,
+) -> PyramidStrategy | None:
+    """Constrói estratégia de entrada faseada para dips de qualidade.
+
+    Aplica quando:
+      • Categoria é HIGH_CONVICTION ou GROWTH (não FLIP — já é trade táctico)
+      • Drawdown 52w < -25% (há espaço para cair mais)
+      • Amount > €60 (mínimo para dividir em 2 tranches)
+
+    Rácios: 65% agora, 35% em limit order a -8% adicional (configurável).
+    Para dips severos (>40%), limit é a -12%.
+    """
+    if amount_eur < 60 or category not in (CAT_HIGH_CONVICTION, CAT_GROWTH):
+        return None
+    dd = abs(float(drawdown_52w)) if drawdown_52w is not None else 0.0
+    if dd < 0.25:
+        return None
+
+    now_pct   = 0.65
+    limit_pct = 1.0 - now_pct
+    trigger   = -0.12 if dd >= 0.40 else -0.08
+
+    return PyramidStrategy(
+        entry_now_eur=round(amount_eur * now_pct, 0),
+        entry_limit_eur=round(amount_eur * limit_pct, 0),
+        limit_trigger_pct=trigger,
+        rationale=(
+            f"Dip severo ({dd*100:.0f}% abaixo do máx). Entra com "
+            f"{now_pct*100:.0f}% agora e reserva {limit_pct*100:.0f}% "
+            f"para limit a {trigger*100:.0f}% adicional."
+        ),
+    )
+
+
+def _build_scale_out(
+    category: str,
+    ml_label: str,
+    fund_score: float,
+    is_bluechip: bool,
+) -> ScaleOutRule | None:
+    """Constrói regra de Scale Out / Moonbag para posições com potencial alto.
+
+    Aplica quando:
+      • Categoria GROWTH com WIN_STRONG — potencial de multi-bagger
+      • Ou HIGH_CONVICTION (blue chip) com WIN_STRONG — pode subir bastante
+
+    Lógica PINS-inspired: quando bate +30-40%, vende 50%, deixa 50% a rolar
+    para um segundo alvo mais ambicioso. Bloqueia lucro sem cortar o upside.
+    """
+    if ml_label not in ("WIN_STRONG", "WIN"):
+        return None
+
+    if category == CAT_HIGH_CONVICTION and ml_label == "WIN_STRONG":
+        return ScaleOutRule(
+            first_target_pct=0.25,
+            sell_pct=0.40,
+            moonbag_pct=0.60,
+            second_target_pct=0.60,
+            rationale=(
+                "Blue chip com sinal forte. Realiza 40% a +25% (bloquear lucro) "
+                "e deixa 60% (moonbag) para alvo de +60%."
+            ),
+        )
+
+    if category == CAT_GROWTH and ml_label == "WIN_STRONG" and fund_score >= 70:
+        return ScaleOutRule(
+            first_target_pct=0.30,
+            sell_pct=0.50,
+            moonbag_pct=0.50,
+            second_target_pct=0.80,
+            rationale=(
+                "Growth de qualidade com sinal forte. Realiza 50% a +30% "
+                "e deixa 50% (moonbag) para alvo de +80% (padrão PINS)."
+            ),
+        )
+
+    if category == CAT_GROWTH and ml_label == "WIN":
+        return ScaleOutRule(
+            first_target_pct=0.20,
+            sell_pct=0.60,
+            moonbag_pct=0.40,
+            second_target_pct=0.40,
+            rationale=(
+                "Growth com sinal moderado. Realiza 60% a +20% e "
+                "deixa 40% (moonbag) para alvo de +40%."
+            ),
+        )
+
+    return None
+
+
 # ── Função pública ────────────────────────────────────────────────────────────
 
 def suggest_allocation(ctx: AllocationContext) -> AllocationDecision:
@@ -422,6 +555,9 @@ def suggest_allocation(ctx: AllocationContext) -> AllocationDecision:
     if category != CAT_PASS and amount == 0.0:
         notes.append("Sizing zerado — recomenda acumular cash até próximo mês.")
 
+    pyramid   = _build_pyramid(amount, category, ctx.drawdown_52w, ctx.fund_score)
+    scale_out = _build_scale_out(category, label, ctx.fund_score, ctx.is_bluechip)
+
     return AllocationDecision(
         ticker         = ctx.ticker,
         category       = category,
@@ -432,6 +568,8 @@ def suggest_allocation(ctx: AllocationContext) -> AllocationDecision:
         exit_rule      = exit_rule,
         target_price   = None,
         notes          = notes,
+        pyramid        = pyramid,
+        scale_out      = scale_out,
     )
 
 
@@ -502,6 +640,28 @@ def format_allocation_telegram(
 
     regime_emoji = {"GREEN": "🟢", "YELLOW": "🟡", "RED": "🔴"}.get(ctx.macro_regime_color, "⚪")
     lines.append(f"⚖️ *Confiança*: {decision.confidence} | Regime: {regime_emoji} {ctx.macro_regime_color}")
+
+    # Pyramiding (entrada faseada)
+    if decision.pyramid is not None:
+        p = decision.pyramid
+        lines.append("")
+        lines.append(
+            f"📊 *Entrada faseada (Pyramiding)*\n"
+            f"  🟢 Comprar agora: €{p.entry_now_eur:.0f}\n"
+            f"  ⏳ Limit order: €{p.entry_limit_eur:.0f} se cair mais {p.limit_trigger_pct*100:.0f}%\n"
+            f"  _{p.rationale}_"
+        )
+
+    # Scale Out / Moonbag
+    if decision.scale_out is not None:
+        s = decision.scale_out
+        lines.append("")
+        lines.append(
+            f"💰 *Scale Out / Moonbag*\n"
+            f"  🎯 1º alvo +{s.first_target_pct*100:.0f}% → vender {s.sell_pct*100:.0f}%\n"
+            f"  🌙 Moonbag {s.moonbag_pct*100:.0f}% → alvo de +{s.second_target_pct*100:.0f}%\n"
+            f"  _{s.rationale}_"
+        )
 
     if decision.notes:
         lines.append("")

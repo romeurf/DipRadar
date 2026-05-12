@@ -2,7 +2,19 @@ from __future__ import annotations
 
 from typing import Optional
 
-HORIZON_DAYS: int = 60
+# ── Horizons ─────────────────────────────────────────────────────────────────
+# Primary target: close_90d alpha (rotação de capital em ~90 dias).
+# Blue-chips e stocks de qualidade podem sugerir hold estendido (6M+).
+HORIZON_DAYS: int = 90                      # janela para close_90d / alpha_90d
+
+# Colunas alvo no parquet — geradas em data.py
+PRIMARY_TARGET: str = "alpha_90d"           # excesso de retorno sobre SPY em 90d
+PRIMARY_TARGET_FALLBACK: str = "alpha_60d"  # fallback para parquets antigos sem alpha_90d
+RISK_TARGET: str = "max_drawdown_60d"       # drawdown máximo nos primeiros 60d
+
+# Threshold do calibrador: P(alpha_90d > CALIBRATOR_THRESHOLD)
+CALIBRATOR_THRESHOLD: float = 0.07         # 7% de alpha — ligeiramente mais alto que 60d
+
 WINSOR_PCT: float = 0.005
 WINSOR_ABS_LO: float = -0.50
 WINSOR_ABS_HI: float = 2.00
@@ -12,6 +24,17 @@ N_FOLDS: int = 10
 PURGE_DAYS: int = 90
 EMBARGO_DAYS: int = 20
 TOPK_FRAC: float = 0.12
+
+# ── Classificação de stocks (usada em ml_predictor ao fazer inference) ────────
+# Stocks acima destes limites são tratados como acumulação de longo prazo,
+# não como dip-and-flip. Podem ainda ser saídos se deterioração estrutural.
+BLUE_CHIP_MARKET_CAP_B: float = 100.0    # market cap > $100B
+BLUE_CHIP_QUALITY_SCORE: float = 0.65   # quality_score normalizado [0,1]
+QUALITY_MARKET_CAP_B: float = 25.0      # $25B < cap <= $100B
+QUALITY_SCORE_MIN: float = 0.55
+
+# Alpha threshold para sugerir extensão de hold para ~6M em stocks de qualidade
+EXTEND_HOLD_ALPHA_THRESHOLD: float = 0.08  # alpha_90d > 8% → considera segurar 6M
 
 FEATURE_COLS: list[str] = [
     "vix",
@@ -56,14 +79,6 @@ FEATURE_COLS: list[str] = [
 # Total: 34 → 20 features. Smoke test (3000 rows × 3 folds) com este corte:
 # single best IC 0.1744 → 0.1946 (+11%). Inference live em position_monitor
 # continua a computar todas as features removidas (mantidas em _FALLBACK).
-#
-# Adicionalmente: month_of_year era constante=5.0 no parquet (bug bootstrap).
-# Agora load_base_dataset força recompute via alert_date.dt.month (PR #28).
-#
-# Histórico de cortes anteriores (PR #25): fcf_yield, short_interest_ratio,
-# earnings_surprise_avg, earnings_distance_days (4 constantes adicionadas no
-# regen do PR #23) e yield_10y_change_5d, sector_relative_6m, return_12m_pre
-# (3 ruidosas com IC ≈ 0).
 
 SUBSAMPLE_YEARS: Optional[list[int]] = None
 MAX_ALERTS_PER_YEAR: int = 2_000

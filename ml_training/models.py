@@ -1,26 +1,81 @@
 """Factories e configuração de modelos candidatos + stacking meta-learner.
 
-v4.0 changes:
-  - Hiperparâmetros mais conservadores em todos os modelos (mais regularização).
-  - max_depth reduzido: XGB 4->3, LGBM 6->4 (menos overfitting em features de
-    baixo sinal como financial data).
-  - min_child_weight / min_child_samples aumentados (mais suavização).
-  - colsample_bytree reduzido para 0.7 (força diversidade de sub-árvores).
-  - LGBM com num_leaves explícito (mais controlável que max_depth).
-  - Adicionado XGB-DartBoost: DART droput regularização (diferente do gradient
-    boosting clássico, reduz variância nos folds extremos).
-  - Adicionado LGBM-GOSS: Gradient-based One-Side Sampling, bom em datasets
-    com muitas features de baixo sinal.
-  - Ridge com alpha-sweep: testa 3 alphas e escolhe o melhor por IC no fold.
-  - Stack meta-learner: usa OOF predictions de TODOS os modelos base +
-    features de regime (vix_regime, vix_percentile_1y, spy_rsi_14) para o
-    meta-modelo aprender em que contextos cada base model é melhor.
-  - EMBARGO_DAYS adicionado ao purge para eliminar leakage temporal subtil.
+v4.1 changes:
+  - ScaledRidge: Ridge com StandardScaler embutido. Ridge é extremamente sensível
+    a escala (return_6m_pre [-99,200] vs vix_regime [0,1,2]). O wrapper garante
+    que o scaler é fittado em X_train e guardado no bundle → inference correcta
+    sem scaler separado. Este era o principal bug a suprimir o IC do Ridge.
+  - lgbm_es_factory: adicionado sentinel m.early_stopping_rounds = 50 para que
+    _fit_model em train.py detecte ES. Sem ele, LGBM-ES treinava 1000 estimadores
+    na totalidade sem parar.
+  - XGB-DART: DART boosting para reduzir overfit nos folds recentes.
+  - LGBM-GOSS: Gradient-based One-Side Sampling para datasets de baixo sinal.
 """
 
 from __future__ import annotations
 
+import numpy as np
 from typing import Callable
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# ScaledRidge — Ridge com StandardScaler integrado
+# ────────────────────────────────────────────────────────────────────────────────
+
+class ScaledRidge:
+    """Ridge regression com StandardScaler embutido no objecto.
+
+    Resolve o problema de Ridge ser extremamente sensível a escala quando as
+    features têm ranges muito diferentes (ex: return_6m_pre ∈ [-99, 200] vs
+    vix_regime ∈ {0, 1, 2}). Sem scaler, Ridge pesa return_6m_pre ~200x mais
+    que vix_regime, ignorando efectivamente as features de pequena escala.
+
+    O scaler é fittado em X_train durante .fit() e guardado internamente →
+    produção não precisa de scaler separado no bundle. Interface 100% compatível
+    com sklearn: fit(X, y, sample_weight=None) / predict(X).
+    Picklável via joblib (apenas contém objectos sklearn standard + float).
+    """
+
+    def __init__(self, alpha: float = 10.0) -> None:
+        from sklearn.linear_model import Ridge
+        from sklearn.preprocessing import StandardScaler
+        self._alpha = alpha
+        self._scaler = StandardScaler()
+        self._ridge = Ridge(alpha=alpha)
+        # _fitted guarda se já foi treinado (para mensagens de erro úteis)
+        self._fitted = False
+
+    def fit(self, X, y, sample_weight=None):
+        X_sc = self._scaler.fit_transform(X)
+        self._ridge.fit(X_sc, y, sample_weight=sample_weight)
+        self._fitted = True
+        return self
+
+    def predict(self, X) -> np.ndarray:
+        if not self._fitted:
+            raise RuntimeError("ScaledRidge.predict() chamado antes de .fit()")
+        X_sc = self._scaler.transform(X)
+        return self._ridge.predict(X_sc)
+
+    @property
+    def coef_(self) -> np.ndarray:
+        """Coeficientes Ridge (para feature importance logging)."""
+        return self._ridge.coef_
+
+    @property
+    def intercept_(self) -> float:
+        return float(self._ridge.intercept_)
+
+    def feature_importance_dict(self, feature_names: list[str]) -> dict[str, float]:
+        """Devolve {feature: |coef| / sum(|coefs|)} para diagnóstico."""
+        coefs = np.abs(self._ridge.coef_)
+        total = coefs.sum()
+        if total > 0:
+            coefs = coefs / total
+        return dict(zip(feature_names, coefs.tolist()))
+
+    def __repr__(self) -> str:
+        return f"ScaledRidge(alpha={self._alpha}, fitted={self._fitted})"
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -32,14 +87,14 @@ def xgb_factory() -> "object":
     from xgboost import XGBRegressor
     return XGBRegressor(
         n_estimators=600,
-        max_depth=3,            # reduzido de 4 — financials são baixo sinal
-        learning_rate=0.03,     # mais lento, mas mais estável
-        min_child_weight=10,    # aumentado de 5 — evita folhas com poucos exemplos
+        max_depth=3,
+        learning_rate=0.03,
+        min_child_weight=10,
         subsample=0.75,
-        colsample_bytree=0.7,   # reduzido de 0.8 — diversifica árvores
-        colsample_bylevel=0.7,  # novo: diversificação adicional por nível
-        reg_alpha=0.5,          # aumentado de 0.1 — L1 esparso
-        reg_lambda=2.0,         # aumentado de 1.0 — L2 suaviza
+        colsample_bytree=0.7,
+        colsample_bylevel=0.7,
+        reg_alpha=0.5,
+        reg_lambda=2.0,
         random_state=42,
         tree_method="hist",
         verbosity=0,
@@ -68,12 +123,10 @@ def xgb_es_factory() -> "object":
 
 
 def xgb_dart_factory() -> "object":
-    """XGBoost DART boosting (v4.0 — novo).
+    """XGBoost DART boosting (v4.0).
 
-    DART (Dropouts meet Multiple Additive Regression Trees) usa dropout
-    durante o boosting, o que reduz drasticamente o overfit nos últimos folds
-    do walk-forward. É particularmente eficaz em dados financeiros de baixo
-    sinal onde o modelo tende a memorizar noise nos folds recentes.
+    DART usa dropout durante o boosting, reduzindo overfit nos folds recentes.
+    Especialmente eficaz em dados financeiros de baixo sinal.
     """
     from xgboost import XGBRegressor
     return XGBRegressor(
@@ -85,9 +138,9 @@ def xgb_dart_factory() -> "object":
         colsample_bytree=0.7,
         reg_alpha=0.3,
         reg_lambda=2.0,
-        booster="dart",         # DART boosting
-        rate_drop=0.1,          # 10% de árvores dropped por iteração
-        skip_drop=0.5,          # 50% de probabilidade de skip do dropout
+        booster="dart",
+        rate_drop=0.1,
+        skip_drop=0.5,
         random_state=42,
         tree_method="hist",
         verbosity=0,
@@ -99,24 +152,29 @@ def lgbm_factory() -> "object":
     from lightgbm import LGBMRegressor
     return LGBMRegressor(
         n_estimators=600,
-        max_depth=4,            # reduzido de 6
-        num_leaves=15,          # explícito: 2^3=8 < 15 < 2^4=16 (conservador)
+        max_depth=4,
+        num_leaves=15,
         learning_rate=0.03,
-        min_child_samples=30,   # aumentado de 20 — mais suavização
+        min_child_samples=30,
         subsample=0.75,
         colsample_bytree=0.7,
         reg_alpha=0.5,
         reg_lambda=2.0,
-        min_split_gain=0.01,    # novo: evita splits que ganham quase nada
+        min_split_gain=0.01,
         random_state=42,
         verbosity=-1,
     )
 
 
 def lgbm_es_factory() -> "object":
-    """LightGBM com early stopping (v4.0)."""
+    """LightGBM com early stopping (v4.1).
+
+    BUG FIX v4.1: adicionado m.early_stopping_rounds = 50 como sentinel para
+    _fit_model em train.py poder detectar ES via hasattr(). Sem este atributo,
+    a detecção falhava e LGBM-ES treinava 1000 estimadores sem parar.
+    """
     from lightgbm import LGBMRegressor
-    return LGBMRegressor(
+    m = LGBMRegressor(
         n_estimators=1000,
         max_depth=4,
         num_leaves=15,
@@ -130,15 +188,17 @@ def lgbm_es_factory() -> "object":
         random_state=42,
         verbosity=-1,
     )
+    # Sentinel para _fit_model detectar ES (LightGBM não guarda este param
+    # como atributo por defeito — XGBoost sim). Ver train.py::_fit_model().
+    m.early_stopping_rounds = 50
+    return m
 
 
 def lgbm_goss_factory() -> "object":
-    """LightGBM com GOSS sampling (v4.0 — novo).
+    """LightGBM com GOSS sampling (v4.0).
 
     Gradient-based One-Side Sampling: foca o treino nos exemplos de maior
-    gradiente (os mais informativos) e amostra aleatoriamente os de baixo
-    gradiente. Em financials com baixo sinal, isto reduz o ruído de treino
-    sem sacrificar os padrões fortes.
+    gradiente, reduzindo o ruído em datasets financeiros de baixo sinal.
     """
     from lightgbm import LGBMRegressor
     return LGBMRegressor(
@@ -147,9 +207,9 @@ def lgbm_goss_factory() -> "object":
         num_leaves=15,
         learning_rate=0.03,
         min_child_samples=30,
-        boosting_type="goss",   # Gradient-based One-Side Sampling
-        top_rate=0.2,           # top 20% gradientes são sempre usados
-        other_rate=0.1,         # 10% amostra aleatória dos restantes
+        boosting_type="goss",
+        top_rate=0.2,
+        other_rate=0.1,
         reg_alpha=0.5,
         reg_lambda=2.0,
         random_state=42,
@@ -162,32 +222,37 @@ def rf_factory() -> "object":
     from sklearn.ensemble import RandomForestRegressor
     return RandomForestRegressor(
         n_estimators=500,
-        max_depth=6,            # reduzido de 8
-        min_samples_leaf=20,    # aumentado de 10 — mais suavização
-        max_features=0.5,       # reduzido de 'sqrt' para forçar mais diversidade
+        max_depth=6,
+        min_samples_leaf=20,
+        max_features=0.5,
         n_jobs=-1,
         random_state=42,
     )
 
 
 def ridge_factory() -> "object":
-    """Ridge com alpha moderado."""
-    from sklearn.linear_model import Ridge
-    return Ridge(alpha=10.0)
+    """ScaledRidge com alpha moderado (v4.1).
+
+    BUG FIX v4.1: substituído Ridge(alpha=10) por ScaledRidge(alpha=10).
+    Ridge sem scaler pesava return_6m_pre (range [-99,200]) ~200x mais que
+    vix_regime (range [0,2]), ignorando efectivamente features de pequena
+    escala. ScaledRidge integra o StandardScaler no próprio objecto → bundle
+    é auto-suficiente, sem scaler separado em inference.
+    """
+    return ScaledRidge(alpha=10.0)
 
 
 def ridge_strong_factory() -> "object":
-    """Ridge muito regularizado — proxy para factor model linear."""
-    from sklearn.linear_model import Ridge
-    return Ridge(alpha=100.0)
+    """ScaledRidge muito regularizado (proxy de factor model linear, v4.1)."""
+    return ScaledRidge(alpha=100.0)
 
 
 def stack_meta_factory() -> "object":
     """Ridge meta-learner para stacking ensemble (Nível 2).
 
-    v4.0: alpha aumentado para 5.0 porque o input (OOF preds) pode ter
-    correlação alta entre modelos similares (XGB vs LGBM). Regularização
-    maior evita que o meta-modelo sobre-pondera um único base model.
+    alpha=5.0 para regularizar correlação alta entre OOF preds de modelos
+    similares (XGB vs LGBM). Não usa ScaledRidge porque as OOF preds já
+    estão numa escala comparável (predições do mesmo target).
     """
     from sklearn.linear_model import Ridge
     return Ridge(alpha=5.0, fit_intercept=True)
@@ -235,9 +300,8 @@ def build_model_configs(
 ) -> dict[str, dict]:
     """Constrói o dicionário MODEL_CONFIGS com candidatos base + stacking.
 
-    v4.0: adicionados XGB-DART, LGBM-GOSS e Ridge-Strong.
-    Todos os modelos agora treinam sobre alpha_60d_rank (target robusto)
-    em vez de alpha_60d bruto — ver nota no notebook.
+    v4.1: Ridge e Ridge-Strong usam agora ScaledRidge (bug fix de escala).
+    LGBM-ES tem sentinel early_stopping_rounds para detecção correcta em _fit_model.
     """
     return {
         # ── XGBoost family ─────────────────────────────────────────────

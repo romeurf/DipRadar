@@ -143,16 +143,13 @@ def run_walk_forward_cv(
             log.info(f"Fold {k}: insuficiente (tr={len(df_tr)}, te={len(df_te)}) — saltar")
             continue
 
-        # Training Y: rank cross-section ou bruto (winsorizado só para o bruto).
-        # Rank já está em [0, 1] então winsorize seria no-op + pode rebentar.
-        if train_target == "alpha_60d":
-            y_alpha_tr = winsorize(df_tr["alpha_60d"].values)
-        else:
-            y_alpha_tr = df_tr[train_target].values.astype(float)
-        # Evaluation Y: sempre alpha_60d bruto (Spearman é rank-invariant entre
-        # pred e y_te, então comparar previsões em rank-space vs raw alpha
-        # produz o mesmo IC). Mantemos raw para comparabilidade entre runs.
-        y_alpha_te = df_te["alpha_60d"].values
+        # Training Y: winsorize qualquer target (rank [0,1] é no-op após clip).
+        y_alpha_tr = winsorize(df_tr[train_target].values.astype(float))
+        # Evaluation Y: usa o mesmo target que o treino para IC comparável.
+        # Se o parquet não tiver a coluna (ex: alpha_90d em parquet antigo),
+        # cai de volta para alpha_60d — avisa mas não falha.
+        _eval_col = train_target if train_target in df_te.columns else "alpha_60d"
+        y_alpha_te = df_te[_eval_col].values
         y_down_tr  = winsorize(df_tr["max_drawdown_60d"].values)
         y_down_te  = df_te["max_drawdown_60d"].values
 
@@ -555,16 +552,20 @@ def train_full_ensemble(
 # Orchestrator end-to-end (drop-in para train_v31.run_training)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _maybe_apply_rank_target(df: pd.DataFrame, *, enable: bool = True) -> pd.DataFrame:
-    """Adiciona ``alpha_60d_rank`` cross-section por data."""
+def _maybe_apply_rank_target(
+    df: pd.DataFrame, *, enable: bool = True, raw_col: str = "alpha_60d"
+) -> pd.DataFrame:
+    """Adiciona ``{raw_col}_rank`` cross-section por data."""
     if not enable:
         return df
     from ml_training.cv_robust import add_crosssection_rank
-    return add_crosssection_rank(df, raw_col="alpha_60d", date_col="alert_date")
+    return add_crosssection_rank(df, raw_col=raw_col, date_col="alert_date")
 
 
-def _maybe_apply_sector_neutral(df: pd.DataFrame, *, enable: bool = True) -> pd.DataFrame:
-    """Adiciona ``alpha_60d_neutral`` e ``alpha_60d_neutral_rank``.
+def _maybe_apply_sector_neutral(
+    df: pd.DataFrame, *, enable: bool = True, target_col: str = "alpha_60d"
+) -> pd.DataFrame:
+    """Adiciona ``{target_col}_neutral`` e ``{target_col}_neutral_rank``.
 
     Subtrai mediana de sector por data antes de re-rankear. Útil para o
     modelo aprender "compra dip dentro do sector" em vez de "compra tech".
@@ -574,7 +575,7 @@ def _maybe_apply_sector_neutral(df: pd.DataFrame, *, enable: bool = True) -> pd.
     from ml_training.target_engineering import neutralize_target_by_sector
     return neutralize_target_by_sector(
         df,
-        target_col="alpha_60d",
+        target_col=target_col,
         sector_col="sector",
         date_col="alert_date",
     )
@@ -696,11 +697,27 @@ def run_training(
         log.info(f"[run_training] max_rows={max_rows} → {len(df)} rows")
 
     # Filtrar linhas com alpha_60d resolvido
-    if "alpha_60d" not in df.columns:
-        raise KeyError("parquet sem coluna alpha_60d — targets não resolvidos")
+    # Selecção do target primário: alpha_90d (se disponível e com dados suficientes)
+    # com fallback para alpha_60d (parquets antigos sem alpha_90d).
+    from ml_training.config import PRIMARY_TARGET, PRIMARY_TARGET_FALLBACK
+    _n_resolved_90 = int(df[PRIMARY_TARGET].notna().sum()) if PRIMARY_TARGET in df.columns else 0
+    if _n_resolved_90 >= min_train * 2:
+        _active_target = PRIMARY_TARGET
+        log.info(f"[run_training] Target primário: {_active_target} ({_n_resolved_90} linhas resolvidas)")
+    elif PRIMARY_TARGET_FALLBACK in df.columns:
+        _active_target = PRIMARY_TARGET_FALLBACK
+        log.warning(
+            f"[run_training] {PRIMARY_TARGET} insuficiente ({_n_resolved_90} linhas) "
+            f"— fallback para {PRIMARY_TARGET_FALLBACK}"
+        )
+    else:
+        raise KeyError(
+            f"Parquet sem target resolvido ({PRIMARY_TARGET} nem {PRIMARY_TARGET_FALLBACK}). "
+            f"Regenera o parquet via scripts/regenerate_training_base.py."
+        )
     n_pre = len(df)
-    df = df[df["alpha_60d"].notna()].reset_index(drop=True)
-    log.info(f"[run_training] Alpha_60d resolvido: {len(df)}/{n_pre}")
+    df = df[df[_active_target].notna()].reset_index(drop=True)
+    log.info(f"[run_training] Target '{_active_target}' resolvido: {len(df)}/{n_pre}")
 
     if "max_drawdown_60d" not in df.columns:
         # Para compat antiga: cria coluna com NaN (depois é winsorizada)
@@ -708,8 +725,8 @@ def run_training(
         df["max_drawdown_60d"] = 0.0
 
     # Robustness: target rank cross-section + sector-neutral
-    df = _maybe_apply_rank_target(df, enable=use_rank_target)
-    df = _maybe_apply_sector_neutral(df, enable=use_sector_neutral)
+    df = _maybe_apply_rank_target(df, enable=use_rank_target, raw_col=_active_target)
+    df = _maybe_apply_sector_neutral(df, enable=use_sector_neutral, target_col=_active_target)
 
     # Feature winsorization (clipa return_1m/3m/6m a ±200% para tratar
     # outliers tipo AXON.PA 5000% / ATO.PA 9549%)
@@ -717,9 +734,10 @@ def run_training(
         df = _winsorize_outlier_features(df)
 
     # Resolve training target (rank se ambos os flags activos + coluna existe)
-    train_target_col = "alpha_60d"
-    if use_rank_target_train and use_rank_target and "alpha_60d_rank" in df.columns:
-        train_target_col = "alpha_60d_rank"
+    _rank_col = f"{_active_target}_rank"
+    train_target_col = _active_target
+    if use_rank_target_train and use_rank_target and _rank_col in df.columns:
+        train_target_col = _rank_col
         log.info(f"[run_training] Training target: {train_target_col} (cross-section rank)")
     else:
         log.info(f"[run_training] Training target: {train_target_col} (raw alpha)")
@@ -895,10 +913,11 @@ def run_training(
     log.info(f"[run_training] Champion final: {champion_kind}={champion_name}")
 
     # Isotonic calibrator OOF (usa champion_oof_pred, seja single ou ensemble)
+    from ml_training.config import CALIBRATOR_THRESHOLD
     iso, brier, n_oof = fit_isotonic_calibrator(
         champion_oof_pred,
-        df["alpha_60d"].values,
-        alpha_threshold=0.05,
+        df[_active_target].values,
+        alpha_threshold=CALIBRATOR_THRESHOLD,
     )
     log.info(
         f"[run_training] Calibrator: brier_oof={brier:.4f} | n_oof={n_oof}"
@@ -929,6 +948,9 @@ def run_training(
     rho_down_final = float(single_champion_row["rho_down_mean"])
     topk_pnl_final = float(single_champion_row["topk_pnl_mean"])
 
+    # win_rate: fracção do dataset com alpha > calibrator threshold
+    win_rate_alpha = float((df[_active_target] > CALIBRATOR_THRESHOLD).mean())
+
     # Bundle
     bundle = DipModelsV3(
         model_up=champ_alpha,
@@ -953,7 +975,6 @@ def run_training(
     )
 
     # Report
-    win_rate_alpha = float((df["alpha_60d"] > 0.05).mean())
     report = build_report(
         bundle=bundle,
         summary_df=summary,

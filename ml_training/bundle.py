@@ -143,8 +143,8 @@ def build_report(
         "metrics":     metrics,
         "comparison":  comparison,
         "target": {
-            "name":         "alpha_60d",
-            "formula":      "max_return_60d - spy_max_return_60d",
+            "name":         "alpha_90d",
+            "formula":      "log1p(close_90d) - log1p(spy_close_90d)",
             "horizon_days": horizon_days,
         },
     }
