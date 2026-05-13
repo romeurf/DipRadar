@@ -216,15 +216,27 @@ def _reply(text: str) -> None:
 
 
 def _md_safe(s: object) -> str:
-    """Sanitiza valor dinâmico para interpolação dentro de ``...`` (code span).
+    """Sanitiza para uso dentro de code span (backtick): remove backticks internos.
 
-    Markdown V1 do Telegram trata o conteúdo dentro de backticks como literal,
-    EXCEPTO o próprio backtick. Para evitar 400 Bad Request por entidades
-    desbalanceadas (e.g. ``alert_db`` em italics ``_..._``), embrulha-se sempre
-    valores dinâmicos em backticks e remove-se backticks internos.
+    Uso correcto: f"`{_md_safe(exception)}`"
+    Não usar directamente em texto bold/italic — usar _md_escape para isso.
+    """
+    return str(s).replace("`", "'") if s is not None else ""
+
+
+def _md_escape(s: object) -> str:
+    """Escapa chars especiais MarkdownV1 para uso em texto livre (fora de code spans).
+
+    Necessário sempre que um valor dinâmico (nome de ficheiro, mensagem de erro,
+    output de API) é inserido directamente em texto Markdown. Sem este escape,
+    underscores em nomes como 'alpha_90d' ou 'admin_retrain' quebram a formatação.
+
+    Uso: f"Erro em {_md_escape(filename)}: {_md_escape(e)}"
     """
     txt = str(s) if s is not None else ""
-    return txt.replace("`", "'")
+    for ch in ["_", "*", "`", "["]:
+        txt = txt.replace(ch, "\\" + ch)
+    return txt
 
 
 def _check_rate(cmd: str) -> bool:
@@ -1049,67 +1061,73 @@ def _handle_admin_load_models(parts: list[str]) -> None:
 # ── /admin_test_feed ─────────────────────────────────────────────────────────────
 
 def _handle_admin_test_feed(parts: list[str]) -> None:
-    """/admin_test_feed [TICKER]  — testa o pipeline de dados para um ticker.
-
-    Mostra o resultado de cada camada (Tiingo → yfinance download → yfinance Ticker)
-    para diagnosticar porque o universe_snapshot está a retornar 0 tickers.
-    Ex: /admin_test_feed AAPL
-    """
+    """Testa o pipeline de dados para um ticker. /admin_test_feed AAPL"""
     ticker = parts[1].upper().strip() if len(parts) > 1 else "AAPL"
 
+    def _safe_str(v) -> str:
+        """Converte valor para string sem chars especiais Markdown."""
+        s = str(v)
+        # Remover chars que quebram MarkdownV1
+        for ch in ["*", "_", "`", "[", "]"]:
+            s = s.replace(ch, "")
+        return s[:80]
+
     def _run():
-        lines = [f"🔬 *Diagnóstico de feed — {ticker}*", ""]
+        lines = [f"Feed test: {ticker}", ""]
         try:
-            # 1. data_feed.get_eod_prices
+            # 1. data_feed
             from data_feed import get_eod_prices
             df = get_eod_prices(ticker, lookback_days=10)
             if df is not None and not df.empty:
-                cols = list(df.columns)
-                lines.append(f"✅ *data_feed:* {len(df)} linhas | cols={cols[:5]}")
-                lines.append(f"   index type={type(df.index).__name__}")
-                if "date" in df.columns:
-                    lines.append(f"   coluna 'date' presente ✓")
-                else:
-                    lines.append(f"   ⚠️ coluna 'date' AUSENTE — cols: {cols}")
+                cols = [_safe_str(c) for c in list(df.columns)[:5]]
+                has_date = "date" in df.columns
+                lines.append(f"data-feed: OK {len(df)} linhas")
+                lines.append(f"  cols: {cols}")
+                lines.append(f"  coluna date: {'presente' if has_date else 'AUSENTE'}")
+                lines.append(f"  index type: {type(df.index).__name__}")
             else:
-                lines.append(f"❌ *data_feed:* devolveu DataFrame vazio")
+                lines.append("data-feed: vazio")
 
-            # 2. yfinance download directo
+            # 2. yfinance download
             try:
                 import yfinance as yf
                 import pandas as pd
                 raw = yf.download(ticker, period="5d", auto_adjust=True, progress=False)
                 if raw is not None and not raw.empty:
                     is_multi = isinstance(raw.columns, pd.MultiIndex)
-                    level0 = list(raw.columns.get_level_values(0)) if is_multi else list(raw.columns)
-                    lines.append(f"✅ *yf.download:* {len(raw)} linhas | MultiIndex={is_multi}")
-                    lines.append(f"   columns level0={level0[:5]}")
-                    lines.append(f"   index name={raw.index.name} tz={getattr(raw.index, 'tz', None)}")
+                    level0 = [_safe_str(c) for c in list(raw.columns.get_level_values(0) if is_multi else raw.columns)[:5]]
+                    tz_str = _safe_str(getattr(raw.index, "tz", "none"))
+                    lines.append(f"yf.download: OK {len(raw)} linhas")
+                    lines.append(f"  MultiIndex: {is_multi}")
+                    lines.append(f"  cols: {level0}")
+                    lines.append(f"  index.name: {_safe_str(raw.index.name)}")
+                    lines.append(f"  tz: {tz_str}")
                 else:
-                    lines.append(f"❌ *yf.download:* devolveu vazio")
+                    lines.append("yf.download: vazio")
             except Exception as e:
-                lines.append(f"❌ *yf.download erro:* `{e}`")
+                lines.append(f"yf.download erro: {_safe_str(e)}")
 
-            # 3. yfinance Ticker.history
+            # 3. yf.Ticker.history (sem raise-errors)
             try:
                 hist = yf.Ticker(ticker).history(period="5d", auto_adjust=True)
                 if hist is not None and not hist.empty:
-                    lines.append(f"✅ *yf.Ticker.history:* {len(hist)} linhas | tz={getattr(hist.index, 'tz', None)}")
+                    tz_str = _safe_str(getattr(hist.index, "tz", "none"))
+                    lines.append(f"yf.history: OK {len(hist)} linhas tz={tz_str}")
                 else:
-                    lines.append(f"❌ *yf.Ticker.history:* devolveu vazio")
+                    lines.append("yf.history: vazio")
             except Exception as e:
-                lines.append(f"❌ *yf.Ticker.history erro:* `{e}`")
+                lines.append(f"yf.history erro: {_safe_str(e)}")
 
-            # 4. fast_info
+            # 4. fast-info
             try:
                 fi = yf.Ticker(ticker).fast_info
                 price = getattr(fi, "last_price", None)
-                lines.append(f"{'✅' if price else '❌'} *fast_info:* last_price={price}")
+                lines.append(f"fast-info: price={price}")
             except Exception as e:
-                lines.append(f"❌ *fast_info erro:* `{e}`")
+                lines.append(f"fast-info erro: {_safe_str(e)}")
 
         except Exception as e:
-            lines.append(f"❌ Erro geral: `{e}`")
+            lines.append(f"Erro geral: {_safe_str(e)}")
 
         _reply("\n".join(lines))
 
