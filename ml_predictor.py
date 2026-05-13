@@ -595,13 +595,13 @@ def ml_badge(result: MLResult) -> str:
     """Linha formatada para o alerta Telegram (v4.1).
 
     Exemplos:
-      🤖 ML v3: 🟢 WIN_STRONG 💎 | α₉₀ +8.2% | dn -6.1% | P(win) 76% | R:R 1.37 | Hold: Longo prazo
-      🤖 ML v3: ✅ WIN ⭐ | α₉₀ +5.1% | dn -9.2% | P(win) 62% | Size: 4% | Hold: ~6 meses
-      🤖 ML v3: 🔄 WEAK | α₉₀ +2.1% | dn -14% | P(win) 45% | Hold: ~90 dias
-      🤖 ML v3: modelo não treinado
+      🤖 ML:🟢 WIN_STRONG 💎 | α₉₀ +8.2% | dn -6.1% | P(win) 76% | R:R 1.37 | Hold: Longo prazo
+      🤖 ML:✅ WIN ⭐ | α₉₀ +5.1% | dn -9.2% | P(win) 62% | Size: 4% | Hold: ~6 meses
+      🤖 ML:🔄 WEAK | α₉₀ +2.1% | dn -14% | P(win) 45% | Hold: ~90 dias
+      🤖 ML:modelo não treinado
     """
     if not result.model_ready:
-        return "🤖 ML v3: _modelo não treinado_"
+        return "🤖 ML:_modelo não treinado_"
 
     emoji_map = {
         "WIN_STRONG": "🟢",
@@ -623,7 +623,7 @@ def ml_badge(result: MLResult) -> str:
     prob_str  = f"{result.win_prob:.0%}"
 
     parts = [
-        f"🤖 *ML v3:* {em} `{result.label}` {type_emoji}",
+        f"🤖 *ML:* {em} `{result.label}` {type_emoji}",
         f"| α₉₀ *{alpha_str}* | dn {down_str} | P(win) *{prob_str}*",
     ]
 

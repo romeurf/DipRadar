@@ -27,7 +27,7 @@ Comandos disponíveis:
   /admin_backfill_ml       → [ADMIN] Semear hist_backtest.csv com 5 anos de dips históricos
   /admin_train_ml          → [ADMIN] Treinar modelo ML e gerar dip_model.pkl
   /admin_load_models <url> → [ADMIN] Descarregar pickles + ml_report do URL para /data/ (atomic)
-  /admin_retrain [dry-run] → [ADMIN] Disparar retrain v3 ad-hoc (ou dry-run para validar input)
+  /admin_retrain [dry-run] → [ADMIN] Disparar retrain ad-hoc (ou dry-run para validar input)
   /admin_set_floor <valor> → [ADMIN] Ajustar o floor absoluto de promoção (ρ_α mínimo); ex.: /admin_set_floor 0.08
   /retrigger               → [ADMIN] Alias rápido de /admin_retrain (full, sem dry-run)
   /health                  → Dashboard de observabilidade (RAM, CPU, latências, last scan)
@@ -1179,7 +1179,7 @@ def _handle_admin_retrain(parts: list[str]) -> None:
     extras_str = f" ({', '.join(extras)})" if extras else ""
 
     _reply(
-        f"⚙️ *Retrain v3 — {mode_str}{extras_str}*\n"
+        f"⚙️ *Retrain — {mode_str}{extras_str}*\n"
         f"_A iniciar... estimativa "
         f"{'~10s (só lê parquets)' if dry_run else '2-5min (CV + champion + isotonic)'}._"
     )
@@ -2164,7 +2164,7 @@ def _handle_command(text: str) -> None:
             "`/remove_theme <key>`      → Remover tema\n"
             "`/admin_regen_parquet [--targets-only]` → [ADMIN] Regenerar parquet com PIT fundamentais + alpha90d\n"
             "`/admin_load_models <url>` → [ADMIN] Carregar pickles novos para /data/\n"
-            "`/admin_retrain [dry-run]` → [ADMIN] Disparar retrain v3 ad-hoc\n"
+            "`/admin_retrain [dry-run]` → [ADMIN] Disparar retrain ad-hoc\n"
             "`/retrigger`               → [ADMIN] Alias rápido de /admin_retrain (full)\\n"
             "`/health`                  → Dashboard observabilidade\n"
             "`/health errors`           → Log de erros críticos\n"

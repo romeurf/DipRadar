@@ -1636,7 +1636,7 @@ def run_monthly_retrain() -> None:
             return ""
 
     lines = [
-        f"{icon} *Retreino Mensal v3 — {decision}*",
+        f"{icon} *Retreino Mensal — {decision}*",
         f"_{now_str} ({elapsed:.0f}s)_",
         "",
     ]
@@ -1861,7 +1861,7 @@ def main() -> None:
         logging.info(f"  • {job.name} — próxima execução: {next_time}")
 
     send_telegram(
-        f"🤖 *DipRadar v2 iniciado*\n"
+        f"🤖 *DipRadar iniciado*\n"
         f"_{datetime.now(LISBON_TZ).strftime('%d/%m/%Y %H:%M')}_\n"
         f"Scans: EU 17h45 | US 21h15\n"
         f"Backup: 23h30 → /data/backups/"
