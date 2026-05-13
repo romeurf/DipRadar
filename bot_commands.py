@@ -1046,6 +1046,76 @@ def _handle_admin_load_models(parts: list[str]) -> None:
     threading.Thread(target=_run, daemon=True, name="admin-load-models").start()
 
 
+# ── /admin_test_feed ─────────────────────────────────────────────────────────────
+
+def _handle_admin_test_feed(parts: list[str]) -> None:
+    """/admin_test_feed [TICKER]  — testa o pipeline de dados para um ticker.
+
+    Mostra o resultado de cada camada (Tiingo → yfinance download → yfinance Ticker)
+    para diagnosticar porque o universe_snapshot está a retornar 0 tickers.
+    Ex: /admin_test_feed AAPL
+    """
+    ticker = parts[1].upper().strip() if len(parts) > 1 else "AAPL"
+
+    def _run():
+        lines = [f"🔬 *Diagnóstico de feed — {ticker}*", ""]
+        try:
+            # 1. data_feed.get_eod_prices
+            from data_feed import get_eod_prices
+            df = get_eod_prices(ticker, lookback_days=10)
+            if df is not None and not df.empty:
+                cols = list(df.columns)
+                lines.append(f"✅ *data_feed:* {len(df)} linhas | cols={cols[:5]}")
+                lines.append(f"   index type={type(df.index).__name__}")
+                if "date" in df.columns:
+                    lines.append(f"   coluna 'date' presente ✓")
+                else:
+                    lines.append(f"   ⚠️ coluna 'date' AUSENTE — cols: {cols}")
+            else:
+                lines.append(f"❌ *data_feed:* devolveu DataFrame vazio")
+
+            # 2. yfinance download directo
+            try:
+                import yfinance as yf
+                import pandas as pd
+                raw = yf.download(ticker, period="5d", auto_adjust=True, progress=False)
+                if raw is not None and not raw.empty:
+                    is_multi = isinstance(raw.columns, pd.MultiIndex)
+                    level0 = list(raw.columns.get_level_values(0)) if is_multi else list(raw.columns)
+                    lines.append(f"✅ *yf.download:* {len(raw)} linhas | MultiIndex={is_multi}")
+                    lines.append(f"   columns level0={level0[:5]}")
+                    lines.append(f"   index name={raw.index.name} tz={getattr(raw.index, 'tz', None)}")
+                else:
+                    lines.append(f"❌ *yf.download:* devolveu vazio")
+            except Exception as e:
+                lines.append(f"❌ *yf.download erro:* `{e}`")
+
+            # 3. yfinance Ticker.history
+            try:
+                hist = yf.Ticker(ticker).history(period="5d", auto_adjust=True)
+                if hist is not None and not hist.empty:
+                    lines.append(f"✅ *yf.Ticker.history:* {len(hist)} linhas | tz={getattr(hist.index, 'tz', None)}")
+                else:
+                    lines.append(f"❌ *yf.Ticker.history:* devolveu vazio")
+            except Exception as e:
+                lines.append(f"❌ *yf.Ticker.history erro:* `{e}`")
+
+            # 4. fast_info
+            try:
+                fi = yf.Ticker(ticker).fast_info
+                price = getattr(fi, "last_price", None)
+                lines.append(f"{'✅' if price else '❌'} *fast_info:* last_price={price}")
+            except Exception as e:
+                lines.append(f"❌ *fast_info erro:* `{e}`")
+
+        except Exception as e:
+            lines.append(f"❌ Erro geral: `{e}`")
+
+        _reply("\n".join(lines))
+
+    threading.Thread(target=_run, daemon=True, name="test-feed").start()
+
+
 # ── /admin_regen_parquet ────────────────────────────────────────────────────────
 
 def _handle_admin_regen_parquet(parts: list[str]) -> None:
@@ -2378,6 +2448,9 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_load_models":
         _handle_admin_load_models(parts)
+
+    elif cmd in ("/admin_test_feed", "/test_feed"):
+        _handle_admin_test_feed(parts)
 
     elif cmd in ("/admin_regen_parquet", "/regen_parquet"):
         _handle_admin_regen_parquet(parts)

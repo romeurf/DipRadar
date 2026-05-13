@@ -167,7 +167,18 @@ def _yfinance_fetch(ticker: str, lookback_days: int) -> pd.DataFrame:
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = raw.columns.get_level_values(0)
 
-        raw = raw.reset_index().rename(columns={"Date": "date", "index": "date"})
+        # yfinance mudou o nome do índice entre versões:
+        #   < 0.2.x : "Date"
+        #   ≥ 0.2.x : "Datetime" (timezone-aware)
+        #   alguns builds: "Price Date"
+        # Sem este rename, a coluna data fica com o nome errado, o cols filter
+        # exclui "date" e o DataFrame volta sem índice temporal → 0 tickers no snapshot.
+        raw = raw.reset_index().rename(columns={
+            "Date":       "date",
+            "Datetime":   "date",
+            "Price Date": "date",
+            "index":      "date",
+        })
         raw["date"] = pd.to_datetime(raw["date"]).dt.tz_localize(None)
 
         if "Adj Close" not in raw.columns and "Close" in raw.columns:

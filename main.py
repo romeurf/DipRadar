@@ -1106,9 +1106,21 @@ def analyze_ticker(symbol: str) -> str:
     try:
         fund = get_fundamentals(symbol, min_market_cap=0)
         if fund.get("skip"):
+            skip_reason = fund.get("skip_reason", "Ticker sem dados disponíveis")
+            # Diagnóstico extra: testar se yfinance responde para este ticker
+            yf_ok = False
+            try:
+                import yfinance as yf
+                fi = yf.Ticker(symbol).fast_info
+                yf_ok = bool(getattr(fi, "last_price", None))
+            except Exception:
+                pass
+            diag = "_yfinance: OK_" if yf_ok else "_yfinance: sem dados — possível ticker errado ou problema de rede_"
             return (
                 f"⚠️ *{symbol}* — dados insuficientes\n"
-                f"_{fund.get('skip_reason', 'Ticker sem dados disponíveis')}_"
+                f"_{skip_reason}_\n\n"
+                f"Diagnóstico: {diag}\n"
+                f"_Verifica se o ticker está correcto (ex: `AAPL`, `NVO`, `EUNL.DE`)_"
             )
 
         hist_pe       = get_historical_pe(symbol)

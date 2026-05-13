@@ -340,13 +340,11 @@ def _fetch_history(symbol: str, lookback_days: int = 280) -> pd.DataFrame:
                 df = df.drop(columns=["date"])
             if not isinstance(df.index, pd.DatetimeIndex):
                 df.index = pd.DatetimeIndex(df.index)
-            try:
-                df.index = df.index.tz_localize(None)
-            except (TypeError, AttributeError):
-                pass
+            if df.index.tz is not None:
+                df.index = df.index.tz_convert(None)
             return df
     except Exception as e:
-        log.debug(f"[hist] {symbol}: data_feed falhou ({e}); a tentar yfinance directo.")
+        log.warning(f"[hist] {symbol}: data_feed falhou ({e}); a tentar yfinance directo.")
 
     try:
         import yfinance as yf
@@ -354,10 +352,16 @@ def _fetch_history(symbol: str, lookback_days: int = 280) -> pd.DataFrame:
                                         auto_adjust=True, raise_errors=False)
         if df is None or df.empty:
             return pd.DataFrame()
-        df.index = pd.DatetimeIndex(df.index).tz_localize(None)
+        # tz_localize(None) falha em índices já timezone-aware (common em yfinance ≥0.2).
+        # Usar tz_convert(None) para remover tz de forma segura.
+        idx = pd.DatetimeIndex(df.index)
+        if idx.tz is not None:
+            df.index = idx.tz_convert(None)
+        else:
+            df.index = idx
         return df
     except Exception as e:
-        log.debug(f"[hist] {symbol}: yfinance falhou ({e}).")
+        log.warning(f"[hist] {symbol}: yfinance directo falhou ({e}).")
         return pd.DataFrame()
 
 
