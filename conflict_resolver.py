@@ -127,7 +127,6 @@ def get_verdict_line(
     state, msg, emoji, sizing = resolve_conflict(
         fund_score, ml_label, has_dislocation, is_preprofit
     )
-    _, verdict, _, _ = state, *_STATE_META[state]
     verdict_str = _STATE_META[state][0]
     return (
         f"{emoji} *{verdict_str}* | Sizing: {sizing}\n"

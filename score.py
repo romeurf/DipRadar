@@ -665,7 +665,7 @@ def calculate_score(
     skip = (
         confidence < 0.50
         or (fcf_yield_v < 0 and pe_v > 200 and rev_growth_v < 0.15)
-        or (qd_val < 0.05 and (0.40 * _safe_float(features.get("quality_score_raw"), quality) + 0.20 * value + 0.20 * timing) * confidence * 100 < 45)
+        or (qd_val < 0.05 and (0.40 * quality + 0.20 * value + 0.20 * timing) * confidence * 100 < 45)
     )
     if skip:
         logging.debug(

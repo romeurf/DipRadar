@@ -207,7 +207,10 @@ def _get_ticker_data(symbol: str) -> dict | None:
         sector     = info.get("sector") or ""
 
         div_yield_raw = info.get("dividendYield") or 0
-        div_yield     = div_yield_raw
+        # yfinance retorna dividendYield como decimal (0.055 = 5.5%).
+        # Os critérios na watchlist usam percentagem (ex: 5.5 → 5.5%).
+        # Converter aqui para que a comparação `div_yield >= val` funcione.
+        div_yield = div_yield_raw * 100
 
         return {
             "price":       price,

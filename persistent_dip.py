@@ -205,7 +205,7 @@ def check_and_alert_streak(
         )
         sent = send_telegram_fn(msg)
         if sent:
-            mark_persistent_alerted(symbol, streak_days)
+            mark_persistent_alerted(symbol)
             logging.info(
                 f"[persistent_dip] {symbol}: alerta enviado "
                 f"(streak={streak_days}, prev_alerted={alerted_at})"

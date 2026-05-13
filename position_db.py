@@ -260,7 +260,7 @@ def close_position(
         if r.ticker == ticker and r.status == "ACTIVE":
             if alert_date and r.alert_date != alert_date:
                 continue
-            r.status = reason  # e.g. "TAKE_PROFIT"
+            r.status = "CLOSED"
             r.close_reason = reason
             r.closed_at = datetime.utcnow().isoformat()
             r.close_price = close_price
@@ -282,10 +282,11 @@ def summary_text() -> str:
     lines = [f"📋 *Posições activas* ({len(active)})", ""]
     for r in sorted(active, key=lambda x: x.alert_date):
         health_emoji = {
-            "STRONG":       "🟢",
-            "IMPROVING":    "📈",
-            "WEAKENING":    "🟡",
-            "DETERIORATING":"🔴",
+            "STRONG":             "🟢",
+            "IMPROVING":          "📈",
+            "WEAKENING":          "🟡",
+            "DETERIORATING":      "🔴",
+            "STRUCTURAL_DECLINE": "🚨",
         }.get(r.thesis_health, "⚪")
         pnl_pct = ((r.alert_price / r.initial_buy_target) - 1) * 100 if r.initial_buy_target else 0
         lines.append(

@@ -468,14 +468,13 @@ def _fundamentals_from_simfin(
         if real_fields < 2:
             return None
 
-        from fundamental_data import _safe_float as sf  # evitar import circular
         return {
-            "fcf_yield":      sf(fcf_yield,     0.04),
-            "revenue_growth": sf(rev_growth,    0.05),
-            "gross_margin":   sf(gm,            0.35),
-            "de_ratio":       sf(de_ratio,      80.0),
-            "pe_vs_fair":     sf(pe_vs_fair,    1.0),
-            "analyst_upside": sf(analyst_upside, 0.10),
+            "fcf_yield":      _safe_float(fcf_yield,     0.04),
+            "revenue_growth": _safe_float(rev_growth,    0.05),
+            "gross_margin":   _safe_float(gm,            0.35),
+            "de_ratio":       _safe_float(de_ratio,      80.0),
+            "pe_vs_fair":     _safe_float(pe_vs_fair,    1.0),
+            "analyst_upside": _safe_float(analyst_upside, 0.10),
             "quality_score":  quality_score,
             "_source":        "simfin_free",
         }

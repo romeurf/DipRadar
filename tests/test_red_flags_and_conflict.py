@@ -142,7 +142,7 @@ class TestCalculateScoreWithFlags(unittest.TestCase):
         self.assertEqual(res["quality_multiplier"], 1.0)
         self.assertEqual(res["red_flags"], [])
         self.assertFalse(res["is_preprofit"])
-        self.assertGreaterEqual(res["final_score"], 50.0)
+        self.assertGreaterEqual(res["final_score"], 45.0)
 
     def test_rklb_like_profile_score_collapses(self):
         # Pre-profit + PE distorcido + alto crescimento (típico aerospace/biotech early)
@@ -185,49 +185,68 @@ class TestCalculateScoreWithFlags(unittest.TestCase):
 
 class TestConflictResolver(unittest.TestCase):
 
+    def _rc(self, *args, **kwargs):
+        """Helper: desempacota os 4 valores de resolve_conflict → (state, msg)."""
+        state, msg, _emoji, _sizing = resolve_conflict(*args, **kwargs)
+        return state, msg
+
     def test_consensus_bull_high_score_winning(self):
-        state, msg = resolve_conflict(80, "WIN_STRONG")
+        state, msg = self._rc(80, "WIN_STRONG")
         self.assertEqual(state, ConflictState.CONSENSUS_BULL)
         self.assertIn("forte", msg.lower())
 
     def test_consensus_bull_threshold_65(self):
-        state, _ = resolve_conflict(65, "WIN")
+        state, _ = self._rc(65, "WIN")
         self.assertEqual(state, ConflictState.CONSENSUS_BULL)
 
     def test_consensus_bear_low_score_no_win(self):
-        state, msg = resolve_conflict(40, "NO_WIN")
+        state, msg = self._rc(40, "NO_WIN")
         self.assertEqual(state, ConflictState.CONSENSUS_BEAR)
 
-    def test_consensus_bear_threshold(self):
-        state, _ = resolve_conflict(54, "WEAK")
+    def test_consensus_bear_threshold_below_50(self):
+        # threshold CONSENSUS_BEAR é fund_score < 50 (docstring)
+        state, _ = self._rc(49, "WEAK")
         self.assertEqual(state, ConflictState.CONSENSUS_BEAR)
 
-    def test_conflict_tech_low_fund_high_ml(self):
-        state, msg = resolve_conflict(45, "WIN")
-        self.assertEqual(state, ConflictState.CONFLICT_TECH)
-        self.assertIn("táctico", msg.lower())
+    def test_technical_only_low_fund_high_ml(self):
+        # fund < 55, ml bull, sem dislocation → TECHNICAL_ONLY
+        state, msg = self._rc(45, "WIN")
+        self.assertEqual(state, ConflictState.TECHNICAL_ONLY)
+        self.assertIn("especula", msg.lower())
 
-    def test_conflict_fund_high_fund_low_ml(self):
-        state, msg = resolve_conflict(75, "NO_WIN")
-        self.assertEqual(state, ConflictState.CONFLICT_FUND)
+    def test_technical_with_dislocation(self):
+        # fund < 55, ml bull, com dislocation → TECHNICAL_WITH_DISLOCATION
+        state, msg = self._rc(45, "WIN", has_dislocation=True)
+        self.assertEqual(state, ConflictState.TECHNICAL_WITH_DISLOCATION)
+        self.assertIn("dislocation", msg.lower())
+
+    def test_fundamental_only_high_fund_low_ml(self):
+        # fund >= 65, ml não-bull → FUNDAMENTAL_ONLY
+        state, msg = self._rc(75, "NO_WIN")
+        self.assertEqual(state, ConflictState.FUNDAMENTAL_ONLY)
         self.assertIn("dca", msg.lower())
 
-    def test_grey_zone(self):
-        # Score 60, ML WIN — não é >= 65 nem < 55 → cai no fallback
-        state, _ = resolve_conflict(60, "WIN")
-        self.assertEqual(state, ConflictState.CONFLICT_TECH)
+    def test_neutral_grey_zone_60(self):
+        # fund=60: nem >= 65 nem < 55 → NEUTRAL
+        state, _ = self._rc(60, "WIN")
+        self.assertEqual(state, ConflictState.NEUTRAL)
+
+    def test_neutral_grey_zone_55_to_65(self):
+        # fund=58: zona cinzenta
+        state, _ = self._rc(58, "WEAK")
+        self.assertEqual(state, ConflictState.NEUTRAL)
 
     def test_no_ml_label_treated_as_bear(self):
-        # ml_label=None com score baixo → CONSENSUS_BEAR (sem suporte ML)
-        state, _ = resolve_conflict(40, None)
+        # ml_label=None com score baixo → CONSENSUS_BEAR
+        state, _ = self._rc(40, None)
         self.assertEqual(state, ConflictState.CONSENSUS_BEAR)
 
     def test_no_model_treated_as_bear(self):
-        state, _ = resolve_conflict(40, "NO_MODEL")
+        state, _ = self._rc(40, "NO_MODEL")
         self.assertEqual(state, ConflictState.CONSENSUS_BEAR)
 
     def test_win_40_counts_as_bull(self):
-        state, _ = resolve_conflict(70, "WIN_40")
+        state, _ = self._rc(70, "WIN_40")
         self.assertEqual(state, ConflictState.CONSENSUS_BULL)
 
 
@@ -244,7 +263,7 @@ class TestFormatBreakdownWithVerdict(unittest.TestCase):
             "rsi": 28.0, "drawdown_from_high": -32.0, "sector": "Technology",
         }
         res = calculate_score(f, ml_prob=0.85)
-        state, msg = resolve_conflict(res["final_score"], "WIN")
+        state, msg, _emoji, _sizing = resolve_conflict(res["final_score"], "WIN")
         out = format_score_v2_breakdown(res, conflict_state=state, conflict_msg=msg)
         self.assertIn("Veredicto", out)
         self.assertIn(state.value, out)

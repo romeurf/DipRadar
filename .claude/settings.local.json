@@ -2,7 +2,16 @@
   "permissions": {
     "allow": [
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\Romeu\\\\OneDrive\\\\Documentos\\\\GitHub\\\\DipRadar\" -Recurse -Filter \"*.py\")",
+      "Bash(Select-Object FullName)",
+      "Bash(Sort-Object FullName)",
+      "Bash(python -m pytest tests/test_red_flags_and_conflict.py tests/test_allocation_engine.py -v --tb=short)",
+      "Bash(python -m unittest tests.test_red_flags_and_conflict tests.test_allocation_engine -v)",
+      "Bash(python -m unittest tests.test_allocation_engine -v)",
+      "Bash(python tests/test_allocation_engine.py)",
+      "Bash(python -c \"import sys; sys.stdout.reconfigure\\(encoding='utf-8', errors='replace'\\)\")",
+      "Bash(set PYTHONIOENCODING=utf-8)"
     ]
   }
 }
