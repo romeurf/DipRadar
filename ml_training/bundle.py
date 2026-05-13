@@ -106,6 +106,7 @@ def build_report(
     purge_days: int,
     horizon_days: int,
     new_features: list[str],
+    feature_stats: "dict | None" = None,
 ) -> dict:
     """Constrói o dict do ``ml_report.json`` (legacy ``ml_report_v3.json``).
 
@@ -147,6 +148,9 @@ def build_report(
             "formula":      "log1p(close_90d) - log1p(spy_close_90d)",
             "horizon_days": horizon_days,
         },
+        # feature_stats: usado pelo health_monitor.check_feature_drift() para PSI.
+        # Sem este campo, drift detection retorna {"skipped": True} graciosamente.
+        "feature_stats": feature_stats or {},
     }
 
 

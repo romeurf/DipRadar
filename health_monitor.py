@@ -586,6 +586,30 @@ def build_health_report(*, ping_apis: bool = True) -> str:
 
     lines.append("")
 
+    # ── ML — drift de probabilidades (rolling 30 dias) ─────────────────────────
+    lines.append("*🎯 Drift de Probabilidades ML (30d):*")
+    try:
+        from prediction_log import compute_win_prob_drift
+        prob_drift = compute_win_prob_drift(window_days=30)
+        if prob_drift.get("skipped"):
+            lines.append(f"  ⚪ _{prob_drift.get('reason', 'sem dados')}_")
+        else:
+            delta = prob_drift.get("delta", 0.0)
+            recent = prob_drift.get("recent_mean", 0.0)
+            baseline = prob_drift.get("baseline_mean", 0.5)
+            n = prob_drift.get("n_recent", 0)
+            drift_flag = prob_drift.get("drift_flag", False)
+            drift_emoji = "🔴" if drift_flag else ("🟡" if abs(delta) > 0.05 else "🟢")
+            lines.append(
+                f"  {drift_emoji} Média recente: *{recent:.0%}* | Baseline: *{baseline:.0%}* | "
+                f"Δ: *{delta:+.0%}* | *{n}* previsões"
+            )
+            if drift_flag:
+                lines.append("  _Win prob desviou >10pp do baseline — considera retraining._")
+    except Exception as e:
+        lines.append(f"  ⚪ _Erro ao calcular: {e}_")
+    lines.append("")
+
     # ── Erros recentes ──────────────────────────────────────────────────────────
     with _lock:
         recent_errors = list(_error_log[-5:])

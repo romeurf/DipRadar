@@ -1230,6 +1230,21 @@ def _handle_admin_retrain(parts: list[str]) -> None:
                 "",
             ]
 
+        # Dataset health verdict
+        dh = result.get("dataset_health") or {}
+        if dh and not dh.get("skipped"):
+            verdict_emoji = {"production_ready": "🟢", "marginal": "🟡",
+                             "unstable": "🟠", "low_volume": "🔴"}.get(dh.get("verdict", ""), "⚪")
+            ic_sr = dh.get("ic_sr")
+            ic_mean = dh.get("ic_mean")
+            pct_pos = dh.get("pct_pos")
+            lines += [
+                f"*Qualidade do sinal:* {verdict_emoji} {dh.get('verdict', '?')}",
+                f"  IC médio: *{ic_mean:.4f}* | IC SR: *{ic_sr:.2f}* | Folds positivos: *{pct_pos:.0%}*",
+                f"  _(IC SR > 0.5 e IC > 0.05 = sinal real e consistente)_",
+                "",
+            ]
+
         if decision == "PENDING":
             lines.append("_Bundle guardado como `dip_models_pending.pkl` — revisão manual._")
         elif decision == "PROMOTED":

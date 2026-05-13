@@ -136,6 +136,71 @@ def log_prediction(
         log.debug(f"[prediction_log] {symbol}: log falhou ({e}) — ignorado.")
 
 
+def compute_win_prob_drift(
+    window_days: int = 30,
+    baseline_win_prob: float | None = None,
+) -> dict:
+    """Calcula drift do win_prob nas últimas `window_days` vs baseline de treino.
+
+    Retorna dict com:
+      - recent_mean: média das últimas window_days previsões
+      - baseline_mean: baseline do treino (do ml_report.json ou parâmetro)
+      - delta: diferença (recent - baseline)
+      - n_recent: número de previsões no período
+      - drift_flag: True se |delta| > 0.10 (10pp de shift → modelo pode ter degradado)
+    """
+    if not PREDICTIONS_PATH.exists():
+        return {"skipped": True, "reason": "predictions log não encontrado"}
+    try:
+        import pandas as pd
+        from datetime import timedelta
+
+        df = pd.read_csv(PREDICTIONS_PATH)
+        if "win_prob" not in df.columns or "ts" not in df.columns or df.empty:
+            return {"skipped": True, "reason": "colunas win_prob/ts ausentes"}
+
+        df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+        cutoff = pd.Timestamp.utcnow().replace(tzinfo=None) - pd.Timedelta(days=window_days)
+        recent = df[df["ts"] >= cutoff]["win_prob"].dropna().astype(float)
+
+        if len(recent) < 5:
+            return {"skipped": True, "reason": f"apenas {len(recent)} previsões no período"}
+
+        recent_mean = float(recent.mean())
+
+        # Baseline do ml_report.json se não fornecido
+        if baseline_win_prob is None:
+            try:
+                import json
+                from pathlib import Path
+                _data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
+                for rp in [_data_dir / "ml_report.json",
+                           Path(__file__).parent / "ml_training" / "ml_report.json"]:
+                    if rp.exists():
+                        rdata = json.loads(rp.read_text())
+                        baseline_win_prob = float(rdata.get("metrics", {}).get("win_rate_alpha", 0.50))
+                        break
+            except Exception:
+                pass
+            if baseline_win_prob is None:
+                baseline_win_prob = 0.50  # fallback neutro
+
+        delta = recent_mean - baseline_win_prob
+        drift_flag = abs(delta) > 0.10
+
+        return {
+            "recent_mean":     round(recent_mean, 4),
+            "baseline_mean":   round(baseline_win_prob, 4),
+            "delta":           round(delta, 4),
+            "n_recent":        int(len(recent)),
+            "window_days":     window_days,
+            "drift_flag":      drift_flag,
+        }
+    except Exception as e:
+        log.warning(f"[prediction_log] compute_win_prob_drift falhou: {e}")
+        return {"skipped": True, "reason": str(e)}
+
+
 def get_log_stats() -> dict:
     """Estatísticas rápidas para /admin (Telegram)."""
     if not PREDICTIONS_PATH.exists():

@@ -1,12 +1,17 @@
 """
-inference.py — Ensemble inference com confidence intervals.
+inference.py — Ensemble inference com confidence intervals (batch/notebook).
 
-Usa os N modelos do ensemble para calcular mean + std do score.
-Std alto = ensemble em desacordo = não entrar.
+⚠️ ESTE MÓDULO É PARA USO EM NOTEBOOKS E BATCH — NÃO ESTÁ EM PRODUÇÃO.
+Para inferência single-alert em produção usa ml_predictor.ml_score().
 
-Integração com ml_predictor.py:
-  Este módulo é usado no notebook de treino/inferência batch.
-  Para inferência single-alert em produção, usa ml_predictor.ml_score().
+Diferença:
+  - ml_predictor.ml_score() : produção, single-alert, hot-reload, Telegram
+  - este módulo              : análise offline, múltiplos modelos, confidence intervals
+
+Quando usar este módulo:
+  1. Análise post-hoc de múltiplos modelos (ensemble variance study)
+  2. Backtesting offline com confidence filtering
+  3. Tuning do `final_entry_filter` antes de actualizar thresholds em produção
 
 Uso:
   from ml_training.inference import predict_with_confidence, final_entry_filter

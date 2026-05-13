@@ -12,7 +12,9 @@
       "Bash(python tests/test_allocation_engine.py)",
       "Bash(python -c \"import sys; sys.stdout.reconfigure\\(encoding='utf-8', errors='replace'\\)\")",
       "Bash(set PYTHONIOENCODING=utf-8)",
-      "Bash(python -c \"from themes import list_themes, get_stock_themes, get_theme_bonus, format_themes_list; themes = list_themes\\(\\); print\\(f'{len\\(themes\\)} temas carregados'\\); matches = get_stock_themes\\('CIEN', 'Technology', 'Ciena Corp'\\); print\\(f'CIEN match: {[m[\\\\\"label\\\\\"] for m in matches]}'\\); bonus = get_theme_bonus\\('NVO', 'Healthcare', 'Novo Nordisk'\\); print\\(f'NVO bonus: x{bonus}'\\)\")"
+      "Bash(python -c \"from themes import list_themes, get_stock_themes, get_theme_bonus, format_themes_list; themes = list_themes\\(\\); print\\(f'{len\\(themes\\)} temas carregados'\\); matches = get_stock_themes\\('CIEN', 'Technology', 'Ciena Corp'\\); print\\(f'CIEN match: {[m[\\\\\"label\\\\\"] for m in matches]}'\\); bonus = get_theme_bonus\\('NVO', 'Healthcare', 'Novo Nordisk'\\); print\\(f'NVO bonus: x{bonus}'\\)\")",
+      "Bash(python -m unittest tests.test_production_quality -v)",
+      "Bash(python -m unittest tests.test_production_quality tests.test_red_flags_and_conflict -v)"
     ]
   }
 }

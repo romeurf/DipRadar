@@ -974,6 +974,23 @@ def run_training(
         fold_metrics=results.get(single_champion_name, []),
     )
 
+    # Baseline de features para drift detection em produção.
+    # health_monitor.check_feature_drift() compara distribuições live vs este baseline.
+    _feature_stats: dict = {}
+    for col in feats_used:
+        if col in df.columns:
+            try:
+                vals = df[col].dropna().astype(float)
+                if len(vals) > 5:
+                    _feature_stats[col] = {
+                        "mean": round(float(vals.mean()), 6),
+                        "std":  round(float(vals.std()), 6),
+                        "p5":   round(float(vals.quantile(0.05)), 6),
+                        "p95":  round(float(vals.quantile(0.95)), 6),
+                    }
+            except Exception:
+                pass
+
     # Report
     report = build_report(
         bundle=bundle,
@@ -987,6 +1004,7 @@ def run_training(
             "return_6m_pre", "vol_of_vol", "bb_width",
             "vix_percentile_1y", "spy_rsi_14",
         ],
+        feature_stats=_feature_stats,
     )
     # Robustness diagnostic fields (sem quebrar o schema legacy)
     report.setdefault("robustness", {})

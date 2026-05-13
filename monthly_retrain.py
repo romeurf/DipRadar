@@ -323,7 +323,8 @@ def _load_alert_db_as_training() -> pd.DataFrame:
     df["label_further_drop"] = None
     df["return_3m"] = pd.to_numeric(df.get("return_3m"), errors="coerce")
     df["return_6m"] = pd.to_numeric(df.get("return_6m"), errors="coerce")
-    df["spy_return_ref"] = pd.to_numeric(df.get("spy_change", 0.0), errors="coerce").fillna(0.0)
+    _spy_col = df["spy_change"] if "spy_change" in df.columns else pd.Series(0.0, index=df.index)
+    df["spy_return_ref"] = pd.to_numeric(_spy_col, errors="coerce").fillna(0.0)
 
     log.info(f"[alert_db] Loaded {len(df)} alertas com outcome resolvido")
     return df
@@ -661,12 +662,13 @@ def run_monthly_retrain_v3(
 
     # 3. Treinar candidate via ml_training.train.run_training
     CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
+    train_result: dict = {}
     try:
         from ml_training.config import N_FOLDS, PURGE_DAYS
         from ml_training.train import run_training
 
         log.info(f"[retrain] A treinar candidate em {CANDIDATE_DIR}...")
-        run_training(
+        train_result = run_training(
             input_parquet=train_path,
             output_bundle=CANDIDATE_BUNDLE,
             output_report=CANDIDATE_REPORT,
@@ -682,6 +684,31 @@ def run_monthly_retrain_v3(
             "outcome_stats": outcome_stats,
         }
 
+    # 3b. Dataset health check (usa fold results do treino para validar sinal)
+    dataset_health: dict = {}
+    try:
+        from ml_training.diagnostics import dataset_health_check
+        from ml_training.config import PRIMARY_TARGET, PRIMARY_TARGET_FALLBACK
+        import pandas as pd
+        _df_check = pd.read_parquet(train_path)
+        _target_check = PRIMARY_TARGET if PRIMARY_TARGET in _df_check.columns else PRIMARY_TARGET_FALLBACK
+        # fold_results extraídos do summary do treino
+        _summary = train_result.get("summary")
+        _fold_results = []
+        if _summary is not None and not _summary.empty:
+            for _, row in _summary.iterrows():
+                _fold_results.append({
+                    "ic_overall": row.get("rho_alpha_mean"),
+                })
+        dataset_health = dataset_health_check(
+            _df_check, _fold_results,
+            target_col=_target_check,
+        )
+        log.info(f"[retrain] Dataset health: verdict={dataset_health.get('verdict')} "
+                 f"IC={dataset_health.get('ic_mean', '?'):.4f} SR={dataset_health.get('ic_sr', '?'):.2f}")
+    except Exception as e:
+        log.warning(f"[retrain] Dataset health check falhou (não bloqueante): {e}")
+
     # 4. Gating + atomic deploy
     cand_metrics = _read_v3_metrics(CANDIDATE_REPORT)
     prod_metrics = _read_v3_metrics(PRODUCTION_REPORT)
@@ -696,8 +723,9 @@ def run_monthly_retrain_v3(
 
     return {
         **gate,
-        "elapsed_s":     round(elapsed, 1),
-        "outcome_stats": outcome_stats,
+        "elapsed_s":      round(elapsed, 1),
+        "outcome_stats":  outcome_stats,
+        "dataset_health": dataset_health,
     }
 
 
