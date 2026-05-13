@@ -1141,16 +1141,14 @@ def _handle_admin_regen_parquet(parts: list[str]) -> None:
     mode_str = " ".join(flags) if flags else "completo"
 
     _targets_only = "--targets-only" in flags
-    _dur = "~10-20 min" if _targets_only else "3-5h (1ª vez) | ~30 min (re-run com cache)"
+    _dur = "~10-20 min" if _targets_only else "3-5h (1a vez) | ~30 min (re-run com cache)"
+    _what = "- Target alpha-90d" if _targets_only else "- Fundamentais PIT + Target alpha-90d"
     _reply(
-        f"⚙️ *Regeneração de parquet — modo: {mode_str}*\n"
-        f"_A reconstruir ml\\_training\\_base.parquet com:_\n"
-        + ("  • Target alpha\\_90d\n" if _targets_only else
-           "  • Fundamentais PIT (EDGAR → yfinance quarterly)\n"
-           "  • Target alpha\\_90d (horizonte correcto)\n")
-        + f"\n_Cache persistido em /data/price\\_cache — retoma onde parou se interrompido._\n"
-        f"_Duração estimada: {_dur}_\n"
-        f"_Podes continuar a usar o bot enquanto isto corre._"
+        f"*Regeneracao de parquet - {mode_str}*\n"
+        f"{_what}\n"
+        f"Cache em /data/price-cache (persiste entre restarts)\n"
+        f"Duracao: {_dur}\n"
+        f"Podes continuar a usar o bot."
     )
     logging.info(f"[regen] Iniciando regeneração modo={mode_str}")
 
@@ -1198,26 +1196,24 @@ def _handle_admin_regen_parquet(parts: list[str]) -> None:
                     n_90d  = int(df_check["alpha_90d"].notna().sum()) if "alpha_90d" in df_check.columns else 0
                     n_fund = int((df_check.get("gross_margin", pd.Series()) != 0.35).sum()) if "gross_margin" in df_check.columns else 0
                     total  = len(df_check)
+                    pct = f"{n_90d/total:.0%}" if total else "0%"
                     _reply(
-                        f"✅ *Parquet regenerado com sucesso!*\n"
-                        f"  Shape: {df_check.shape[0]:,} × {df_check.shape[1]} colunas\n"
-                        f"  alpha\\_90d resolvido: *{n_90d:,}/{total:,}* ({n_90d/total:.0%})\n"
-                        f"  Fundamentais PIT: *{n_fund:,}/{total:,}* linhas com dados reais\n\n"
-                        f"_Podes agora fazer `/admin_retrain` para treinar o modelo._"
+                        f"*Parquet regenerado!*\n"
+                        f"  Shape: {df_check.shape[0]:,} x {df_check.shape[1]} colunas\n"
+                        f"  alpha-90d resolvido: {n_90d:,}/{total:,} ({pct})\n"
+                        f"  Fundamentais PIT: {n_fund:,}/{total:,} linhas\n\n"
+                        f"Faz /admin\\_retrain para treinar o modelo."
                     )
                 except Exception as e:
-                    _reply(f"✅ *Parquet regenerado.* (verificação: {e})\n_Faz `/admin_retrain`._")
+                    _reply(f"Parquet regenerado. (verificacao: {e})\nFaz /admin\\_retrain")
             else:
-                stderr = (result.stderr or "")[-800:]
-                _reply(
-                    f"❌ *Regeneração falhou* (exit {result.returncode})\n"
-                    f"`{stderr}`"
-                )
+                stderr = (result.stderr or "")[-500:]
+                _reply(f"Regeneracao falhou (exit {result.returncode})\n{stderr}")
         except subprocess.TimeoutExpired:
             _reply(
-                "⚠️ *Regeneração excedeu 6h.* O Railway pode ter reiniciado o container.\n"
-                "_O progresso já descarregado está em cache — tenta novamente com `/admin_regen_parquet`._\n"
-                "_Para uma opção mais rápida: `/admin_regen_parquet --targets-only` (~10 min)._"
+                "Regeneracao excedeu 6h. O Railway pode ter reiniciado o container.\n"
+                "O cache de precos esta preservado em /data/price-cache.\n"
+                "Tenta novamente com /admin\\_regen\\_parquet --targets-only"
             )
         except Exception as e:
             logging.error(f"[regen] {e}", exc_info=True)
