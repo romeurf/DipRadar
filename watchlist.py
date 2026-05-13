@@ -206,11 +206,16 @@ def _get_ticker_data(symbol: str) -> dict | None:
         mc         = info.get("marketCap") or 0
         sector     = info.get("sector") or ""
 
-        div_yield_raw = info.get("dividendYield") or 0
-        # yfinance retorna dividendYield como decimal (0.055 = 5.5%).
-        # Os critérios na watchlist usam percentagem (ex: 5.5 → 5.5%).
-        # Converter aqui para que a comparação `div_yield >= val` funcione.
-        div_yield = div_yield_raw * 100
+        div_yield_raw = float(info.get("dividendYield") or 0)
+        # yfinance é inconsistente: alguns tickers devolvem decimal (0.0517 = 5.17%),
+        # outros devolvem directamente em percentagem (5.17 = 5.17%).
+        # Heurística: se o valor >= 1.0, assume que já está em percentagem;
+        # se < 1.0, converte de decimal para percentagem.
+        div_yield = div_yield_raw if div_yield_raw >= 1.0 else div_yield_raw * 100
+
+        # Payout ratio: dividendos pagos / lucro líquido.
+        # > 1.0 (>100%) significa que a empresa paga mais do que ganha — red flag.
+        payout_ratio = float(info.get("payoutRatio") or 0)
 
         return {
             "price":       price,
@@ -226,7 +231,8 @@ def _get_ticker_data(symbol: str) -> dict | None:
             "gross_margins":   info.get("grossMargins") or 0,
             "debt_to_equity":  info.get("debtToEquity"),
             "revenue_growth":  info.get("revenueGrowth") or 0,
-            "dividend_yield_raw": div_yield_raw / 100.0,
+            "dividend_yield_raw": div_yield / 100.0,   # sempre em decimal para cálculos
+            "payout_ratio":    payout_ratio,
         }
     except Exception as e:
         logging.warning(f"[watchlist] {symbol}: {e}")
@@ -357,11 +363,32 @@ def _build_watchlist_alert(
     slot_e    = _SLOT_EMOJI.get(slot, "⚪")
     port_tag  = " 📦 *Já em carteira*" if in_portfolio else ""
     mc_str    = f"${data['mc_b']:.1f}B" if data["mc_b"] else "N/D"
+    # Aviso de payout ratio elevado (paga mais dividendos do que ganha)
+    payout_ratio  = float(data.get("payout_ratio") or 0)
+    div_yield_val = float(data.get("div_yield") or 0)
+    payout_warn   = ""
+    if div_yield_val > 0 and payout_ratio > 1.0:
+        payout_pct = payout_ratio * 100
+        if payout_ratio > 1.5:
+            payout_warn = (
+                f"\n⛔ *ATENÇÃO — Payout ratio {payout_pct:.0f}%!*\n"
+                f"_Esta empresa paga {payout_pct:.0f}% dos lucros em dividendos — "
+                f"claramente insustentável. O dividendo está em risco de corte._"
+            )
+        else:
+            payout_warn = (
+                f"\n⚠️ *Payout ratio {payout_pct:.0f}%*\n"
+                f"_Paga mais de 100% dos lucros em dividendos. "
+                f"Verifica se é FCF-based (REITs usam FFO) ou se está a ser financiado por dívida._"
+            )
+
     lines = [
         f"🎯 *Watchlist Hit: {symbol} — {data['name']}*{port_tag}",
         f"{slot_e} Slot *{slot}* | 💰 ${data['price']:.2f} | 🏦 {mc_str}",
         f"📉 52w drawdown: *{data['drawdown']:.1f}%* | Yield: *{data['div_yield']:.2f}%*",
     ]
+    if payout_warn:
+        lines.append(payout_warn)
     if intention:
         lines.append(f"🗂️ Intenção: *{intention}*")
     if divergence:
@@ -468,7 +495,8 @@ def build_watchlist_morning_summary(direct_tickers: set | list) -> str:
         lines.append(
             f"  {slot_e} *{symbol}*{port_tag}{hit_tag}{cat_tag} — "
             f"${data['price']:.2f} | 52w \u2193{data['drawdown']:.0f}% | "
-            f"Yield {data['div_yield']:.1f}%"
+            f"Yield {data.get('div_yield', 0):.1f}%"
+            + (" \u26a0\ufe0fPay>100%" if (data.get("payout_ratio") or 0) > 1.0 else "")
         )
     lines.append(f"\n_⏰ {datetime.now(LISBON_TZ).strftime('%d/%m %H:%M')}_")
     return "\n".join(lines)

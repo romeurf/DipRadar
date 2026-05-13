@@ -1082,6 +1082,7 @@ def _handle_admin_regen_parquet(parts: list[str]) -> None:
 
     def _run():
         import subprocess, sys
+        from pathlib import Path
         try:
             script = Path(__file__).parent / "scripts" / "regenerate_training_base.py"
             args   = [sys.executable, str(script)] + flags

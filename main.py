@@ -994,6 +994,23 @@ def build_alert(
 
     rsi_part = f" | RSI: {rsi_str}" if rsi_str else ""
 
+    # Aviso de payout ratio insustentável (quando empresa paga dividendos)
+    _div_yield  = float(fundamentals.get("dividend_yield") or 0)
+    _payout_raw = float(fundamentals.get("payoutRatio") or fundamentals.get("payout_ratio") or 0)
+    payout_warn = ""
+    if _div_yield > 0 and _payout_raw > 1.0:
+        _pr_pct = _payout_raw * 100
+        if _payout_raw > 1.5:
+            payout_warn = (
+                f"\n⛔ *Payout ratio {_pr_pct:.0f}%* — paga mais em dividendos do que ganha. "
+                f"Dividendo em risco de corte."
+            )
+        else:
+            payout_warn = (
+                f"\n⚠️ *Payout ratio {_pr_pct:.0f}%* — acima de 100% dos lucros. "
+                f"Verifica se é FCF-based (REITs usam FFO) ou financiado por dívida."
+            )
+
     # FIX: pass sector as third argument (required by format_valuation_block)
     valuation_block = format_valuation_block(fundamentals, historical_pe, sector)
 
@@ -1066,6 +1083,7 @@ def build_alert(
         f"{plain_summary}\n"
         f"Sector: {sector_cfg.get('label', sector)} | ≈{mc_b:.1f}B\n"
         f"Hoje: *{change:+.1f}%* — ${price}{drawdown_str}{vol_flag}{insider_flag}{short_flag}{rsi_part}{sector_warn}\n"
+        f"{payout_warn}"
         f"{earn_warn}"
         f"{valuation_block}"
         f"\n*Categoria:* {category}\n"
