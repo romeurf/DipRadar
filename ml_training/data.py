@@ -219,6 +219,26 @@ def build_dataset(base_df: pd.DataFrame, price_cache: dict[str, pd.DataFrame], e
         tnx_hist = combined_macro_cache.get("^TNX")
         vix_hist = combined_macro_cache.get("^VIX")
         add_regime_features(fv, spy_slice, tnx_hist, alert_date, vix_hist)
+
+        # Fase 5: sinais de qualidade e sentimento (point-in-time usando hist já fetchado).
+        # Sem chamadas extra à rede — usa price_history local.
+        # Inclui: consecutive_red_days, ma_200d_ratio, insider_buy_recent (SEC EDGAR),
+        # earnings_beat_rate, analyst_rating, short_interest_pct (yfinance live).
+        # NOTA: insider/earnings/analyst chamam APIs externas → lento; silent-fail com NaN.
+        try:
+            from fundamental_signals import compute_fundamental_signals
+            _fase5 = compute_fundamental_signals(
+                ticker,
+                price_history=hist,  # já sliced point-in-time
+                alert_date=alert_date,
+                use_alphavantage=False,  # sem API key extra no treino
+                use_fmp=False,
+            )
+            for _k, _v in _fase5.items():
+                if _k in FEATURE_COLUMNS and _k not in fv:
+                    fv[_k] = float(_v) if math.isfinite(float(_v)) else float("nan")
+        except Exception as _e:
+            log.debug(f"[data] Fase5 signals {ticker}@{alert_date}: {_e}")
         entry_price = float(row.get("price", 0.0))
         if entry_price <= 0:
             entry_price = float(hist["Close"].iloc[-1]) if not hist.empty else 0.0

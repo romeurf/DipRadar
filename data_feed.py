@@ -408,6 +408,8 @@ def is_tiingo_available() -> bool:
     """Verifica se a chave Tiingo está configurada e funcional."""
     if not TIINGO_API_KEY:
         return False
+    if _tiingo_rate_limited:
+        return False  # rate limit atingido nesta sessão
     try:
         url = f"{TIINGO_BASE}/AAPL/prices"
         r   = requests.get(

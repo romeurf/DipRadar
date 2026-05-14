@@ -152,18 +152,26 @@ def _ensure_cik_map() -> None:
     global _CIK_MAP, _CIK_LOADED
     if _CIK_LOADED:
         return
-    import requests
-    r = requests.get(
-        "https://www.sec.gov/files/company_tickers.json",
-        headers=_EDGAR_HEADERS, timeout=20,
-    )
-    r.raise_for_status()
-    _CIK_MAP = {
-        v["ticker"].upper(): str(v["cik_str"]).zfill(10)
-        for v in r.json().values()
-        if "ticker" in v and "cik_str" in v
-    }
-    _CIK_LOADED = True
+    _CIK_LOADED = True  # marcar antes de tentar — evita retry storms
+    try:
+        import requests
+        r = requests.get(
+            "https://www.sec.gov/files/company_tickers.json",
+            headers=_EDGAR_HEADERS, timeout=20,
+        )
+        r.raise_for_status()
+        _CIK_MAP = {
+            v["ticker"].upper(): str(v["cik_str"]).zfill(10)
+            for v in r.json().values()
+            if "ticker" in v and "cik_str" in v
+        }
+        log.info(f"[insider] CIK map carregado: {len(_CIK_MAP)} tickers SEC")
+    except Exception as e:
+        log.error(
+            f"[insider] Falha a carregar CIK map do SEC EDGAR: {e}. "
+            f"insider_buy_recent retornará NaN para esta sessão."
+        )
+        _CIK_MAP = {}  # vazio — insider_buy_recent retorna NaN para todos
 
 
 def insider_buy_recent(ticker: str, lookback_days: int = 30) -> float:
