@@ -697,21 +697,27 @@ def run_training(
         log.info(f"[run_training] max_rows={max_rows} → {len(df)} rows")
 
     # Filtrar linhas com alpha_60d resolvido
-    # Target primário: alpha_90d — sem fallback.
-    # Se o parquet não tiver alpha_90d, regenera via:
-    #   python scripts/regenerate_training_base.py --targets-only
-    # ou no Railway via /admin_regen_parquet
-    from ml_training.config import PRIMARY_TARGET
-    _n_resolved = int(df[PRIMARY_TARGET].notna().sum()) if PRIMARY_TARGET in df.columns else 0
-    if _n_resolved < min_train * 2:
-        raise KeyError(
-            f"Parquet sem '{PRIMARY_TARGET}' suficiente ({_n_resolved} linhas resolvidas, "
-            f"mínimo={min_train*2}). "
-            f"Regenera o parquet: python scripts/regenerate_training_base.py --targets-only\n"
-            f"Ou no Railway: /admin_regen_parquet"
+    # Selecção do target: alpha_90d (preferencial) com fallback automático para
+    # alpha_60d se o parquet não tiver dados suficientes de 90d.
+    # Quando o parquet for regenerado com --targets-only, o próximo retrain
+    # usa automaticamente alpha_90d sem nenhuma intervenção manual.
+    from ml_training.config import PRIMARY_TARGET, PRIMARY_TARGET_FALLBACK
+    _n_90d = int(df[PRIMARY_TARGET].notna().sum()) if PRIMARY_TARGET in df.columns else 0
+    if _n_90d >= min_train * 2:
+        _active_target = PRIMARY_TARGET
+        log.info(f"[run_training] Target: {_active_target} ({_n_90d} linhas resolvidas)")
+    elif PRIMARY_TARGET_FALLBACK in df.columns and df[PRIMARY_TARGET_FALLBACK].notna().sum() >= min_train * 2:
+        _active_target = PRIMARY_TARGET_FALLBACK
+        log.warning(
+            f"[run_training] {PRIMARY_TARGET} insuficiente ({_n_90d} linhas) — "
+            f"fallback para {PRIMARY_TARGET_FALLBACK}. "
+            f"Corre /admin_regen_parquet --targets-only para activar o horizonte de 90d."
         )
-    _active_target = PRIMARY_TARGET
-    log.info(f"[run_training] Target: {_active_target} ({_n_resolved} linhas resolvidas)")
+    else:
+        raise KeyError(
+            f"Parquet sem target resolvido ({PRIMARY_TARGET}: {_n_90d} linhas). "
+            f"Corre /admin_regen_parquet --targets-only."
+        )
     n_pre = len(df)
     df = df[df[_active_target].notna()].reset_index(drop=True)
     log.info(f"[run_training] Target '{_active_target}' resolvido: {len(df)}/{n_pre}")
