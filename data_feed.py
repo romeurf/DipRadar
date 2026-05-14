@@ -193,7 +193,11 @@ def _yfinance_fetch(ticker: str, lookback_days: int) -> pd.DataFrame:
             "Price Date": "date",
             "index":      "date",
         })
-        raw["date"] = pd.to_datetime(raw["date"]).dt.tz_localize(None)
+        # tz_localize(None) num Series já timezone-naive lança TypeError.
+        # tz_convert(None) remove timezone de Series tz-aware (yfinance ≥0.2 devolve UTC).
+        # Esta verificação cobre ambos os casos sem exceções.
+        _dates = pd.to_datetime(raw["date"])
+        raw["date"] = _dates.dt.tz_convert(None) if _dates.dt.tz is not None else _dates
 
         if "Adj Close" not in raw.columns and "Close" in raw.columns:
             raw["Adj Close"] = raw["Close"]
