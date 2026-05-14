@@ -334,6 +334,117 @@ def _load_alert_db_as_training() -> pd.DataFrame:
 # Build training input from 3 sources
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _compute_alpha_90d_inline(df: pd.DataFrame) -> pd.DataFrame:
+    """Computa alpha_90d para as linhas que não o têm, usando o price cache local.
+
+    Usa /data/price_cache/ (criado por regen anteriores) ou descarrega via
+    yfinance se o cache não existir. É invocado automaticamente por
+    build_training_input() quando o merged parquet não tem alpha_90d.
+    """
+    import math, time
+    from pathlib import Path as _P
+
+    _cache_dir = _P("/data/price_cache") if _P("/data").exists() else _P("/tmp/price_cache")
+    _cache_dir.mkdir(parents=True, exist_ok=True)
+    _spy_hist: Optional[pd.DataFrame] = None
+
+    def _get_hist(ticker: str) -> Optional[pd.DataFrame]:
+        """Lê do cache ou descarrega via yfinance (sem raise_errors)."""
+        safe = ticker.replace("^", "_idx_").replace("/", "_")
+        pq = _cache_dir / f"{safe}.parquet"
+        if pq.exists():
+            try:
+                h = pd.read_parquet(pq)
+                h.index = pd.to_datetime(h.index)
+                idx = pd.DatetimeIndex(h.index)
+                if idx.tz is not None:
+                    h.index = idx.tz_convert(None)
+                return h
+            except Exception:
+                pass
+        try:
+            import yfinance as yf
+            h = yf.Ticker(ticker).history(start="1995-01-01", auto_adjust=True)
+            if h is None or h.empty:
+                return None
+            idx = pd.DatetimeIndex(h.index)
+            h.index = idx.tz_convert(None) if idx.tz is not None else idx
+            h = h[["Open", "High", "Low", "Close", "Volume"]]
+            try:
+                h.to_parquet(pq)
+            except Exception:
+                pass
+            time.sleep(0.3)
+            return h
+        except Exception as e:
+            log.debug(f"[inline_90d] {ticker}: {e}")
+            return None
+
+    # SPY para benchmark
+    _spy_hist = _get_hist("SPY")
+
+    df = df.copy()
+    from ml_training.config import PRIMARY_TARGET
+    if PRIMARY_TARGET not in df.columns:
+        df[PRIMARY_TARGET] = float("nan")
+
+    needs_mask = df[PRIMARY_TARGET].isna()
+    if not needs_mask.any():
+        return df
+
+    unique_tickers = df.loc[needs_mask, "ticker"].astype(str).unique() if "ticker" in df.columns else []
+    price_cache: dict = {}
+    for t in unique_tickers:
+        h = _get_hist(t)
+        if h is not None:
+            price_cache[t] = h
+
+    resolved = 0
+    for idx_val in df.index[needs_mask]:
+        row = df.loc[idx_val]
+        ticker = str(row.get("ticker", ""))
+        hist = price_cache.get(ticker)
+        if hist is None or hist.empty:
+            continue
+        try:
+            _ts = pd.Timestamp(row["alert_date"])
+            alert_date = _ts.tz_convert(None) if _ts.tz is not None else _ts
+            # Entry price from history
+            entry_slice = hist[hist.index <= alert_date]
+            if entry_slice.empty:
+                continue
+            price = float(entry_slice["Close"].iloc[-1])
+            if price <= 0:
+                continue
+            exit_date = alert_date + pd.Timedelta(days=90)
+            fwd = hist[(hist.index > alert_date) & (hist.index <= exit_date)]
+            if len(fwd) < 5:
+                continue
+            stock_ret = float(fwd["Close"].iloc[-1]) / price - 1.0
+            if not math.isfinite(stock_ret) or abs(stock_ret) > 2.0:
+                continue
+            # SPY benchmark
+            spy_ret = float("nan")
+            if _spy_hist is not None and not _spy_hist.empty:
+                sp_e = _spy_hist[_spy_hist.index <= alert_date]
+                sp_x = _spy_hist[(_spy_hist.index > alert_date) & (_spy_hist.index <= exit_date)]
+                if not sp_e.empty and not sp_x.empty:
+                    sp_p = float(sp_e["Close"].iloc[-1])
+                    if sp_p > 0:
+                        spy_ret = float(sp_x["Close"].iloc[-1]) / sp_p - 1.0
+            if math.isfinite(spy_ret):
+                alpha = math.log1p(stock_ret) - math.log1p(spy_ret)
+            else:
+                alpha = stock_ret  # sem benchmark, usa retorno absoluto
+            df.at[idx_val, PRIMARY_TARGET] = round(alpha, 6)
+            resolved += 1
+        except Exception:
+            pass
+
+    log.info(f"[inline_90d] Resolvidos {resolved}/{needs_mask.sum()} rows")
+    return df
+
+
 def build_training_input(include_snapshot: bool = True,
                          include_alert_db: bool = True) -> Path:
     """Concat: bootstrap + alert_db + snapshot (matured).
@@ -423,6 +534,17 @@ def build_training_input(include_snapshot: bool = True,
         subset=[dedup_col, "alert_date"], keep="last"
     ).drop(columns=["_prio", "_source"])
     log.info(f"[input] After dedup ({dedup_col}, alert_date): {len(merged)} rows")
+
+    # ── Computar alpha_90d inline se estiver em falta ───────────────────────
+    # Garante que o merged parquet tem sempre alpha_90d antes do treino,
+    # independentemente da origem dos dados ou do estado do bootstrap.
+    from ml_training.config import PRIMARY_TARGET
+    _n_90d = int(merged[PRIMARY_TARGET].notna().sum()) if PRIMARY_TARGET in merged.columns else 0
+    if _n_90d < 200:
+        log.info(f"[input] alpha_90d em falta ({_n_90d} linhas) — a computar inline...")
+        merged = _compute_alpha_90d_inline(merged)
+        _n_90d_after = int(merged[PRIMARY_TARGET].notna().sum()) if PRIMARY_TARGET in merged.columns else 0
+        log.info(f"[input] alpha_90d resolvido inline: {_n_90d_after}/{len(merged)}")
 
     TRAINING_INPUT.parent.mkdir(parents=True, exist_ok=True)
     merged.to_parquet(TRAINING_INPUT, index=False)

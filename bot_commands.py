@@ -1290,50 +1290,6 @@ def _handle_admin_retrain(parts: list[str]) -> None:
     def _run() -> None:
         global _retrain_running
         _retrain_running = True
-        # ── Passo 0: garantir que o parquet tem alpha_90d ────────────────────
-        # Se não tiver, gera os targets automaticamente antes de treinar.
-        # O utilizador não precisa de correr /admin_regen_parquet manualmente.
-        if not dry_run:
-            import subprocess as _sp, sys as _sys
-            from pathlib import Path as _Path
-            _data_dir = _Path("/data") if _Path("/data").exists() else _Path("/tmp")
-            _pq_data  = _data_dir / "ml_training_base.parquet"
-            _pq_repo  = _Path(__file__).parent / "ml_training_base.parquet"
-
-            # Determinar o parquet de input
-            _in_pq = _pq_data if _pq_data.exists() else _pq_repo
-
-            # Verificar se alpha_90d está resolvido
-            _needs_targets = True
-            try:
-                import pandas as _pd
-                _df_chk = _pd.read_parquet(_in_pq, columns=["alpha_90d"])
-                if _df_chk["alpha_90d"].notna().sum() >= 200:
-                    _needs_targets = False
-            except Exception:
-                pass
-
-            if _needs_targets:
-                _reply(
-                    "Parquet sem alpha-90d. A gerar targets antes do treino...\n"
-                    "Pode demorar 10-30 min. O bot continua a funcionar."
-                )
-                _script = _Path(__file__).parent / "scripts" / "regenerate_training_base.py"
-                _cache  = _data_dir / "price_cache"
-                _regen_args = [
-                    _sys.executable, str(_script),
-                    "--targets-only",
-                    "--in",    str(_in_pq),
-                    "--out",   str(_pq_data),
-                    "--cache", str(_cache),
-                ]
-                _rr = _sp.run(_regen_args, capture_output=True, text=True, timeout=4 * 3600)
-                if _rr.returncode != 0:
-                    _reply(f"Geracao de targets falhou (exit {_rr.returncode}).\n{(_rr.stderr or '')[-400:]}")
-                    _retrain_running = False
-                    return
-                _reply("Targets gerados com sucesso. A treinar o modelo...")
-
         start_ts = time.time()
         try:
             from monthly_retrain import run_monthly_retrain_v3
