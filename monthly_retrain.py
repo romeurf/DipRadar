@@ -351,6 +351,15 @@ def build_training_input(include_snapshot: bool = True,
             f"[input] {BOOTSTRAP_PATH} ausente — fallback para parquet do repo "
             f"({BOOTSTRAP_FALLBACK})."
         )
+        # Copiar o parquet do repo para /data/ imediatamente para que deploys
+        # futuros não percam o parquet regenerado (que é escrito em /data/).
+        try:
+            import shutil
+            BOOTSTRAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(BOOTSTRAP_FALLBACK, BOOTSTRAP_PATH)
+            log.info(f"[input] Parquet copiado para {BOOTSTRAP_PATH} — futuras regens escrevem aqui.")
+        except Exception as _cp_err:
+            log.warning(f"[input] Falha ao copiar para /data/: {_cp_err}")
     elif LEGACY_BOOTSTRAP_PATH.exists():
         bootstrap_src = LEGACY_BOOTSTRAP_PATH
         log.warning(

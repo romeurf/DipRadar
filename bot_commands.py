@@ -1177,25 +1177,27 @@ def _handle_admin_regen_parquet(parts: list[str]) -> None:
             script = Path(__file__).parent / "scripts" / "regenerate_training_base.py"
             args   = [sys.executable, str(script)] + flags
 
-            # Path do parquet (Railway Volume)
+            # Path do parquet
             data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
-            pq = data_dir / "ml_training_base.parquet"
-            if not pq.exists():
-                # Tenta o nome legacy
+            # OUTPUT: SEMPRE em /data/ para persistir entre deploys.
+            # Se escrevermos no repo (/app/), o próximo deploy sobrescreve e
+            # o alpha_90d gerado é perdido.
+            out_pq = data_dir / "ml_training_base.parquet"
+
+            # INPUT: /data/ se existir; senão lê do repo como base.
+            in_pq = out_pq
+            if not in_pq.exists():
                 for alt in [data_dir / "ml_training_merged.parquet",
                              Path(__file__).parent / "ml_training_base.parquet"]:
                     if alt.exists():
-                        pq = alt
+                        in_pq = alt
                         break
 
-            if not pq.exists():
-                _reply(
-                    "❌ *Regeneração falhou:* parquet de treino não encontrado.\n"
-                    "_Faz `/admin_retrain dry-run` para verificar os paths._"
-                )
+            if not in_pq.exists():
+                _reply("Regeneracao falhou: parquet de treino nao encontrado.")
                 return
 
-            args += ["--in", str(pq), "--out", str(pq)]
+            args += ["--in", str(in_pq), "--out", str(out_pq)]
             # Cache em /data/ (persistido no Railway Volume) para não perder
             # o progresso em restarts. /tmp seria apagado e obrigaria re-download.
             cache_dir = data_dir / "price_cache"
