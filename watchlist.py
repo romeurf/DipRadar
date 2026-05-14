@@ -207,11 +207,16 @@ def _get_ticker_data(symbol: str) -> dict | None:
         sector     = info.get("sector") or ""
 
         div_yield_raw = float(info.get("dividendYield") or 0)
-        # yfinance é inconsistente: alguns tickers devolvem decimal (0.0517 = 5.17%),
-        # outros devolvem directamente em percentagem (5.17 = 5.17%).
-        # Heurística: se o valor >= 1.0, assume que já está em percentagem;
-        # se < 1.0, converte de decimal para percentagem.
+        # yfinance é inconsistente entre tickers:
+        #   decimal  (0.0517 = 5.17%) → multiplicar por 100
+        #   percent  (5.17   = 5.17%) → usar como está
+        # Heurística: >= 1.0 assume percentagem; < 1.0 converte de decimal.
         div_yield = div_yield_raw if div_yield_raw >= 1.0 else div_yield_raw * 100
+        # Cap de segurança: yields > 25% são quase sempre erros de dados da yfinance
+        # (ex: TSM devolve 0.95 que depois × 100 = 95%; AVGO devolve 62.0 directamente).
+        # Para estes casos, mostramos 0 em vez de enganar.
+        if div_yield > 25.0:
+            div_yield = 0.0
 
         # Payout ratio: dividendos pagos / lucro líquido.
         # > 1.0 (>100%) significa que a empresa paga mais do que ganha — red flag.
