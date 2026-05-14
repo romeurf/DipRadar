@@ -78,7 +78,10 @@ _MIN_DAYS_60D = 62  # 60 dias de calendário + 2 dias de buffer para fecho de me
 
 
 def _ensure_header() -> None:
-    """Cria o ficheiro CSV com cabeçalho se não existir."""
+    """Cria o ficheiro CSV com cabeçalho se não existir.
+    Se existir mas o schema tiver mudado (ex: campos novos adicionados),
+    migra o header automaticamente sem perder dados.
+    """
     if not _DB_PATH.exists():
         try:
             _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -91,6 +94,40 @@ def _ensure_header() -> None:
             logging.info(f"[alert_db] Criado: {_DB_PATH}")
         except Exception as e:
             logging.warning(f"[alert_db] Erro ao criar header: {e}")
+        return
+
+    # Verificar se o schema está actualizado
+    try:
+        with _DB_PATH.open("r", newline="", encoding="utf-8") as f:
+            first_line = f.readline()
+        # Extrair campos do header actual (remover aspas e whitespace)
+        current_fields = [c.strip().strip('"') for c in first_line.strip().split(",")]
+        if current_fields == _FIELDS:
+            return  # Schema OK — nada a fazer
+
+        # Header desactualizado: substituir a primeira linha pelo novo header,
+        # mantendo TODOS os dados existentes intactos.
+        # Linhas com schema novo (37 cols) passam a ser lidas correctamente;
+        # linhas antigas (35 cols) ficam com NaN nos campos novos — aceitável.
+        with _DB_PATH.open("r", encoding="utf-8") as f:
+            all_lines = f.readlines()
+
+        # Gerar novo header string
+        import io as _io
+        buf = _io.StringIO()
+        csv.DictWriter(buf, fieldnames=_FIELDS, quoting=csv.QUOTE_NONNUMERIC).writeheader()
+        new_header_line = buf.getvalue()
+
+        with _DB_PATH.open("w", encoding="utf-8") as f:
+            f.write(new_header_line)
+            f.writelines(all_lines[1:])  # Preserva todas as linhas de dados
+
+        logging.info(
+            f"[alert_db] Schema migrado: {len(current_fields)} → {len(_FIELDS)} campos. "
+            f"{len(all_lines)-1} linhas preservadas."
+        )
+    except Exception as e:
+        logging.warning(f"[alert_db] Erro ao verificar/migrar header: {e}")
 
 
 def _safe_volume_ratio(vol: float | None, avg_vol: float | None) -> float | str:
