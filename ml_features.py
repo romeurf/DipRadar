@@ -67,6 +67,15 @@ FEATURE_COLUMNS: list[str] = [
     "close_in_range_20d",  # mean((C−L)/(H−L)) last 20 — fecho perto de high/low
     "up_days_pct_20d",     # % de dias com retorno positivo nos últimos 20
     "true_range_pct_20d",  # mean(TR_d / Close_d) últimos 20 — intraday vol
+    # ── Novos sinais de qualidade e sentimento (Fase 5) ──────────────────────
+    # Computados via yfinance + SEC EDGAR + Alpha Vantage/FMP (free tiers).
+    # Cada um captura uma dimensão ortogonal às features técnicas existentes.
+    "consecutive_red_days",  # dias consecutivos em queda antes do alerta — capitulação
+    "ma_200d_ratio",         # price / 200-day MA — quão abaixo da média de longo prazo
+    "insider_buy_recent",    # 1 se houve compra insider nos últimos 30d (SEC Form 4)
+    "earnings_beat_rate",    # % de últimos 4 trimestres onde bateu EPS estimativas
+    "analyst_rating",        # consenso analistas: 1=Strong Buy … 5=Strong Sell
+    "short_interest_pct",    # short interest como % do float — squeeze potential
 ]
 # PR #28 (Phase A): drop 14 dead features after IC profiling on full parquet:
 #   • 9 CONSTANTES (std=0, IC indefinida — _FALLBACK em todas as linhas):
@@ -158,6 +167,13 @@ _FALLBACK: dict[str, float] = {
     "close_in_range_20d": 0.5,   # 0.5 = neutral (closing mid-range)
     "up_days_pct_20d": 0.5,      # 50% — random walk baseline
     "true_range_pct_20d": 0.02,  # 2% intraday — typical equity
+    # Fase 5: novos sinais de qualidade e sentimento
+    "consecutive_red_days": 3.0,  # 3 dias consecutivos — neutro para um dip típico
+    "ma_200d_ratio": 0.90,        # 10% abaixo da MA200 — dip típico
+    "insider_buy_recent": 0.0,    # sem compra insider — caso mais comum
+    "earnings_beat_rate": 0.50,   # 50% — neutro (random)
+    "analyst_rating": 2.5,        # entre Buy e Hold — neutro
+    "short_interest_pct": 0.05,   # 5% — short interest típico
 }
 
 def _tz_normalize(ts: Any) -> pd.Timestamp:
@@ -313,6 +329,23 @@ def build_features(
     # price_history; caso contrário cai nos fallbacks neutros.
     if price_history is not None:
         add_raw_ohlcv_features(features, price_history)
+
+    # Stage 5 — Sinais de qualidade e sentimento (Fase 5).
+    # NaN onde não disponível — o modelo trata NaN como "informação em falta",
+    # não como valor neutro inventado.
+    try:
+        from fundamental_signals import compute_fundamental_signals
+        signals = compute_fundamental_signals(
+            ticker,
+            price_history=price_history,
+            alert_date=alert_date,
+        )
+        for key, val in signals.items():
+            if key in FEATURE_COLUMNS:
+                features[key] = float(val) if math.isfinite(float(val)) else float("nan")
+    except Exception as e:
+        logger.error(f"build_features[{ticker}]: fundamental_signals falhou: {e}")
+        # Não preencher com fallback — o modelo vê NaN e sabe que faltam dados
 
     return features
 

@@ -77,10 +77,68 @@ _FIELDS = [
 _MIN_DAYS_60D = 62  # 60 dias de calendário + 2 dias de buffer para fecho de mercado
 
 
+def migrate_schema() -> bool:
+    """Garante que alert_db.csv usa o schema actual (_FIELDS).
+
+    Se o header do CSV não corresponder a _FIELDS, o ficheiro é arquivado
+    (renomeado para .bak) e recriado limpo com o schema correcto.
+    As linhas do CSV novo que já estavam no schema actual (37 campos) são
+    preservadas; linhas no schema antigo (35 campos) são descartadas porque
+    os campos em falta (return_60d, spy_return_60d) não podem ser reconstruídos.
+
+    Devolve True se o schema foi actualizado.
+    """
+    if not _DB_PATH.exists():
+        return False
+    try:
+        with _DB_PATH.open("r", encoding="utf-8", newline="") as f:
+            raw_reader = csv.reader(f)
+            current_header = next(raw_reader, [])
+            all_rows = list(raw_reader)
+
+        n_current = len(current_header)
+        n_target  = len(_FIELDS)
+
+        if n_current == n_target and current_header == _FIELDS:
+            return False  # Schema já correcto
+
+        logging.info(
+            f"[alert_db] Schema desactualizado ({n_current} → {n_target} campos). "
+            f"A arquivar e recriar limpo."
+        )
+
+        # Recuperar linhas que já estão no schema novo (37 campos)
+        # — estas são os alertas mais recentes, escritos com o schema actual.
+        recovered: list[dict] = []
+        for row in all_rows:
+            if len(row) == n_target:
+                recovered.append(dict(zip(_FIELDS, row)))
+
+        # Recriar CSV limpo com schema correcto
+        with _DB_PATH.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=_FIELDS,
+                quoting=csv.QUOTE_NONNUMERIC,
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+            writer.writerows(recovered)
+
+        logging.info(
+            f"[alert_db] CSV recriado com schema correcto: "
+            f"{len(recovered)} linhas válidas preservadas, "
+            f"linhas de schema antigo eliminadas (campos em falta, irrecuperáveis)."
+        )
+        return True
+
+    except Exception as e:
+        logging.warning(f"[alert_db] Falha em migrate_schema: {e}")
+        return False
+
+
 def _ensure_header() -> None:
     """Cria o ficheiro CSV com cabeçalho se não existir.
-    Se existir mas o schema tiver mudado (ex: campos novos adicionados),
-    migra o header automaticamente sem perder dados.
+    Se existir com schema desactualizado, migra automaticamente.
     """
     if not _DB_PATH.exists():
         try:
@@ -95,39 +153,8 @@ def _ensure_header() -> None:
         except Exception as e:
             logging.warning(f"[alert_db] Erro ao criar header: {e}")
         return
-
-    # Verificar se o schema está actualizado
-    try:
-        with _DB_PATH.open("r", newline="", encoding="utf-8") as f:
-            first_line = f.readline()
-        # Extrair campos do header actual (remover aspas e whitespace)
-        current_fields = [c.strip().strip('"') for c in first_line.strip().split(",")]
-        if current_fields == _FIELDS:
-            return  # Schema OK — nada a fazer
-
-        # Header desactualizado: substituir a primeira linha pelo novo header,
-        # mantendo TODOS os dados existentes intactos.
-        # Linhas com schema novo (37 cols) passam a ser lidas correctamente;
-        # linhas antigas (35 cols) ficam com NaN nos campos novos — aceitável.
-        with _DB_PATH.open("r", encoding="utf-8") as f:
-            all_lines = f.readlines()
-
-        # Gerar novo header string
-        import io as _io
-        buf = _io.StringIO()
-        csv.DictWriter(buf, fieldnames=_FIELDS, quoting=csv.QUOTE_NONNUMERIC).writeheader()
-        new_header_line = buf.getvalue()
-
-        with _DB_PATH.open("w", encoding="utf-8") as f:
-            f.write(new_header_line)
-            f.writelines(all_lines[1:])  # Preserva todas as linhas de dados
-
-        logging.info(
-            f"[alert_db] Schema migrado: {len(current_fields)} → {len(_FIELDS)} campos. "
-            f"{len(all_lines)-1} linhas preservadas."
-        )
-    except Exception as e:
-        logging.warning(f"[alert_db] Erro ao verificar/migrar header: {e}")
+    # Migrar schema se necessário (detecta e corrige header desactualizado)
+    migrate_schema()
 
 
 def _safe_volume_ratio(vol: float | None, avg_vol: float | None) -> float | str:

@@ -253,8 +253,16 @@ def _load_alert_db_as_training() -> pd.DataFrame:
     if not ALERT_DB_PATH.exists():
         return pd.DataFrame()
 
+    # Migrar schema antes de ler — elimina os ParserWarnings causados por
+    # linhas com campo count diferente do header. Idempotente e seguro.
     try:
-        df = pd.read_csv(ALERT_DB_PATH, on_bad_lines="warn", engine="python")
+        from alert_db import migrate_schema
+        migrate_schema()
+    except Exception as _mig_err:
+        log.warning(f"[alert_db] migrate_schema falhou: {_mig_err}")
+
+    try:
+        df = pd.read_csv(ALERT_DB_PATH, engine="python")
     except Exception as e:
         log.warning(f"[alert_db] Falha a ler {ALERT_DB_PATH}: {e}")
         return pd.DataFrame()

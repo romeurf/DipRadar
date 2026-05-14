@@ -1790,6 +1790,16 @@ def run_daily_backup() -> None:
 def main() -> None:
     global _alerted_today
 
+    # Migrar alert_db.csv para o schema actual no arranque.
+    # Elimina os ParserWarnings "Expected 35 fields, saw 37" causados por
+    # campos adicionados (return_60d, spy_return_60d) depois do CSV ser criado.
+    try:
+        from alert_db import migrate_schema
+        if migrate_schema():
+            logging.info("[main] alert_db.csv migrado para schema actual.")
+    except Exception as _e:
+        logging.warning(f"[main] alert_db migrate_schema: {_e}")
+
     bot_commands.setup(
         send_fn=send_telegram,
         analyze_fn=analyze_ticker,

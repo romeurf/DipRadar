@@ -68,6 +68,13 @@ FEATURE_COLS: list[str] = [
     "close_in_range_20d",
     "up_days_pct_20d",
     "true_range_pct_20d",
+    # Fase 5: sinais de qualidade e sentimento
+    "consecutive_red_days",
+    "ma_200d_ratio",
+    "insider_buy_recent",
+    "earnings_beat_rate",
+    "analyst_rating",
+    "short_interest_pct",
 ]
 # Features removidas vs PR #25 (Spearman IC profiling sobre o parquet completo
 # 36929 rows confirmou 14 features inúteis):

@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(python -m unittest tests.test_production_quality tests.test_red_flags_and_conflict)",
+      "Bash(python -c \"from alert_db import migrate_schema, _FIELDS; print\\(f'alert_db OK — {len\\(_FIELDS\\)} campos'\\)\")"
     ]
   }
 }
