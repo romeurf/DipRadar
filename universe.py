@@ -39,12 +39,45 @@ _CACHE_DAYS = 7
 ETF_TICKERS: set[str] = {
     "EUNL.DE",  # iShares Core MSCI World UCITS ETF (carteira)
     "IEMA",    # iShares MSCI EM ESG Leaders (watchlist)
-    "IS3N.L",  # alias antigo — manter por compatibilidade com alertas guardados
-    # Acrescenta outros ETFs aqui se necessaire
+    "IS3N.L",  # alias antigo
     "IWDA.AS", "CSPX.L", "VUSA.L", "VWRL.L", "VWCE.DE",
     "EMIM.L",  "IQQQ.DE", "XDWD.DE", "DBXD.DE", "EEM",
     "SPY",     "QQQ",     "IVV",    "VTI",    "VOO",
     "GLD",     "SLV",     "TLT",    "HYG",    "LQD",
+}
+
+# Tickers delisted ou adquiridos — removidos do universo ML.
+# Atualizar sempre que o S&P 500 / STOXX 600 tiver mudanças de composição.
+# Fonte: yfinance "possibly delisted" errors nos logs do Railway.
+_KNOWN_DELISTED: set[str] = {
+    # Adquiridos (M&A) — já não existem como tickers independentes
+    "DFS",     # Discover Financial → adquirido pela Capital One (2024)
+    "HES",     # Hess → adquirido pela Chevron (2024)
+    "JNPR",    # Juniper Networks → adquirido pela HPE (2024)
+    "K",       # Kellanova → adquirido pela Mars (2024)
+    "MRO",     # Marathon Oil → adquirido pela ConocoPhillips (2024)
+    "PARA",    # Paramount → fusão/aquisição (2024)
+    "WBA",     # Walgreens → going private (2024)
+    "IPG",     # Interpublic → adquirido pela Omnicom (2024)
+    "MMC",     # Marsh McLennan → verificar; pode ser ticker inalterado
+    "SGEN",    # Seagen → adquirido pela Pfizer (2023)
+    "BCR",     # Bard → adquirido pela BD (ticker BCR não mais existe)
+    "WYDAY",   # Workday → ticker obsoleto
+    # Europa — delisted
+    "CSGN.SW", # Credit Suisse → adquirido pelo UBS (2023)
+    "STM.MI",  # ST Micro Milan → verificar duplicado (STM é o ticker US)
+    "FCA.MI",  # Fiat Chrysler → fusão em Stellantis (STLA)
+    "CRH.I",   # CRH Dublin → migrado para NYSE (CRH)
+    "KYGA.I",  # Kerry Group Ireland → ticker mudou
+    # London
+    "EVR.L",   # Evraz → delisted por sanções Rússia (2022)
+    "SMDS.L",  # Smith DS → adquirido / ticker mudou
+    "NEXT.L",  # Next Plc → verificar; pode ser ticker incorreto
+    "PHNX.L",  # Phoenix Group → verificar ticker
+    "WRK",     # WestRock → fusão com Smurfit (2024)
+    "CTLT",    # Catalent → adquirido pela Novo Holdings (2024)
+    "DAY",     # Dayforce (antigo Ceridian) → ticker mudou de CDAY
+    "FI",      # Fiserv → ticker pode ter mudado para FI mas sem timezone = possível erro
 }
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -306,7 +339,7 @@ def get_ml_universe() -> list[str]:
     em vez de silenciosamente processar 0 tickers.
     """
     full     = get_full_universe()
-    filtered = [t for t in full if t not in ETF_TICKERS]
+    filtered = [t for t in full if t not in ETF_TICKERS and t not in _KNOWN_DELISTED]
     excluded = len(full) - len(filtered)
     logging.info(f"[universe] ML universe: {len(filtered)} tickers ({excluded} ETFs excluídos)")
 

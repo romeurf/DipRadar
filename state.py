@@ -136,7 +136,13 @@ def append_weekly_log(entry: dict) -> None:
 # ── Rejected log ──────────────────────────────────────────────────────────
 
 def load_rejected_log() -> list:
-    return _load_json("rejected_log.json", [])
+    data = _load_json("rejected_log.json", [])
+    # append_rejected_log() escreve {"entries": [...]}.
+    # load_rejected_log() devolvia o dict inteiro → sorted() iterava sobre
+    # as chaves ("entries") → AttributeError 'str' has no attribute 'get'.
+    if isinstance(data, dict):
+        return data.get("entries", [])
+    return data if isinstance(data, list) else []
 
 
 def append_rejected_log(entry: dict) -> None:

@@ -654,7 +654,9 @@ def suggest_position_size(
     spy_change:    float | None = None,
 ) -> tuple[float, str]:
     if not FLIP_FUND_EUR or FLIP_FUND_EUR <= 0:
-        return 0.0, "⚠️ FLIP_FUND_EUR não configurado"
+        # Sem fund configurado: retorna string vazia (sem ruído em alertas de monitoring).
+        # Para activar: define FLIPFUNDEUR=<valor> nas env vars do Railway.
+        return 0.0, ""
 
     raw       = FLIP_FUND_EUR * (score / 100.0)
     beta_val  = max(0.0, min(float(beta or 1.0), 3.0))

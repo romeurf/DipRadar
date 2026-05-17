@@ -953,34 +953,31 @@ def _build_plain_summary(
     else:
         queda = f"caiu {abs_change:.1f}%"
 
+    # Sem italic _..._ — o em-dash (—) dentro de italic causa Markdown 400 em alguns stocks.
+    # Plain text para a frase 2, bold apenas onde seguro.
     frase1 = f"*{name}* {queda} hoje."
 
-    # Frase 2 — o que fazer
     if verdict == "COMPRAR" and ml_result is not None and ml_result.model_ready:
         wp = ml_result.win_prob
         hold = {"LONG_TERM": "longo prazo", "6M": "~6 meses", "90D": "~90 dias"}.get(
             ml_result.recommended_hold, "90 dias"
         )
-        if ml_result.position_size_pct > 0:
-            sz = f"Sugiro alocar ~{ml_result.position_size_pct*100:.0f}% do portefólio, hold {hold}."
-        else:
-            sz = f"Hold {hold}."
-        frase2 = f"_Modelo vê {wp:.0%} de probabilidade de bater o mercado. {sz}_"
+        sz = (f"Sugiro alocar ~{ml_result.position_size_pct*100:.0f}% do portfolio, hold {hold}."
+              if ml_result.position_size_pct > 0 else f"Hold {hold}.")
+        frase2 = f"Modelo ve {wp:.0%} de probabilidade de bater o mercado. {sz}"
 
     elif verdict == "COMPRAR":
-        if dip_score >= 85:
-            frase2 = f"_Score fundamental muito forte ({dip_score:.0f}/100) — oportunidade de compra clara._"
-        else:
-            frase2 = f"_Score {dip_score:.0f}/100 — queda com suporte fundamental._"
+        frase2 = ("Score fundamental forte." if dip_score >= 85
+                  else f"Score {dip_score:.0f}/100, queda com suporte fundamental.")
 
     elif verdict == "MONITORIZAR":
         if ml_result is not None and ml_result.model_ready and ml_result.win_prob > 0.55:
-            frase2 = f"_Score intermédio ({dip_score:.0f}/100) mas ML optimista ({ml_result.win_prob:.0%}). Monitorizar._"
+            frase2 = f"Score {dip_score:.0f}/100, ML optimista ({ml_result.win_prob:.0%}). Monitorizar."
         else:
-            frase2 = f"_Score {dip_score:.0f}/100 — ainda não reúne todos os critérios. Aguardar._"
+            frase2 = f"Score {dip_score:.0f}/100. Ainda nao reune todos os criterios. Aguardar."
 
-    else:  # EVITAR
-        frase2 = f"_Score fraco ({dip_score:.0f}/100) — sem suporte fundamental. Evitar._"
+    else:
+        frase2 = f"Score fraco ({dip_score:.0f}/100). Sem suporte fundamental."
 
     return f"{frase1}\n{frase2}"
 
