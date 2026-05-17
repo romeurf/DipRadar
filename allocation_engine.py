@@ -142,6 +142,10 @@ class AllocationContext:
     # A visão: "não compres mais do que isto porque já atingiste o teu limite de
     # exposição ao setor Tecnológico." Cap sector: 35% portfolio por defeito.
     existing_sector_pct:   float                = 0.0      # 0.15 = 15% do portfolio
+    # Correlação de retornos com posições existentes (Pearson, 90d).
+    # NVDA+AMD têm correlação >0.85 — entrar em ambas duplica risco real.
+    # 0 = sem correlação, 1 = correlação total. Penaliza a partir de 0.65.
+    portfolio_correlation: float                = 0.0      # [0, 1]
     drawdown_52w:          float | None         = None     # negativo (-0.35) ou None
     dividend_yield:        float | None         = None     # 0.025 = 2.5%
     classify_category:     str | None           = None     # legado — output de classify_dip_category
@@ -411,7 +415,22 @@ def _size(ctx: AllocationContext, category: str) -> tuple[float, float, list[str
         amount *= _SECTOR_BONUS
         notes.append(f"Sector premium ×{_SECTOR_BONUS:.2f}")
 
-    # 5) Sector concentration cap — a visão do DipRadar exige limite por sector.
+    # 5) Correlação de retornos com posições existentes.
+    # Se o novo stock se move muito em sincronia com o que já tens, o risco
+    # real é muito maior do que a concentração por ticker sugere.
+    # Penalidade: linear de 0 entre 0.65 e 0.90 de correlação.
+    _corr = float(ctx.portfolio_correlation)
+    if category not in (CAT_CORE, CAT_PASS) and _corr > 0.65:
+        _corr_penalty = min(1.0, (_corr - 0.65) / 0.25)  # 0→1 de 0.65→0.90
+        _corr_mult    = 1.0 - _corr_penalty * 0.6          # até -60% no sizing
+        if _corr_mult < 0.4:
+            notes.append(
+                f"Correlação com carteira {_corr:.2f} — demasiado correlacionado, "
+                f"sizing reduzido em {(1-_corr_mult)*100:.0f}%"
+            )
+        amount *= _corr_mult
+
+    # 6) Sector concentration cap — a visão do DipRadar exige limite por sector.
     # Default: 35% do portfolio máximo num único sector.
     # Garante diversificação e evita risco concentrado em Tech ou Energy.
     _SECTOR_CAP = float(os.environ.get("SECTOR_CONCENTRATION_CAP", "0.35"))

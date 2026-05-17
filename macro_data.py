@@ -242,6 +242,59 @@ def _fetch_pmi_proxy() -> float:
 FRED_SERIES_T10Y2Y = "T10Y2Y"
 
 
+def get_sector_stress_count(sector_etf_map: dict | None = None) -> int:
+    """Conta quantos sectores estão em stress simultâneo (queda ≥ 2% em 5 dias).
+
+    Quando ≥ 3 sectores caem em simultâneo, é rotação sectorial agressiva
+    ou início de bear market — não é um dip pontual. O sistema eleva o
+    threshold mínimo de score para entrar em novas posições.
+
+    Retorna: número de sectores (0-11) com queda ≥ 2% nos últimos 5 dias.
+    """
+    _SECTOR_ETFS = sector_etf_map or {
+        "XLK": "Technology", "XLF": "Financials", "XLV": "Healthcare",
+        "XLY": "Consumer Cyclical", "XLP": "Consumer Defensive",
+        "XLI": "Industrials", "XLE": "Energy", "XLU": "Utilities",
+        "XLRE": "Real Estate", "XLB": "Materials", "XLC": "Communication",
+    }
+    stress_count = 0
+    try:
+        for etf in _SECTOR_ETFS:
+            pct = _fetch_pct_change_5d(etf)
+            if pct <= -2.0:
+                stress_count += 1
+                logger.debug(f"[sector_stress] {etf}: {pct:.1f}% ← stress")
+    except Exception as e:
+        logger.warning(f"get_sector_stress_count: {e}")
+    return stress_count
+
+
+def get_dynamic_min_score(base_min_score: float = 30.0) -> float:
+    """Calcula o score mínimo dinâmico baseado no stress sectorial.
+
+    Se ≥ 3 sectores estiverem em stress, o sistema eleva o threshold:
+      0-2 sectores em stress → score mínimo base (sem ajuste)
+      3-4 sectores em stress → +15 pontos (mais selectivo)
+      5+ sectores em stress  → +25 pontos (muito selectivo — mercado em stress)
+
+    Protege contra "apanhar facas" em bear markets disfarçados de dips pontuais.
+    """
+    try:
+        stress = get_sector_stress_count()
+        if stress >= 5:
+            adj = 25.0
+            logger.info(f"[macro_overlay] {stress} sectores em stress — threshold +25")
+        elif stress >= 3:
+            adj = 15.0
+            logger.info(f"[macro_overlay] {stress} sectores em stress — threshold +15")
+        else:
+            adj = 0.0
+        return base_min_score + adj
+    except Exception as e:
+        logger.warning(f"get_dynamic_min_score: {e}")
+        return base_min_score
+
+
 def _compute_macro_score(
     vix: float,
     spy_5d: float,

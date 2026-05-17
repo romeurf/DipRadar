@@ -1134,6 +1134,44 @@ def _handle_admin_test_feed(parts: list[str]) -> None:
     threading.Thread(target=_run, daemon=True, name="test-feed").start()
 
 
+# ── /ml_accuracy ─────────────────────────────────────────────────────────────────
+
+def _handle_ml_accuracy() -> None:
+    """Mede a precisao real do modelo comparando predicoes com outcomes reais.
+    Este e o backtest continuo que fecha o loop alerta -> resultado -> modelo.
+    """
+    def _run():
+        try:
+            from prediction_log import compute_ml_accuracy
+            acc = compute_ml_accuracy()
+            if acc.get("skipped"):
+                _reply(f"ML Accuracy: {acc.get('reason', 'sem dados')}")
+                return
+            n    = acc["n_resolved"]
+            prec = acc["precision"]
+            rec  = acc["recall"]
+            accu = acc["accuracy"]
+            f1   = acc["f1"]
+            brier = acc["brier_live"]
+            win_r = acc["win_rate_actual"]
+            lines = [
+                f"ML Accuracy ({n} predicoes com outcome resolvido)",
+                "",
+                f"Precision: {prec:.0%}  (de cada COMPRAR, quantos ganharam)",
+                f"Recall: {rec:.0%}  (de todos os ganhos, quantos identificamos)",
+                f"Accuracy: {accu:.0%}  (total de acertos)",
+                f"F1 Score: {f1:.3f}  (equilibrio precision/recall)",
+                f"Brier live: {brier:.4f}  (calibracao das probabilidades)",
+                f"Win rate real: {win_r:.0%}  (stocks que efectivamente subiram)",
+                "",
+                f"TP:{acc['tp']}  FP:{acc['fp']}  FN:{acc['fn']}  TN:{acc['tn']}",
+            ]
+            _reply("\n".join(lines))
+        except Exception as e:
+            _reply(f"Erro ao calcular accuracy: {e}")
+    threading.Thread(target=_run, daemon=True).start()
+
+
 # ── /admin_check_config ──────────────────────────────────────────────────────────
 
 def _handle_admin_check_config() -> None:
@@ -2520,6 +2558,9 @@ def _handle_command(text: str) -> None:
 
     elif cmd in ("/admin_check_config", "/check_config"):
         _handle_admin_check_config()
+
+    elif cmd in ("/ml_accuracy", "/backtest_ml"):
+        _handle_ml_accuracy()
 
     elif cmd in ("/admin_regen_parquet", "/regen_parquet"):
         _handle_admin_regen_parquet(parts)

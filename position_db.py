@@ -96,6 +96,11 @@ class PositionRecord:
     last_checked_date:    Optional[str]          = None
     thesis_health:        str                    = "STRONG"
 
+    # Alpha inicial previsto pelo ML no momento do alerta (pred_up / alpha_90d).
+    # Usado pelo Early Alpha Capture: quando o retorno actual já representa
+    # >70% do alpha previsto em menos de metade do tempo, sugere saída parcial.
+    initial_pred_alpha:   Optional[float]        = None   # log-return excess SPY
+
     # Outcome
     closed_at:            Optional[str]          = None
     close_reason:         Optional[str]          = None

@@ -136,6 +136,71 @@ def log_prediction(
         log.debug(f"[prediction_log] {symbol}: log falhou ({e}) — ignorado.")
 
 
+def compute_ml_accuracy() -> dict:
+    """Mede a precisão real do ML comparando win_prob com outcomes.
+
+    Para cada predição com outcome resolvido:
+    - win_prob > 0.55 E retorno > 0  → TP (True Positive)
+    - win_prob > 0.55 E retorno <= 0 → FP (False Positive)
+    - win_prob <= 0.55 E retorno > 0 → FN (False Negative)
+    - win_prob <= 0.55 E retorno <= 0 → TN (True Negative)
+
+    Retorna precision, recall, accuracy e Brier score live.
+    Este loop de feedback fecha o ciclo alerta→resultado→modelo.
+    """
+    if not PREDICTIONS_PATH.exists():
+        return {"skipped": True, "reason": "predictions log nao encontrado"}
+    try:
+        import pandas as pd
+        df = pd.read_csv(PREDICTIONS_PATH)
+        required = ["win_prob", "outcome_label"]
+        if not all(c in df.columns for c in required):
+            return {"skipped": True, "reason": "colunas em falta"}
+
+        # Só linhas com outcome resolvido
+        resolved = df[
+            df["outcome_label"].notna() &
+            (df["outcome_label"].astype(str).str.strip() != "")
+        ].copy()
+        if len(resolved) < 10:
+            return {"skipped": True, "reason": f"apenas {len(resolved)} outcomes resolvidos (min 10)"}
+
+        # Mapear outcome_label → binário
+        _WIN_LABELS = {"WIN_40", "WIN_20"}
+        resolved["actual_win"] = resolved["outcome_label"].isin(_WIN_LABELS).astype(int)
+        resolved["predicted_win"] = (resolved["win_prob"].astype(float) > 0.55).astype(int)
+
+        tp = int(((resolved["predicted_win"] == 1) & (resolved["actual_win"] == 1)).sum())
+        fp = int(((resolved["predicted_win"] == 1) & (resolved["actual_win"] == 0)).sum())
+        fn = int(((resolved["predicted_win"] == 0) & (resolved["actual_win"] == 1)).sum())
+        tn = int(((resolved["predicted_win"] == 0) & (resolved["actual_win"] == 0)).sum())
+
+        precision  = tp / max(1, tp + fp)
+        recall     = tp / max(1, tp + fn)
+        accuracy   = (tp + tn) / max(1, len(resolved))
+        f1         = 2 * precision * recall / max(1e-6, precision + recall)
+
+        # Brier score live (MSE entre win_prob e actual_win)
+        probs   = resolved["win_prob"].astype(float).clip(0, 1)
+        actuals = resolved["actual_win"].astype(float)
+        brier   = float(((probs - actuals) ** 2).mean())
+
+        win_rate = float(resolved["actual_win"].mean())
+
+        return {
+            "n_resolved":   len(resolved),
+            "precision":    round(precision, 3),
+            "recall":       round(recall, 3),
+            "accuracy":     round(accuracy, 3),
+            "f1":           round(f1, 3),
+            "brier_live":   round(brier, 4),
+            "win_rate_actual": round(win_rate, 3),
+            "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        }
+    except Exception as e:
+        return {"skipped": True, "reason": str(e)}
+
+
 def compute_win_prob_drift(
     window_days: int = 30,
     baseline_win_prob: float | None = None,

@@ -1224,6 +1224,44 @@ def analyze_ticker(symbol: str) -> str:
 #
 # Esta função é puramente informativa — nenhuma ordem é executada.
 
+def _get_portfolio_correlation(new_ticker: str, lookback_days: int = 90) -> float:
+    """Calcula a correlação máxima de Pearson entre o novo ticker e as posições activas.
+
+    Usa 90 dias de retornos diários. Se qualquer posição existente tiver correlação
+    > 0.65 com o novo ticker, o Allocation Engine penaliza o sizing.
+    Retorna 0.0 se não houver posições ou dados insuficientes.
+    """
+    try:
+        positions = [sym for sym, _, _ in HOLDINGS if sym not in {"EUNL.DE", "PPR"}]
+        if not positions:
+            return 0.0
+        import yfinance as yf
+        import pandas as pd
+        all_tickers = list({new_ticker} | set(positions))
+        data = yf.download(all_tickers, period=f"{lookback_days}d",
+                           auto_adjust=True, progress=False)
+        if data is None or data.empty:
+            return 0.0
+        closes = data["Close"] if "Close" in data.columns else data.iloc[:, 0]
+        if isinstance(closes, pd.Series):
+            return 0.0
+        rets = closes.pct_change().dropna()
+        if new_ticker not in rets.columns:
+            return 0.0
+        new_ret = rets[new_ticker]
+        max_corr = 0.0
+        for pos in positions:
+            if pos not in rets.columns or pos == new_ticker:
+                continue
+            corr = float(new_ret.corr(rets[pos]))
+            if corr > max_corr:
+                max_corr = corr
+        return round(max_corr, 3)
+    except Exception as e:
+        logging.debug(f"[correlation] {new_ticker}: {e}")
+        return 0.0
+
+
 def _get_sector_pct(sector: str, usd_eur: float = 0.92) -> float:
     """Calcula a % do portfolio total que já está exposta a este sector.
 
@@ -1366,6 +1404,7 @@ def allocate_ticker(symbol: str) -> str:
             monthly_budget_eur    = float(os.environ.get("MONTHLY_BUDGET_EUR", "1050")),
             existing_position_pct = existing_pct,
             existing_sector_pct   = _get_sector_pct(fund.get("sector", ""), usd_eur=get_usdeur()),
+            portfolio_correlation = _get_portfolio_correlation(symbol),
         )
         decision = suggest_allocation(ctx)
 
@@ -1403,6 +1442,21 @@ def run_scan() -> None:
             logging.info("Sem stocks na triagem.")
             return
 
+        # ── Macro-overlay: threshold dinâmico baseado em stress sectorial ──────
+        # Se ≥ 3 sectores caírem >2% em simultâneo, é rotação agressiva ou
+        # bear market — aumentamos o score mínimo para evitar "apanhar facas".
+        try:
+            from macro_data import get_dynamic_min_score
+            effective_min_score = get_dynamic_min_score(base_min_score=MIN_DIP_SCORE)
+            if effective_min_score > MIN_DIP_SCORE:
+                logging.info(
+                    f"[macro_overlay] Score mínimo elevado: "
+                    f"{MIN_DIP_SCORE} → {effective_min_score:.0f} "
+                    f"(stress sectorial detectado)"
+                )
+        except Exception:
+            effective_min_score = float(MIN_DIP_SCORE)
+
         ranked_entries = []
         comprar_syms   = set()
 
@@ -1438,10 +1492,10 @@ def run_scan() -> None:
                 except Exception:
                     pass
 
-                if score < MIN_DIP_SCORE:
+                if score < effective_min_score:
                     append_rejected_log({
                         "symbol": sym, "change": stock["change_pct"],
-                        "reason": f"score baixo ({score:.0f})",
+                        "reason": f"score baixo ({score:.0f} < {effective_min_score:.0f})",
                         "score": score, "verdict": "EVITAR",
                     })
                     continue

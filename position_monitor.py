@@ -164,6 +164,7 @@ def _fetch_fundamentals_snapshot(ticker: str, current_price: float = 0.0) -> dic
 # ─────────────────────────────────────────────────────────────────────────────
 
 TRIGGER_TAKE_PROFIT        = "TAKE_PROFIT"
+TRIGGER_EARLY_ALPHA        = "EARLY_ALPHA_CAPTURE"  # 70%+ do alpha em <50% do tempo
 TRIGGER_STRUCTURAL_DECLINE = "STRUCTURAL_DECLINE"   # dip virou queda estrutural
 TRIGGER_DETERIORATION      = "DETERIORATION"
 TRIGGER_TIME_DECAY         = "TIME_DECAY"
@@ -222,6 +223,31 @@ def _detect_structural_decline(
     return is_structural, " | ".join(reasons)
 
 
+def _check_early_alpha(record: PositionRecord, current_price: float) -> bool:
+    """Detecta quando capturaste 70%+ do alpha esperado em <50% do tempo previsto.
+
+    Ex: ML previu +12% em 90 dias. Ao fim de 30 dias já subiu +9% (75% do target
+    em 33% do tempo). O mercado pode virar — considera realizar o lucro agora.
+    """
+    initial_pred = getattr(record, "initial_pred_alpha", None)
+    if not initial_pred or initial_pred <= 0.02:
+        return False  # sem previsão ou previsão muito baixa
+    if record.alert_price <= 0:
+        return False
+
+    actual_return = (current_price / record.alert_price) - 1.0
+    if actual_return <= 0:
+        return False
+
+    # Fracção do alpha previsto já capturado
+    alpha_fraction = actual_return / initial_pred
+    # Fracção do tempo previsto já decorrido
+    time_fraction  = record.days_held / max(1, getattr(record, "initial_hold_days", 90))
+
+    # Trigger: capturámos >70% do alpha esperado em <50% do tempo
+    return alpha_fraction >= 0.70 and time_fraction < 0.50
+
+
 def _classify_trigger(
     record: PositionRecord,
     current_price: float,
@@ -239,6 +265,10 @@ def _classify_trigger(
     # 1. Preço atingiu o target → realizar lucro
     if current_price >= record.current_sell_target:
         return TRIGGER_TAKE_PROFIT
+
+    # 1b. Early Alpha Capture: 70%+ do alpha em <50% do tempo → saída parcial
+    if _check_early_alpha(record, current_price):
+        return TRIGGER_EARLY_ALPHA
 
     # 2. Deterioração estrutural (multi-critério) — mais severo que deterioração simples
     if feature_row_today is not None:
@@ -263,9 +293,30 @@ def _classify_trigger(
     return TRIGGER_ROUTINE
 
 
+def _build_early_alpha_alert(
+    record: PositionRecord,
+    current_price: float,
+) -> str:
+    pnl_pct = (current_price / record.alert_price - 1) * 100
+    initial_pred = getattr(record, "initial_pred_alpha", 0) or 0
+    alpha_fraction = (current_price / record.alert_price - 1) / initial_pred if initial_pred > 0 else 0
+    time_fraction  = record.days_held / max(1, getattr(record, "initial_hold_days", 90))
+    return "\n".join([
+        f"💰 *EARLY ALPHA CAPTURE — {record.ticker}*  [Dia {record.days_held}/{record.initial_hold_days}]",
+        f"_Capturaste {alpha_fraction*100:.0f}% do alpha previsto em apenas {time_fraction*100:.0f}% do tempo._",
+        "",
+        f"📈 P&L actual: *{_pct(pnl_pct)}* | ML previu: {initial_pred*100:.1f}% em {record.initial_hold_days}d",
+        "",
+        "💡 *Ação sugerida:* Considera vender 50-60% para garantir lucro.",
+        "_Deixa o restante a rolar (moonbag) caso continue a subir._",
+        f"_Target original: ${record.current_sell_target:.2f} ainda activo para a moonbag._",
+    ])
+
+
 def _resolve_thesis_health(trigger: str, delta: float) -> str:
     mapping = {
         TRIGGER_TAKE_PROFIT:        "STRONG",
+        TRIGGER_EARLY_ALPHA:        "STRONG",
         TRIGGER_IMPROVEMENT:        "IMPROVING",
         TRIGGER_ROUTINE:            "STRONG" if delta < 0.05 else "WEAKENING",
         TRIGGER_DETERIORATION:      "DETERIORATING",
@@ -497,6 +548,9 @@ def _monitor_one(
 
     if trigger == TRIGGER_TAKE_PROFIT:
         msg = _build_take_profit_alert(record, current_price)
+
+    elif trigger == TRIGGER_EARLY_ALPHA:
+        msg = _build_early_alpha_alert(record, current_price)
 
     elif trigger == TRIGGER_STRUCTURAL_DECLINE:
         _, reasons_str = _detect_structural_decline(
