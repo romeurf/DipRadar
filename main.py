@@ -1839,14 +1839,35 @@ def main() -> None:
     global _alerted_today
 
     # Migrar alert_db.csv para o schema actual no arranque.
-    # Elimina os ParserWarnings "Expected 35 fields, saw 37" causados por
-    # campos adicionados (return_60d, spy_return_60d) depois do CSV ser criado.
     try:
         from alert_db import migrate_schema
         if migrate_schema():
             logging.info("[main] alert_db.csv migrado para schema actual.")
     except Exception as _e:
         logging.warning(f"[main] alert_db migrate_schema: {_e}")
+
+    # ── Verificação de configuração crítica ──────────────────────────────────
+    _missing_config: list[str] = []
+    if not os.environ.get("FLIP_FUND_EUR") or float(os.environ.get("FLIP_FUND_EUR", "0")) <= 0:
+        _missing_config.append(
+            "FLIP_FUND_EUR — capital do Flip Fund em euros "
+            "(ex: FLIP_FUND_EUR=1000). Sem isto, o Tesoureiro nao gera sizing."
+        )
+    if not os.environ.get("ALPHAVANTAGE_API_KEY"):
+        _missing_config.append(
+            "ALPHAVANTAGE_API_KEY — chave gratuita em alphavantage.co "
+            "(25 req/dia). Melhora previsao de revisoes de analistas."
+        )
+    if not os.environ.get("FMP_API_KEY"):
+        _missing_config.append(
+            "FMP_API_KEY — chave gratuita em financialmodelingprep.com "
+            "(250 req/dia). Melhora sinais de revisoes de analistas."
+        )
+    if _missing_config:
+        logging.warning(
+            f"[config] {len(_missing_config)} env var(s) em falta que afectam "
+            f"funcionalidade: {', '.join(v.split(' — ')[0] for v in _missing_config)}"
+        )
 
     bot_commands.setup(
         send_fn=send_telegram,

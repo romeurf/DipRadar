@@ -1134,6 +1134,57 @@ def _handle_admin_test_feed(parts: list[str]) -> None:
     threading.Thread(target=_run, daemon=True, name="test-feed").start()
 
 
+# ── /admin_check_config ──────────────────────────────────────────────────────────
+
+def _handle_admin_check_config() -> None:
+    """Verifica todas as env vars criticas e mostra o estado do sistema."""
+    import os
+    lines = ["Config check — DipRadar", ""]
+
+    checks = [
+        # (env_var, label, obrigatorio, descricao)
+        ("MONTHLY_BUDGET_EUR",      "Orcamento mensal",      True,  "Ex: 1050"),
+        ("FLIP_FUND_EUR",           "Capital Flip Fund",     True,  "Ex: 500 — o Tesoureiro usa isto para sizing"),
+        ("TIINGO_API_KEY",          "Tiingo EOD",            False, "Dados EOD (fallback yfinance se ausente)"),
+        ("ALPHAVANTAGE_API_KEY",    "Alpha Vantage",         False, "25 req/dia gratis — revisoes analistas"),
+        ("FMP_API_KEY",             "FMP",                   False, "250 req/dia gratis — upgrades/downgrades"),
+        ("FRED_API_KEY",            "FRED (Fed Reserve)",    False, "Gratis — recession probability mais precisa"),
+        ("SECTOR_CONCENTRATION_CAP","Sector cap",            False, "Default 35% — limite de exposicao por sector"),
+        ("TELEGRAM_TOKEN",          "Telegram Bot",          True,  "Token do bot"),
+        ("TELEGRAM_CHAT_ID",        "Telegram Chat",         True,  "ID do chat"),
+    ]
+
+    ok_count = 0
+    warn_count = 0
+    for env, label, required, desc in checks:
+        val = os.environ.get(env, "")
+        if val:
+            ok_count += 1
+            display = "****" + val[-4:] if len(val) > 6 else "***"
+            lines.append(f"OK  {label}: {display}")
+        elif required:
+            warn_count += 1
+            lines.append(f"FALTA  {label} — {desc}")
+        else:
+            lines.append(f"opcional  {label} — {desc}")
+
+    lines.append("")
+    lines.append(f"Resultado: {ok_count} configuradas, {warn_count} obrigatorias em falta")
+
+    # Estado do modelo ML
+    try:
+        from ml_predictor import is_model_ready, get_model_info
+        if is_model_ready():
+            info = get_model_info()
+            lines.append(f"Modelo ML: pronto (IC={info.get('rho_mean', '?')})")
+        else:
+            lines.append("Modelo ML: NAO treinado — faz /admin_retrain")
+    except Exception:
+        lines.append("Modelo ML: erro ao verificar")
+
+    _reply("\n".join(lines))
+
+
 # ── /admin_regen_parquet ────────────────────────────────────────────────────────
 
 def _handle_admin_regen_parquet(parts: list[str]) -> None:
@@ -2466,6 +2517,9 @@ def _handle_command(text: str) -> None:
 
     elif cmd in ("/admin_test_feed", "/test_feed"):
         _handle_admin_test_feed(parts)
+
+    elif cmd in ("/admin_check_config", "/check_config"):
+        _handle_admin_check_config()
 
     elif cmd in ("/admin_regen_parquet", "/regen_parquet"):
         _handle_admin_regen_parquet(parts)

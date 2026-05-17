@@ -66,7 +66,17 @@ def _float_env(key: str, default: float = 0.0) -> float:
         return default
 
 
-FLIP_FUND_EUR = _float_env("FLIP_FUND_EUR")
+# FLIP_FUND_EUR: capital dedicado ao Flip Fund.
+# Se não configurado explicitamente, deriva automaticamente de MONTHLY_BUDGET_EUR
+# (10% do orçamento mensal como base de arranque).
+# Define FLIP_FUND_EUR=<valor> no Railway para controlo explícito.
+_explicit_flip = _float_env("FLIP_FUND_EUR")
+_monthly       = _float_env("MONTHLY_BUDGET_EUR", default=0.0)
+FLIP_FUND_EUR: float = (
+    _explicit_flip
+    if _explicit_flip > 0
+    else (_monthly * 0.10 if _monthly > 0 else 0.0)
+)
 
 # ─────────────────────────────────────────────────────────────────────────
 # HOLDINGS — lê env vars com o padrão HOLDING_<TICKER>=shares,avg_cost
