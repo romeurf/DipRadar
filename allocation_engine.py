@@ -138,6 +138,10 @@ class AllocationContext:
     is_bluechip:           bool                 = False    # is_bluechip(fund) — derivado
     sector:                str                  = ""
     company_name:          str                  = ""       # para match de temas por keyword
+    # Sector concentration (% do portfolio total já neste sector)
+    # A visão: "não compres mais do que isto porque já atingiste o teu limite de
+    # exposição ao setor Tecnológico." Cap sector: 35% portfolio por defeito.
+    existing_sector_pct:   float                = 0.0      # 0.15 = 15% do portfolio
     drawdown_52w:          float | None         = None     # negativo (-0.35) ou None
     dividend_yield:        float | None         = None     # 0.025 = 2.5%
     classify_category:     str | None           = None     # legado — output de classify_dip_category
@@ -407,7 +411,18 @@ def _size(ctx: AllocationContext, category: str) -> tuple[float, float, list[str
         amount *= _SECTOR_BONUS
         notes.append(f"Sector premium ×{_SECTOR_BONUS:.2f}")
 
-    # 5) Bonus de tema/trend (ex: fotónica, GLP-1, IA) — não aplica a CORE
+    # 5) Sector concentration cap — a visão do DipRadar exige limite por sector.
+    # Default: 35% do portfolio máximo num único sector.
+    # Garante diversificação e evita risco concentrado em Tech ou Energy.
+    _SECTOR_CAP = float(os.environ.get("SECTOR_CONCENTRATION_CAP", "0.35"))
+    if category != CAT_CORE and ctx.existing_sector_pct >= _SECTOR_CAP:
+        notes.append(
+            f"Sector {ctx.sector or 'desconhecido'} no limite "
+            f"({ctx.existing_sector_pct*100:.0f}% >= {_SECTOR_CAP*100:.0f}% max)"
+        )
+        return 0.0, raw_amount, notes
+
+    # 6) Bonus de tema/trend (ex: fotónica, GLP-1, IA) — não aplica a CORE
     if category != CAT_CORE:
         try:
             from themes import get_theme_bonus

@@ -1224,6 +1224,37 @@ def analyze_ticker(symbol: str) -> str:
 #
 # Esta função é puramente informativa — nenhuma ordem é executada.
 
+def _get_sector_pct(sector: str, usd_eur: float = 0.92) -> float:
+    """Calcula a % do portfolio total que já está exposta a este sector.
+
+    Usado pelo Allocation Engine para impor o limite de concentração por sector
+    (default 35%, configurável via SECTOR_CONCENTRATION_CAP no Railway).
+    """
+    if not sector:
+        return 0.0
+    try:
+        from portfolio import get_positions, get_portfolio_snapshot
+        snapshot = get_portfolio_snapshot(usd_eur=usd_eur)
+        total_eur = snapshot.get("total_eur", 0)
+        if not total_eur or total_eur <= 0:
+            return 0.0
+        positions = snapshot.get("positions", [])
+        from market_client import get_fundamentals
+        sector_value = 0.0
+        for pos in positions:
+            sym = pos.get("symbol", "")
+            try:
+                fund_pos = get_fundamentals(sym, min_market_cap=0)
+                if fund_pos.get("sector", "") == sector:
+                    sector_value += float(pos.get("value_eur", 0) or 0)
+            except Exception:
+                pass
+        return round(sector_value / total_eur, 4)
+    except Exception as e:
+        logging.debug(f"[sector_pct] {sector}: {e}")
+        return 0.0
+
+
 def allocate_ticker(symbol: str) -> str:
     from allocation_engine import (
         AllocationContext,
@@ -1334,6 +1365,7 @@ def allocate_ticker(symbol: str) -> str:
             cash_available_eur    = cash_eur,
             monthly_budget_eur    = float(os.environ.get("MONTHLY_BUDGET_EUR", "1050")),
             existing_position_pct = existing_pct,
+            existing_sector_pct   = _get_sector_pct(fund.get("sector", ""), usd_eur=get_usdeur()),
         )
         decision = suggest_allocation(ctx)
 
@@ -1459,6 +1491,25 @@ def run_scan() -> None:
                     f"conf={score_data['confidence']:.2f} "
                     f"trap={score_data['is_value_trap']}"
                 )
+
+                # Filtrar com score V2: stocks com score muito baixo não geram alertas.
+                # ML a predizer P(win)=0% → score V2=0 → Shield diz NÃO.
+                if score < MIN_DIP_SCORE:
+                    append_rejected_log({
+                        "symbol": sym, "change": stock["change_pct"],
+                        "reason": f"v2_score baixo ({score:.0f})",
+                        "score": score, "verdict": "EVITAR",
+                    })
+                    logging.info(f"[v2] {sym} rejeitado — score V2 {score:.0f} < MIN ({MIN_DIP_SCORE})")
+                    continue
+
+                # Recalcular verdict a partir do score V2 (coerência visual)
+                if score >= 75:
+                    verdict, emoji_str, tier = "COMPRAR", "🟢", 1
+                elif score >= 60:
+                    verdict, emoji_str, tier = "MONITORIZAR", "🟡", 2
+                else:
+                    verdict, emoji_str, tier = "MONITORIZAR", "🔵", 3
 
                 # ── Feature 8: Dip Persistente ────────────────────────────
                 dip_state = record_dip_day(
