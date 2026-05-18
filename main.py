@@ -1832,16 +1832,46 @@ def run_monthly_retrain() -> None:
     logging.info("[monthly_retrain] A iniciar retreino mensal v3...")
     now_str = datetime.now(LISBON_TZ).strftime("%d/%m/%Y %H:%M")
 
-    try:
-        from monthly_retrain import run_monthly_retrain_v3
-        result = run_monthly_retrain_v3()
-    except Exception as e:
-        logging.error(f"[monthly_retrain] v3 falhou: {e}", exc_info=True)
+    # Notificar início (era o que faltava — sem isto o utilizador não sabe que correu)
+    send_telegram(
+        f"Retreino mensal iniciado ({now_str}).\n"
+        f"Pode demorar 1-2h. Sera enviada notificacao quando terminar."
+    )
+
+    # Watchdog: timeout total de 3 horas para o retrain completo.
+    # Sem isto, um hang silencioso ficava 2 dias sem notificacao.
+    import threading
+    _MAX_RETRAIN_HOURS = int(os.environ.get("RETRAIN_MAX_HOURS", "3"))
+    _result_holder: list = [None]
+    _error_holder:  list = [None]
+
+    def _run_retrain():
+        try:
+            from monthly_retrain import run_monthly_retrain_v3
+            _result_holder[0] = run_monthly_retrain_v3()
+        except Exception as e:
+            _error_holder[0] = e
+
+    t = threading.Thread(target=_run_retrain, daemon=True)
+    t.start()
+    t.join(timeout=_MAX_RETRAIN_HOURS * 3600)
+
+    if t.is_alive():
+        logging.error(f"[monthly_retrain] Timeout de {_MAX_RETRAIN_HOURS}h — a abortar")
         send_telegram(
-            f"❌ *Retreino Mensal — Erro*\n"
-            f"`{e}`\n_⏰ {now_str}_"
+            f"Retreino mensal excedeu {_MAX_RETRAIN_HOURS}h e foi abortado.\n"
+            f"O modelo anterior continua em producao.\n"
+            f"Verifica os logs do Railway para perceber o que pendurou."
         )
         return
+
+    if _error_holder[0] is not None:
+        e = _error_holder[0]
+        logging.error(f"[monthly_retrain] v3 falhou: {e}", exc_info=True)
+        send_telegram(f"Retreino Mensal falhou:\n{e}\n{now_str}")
+        return
+
+    result = _result_holder[0] or {}
 
     decision   = result.get("decision", "?")
     cand_rho   = result.get("candidate_rho_alpha")

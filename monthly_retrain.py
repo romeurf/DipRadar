@@ -356,8 +356,11 @@ def _compute_alpha_90d_inline(df: pd.DataFrame) -> pd.DataFrame:
     _cache_dir.mkdir(parents=True, exist_ok=True)
     _spy_hist: Optional[pd.DataFrame] = None
 
-    _TICKER_TIMEOUT  = 20   # segundos por ticker (yfinance sem timeout = hang infinito)
-    _TOTAL_BUDGET    = 45 * 60  # 45 minutos máximo para toda a fase inline
+    # Configurável via env vars no Railway:
+    #   INLINE_TICKER_TIMEOUT — segundos por ticker (default 25s)
+    #   INLINE_BUDGET_MINUTES — minutos máximo para toda a fase (default 60min)
+    _TICKER_TIMEOUT  = int(os.environ.get("INLINE_TICKER_TIMEOUT", "25"))
+    _TOTAL_BUDGET    = int(os.environ.get("INLINE_BUDGET_MINUTES", "60")) * 60
     _t_start_inline  = time.time()
 
     def _get_hist(ticker: str) -> Optional[pd.DataFrame]:
