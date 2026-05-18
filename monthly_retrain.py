@@ -939,10 +939,15 @@ def run_monthly_retrain_v3(
     dataset_health: dict = {}
     try:
         from ml_training.diagnostics import dataset_health_check
-        from ml_training.config import PRIMARY_TARGET, PRIMARY_TARGET_FALLBACK
+        from ml_training.config import PRIMARY_TARGET
         import pandas as pd
         _df_check = pd.read_parquet(train_path)
-        _target_check = PRIMARY_TARGET if PRIMARY_TARGET in _df_check.columns else PRIMARY_TARGET_FALLBACK
+        if PRIMARY_TARGET not in _df_check.columns:
+            raise KeyError(
+                f"Parquet não tem coluna '{PRIMARY_TARGET}'. "
+                f"Colunas presentes: {list(_df_check.columns)[:15]}"
+            )
+        _target_check = PRIMARY_TARGET
         # fold_results extraídos do summary do treino
         _summary = train_result.get("summary")
         _fold_results = []

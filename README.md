@@ -10,11 +10,7 @@
 
 ## 💡 A Filosofia
 
-O DipRadar executa uma única filosofia com precisão institucional: **Dip Hunting**. Varre o mercado à procura de quedas abruptas, separa empresas de excelência do lixo especulativo, e diz-te exactamente quanto capital arriscar na recuperação.
-
-**O problema que resolve:**
-1. **Apanhar facas em queda** — comprar apenas porque caiu 50%, sem perceber que a empresa está a queimar caixa
-2. **Dimensionamento emocional** — apostar demasiado por impulso, ou não ter liquidez quando a oportunidade real aparece
+O DipRadar executa uma única filosofia com precisão institucional: **Dip Hunting**. Varre o mercado à procura de quedas abruptas, separa empresas de excelência do lixo especulativo, e diz-te exactamente quanto capital arriscar na recuperação — sem intervenção humana.
 
 ---
 
@@ -23,36 +19,39 @@ O DipRadar executa uma única filosofia com precisão institucional: **Dip Hunti
 ### 1. O Radar (Machine Learning)
 Modelo preditivo treinado com dados históricos validados com regras de walk-forward CV (padrão institucional):
 - **Target**: `alpha_90d = log1p(stock_return_90d) − log1p(spy_return_90d)` — excesso sobre o S&P 500 em 90 dias
-- **IC actual**: 0.124 (+27% vs modelo anterior) | IC SR: 4.49 | 100% folds positivos
-- **Modelos**: ScaledRidge (champion), XGBoost, LightGBM, Random Forest com walk-forward CV purged
-- **Features**: 30 variáveis técnicas + fundamentais + sentimento (RSI, momentum, VIX regime, insider buying, earnings beat rate, etc.)
-- **Retreino**: automático no dia 1 de cada mês com gating — só promove se IC ≥ anterior × 90%
+- **IC actual**: 0.124 (IC SR: 4.49) | 100% folds positivos
+- **Features (33)**: técnicas + fundamentais PIT + sentimento SEC + short interest + earnings call tone
+- **Modelos**: ScaledRidge (champion), XGBoost DART, LightGBM GOSS, RF com walk-forward CV purged
+- **Sector models**: modelos especializados por grupo sectorial (Tech/HC, Fin/Industrial, Commodity, Defensivos)
+- **Retreino**: automático Dia 1 do mês, watchdog 3h, notificação de início + conclusão
 
 ### 2. O Escudo (Análise Fundamental)
-Antes de recomendar uma compra, o sistema aplica um "Teste de Qualidade" em duas camadas:
+Sistema de filtragem em 3 camadas:
 - **Score V2 (0–100)**: Quality (40%) + Value (20%) + Timing (20%) + Divergência (20%)
 - **Red Flags**: FCF negativo → pre-profit cap; P/E > 200 → rejeição; D/E extremo → penalidade
-- **Conflict Resolver**: quando ML e fundamentais divergem → CONSENSUS_BULL / TECHNICAL_ONLY / FUNDAMENTAL_ONLY / NEUTRAL
-- **Sector-aware**: thresholds diferentes para REITs (FFO), Utilities, Tech, Energy, etc.
+- **Dividend Safety**: FCF/dividendos < 0.8 → penalidade 15% (excl. REITs/Utilities que usam FFO)
+- **8-K Veto**: restatement ou default → muda COMPRAR para MONITORIZAR automaticamente
+- **RSI Crossover**: só entra em COMPRAR se RSI < 42 (oversold confirmado)
+- **Volume Capitulação**: preferencialmente dips com volume > média (pânico esgotado)
 
 ### 3. O Tesoureiro (Allocation Engine)
-Não diz apenas "Compra ServiceNow". Diz:
-> *"Compra €800 de ServiceNow agora. Reserva €300 para limit order a -8%. Não compres mais — atingiste o limite de 35% em Tech."*
-
-Funcionalidades:
-- **Sizing dinâmico**: edge × R:R × max_position (Kelly-inspired, sem hardcodes)
-- **Pyramiding**: entrada faseada 65%/35% para dips severos (drawdown > 25%)
-- **Scale Out / Moonbag**: vender 50% quando o stock atinge o target, deixar 50% a rolar
-- **Sector concentration cap**: 35% por sector (configurável via `SECTOR_CONCENTRATION_CAP`)
-- **Correlação de posições**: penaliza novas entradas correlacionadas (>0.65) com o que já tens
-- **Early Alpha Capture**: quando capturaste 70%+ do alpha esperado em <50% do tempo → sugere saída parcial
+Não diz apenas "Compra ServiceNow". Calcula exactamente quanto:
+- **Sizing dinâmico**: edge × R:R × max_position (Kelly-inspired)
+- **Correlação de posições**: penaliza entries correlacionadas (>0.65) com portfolio actual
+- **Sector concentration cap**: 35% máximo por sector (configurável)
+- **Portfolio VaR**: se VaR > 8%, reduz sizing automaticamente
+- **Pyramiding**: entrada faseada 65%/35% para dips severos
+- **Scale Out / Moonbag**: realiza 50% no target, deixa 50% a rolar
+- **Early Alpha Capture**: sai quando captura 70%+ do alpha em <50% do tempo
+- **Stop-loss**: sai automaticamente se preço cair >12% do entry (configurável)
 
 ### 4. Evolução Contínua (MLOps)
 Sistema vivo que aprende com os seus próprios erros:
-- **Registo de decisões**: cada alerta → `alert_db.csv` com timestamp, features, scores
-- **Back-fill de outcomes**: 90 dias depois, verifica o que aconteceu a cada stock
-- **ML Accuracy**: `/ml_accuracy` mostra precision, recall, F1 e Brier score live
-- **Retreino mensal automático**: Dia 1 às 06:00 → novo modelo treinado → gating → promoção
+- **Paper trading autónomo**: cada COMPRAR cria posição simulada com o budget real (€850/mês)
+- **Self-evaluation**: mede se bate o SPY sem intervenção humana
+- **Saída antecipada inteligente**: fecha paper trades quando target atingido cedo
+- **ML Accuracy**: `/ml_accuracy` mede precision, recall, F1, Brier score vs outcomes reais
+- **Retreino mensal**: watchdog 3h, notificação de início e conclusão
 - **Drift detection**: win_prob médio monitorizado vs baseline de treino
 
 ---
@@ -62,57 +61,66 @@ Sistema vivo que aprende com os seus próprios erros:
 ### Mercado e análise
 | Comando | Descrição |
 |---------|-----------|
-| `/scan` | Força scan imediato (só em horas de mercado) |
-| `/analisar <TICKER>` | Análise completa: score, ML, valuation, sizing |
+| `/scan` | Força scan imediato |
+| `/analisar <TICKER>` | Análise completa com narrativa natural dos sinais |
 | `/comparar T1 T2 ...` | Comparar scores de 2-5 tickers |
-| `/historico <TICKER>` | Histórico de scores registados |
-| `/performance [data] [score]` | Retorno anual + risco se tivesses seguido o bot |
-| `/themes` | Temas em trend (fotónica, GLP-1, IA, defesa...) |
-| `/add_theme key label TICK1,TICK2 [conf]` | Adicionar tema |
+| `/historico <TICKER>` | Histórico de scores |
+| `/rejeitados` | Stocks rejeitados hoje (com razão) |
+| `/tier3` | Gems do último resumo de fecho |
+
+### Performance e simulação
+| Comando | Descrição |
+|---------|-----------|
+| `/performance [data] [score]` | Retorno histórico seguindo o bot |
+| `/paper_portfolio` | Paper trading: retorno do bot vs SPY |
+| `/paper_portfolio open` | Posições simuladas abertas |
+| `/paper_portfolio 6` | Últimos 6 meses de simulação |
+| `/ml_accuracy` | Precisão real do modelo vs outcomes reais |
+
+### Temas / Trends
+| Comando | Descrição |
+|---------|-----------|
+| `/themes` | Ver temas em trend (fotónica, GLP-1, IA...) |
+| `/add_theme key label TICK1,TICK2` | Adicionar tema |
 | `/remove_theme key` | Remover tema |
 
 ### Carteira e posições
 | Comando | Descrição |
 |---------|-----------|
-| `/carteira` | Snapshot da carteira em tempo real |
-| `/portfolio` | Resumo das posições activas com P&L |
-| `/buy TICK PREÇO SHARES [SCORE]` | Registar compra |
-| `/sell TICK PREÇO [SHARES]` | Registar venda (parcial ou total) |
-| `/sync_portfolio` | Sincronizar carteira actual (substitui env vars temporariamente) |
-| `/liquidez [+\|-VALOR]` | Ver / ajustar saldo disponível |
-| `/allocate <TICKER>` | Sugestão de alocação read-only com sizing |
-| `/flip` | Log e P&L do Flip Fund |
-| `/flip add TICK ENTRY SHARES [NOTA]` | Registar entrada num flip |
-| `/flip close ID EXIT` | Fechar flip com preço de saída |
+| `/carteira` | Snapshot em tempo real |
+| `/portfolio` | Posições activas com P&L |
+| `/sync_portfolio TICK:shares:preco ...` | Sincronizar carteira via Telegram |
+| `/buy TICK PREÇO SHARES` | Registar compra |
+| `/sell TICK PREÇO [SHARES]` | Registar venda |
+| `/liquidez [+\|-VALOR]` | Ajustar saldo |
+| `/allocate <TICKER>` | Sugestão de alocação com VaR e sector check |
+| `/flip` | Flip Fund P&L |
 
 ### Watchlist
 | Comando | Descrição |
 |---------|-----------|
-| `/watchlist` | Estado da watchlist pessoal |
-| `/watchlist add TICKER` | Adicionar ticker |
-| `/watchlist rm TICKER` | Remover ticker |
+| `/watchlist` | Estado da watchlist |
+| `/watchlist add TICKER` | Adicionar |
+| `/watchlist rm TICKER` | Remover |
 
 ### ML e retreino
 | Comando | Descrição |
 |---------|-----------|
-| `/mldata` | Estatísticas da base de dados ML |
+| `/mldata` | Stats da base de dados ML |
 | `/mldata update` | Forçar update de outcomes |
-| `/ml_accuracy` | Precisão real do modelo vs outcomes reais |
-| `/admin_retrain [dry-run]` | Disparar retreino ad-hoc |
-| `/retrigger` | Alias rápido de `/admin_retrain` |
-| `/admin_regen_parquet [--targets-only]` | Regenerar parquet de treino (com EDGAR PIT + alpha_90d) |
-| `/admin_set_floor <valor>` | Ajustar floor de IC mínimo para promoção |
+| `/admin_retrain [dry-run]` | Disparar retreino (notificação de início imediata) |
+| `/retrigger` | Alias de `/admin_retrain` |
+| `/admin_regen_parquet [--targets-only]` | Regenerar parquet (EDGAR PIT + alpha_90d) |
+| `/admin_set_floor <valor>` | Ajustar floor de IC |
 
 ### Sistema e diagnóstico
 | Comando | Descrição |
 |---------|-----------|
-| `/status` | Estado do bot, mercado, modelo ML |
-| `/health` | Dashboard completo: RAM, CPU, drift, APIs |
-| `/admin_check_config` | Verifica todas as env vars críticas |
-| `/admin_test_feed TICKER` | Testa pipeline de dados para um ticker |
-| `/backtest` | Resumo do backtest de alertas |
-| `/rejeitados` | Stocks analisados e rejeitados hoje |
-| `/tier3` | Gems do último resumo de fecho |
+| `/status` | Estado do bot |
+| `/health` | Dashboard: RAM, CPU, drift, APIs |
+| `/admin_check_config` | Verificar env vars |
+| `/admin_test_feed TICKER` | Testar pipeline de dados |
+| `/backtest` | Resumo do backtest |
 
 ---
 
@@ -121,120 +129,123 @@ Sistema vivo que aprende com os seus próprios erros:
 ### Obrigatórias
 | Variável | Descrição |
 |----------|-----------|
-| `TELEGRAM_TOKEN` | Token do bot (@BotFather) |
-| `TELEGRAM_CHAT_ID` | Chat ID do teu Telegram |
-| `MONTHLY_BUDGET_EUR` | Orçamento mensal de investimento (ex: `1050`) |
+| `TELEGRAM_TOKEN` | Token do bot |
+| `TELEGRAM_CHAT_ID` | Chat ID |
+| `MONTHLY_BUDGET_EUR` | Orçamento mensal total (ex: `1050`) |
 | `TZ` | `Europe/Lisbon` |
 
-### Tesoureiro (recomendadas)
+### Orçamento e alocação
 | Variável | Default | Descrição |
 |----------|---------|-----------|
-| `FLIP_FUND_EUR` | 10% de MONTHLY_BUDGET_EUR | Capital dedicado ao Flip Fund |
+| `PAPER_BUDGET_EUR` | — | Capital para dip hunting (ex: `850` se investes €200 em ETFs) |
+| `ETF_DCA_EUR` | `0` | ETFs mensais a excluir do paper trading (ex: `200`) |
+| `FLIP_FUND_EUR` | 10% do budget | Capital do Flip Fund (auto-deriva se não definido) |
 | `SECTOR_CONCENTRATION_CAP` | `0.35` | Limite de exposição por sector (35%) |
 
-### APIs gratuitas (melhoram qualidade)
-| Variável | Fonte | Descrição |
-|----------|-------|-----------|
-| `TIINGO_API_KEY` | api.tiingo.com (grátis) | Dados EOD de melhor qualidade |
-| `ALPHAVANTAGE_API_KEY` | alphavantage.co (grátis, 25 req/dia) | Revisões de estimativas de analistas |
-| `FMP_API_KEY` | financialmodelingprep.com (grátis, 250 req/dia) | Upgrades/downgrades de analistas |
-| `FRED_API_KEY` | fred.stlouisfed.org (grátis) | Recession probability via T10Y2Y |
-| `TAVILY_API_KEY` | tavily.com (grátis tier) | Notícias e catalisadores |
-
-### Scan e filtros
+### Gestão de risco
 | Variável | Default | Descrição |
 |----------|---------|-----------|
-| `DROP_THRESHOLD` | `8` | % queda mínima para Tier 1 |
-| `MIN_MARKET_CAP` | `2000000000` | Market cap mínimo ($2B) |
-| `MIN_DIP_SCORE` | `50` | Score V2 mínimo (0-100); sobe automaticamente em stress sectorial |
-| `SCAN_EVERY_MINUTES` | `30` | Frequência do scan |
+| `POSITION_STOP_LOSS_PCT` | `0.12` | Stop-loss automático (12% abaixo do entry) |
+| `MIN_DIP_SCORE` | `50` | Score V2 mínimo (sobe automaticamente em stress sectorial) |
+
+### Retrain
+| Variável | Default | Descrição |
+|----------|---------|-----------|
+| `INLINE_TICKER_TIMEOUT` | `25` | Segundos por ticker no download de preços |
+| `INLINE_BUDGET_MINUTES` | `60` | Minutos máximo para computar alpha_90d |
+| `RETRAIN_MAX_HOURS` | `3` | Watchdog: mata o retrain se demorar mais |
+
+### APIs gratuitas
+| Variável | Fonte | Descrição |
+|----------|-------|-----------|
+| `TIINGO_API_KEY` | api.tiingo.com | EOD de qualidade |
+| `ALPHAVANTAGE_API_KEY` | alphavantage.co (25 req/dia) | Revisões de analistas |
+| `FMP_API_KEY` | financialmodelingprep.com (250 req/dia) | Upgrades/downgrades |
+| `FRED_API_KEY` | fred.stlouisfed.org | Recession probability |
+| `TAVILY_API_KEY` | tavily.com | Catalisadores e notícias |
 
 ### Carteira (privados — nunca no repo)
 ```
 HOLDING_NVO=<shares>,<avg_cost>
 HOLDING_ADBE=<shares>,<avg_cost>
 HOLDING_MSFT=<shares>,<avg_cost>
-HOLDING_PINS=<shares>,<avg_cost>
-HOLDING_CRWD=<shares>,<avg_cost>
-HOLDING_PLTR=<shares>,<avg_cost>
 ...
 PPR_SHARES=<shares>
 PPR_AVG_COST=<preco_medio>
 ```
-
-> **Alternativa**: usa `/sync_portfolio` no Telegram para actualizar a carteira sem tocar nas env vars.
-
----
-
-## 🧠 Arquitectura ML
-
-```
-Dados históricos (36k alertas, 2014-2026)
-    │
-    ├── features técnicas: RSI, drawdown, momentum, VIX, vol_of_vol, ...
-    ├── features fundamentais PIT: gross_margin, de_ratio, fcf_yield (SEC EDGAR)
-    ├── features sentimento: insider_buy_recent, earnings_beat_rate, analyst_rating
-    └── target: alpha_90d = log1p(stock_90d) − log1p(spy_90d)
-         │
-         ▼
-Walk-forward CV (10 folds, purge 90d, embargo 20d)
-    │
-    ├── ScaledRidge (champion: IC=0.124, SR=4.49)
-    ├── XGBoost DART
-    ├── LightGBM GOSS
-    └── Random Forest
-         │
-         ▼
-Gating automático (IC ≥ prod × 90%)
-    │
-    ├── PROMOTED → /data/dip_models.pkl
-    └── PENDING → análise detalhada do que piorou
-```
+> **Alternativa**: `/sync_portfolio NVO:25:85.50 ADBE:8:420` no Telegram
 
 ---
 
-## 📁 Estrutura do Projecto
+## 🧠 Features do Modelo ML (33 features)
 
-| Ficheiro | Papel |
-|---------|-------|
-| `main.py` | Engine: scheduler, scan, heartbeat, delivery |
-| `score.py` | Score V2 (0-100): Quality/Value/Timing/Divergência + Red Flags |
-| `allocation_engine.py` | Tesoureiro: sizing, pyramiding, scale-out, sector cap, correlação |
-| `conflict_resolver.py` | Árbitro ML vs fundamentais |
-| `position_monitor.py` | Vigilante: daily check, early alpha capture, structural decline |
-| `position_db.py` | Base de dados de posições activas |
-| `portfolio_simulator.py` | Backtest de portfolio: retorno anual, Sharpe, max drawdown |
-| `themes.py` | Temas em trend: fotónica, GLP-1, IA, defesa, etc. |
-| `fundamental_signals.py` | Sinais de sentimento: insider buying (SEC EDGAR), earnings beat, short interest |
-| `fundamental_history.py` | Fundamentais PIT: Tiingo → SEC EDGAR XBRL → yfinance quarterly |
-| `ml_predictor.py` | Inferência em produção: hot-reload, calibrador, stock classification |
-| `ml_training/` | Pipeline de treino: CV, modelos, bundle, calibração, diagnósticos |
-| `monthly_retrain.py` | Retreino mensal automático com gating e alpha inline |
-| `universe_snapshot.py` | Snapshot diário: 780 tickers, 22:30 Lisboa |
-| `data_feed.py` | Preços EOD: Tiingo → yfinance → Stooq |
-| `alert_db.py` | Registo de alertas + back-fill de outcomes |
-| `prediction_log.py` | Log de previsões ML + drift detection + ML accuracy |
-| `watchlist.py` | Watchlist pessoal com critérios de entrada por stock |
-| `market_client.py` | Fundamentais, screener, RSI, PE histórico |
-| `macro_data.py` | Regime macro: VIX, SPY drawdown, yield curve, credit spread, sector stress |
-| `bot_commands.py` | Todos os comandos Telegram |
-| `state.py` | Persistência: alertas, watchlist, flip log, scores |
-| `portfolio.py` | Carteira: leitura de env vars, sizing, heartbeat |
+### Técnicas (base)
+RSI, drawdown 52w, momentum 1m/3m/6m, beta, vol_of_vol, bb_width, VIX regime, VIX percentil 1y, SPY RSI, sector relative, volume zscore, up days pct, true range, drop × drawdown
+
+### Macro
+VIX, sector alert count 7d, sector drawdown 5d
+
+### Sentimento e qualidade (Fase 5 — SEC EDGAR + yfinance)
+| Feature | Fonte | O que mede |
+|---------|-------|-----------|
+| `insider_buy_recent` | SEC Form 4 | Houve compra de insider nos últimos 30 dias? |
+| `insider_buy_amount_score` | SEC Form 4 XML | Magnitude normalizada da compra (0-1) |
+| `recent_8k_score` | SEC 8-K item codes | Tipo de evento: -1=restatement, +1=M&A target |
+| `earnings_call_tone` | SEC 8-K texto | Sentimento da earnings call [-1=pessimista, +1=confiante] |
+| `short_interest_pct` | yfinance | Short interest % do float |
+| `short_interest_trend` | yfinance | Variação do short interest vs mês anterior |
+| `consecutive_red_days` | Price history | Dias consecutivos em queda (capitulação) |
+| `ma_200d_ratio` | Price history | Price / MA200 (quão abaixo da média de longo prazo) |
+| `earnings_beat_rate` | yfinance | % de últimos 4 trimestres com EPS beat |
+| `analyst_rating` | yfinance | Consenso analistas: 1=Strong Buy … 5=Strong Sell |
 
 ---
 
-## 📊 Fluxo de um Alerta
+## 📊 Arquitectura de Risco
 
 ```
-Stock cai ≥8% →
-    Screen: market cap ≥$2B, não ETF, não delisted →
-        Macro-overlay: stress sectorial? → threshold ↑ →
-            Fundamentais: Red Flags? → rejeitar se pre-profit/lixo →
-                Score V2 (0-100): acima do threshold? →
-                    ML Score: alpha_90d previsto, P(win), R:R →
-                        Allocation: sizing, pyramiding, sector cap, correlação →
-                            Telegram → alerta com summary plain language
+Novo alerta COMPRAR →
+  ├── RSI < 42? (oversold confirmado)     ← se não: MONITORIZAR
+  ├── 8-K restatement recente?            ← se sim: veto → MONITORIZAR
+  ├── Volume spike no dip?                ← se não: menos confiança
+  ├── Score V2 > threshold macro-ajustado?← threshold sobe em stress sectorial
+  │
+  ├── Allocation Engine:
+  │   ├── Sector concentration < 35%?
+  │   ├── Correlação < 0.65 com portfolio?
+  │   ├── Portfolio VaR OK?
+  │   └── Sizing = edge × R:R × budget
+  │
+  └── Paper trade criado automaticamente
+
+Position Monitor (diário 22h):
+  ├── Target atingido → TAKE_PROFIT
+  ├── 70%+ alpha em <50% tempo → EARLY_ALPHA_CAPTURE
+  ├── Preço < entry × 0.88 → STOP_LOSS
+  ├── 2+ critérios de deterioração → STRUCTURAL_DECLINE
+  └── Rotina → update silencioso
 ```
+
+---
+
+## 🎯 Paper Trading Autónomo
+
+O bot simula as suas próprias recomendações para provar se bate o mercado:
+
+```
+Dia 1 do mês → budget renovado (PAPER_BUDGET_EUR)
+Cada COMPRAR → posição criada automaticamente
+22h50 diariamente → fecha posições que:
+  - Atingiram o target de preço
+  - 70%+ do alpha em <50% do tempo (early exit)
+  - Esgotaram o período de holding (90 dias)
+Dia 1 → relatório: "Se seguisses o bot, ganharias X% vs SPY Y%"
+```
+
+**Comandos**:
+- `/paper_portfolio` — performance dos últimos 3 meses
+- `/paper_portfolio 6` — últimos 6 meses
+- `/paper_portfolio open` — posições abertas
 
 ---
 

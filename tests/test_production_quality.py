@@ -371,19 +371,19 @@ class TestTargetSelection(unittest.TestCase):
         report = result.get("report") or {}
         self.assertIn("alpha_90d", str(report.get("target", {}).get("name", "")))
 
-    def test_fallback_to_alpha_60d(self):
-        """run_training cai para alpha_60d quando alpha_90d não existe."""
+    def test_fails_without_alpha_90d(self):
+        """run_training falha com KeyError quando alpha_90d está ausente — sem fallback silencioso."""
         from ml_training.train import run_training
         df = self._make_df(n=300, has_90d=False)
         with tempfile.TemporaryDirectory() as tmp:
             pq = Path(tmp) / "train.parquet"
             df.to_parquet(pq, index=False)
-            result = run_training(
-                input_parquet=pq,
-                n_folds=2, purge_days=10, min_train=50, min_test=10,
-                log_summary=False,
-            )
-        self.assertIn("bundle", result)  # treino não falhou
+            with self.assertRaises(KeyError):
+                run_training(
+                    input_parquet=pq,
+                    n_folds=2, purge_days=10, min_train=50, min_test=10,
+                    log_summary=False,
+                )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

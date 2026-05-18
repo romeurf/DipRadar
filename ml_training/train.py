@@ -101,16 +101,16 @@ def run_walk_forward_cv(
     purge_days: int,
     min_train: int = 100,
     min_test: int = 20,
-    train_target: str = "alpha_60d",
+    train_target: str = "alpha_90d",
 ) -> tuple[dict[str, list[dict]], dict[str, np.ndarray], list[tuple]]:
     """Walk-forward CV em todos os modelos candidatos.
 
     Parameters
     ----------
     train_target : str
-        Coluna usada como Y para fit dos modelos. Use ``"alpha_60d_rank"``
+        Coluna usada como Y para fit dos modelos. Use ``"alpha_90d_rank"``
         para treino sobre rank cross-section (mais estável). Avaliação
-        (IC, top-K PnL) usa sempre ``alpha_60d`` bruto para
+        (IC, top-K PnL) usa sempre ``alpha_90d`` bruto para
         comparabilidade entre experiências.
 
     Devolve:
@@ -145,11 +145,12 @@ def run_walk_forward_cv(
 
         # Training Y: winsorize qualquer target (rank [0,1] é no-op após clip).
         y_alpha_tr = winsorize(df_tr[train_target].values.astype(float))
-        # Evaluation Y: usa o mesmo target que o treino para IC comparável.
-        # Se o parquet não tiver a coluna (ex: alpha_90d em parquet antigo),
-        # cai de volta para alpha_60d — avisa mas não falha.
-        _eval_col = train_target if train_target in df_te.columns else "alpha_60d"
-        y_alpha_te = df_te[_eval_col].values
+        if train_target not in df_te.columns:
+            raise ValueError(
+                f"Target '{train_target}' ausente no fold {k} test set. "
+                f"Colunas: {list(df_te.columns)[:10]}..."
+            )
+        y_alpha_te = df_te[train_target].values
         y_down_tr  = winsorize(df_tr["max_drawdown_60d"].values)
         y_down_te  = df_te["max_drawdown_60d"].values
 
@@ -443,15 +444,14 @@ def train_full_champion(
     df_v31: pd.DataFrame,
     champion_cfg: dict,
     *,
-    train_target: str = "alpha_60d",
+    train_target: str = "alpha_90d",
 ) -> tuple[object, object, list[str], int]:
     """Treina (model_up, model_down) no dataset COMPLETO com early stopping.
 
     Parameters
     ----------
     train_target : str
-        Coluna usada como Y para fit do model_up. Default ``alpha_60d``.
-        Use ``alpha_60d_rank`` para treino sobre rank cross-section.
+        Coluna usada como Y para fit do model_up. Default ``alpha_90d``.
 
     Devolve (champ_alpha, champ_down, feats_used, n_train).
     """
@@ -459,11 +459,13 @@ def train_full_champion(
     max_date = pd.to_datetime(df_v31["alert_date"]).max()
     feats    = [f for f in champion_cfg["feats"] if f in df_v31.columns]
 
+    if train_target not in df_v31.columns:
+        raise ValueError(
+            f"Target '{train_target}' ausente no DataFrame. "
+            f"Regenera o parquet via /admin_regen_parquet."
+        )
     X_full        = df_v31[feats].fillna(0).values.astype(np.float32)
-    if train_target == "alpha_60d":
-        y_alpha_full  = winsorize(df_v31["alpha_60d"].values)
-    else:
-        y_alpha_full  = df_v31[train_target].values.astype(float)
+    y_alpha_full  = winsorize(df_v31[train_target].values.astype(float))
     y_down_full   = winsorize(df_v31["max_drawdown_60d"].values)
     sw_full       = temporal_weights(df_v31["alert_date"], max_date)
 
@@ -488,7 +490,7 @@ def train_full_ensemble(
     ensemble_names: list[str],
     ensemble_weights: dict[str, float],
     *,
-    train_target: str = "alpha_60d",
+    train_target: str = "alpha_90d",
 ) -> tuple["EnsembleRegressor", "EnsembleRegressor", list[str], int]:
     """Treina ensemble (model_up + model_down) no dataset COMPLETO.
 
@@ -516,11 +518,13 @@ def train_full_ensemble(
         )
     feats = list(unique_sets.pop())
 
+    if train_target not in df_v31.columns:
+        raise ValueError(
+            f"Target '{train_target}' ausente no DataFrame. "
+            f"Regenera o parquet via /admin_regen_parquet."
+        )
     X_full        = df_v31[feats].fillna(0).values.astype(np.float32)
-    if train_target == "alpha_60d":
-        y_alpha_full  = winsorize(df_v31["alpha_60d"].values)
-    else:
-        y_alpha_full  = df_v31[train_target].values.astype(float)
+    y_alpha_full  = winsorize(df_v31[train_target].values.astype(float))
     y_down_full   = winsorize(df_v31["max_drawdown_60d"].values)
     sw_full       = temporal_weights(df_v31["alert_date"], max_date)
 

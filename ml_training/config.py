@@ -9,7 +9,6 @@ HORIZON_DAYS: int = 90                      # janela para close_90d / alpha_90d
 
 # Colunas alvo no parquet — geradas em data.py
 PRIMARY_TARGET: str = "alpha_90d"           # excesso de retorno sobre SPY em 90d
-PRIMARY_TARGET_FALLBACK: str = "alpha_60d"  # fallback para parquets antigos sem alpha_90d
 RISK_TARGET: str = "max_drawdown_60d"       # drawdown máximo nos primeiros 60d
 
 # Threshold do calibrador: P(alpha_90d > CALIBRATOR_THRESHOLD)
@@ -79,6 +78,12 @@ FEATURE_COLS: list[str] = [
     "insider_buy_amount_score",
     "recent_8k_score",
     "short_interest_trend",
+    "earnings_call_tone",
+    # Sector-conditioned features (v4.2): RSI/VIX/drawdown ajustados ao tipo de sector.
+    # Sincronizadas com FEATURE_COLUMNS em ml_features.py.
+    "rsi_sector_adjusted",
+    "vix_sector_signal",
+    "drawdown_sector_normalized",
 ]
 # Features removidas vs PR #25 (Spearman IC profiling sobre o parquet completo
 # 36929 rows confirmou 14 features inúteis):

@@ -47,9 +47,12 @@ mantidos como aliases dos novos nomes para não quebrar consumers externos.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 
 # ── Orçamento mensal (obrigatório via env var Railway) ──────────────────────
@@ -183,7 +186,8 @@ def portfolio_var_pct(
         # VaR histórico: percentil (1-confidence) das perdas
         var = float(np.percentile(port_rets.dropna(), (1 - confidence) * 100))
         return round(abs(var) * 100, 2)  # em percentagem
-    except Exception:
+    except Exception as e:
+        log.warning(f"[VaR] Falha ao calcular VaR do portfolio: {e}")
         return 0.0
 
 
@@ -527,8 +531,8 @@ def _size(ctx: AllocationContext, category: str) -> tuple[float, float, list[str
             if theme_mult > 1.0:
                 amount *= theme_mult
                 notes.append(f"Tema em trend x{theme_mult:.2f}")
-        except Exception:
-            pass  # themes.py opcional — nunca bloqueia
+        except Exception as e:
+            log.debug(f"[alloc] theme bonus falhou para {ctx.ticker}: {e}")
 
     # 6) Concentration cap (% do portfolio actual) — não aplica a CORE
     if category != CAT_CORE:

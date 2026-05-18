@@ -81,6 +81,12 @@ FEATURE_COLUMNS: list[str] = [
     "recent_8k_score",           # tipo de evento 8-K: -1=restatement, +1=M&A target
     "short_interest_trend",      # variação do short interest vs mês anterior
     "earnings_call_tone",        # sentimento da última earnings call [-1=pessimista, +1=confiante]
+    # Sector-conditioned features (v4.2): RSI, VIX e drawdown ajustados ao tipo de sector.
+    # Um VIX=35 significa coisas diferentes para growth vs commodity vs defensive.
+    # Captura o desvio relativo ao regime normal do sector — dimensão ortogonal ao modelo global.
+    "rsi_sector_adjusted",       # max(0, threshold_sector - rsi) — quão oversold vs norma do sector
+    "vix_sector_signal",         # VIX × factor_sector / 40 — growth reage negativamente, defensive positivamente
+    "drawdown_sector_normalized",# drawdown / typical_drawdown_sector — 0=normal, -3=capitulação extrema
 ]
 # PR #28 (Phase A): drop 14 dead features after IC profiling on full parquet:
 #   • 9 CONSTANTES (std=0, IC indefinida — _FALLBACK em todas as linhas):
@@ -184,6 +190,10 @@ _FALLBACK: dict[str, float] = {
     "recent_8k_score": 0.0,           # sem 8-K recente ou neutro
     "short_interest_trend": 0.0,      # estável
     "earnings_call_tone": 0.0,        # neutro — sem earnings call recente
+    # Sector-conditioned features (v4.2)
+    "rsi_sector_adjusted": 0.0,       # 0 = RSI na norma do sector (sem sinal de oversold)
+    "vix_sector_signal": 0.0,         # 0 = VIX neutro ou sector tipo desconhecido
+    "drawdown_sector_normalized": -1.0,  # -1 = drawdown leve (metade do típico)
 }
 
 def _tz_normalize(ts: Any) -> pd.Timestamp:
@@ -200,13 +210,55 @@ def _normalize_index(df: pd.DataFrame) -> pd.DataFrame:
         df.index = df.index.tz_localize(None)
     return df
 
+# Mapeamento sector → tipo de dinâmica para sector-conditioned features.
+# O modelo aprende que VIX=35 significa coisas diferentes consoante o sector.
+_SECTOR_TYPE: dict[str, str] = {
+    "Technology":             "growth",
+    "Healthcare":             "growth",
+    "Communication Services": "growth",
+    "Financial Services":     "cyclical",
+    "Financials":             "cyclical",
+    "Industrials":            "cyclical",
+    "Real Estate":            "cyclical",
+    "Energy":                 "commodity",
+    "Basic Materials":        "commodity",
+    "Consumer Defensive":     "defensive",
+    "Utilities":              "defensive",
+    "Consumer Cyclical":      "defensive",
+    "Unknown":                "cyclical",  # fallback neutro
+}
+
+# Limiar de "oversold" varia por sector:
+# Growth: RSI<35 é forte sinal (tech recupera rápido de vendas de pânico)
+# Commodity: RSI<30 é necessário (movem com ciclos mais longos)
+# Defensive: RSI<40 suficiente (baixa volatilidade naturalmente)
+_RSI_OVERSOLD_THRESHOLD: dict[str, float] = {
+    "growth":    35.0,
+    "cyclical":  32.0,
+    "commodity": 28.0,
+    "defensive": 40.0,
+}
+
+
 def add_derived_features(features: dict, alert_date: Optional[Any] = None) -> dict:
+    """Computa features derivadas (interacções) + sector-conditioned features.
+
+    Sector-conditioned features: o mesmo sinal (VIX, RSI, drawdown) tem pesos
+    diferentes por tipo de sector. Em vez de modelos separados por sector
+    (impossível com 46 linhas/stock em média), adicionamos versões condicionadas
+    ao sector que o modelo global pode aprender a ponderar correctamente.
+
+    Exemplo: RSI<30 em tech → sinal forte (pânico temporário).
+             RSI<30 em energy → sinal fraco (pode reflectir queda do crude).
+    """
     rsi = float(features.get("rsi_14", _FALLBACK["rsi_14"]))
     vix = float(features.get("vix", _FALLBACK["vix"]))
     pe_vf = float(features.get("pe_vs_fair", _FALLBACK["pe_vs_fair"]))
     drop = float(features.get("drop_pct_today", _FALLBACK["drop_pct_today"]))
     dd52 = float(features.get("drawdown_52w", _FALLBACK["drawdown_52w"]))
     volsp = float(features.get("volume_spike", _FALLBACK["volume_spike"]))
+
+    # ── Features derivadas standard ───────────────────────────────────────────
     features["rsi_oversold_strength"] = round(max(0.0, 40.0 - rsi), 4)
     features["vix_regime"] = 0.0 if vix < 15.0 else (1.0 if vix < 25.0 else 2.0)
     features["pe_attractive"] = round(max(0.0, 1.0 - pe_vf), 4)
@@ -226,6 +278,30 @@ def add_derived_features(features: dict, alert_date: Optional[Any] = None) -> di
         features["month_of_year"] = float(pd.Timestamp(alert_date).month) if alert_date is not None else float(datetime.now().month)
     except Exception:
         features["month_of_year"] = float(datetime.now().month)
+
+    # ── Sector-conditioned features ───────────────────────────────────────────
+    # O modelo global aprende pesos diferentes para os mesmos sinais consoante
+    # o tipo de sector. Não são modelos separados (impossível com ~46 linhas/stock)
+    # mas o modelo aprende que VIX=35 em growth ≠ VIX=35 em commodity.
+    sector   = str(features.get("sector", "Unknown") or "Unknown")
+    sec_type = _SECTOR_TYPE.get(sector, "cyclical")
+    rsi_thr  = _RSI_OVERSOLD_THRESHOLD.get(sec_type, 32.0)
+
+    # RSI ajustado ao sector: quão oversold está, relativo ao limiar sectorial
+    # growth: RSI<35 é "muito oversold"; commodity: RSI<28 é "muito oversold"
+    features["rsi_sector_adjusted"] = round(max(0.0, rsi_thr - rsi), 4)
+
+    # VIX × sector_type: alta volatilidade é positiva para defensivos (flight to safety)
+    # mas negativa para growth (risk-off → sell tech).
+    _vix_factor = {"growth": -1.0, "cyclical": -0.5, "commodity": 0.0, "defensive": +0.5}
+    features["vix_sector_signal"] = round(vix * _vix_factor.get(sec_type, -0.5) / 40.0, 4)
+
+    # Drawdown normalizado pelo sector: em energy, drawdown de -30% é comum;
+    # em tech, -30% é extremo. Normaliza pelo drawdown típico do sector.
+    _dd_typical = {"growth": -25.0, "cyclical": -30.0, "commodity": -40.0, "defensive": -20.0}
+    dd_norm = dd52 / abs(_dd_typical.get(sec_type, -30.0))
+    features["drawdown_sector_normalized"] = round(float(max(-3.0, min(0.0, dd_norm))), 4)
+
     return features
 
 

@@ -475,7 +475,7 @@ def get_model_info() -> dict:
         "score_high":    _SCORE_HIGH,
         "score_med":     _SCORE_MED,
         "score_floor":   _SCORE_FLOOR,
-        "target":        "alpha_60d",
+        "target":        "alpha_90d",
     }
 
 
