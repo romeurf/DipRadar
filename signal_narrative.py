@@ -45,8 +45,13 @@ def generate_signal_narrative(
     pred_drawdown:   Optional[float] = None,  # max drawdown esperado
 
     # Insider signals (Form 4)
-    insider_recent:       Optional[float] = None,  # 0/1
-    insider_amount_score: Optional[float] = None,  # [0,1]
+    insider_recent:         Optional[float] = None,  # 0/1
+    insider_amount_score:   Optional[float] = None,  # [0,1]
+    insider_buy_amount_usd: Optional[float] = None,  # valor real em USD
+    insider_name:           Optional[str]   = None,  # ex: "John Smith"
+    insider_title:          Optional[str]   = None,  # ex: "Chief Executive Officer"
+    # 8-K exact description
+    eight_k_description:    Optional[str]   = None,  # descrição precisa do item code
 
     # 8-K event
     eight_k_score:   Optional[float] = None,  # [-1,+1]
@@ -75,22 +80,25 @@ def generate_signal_narrative(
 
     # ── 1. Red flags (8-K grave) — mencionados imediatamente ─────────────────
     if _is_valid(eight_k_score):
-        ek = float(eight_k_score)
+        ek   = float(eight_k_score)
+        desc = eight_k_description or ""
         if ek <= -0.7:
+            event_str = f'"{desc}"' if desc else "evento grave (restatement ou default)"
             red_flags.append(
-                "A empresa publicou um 8-K grave esta semana (possivelmente "
-                "restatement ou default). Este dip pode ser estrutural — "
-                "o Shield recomenda cautela máxima."
+                f"A empresa publicou um 8-K com {event_str}. "
+                f"Este dip pode ser estrutural — o Shield recomenda cautela máxima."
             )
         elif ek <= -0.4:
+            event_str = f'"{desc}"' if desc else "evento negativo"
             red_flags.append(
-                "Houve um evento 8-K negativo recente (saída de executivo "
-                "ou mudança de auditor). Confirma os fundamentos antes de entrar."
+                f"Houve um 8-K recente com {event_str}. "
+                f"Confirma os fundamentos antes de entrar."
             )
         elif ek >= 0.4:
+            event_str = f'"{desc}"' if desc else "evento favorável"
             parts.append(
-                "O 8-K mais recente é positivo — pode indicar aquisição ou "
-                "evento favorável que explica a queda como ruído temporário."
+                f"O 8-K mais recente indica {event_str} — "
+                f"pode explicar a queda como ruído temporário."
             )
 
     # ── 2. Sinal principal ML ─────────────────────────────────────────────────
@@ -130,21 +138,45 @@ def generate_signal_narrative(
 
     # ── 3. Insider buying ─────────────────────────────────────────────────────
     if _is_valid(insider_amount_score) and float(insider_amount_score) >= 0.3:
-        amount = float(insider_amount_score)
-        if amount >= 0.8:
+        score_val  = float(insider_amount_score)
+        amount_usd = float(insider_buy_amount_usd) if _is_valid(insider_buy_amount_usd) and insider_buy_amount_usd else 0
+
+        # Formatar o montante real se disponível
+        if amount_usd >= 1_000_000:
+            amount_str = f"*${amount_usd/1_000_000:.1f}M*"
+        elif amount_usd >= 100_000:
+            amount_str = f"*${amount_usd/1_000:.0f}k*"
+        elif amount_usd > 0:
+            amount_str = f"*${amount_usd:,.0f}*"
+        else:
+            amount_str = "uma quantidade significativa"
+
+        # Nome e cargo do insider
+        _name  = (insider_name or "").strip()
+        _title = (insider_title or "").strip()
+        if _name and _title:
+            who = f"*{_name}* ({_title})"
+        elif _name:
+            who = f"*{_name}*"
+        elif _title:
+            who = f"o *{_title}*"
+        else:
+            who = "um executivo"
+
+        if score_val >= 0.8:
             parts.append(
-                "Um executivo comprou uma quantidade *muito significativa* de "
-                "ações recentemente (Form 4 SEC) — raramente insiders apostam "
-                "este montante se não tiverem convicção na recuperação."
+                f"{who} comprou {amount_str} em ações recentemente "
+                f"(Form 4 SEC) — raramente insiders apostam este montante "
+                f"se não tiverem convicção de que o dip é temporário."
             )
-        elif amount >= 0.5:
+        elif score_val >= 0.5:
             parts.append(
-                "Houve compras de insider significativas recentemente (Form 4 SEC). "
-                "Quem conhece a empresa melhor do que ninguém está a comprar."
+                f"{who} comprou {amount_str} em ações recentemente "
+                f"(Form 4 SEC). Quem conhece melhor a empresa está a comprar."
             )
         else:
             parts.append(
-                "Houve compras de insider moderadas recentemente — sinal positivo."
+                f"{who} comprou {amount_str} em ações recentemente — sinal positivo."
             )
     elif _is_valid(insider_recent) and float(insider_recent) > 0:
         parts.append(

@@ -195,22 +195,21 @@ def _edgar_submissions(ticker: str) -> dict:
 
 
 def _parse_form4_xml(accession_no: str, cik: str) -> dict:
-    """Parseia um Form 4 XML e devolve {amount_usd, is_purchase, code}.
+    """Parseia um Form 4 XML e devolve {amount_usd, is_purchase, name, title}.
+
+    Extrai:
+    - amount_usd : valor total das compras (shares × price)
+    - is_purchase: True se houve aquisição (code A)
+    - name        : nome do insider (ex: "John Smith")
+    - title       : cargo (ex: "Chief Executive Officer", "Director")
 
     Usa xml.etree.ElementTree — sem dependências extra.
-    Retorna {} se falhar ou não for compra.
     """
     import requests
     import xml.etree.ElementTree as ET
 
     acc_clean = accession_no.replace("-", "")
-    url = (
-        f"https://www.sec.gov/Archives/edgar/full-index/"
-        f"cgi-bin/browse-edgar?action=getcompany&CIK={cik}"
-        f"&type=4&dateb=&owner=include&count=5"
-    )
-    # Abordagem directa: buscar o documento XML do filing
-    doc_url = (
+    doc_url   = (
         f"https://www.sec.gov/Archives/edgar/data/{int(cik)}"
         f"/{acc_clean}/{acc_clean}.txt"
     )
@@ -218,17 +217,27 @@ def _parse_form4_xml(accession_no: str, cik: str) -> dict:
         r = requests.get(doc_url, headers=_EDGAR_HEADERS, timeout=10)
         if r.status_code != 200:
             return {}
-        # Encontrar bloco XML dentro do ficheiro SGML
-        text = r.text
+        text  = r.text
         start = text.find("<ownershipDocument>")
         end   = text.find("</ownershipDocument>")
         if start == -1 or end == -1:
             return {}
-        xml_str = text[start:end + len("</ownershipDocument>")]
-        root = ET.fromstring(xml_str)
+        root = ET.fromstring(text[start:end + len("</ownershipDocument>")])
     except Exception:
         return {}
 
+    # ── Identidade do insider ─────────────────────────────────────────────────
+    name  = root.findtext(".//reportingOwner/reportingOwnerId/rptOwnerName", "").strip()
+    title = root.findtext(
+        ".//reportingOwner/reportingOwnerRelationship/officerTitle", ""
+    ).strip()
+    is_director = root.findtext(
+        ".//reportingOwner/reportingOwnerRelationship/isDirector", "0"
+    ).strip() == "1"
+    if not title and is_director:
+        title = "Director"
+
+    # ── Transacções ───────────────────────────────────────────────────────────
     total_amount = 0.0
     has_purchase = False
     for txn in root.findall(".//nonDerivativeTransaction"):
@@ -243,7 +252,12 @@ def _parse_form4_xml(accession_no: str, cik: str) -> dict:
         except (ValueError, TypeError):
             pass
 
-    return {"amount_usd": total_amount, "is_purchase": has_purchase}
+    return {
+        "amount_usd":  total_amount,
+        "is_purchase": has_purchase,
+        "name":        name,
+        "title":       title,
+    }
 
 
 def insider_buy_recent(ticker: str, lookback_days: int = 30) -> float:
@@ -270,22 +284,25 @@ def insider_buy_recent(ticker: str, lookback_days: int = 30) -> float:
         return NaN
 
 
-def insider_buy_amount_score(ticker: str, lookback_days: int = 60) -> float:
-    """Score normalizado da MAGNITUDE das compras de insiders [0, 1].
+def insider_buy_amount_score(ticker: str, lookback_days: int = 60) -> tuple[float, float]:
+    """Score normalizado + montante raw das compras de insiders.
 
-    0.0 = sem compras recentes
-    0.3 = compras pequenas (<$100k)
-    0.7 = compras significativas ($100k-$1M)
-    1.0 = compras muito grandes (>$1M) — executives a apostar forte
+    Devolve (score [0,1], amount_usd) para que a narrativa possa mostrar
+    o valor real em vez de "muito significativa".
 
-    Um CEO que compra $2M em ações pós-dip é o sinal mais forte de todos.
+    score:
+      0.0 = sem compras
+      0.3 = compras pequenas (<$100k)
+      0.7 = compras significativas ($100k-$1M)
+      1.0 = compras muito grandes (>$1M)
+
     Usa Form 4 + parsing XML do SEC EDGAR (gratuito).
     """
     try:
         data   = _edgar_submissions(ticker)
         cik    = data.get("cik", "")
         if not cik:
-            return NaN
+            return NaN, 0.0
         cik_str = str(cik).zfill(10)
         recent  = data.get("filings", {}).get("recent", {})
         forms        = recent.get("form", [])
@@ -294,6 +311,10 @@ def insider_buy_amount_score(ticker: str, lookback_days: int = 60) -> float:
         cutoff = date.today() - timedelta(days=lookback_days)
 
         total_purchase = 0.0
+        top_name  = ""
+        top_title = ""
+        top_amount = 0.0
+
         for form, filed_str, acc in zip(forms, dates_filed, accessions):
             if form not in ("4", "4/A"):
                 continue
@@ -304,41 +325,72 @@ def insider_buy_amount_score(ticker: str, lookback_days: int = 60) -> float:
                 continue
             parsed = _parse_form4_xml(acc, cik_str)
             if parsed.get("is_purchase"):
-                total_purchase += parsed.get("amount_usd", 0)
+                amt = parsed.get("amount_usd", 0)
+                total_purchase += amt
+                # Guardar o insider com maior compra individual
+                if amt > top_amount:
+                    top_amount = amt
+                    top_name   = parsed.get("name", "")
+                    top_title  = parsed.get("title", "")
 
         if total_purchase <= 0:
-            return 0.0
-        # Normalizar: escala logarítmica [$1k, $10M]
+            return 0.0, 0.0
+
         import math
         score = math.log10(max(total_purchase, 1000)) / math.log10(10_000_000)
-        return round(float(min(score, 1.0)), 3)
+        # Guardar nome e cargo na variável de módulo para uso na narrativa
+        _last_insider_details[ticker.upper()] = {
+            "name":   top_name,
+            "title":  top_title,
+            "amount": round(total_purchase, 0),
+        }
+        return round(float(min(score, 1.0)), 3), round(total_purchase, 0)
     except Exception as e:
         log.debug(f"[insider_amount] {ticker}: {e}")
-        return NaN
+        return NaN, 0.0
+
+
+# Cache em memória dos detalhes do último insider e 8-K por ticker
+_last_insider_details: dict[str, dict] = {}
+_last_8k_details: dict[str, dict] = {}
+
+
+def get_insider_details(ticker: str) -> dict:
+    """Devolve {name, title, amount} do insider com maior compra recente."""
+    return _last_insider_details.get(ticker.upper(), {})
+
+
+def get_8k_details(ticker: str) -> dict:
+    """Devolve {item, description, filed, score} do 8-K mais relevante recente."""
+    return _last_8k_details.get(ticker.upper(), {})
 
 
 # ── 8-K Classification ────────────────────────────────────────────────────────
 
 # Mapeamento de item codes SEC → impacto para dip hunting
 # Items completos: https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&type=8-K
-_8K_ITEM_SCORES: dict[str, float] = {
-    "1.01": +0.2,   # Material Definitive Agreement (contrato importante)
-    "1.02": -0.2,   # Termination of Material Agreement
-    "1.05": -0.5,   # Cybersecurity Incident
-    "2.01": +0.4,   # Completion of Acquisition (consolidação)
-    "2.02":  0.0,   # Results of Operations (earnings — neutro sem contexto)
-    "2.04": -0.8,   # Triggering Events (covenant breach, default)
-    "2.06": -0.3,   # Material Impairment
-    "3.01": -0.6,   # Notice of Delisting
-    "4.01": -0.5,   # Change in Auditor (sinal de problemas)
-    "4.02": -0.9,   # Non-Reliance on Prior Financials (RESTATEMENT — estrutural)
-    "5.01": +0.1,   # Change in Control (aquisição geralmente positiva)
-    "5.02": -0.3,   # Departure of Executive (incerteza)
-    "5.03": -0.1,   # Amendments to AoI
-    "7.01":  0.0,   # Regulation FD Disclosure (neutro)
-    "8.01":  0.0,   # Other Events (neutro sem contexto)
-    "9.01":  0.0,   # Financial Statements (acompanha outros itens)
+# Item codes 8-K: (score, descrição precisa para narrativa)
+_8K_ITEMS: dict[str, tuple[float, str]] = {
+    "1.01": (+0.2, "Material Definitive Agreement — contrato estratégico importante"),
+    "1.02": (-0.2, "Termination of Material Agreement — rescisão de contrato relevante"),
+    "1.05": (-0.5, "Material Cybersecurity Incident — incidente de cibersegurança grave"),
+    "2.01": (+0.4, "Completion of Acquisition or Disposition — aquisição ou alienação completada"),
+    "2.02": ( 0.0, "Results of Operations and Financial Condition — divulgação de resultados"),
+    "2.04": (-0.8, "Triggering Events for Direct Financial Obligation — risco de default ou aceleração de dívida"),
+    "2.06": (-0.3, "Material Impairment — imparidade de activos"),
+    "3.01": (-0.6, "Notice of Delisting — risco de saída da bolsa"),
+    "4.01": (-0.5, "Changes in Registrant's Certifying Accountant — mudança de auditor (sinal de problemas)"),
+    "4.02": (-0.9, "Non-Reliance on Previously Issued Financial Statements — restatement de resultados anteriores"),
+    "5.01": (+0.1, "Changes in Control of Registrant — mudança de controlo"),
+    "5.02": (-0.3, "Departure of Directors or Certain Officers — saída de executivo ou director"),
+    "5.03": (-0.1, "Amendments to AoI or Bylaws — alteração de estatutos"),
+    "7.01": ( 0.0, "Regulation FD Disclosure — divulgação ao abrigo do Regulamento FD"),
+    "8.01": ( 0.0, "Other Events — outros eventos"),
+    "9.01": ( 0.0, "Financial Statements and Exhibits — demonstrações financeiras e anexos"),
 }
+
+# Manter o dict de scores para compatibilidade
+_8K_ITEM_SCORES: dict[str, float] = {k: v[0] for k, v in _8K_ITEMS.items()}
 
 
 def classify_recent_8k(ticker: str, lookback_days: int = 30) -> float:
@@ -376,14 +428,26 @@ def classify_recent_8k(ticker: str, lookback_days: int = 30) -> float:
             else:
                 item_codes = [x.strip() for x in str(items).split(",")]
 
-            # Score = soma ponderada dos item codes (mais negativo domina)
             scores = [_8K_ITEM_SCORES.get(code, 0.0) for code in item_codes if code]
             if not scores:
                 return 0.0
-            # O item mais extremo domina o score (red flags são absolutos)
+
+            # O item mais extremo domina
             min_score = min(scores)
             max_score = max(scores)
             final = min_score if abs(min_score) > abs(max_score) else max_score
+            dominant_code = (
+                min(item_codes, key=lambda c: _8K_ITEM_SCORES.get(c, 0.0))
+                if abs(min_score) >= abs(max_score)
+                else max(item_codes, key=lambda c: _8K_ITEM_SCORES.get(c, 0.0))
+            )
+            # Guardar descrição exacta para a narrativa
+            _last_8k_details[ticker.upper()] = {
+                "item":        dominant_code,
+                "description": _8K_ITEMS.get(dominant_code, (0, "Evento 8-K"))[1],
+                "filed":       filed_str[:10],
+                "score":       round(float(max(-1.0, min(1.0, final))), 2),
+            }
             return round(float(max(-1.0, min(1.0, final))), 2)
 
         return NaN  # sem 8-K recente
@@ -576,10 +640,13 @@ def compute_fundamental_signals(
             result["insider_buy_recent"] = NaN
 
         try:
-            result["insider_buy_amount_score"] = insider_buy_amount_score(ticker)
+            _score, _amount = insider_buy_amount_score(ticker)
+            result["insider_buy_amount_score"] = _score
+            result["insider_buy_amount_usd"]   = _amount  # valor real em dólares
         except Exception as e:
             log.error(f"[signals] insider_buy_amount {ticker}: {e}")
             result["insider_buy_amount_score"] = NaN
+            result["insider_buy_amount_usd"]   = 0.0
 
         try:
             result["recent_8k_score"] = classify_recent_8k(ticker)

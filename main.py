@@ -1087,18 +1087,31 @@ def build_alert(
         from ml_features import _FALLBACK as _mf_fallback
         _feats = {**fundamentals} if fundamentals else {}
         _eight_k = _feats.get("recent_8k_score") or _mf_fallback.get("recent_8k_score")
+        # Detalhes insider e 8-K (nome, cargo, descrição exacta)
+        try:
+            from fundamental_signals import get_insider_details, get_8k_details
+            _ins_det = get_insider_details(symbol)
+            _8k_det  = get_8k_details(symbol)
+        except Exception:
+            _ins_det = {}
+            _8k_det  = {}
+
         _narrative = generate_signal_narrative(
-            pred_alpha_90d  = ml_result.pred_up     if ml_result and ml_result.model_ready else None,
-            win_prob        = ml_result.win_prob     if ml_result and ml_result.model_ready else None,
-            pred_drawdown   = ml_result.pred_down    if ml_result and ml_result.model_ready else None,
-            insider_recent  = _feats.get("insider_buy_recent"),
-            insider_amount_score = _feats.get("insider_buy_amount_score"),
-            eight_k_score   = _eight_k,
-            short_trend     = _feats.get("short_interest_trend"),
-            consecutive_red = _feats.get("consecutive_red_days"),
-            ma_200d_ratio   = _feats.get("ma_200d_ratio"),
-            stock_type      = ml_result.stock_type if ml_result and ml_result.model_ready else "SPECULATIVE",
-            ticker          = symbol,
+            pred_alpha_90d        = ml_result.pred_up     if ml_result and ml_result.model_ready else None,
+            win_prob              = ml_result.win_prob     if ml_result and ml_result.model_ready else None,
+            pred_drawdown         = ml_result.pred_down    if ml_result and ml_result.model_ready else None,
+            insider_recent        = _feats.get("insider_buy_recent"),
+            insider_amount_score  = _feats.get("insider_buy_amount_score"),
+            insider_buy_amount_usd = _feats.get("insider_buy_amount_usd") or _ins_det.get("amount"),
+            insider_name          = _ins_det.get("name"),
+            insider_title         = _ins_det.get("title"),
+            eight_k_score         = _eight_k,
+            eight_k_description   = _8k_det.get("description"),
+            short_trend           = _feats.get("short_interest_trend"),
+            consecutive_red       = _feats.get("consecutive_red_days"),
+            ma_200d_ratio         = _feats.get("ma_200d_ratio"),
+            stock_type            = ml_result.stock_type if ml_result and ml_result.model_ready else "SPECULATIVE",
+            ticker                = symbol,
         )
         if _narrative:
             signal_narrative_text = f"\n\n{_narrative}"
