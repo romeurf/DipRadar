@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m unittest tests.test_production_quality tests.test_red_flags_and_conflict)"
+    ]
+  }
+}

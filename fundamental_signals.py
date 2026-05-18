@@ -174,50 +174,249 @@ def _ensure_cik_map() -> None:
         _CIK_MAP = {}  # vazio — insider_buy_recent retorna NaN para todos
 
 
-def insider_buy_recent(ticker: str, lookback_days: int = 30) -> float:
-    """1.0 se houve compra de insider (Form 4) nos últimos lookback_days, 0.0 se não.
-
-    Retorna NaN se o ticker não tiver cobertura SEC (tickers não-US).
-    Propaga requests.HTTPError em falhas de API.
-    """
+def _edgar_submissions(ticker: str) -> dict:
+    """Retorna o JSON de submissions EDGAR para um ticker US. Raises se falhar."""
     import requests
-
-    # Tickers não-US não têm EDGAR coverage
-    base_ticker = ticker.upper().split(".")[0]
+    base = ticker.upper().split(".")[0]
     if "." in ticker:
-        return NaN
-
+        raise ValueError(f"{ticker} não é um ticker US (sem cobertura EDGAR)")
     _ensure_cik_map()
-    cik = _CIK_MAP.get(base_ticker)
+    cik = _CIK_MAP.get(base)
     if not cik:
-        return NaN
-
+        raise ValueError(f"{base} sem CIK EDGAR")
     r = requests.get(
         f"https://data.sec.gov/submissions/CIK{cik}.json",
         headers=_EDGAR_HEADERS, timeout=15,
     )
     if r.status_code == 404:
-        return NaN
+        raise ValueError(f"{base} sem cobertura EDGAR (404)")
     r.raise_for_status()
+    return r.json()
 
-    data = r.json()
-    recent = data.get("filings", {}).get("recent", {})
-    forms       = recent.get("form", [])
-    dates_filed = recent.get("filingDate", [])
 
-    cutoff = date.today() - timedelta(days=lookback_days)
-    for form, filed_str in zip(forms, dates_filed):
-        if form not in ("4", "4/A"):
+def _parse_form4_xml(accession_no: str, cik: str) -> dict:
+    """Parseia um Form 4 XML e devolve {amount_usd, is_purchase, code}.
+
+    Usa xml.etree.ElementTree — sem dependências extra.
+    Retorna {} se falhar ou não for compra.
+    """
+    import requests
+    import xml.etree.ElementTree as ET
+
+    acc_clean = accession_no.replace("-", "")
+    url = (
+        f"https://www.sec.gov/Archives/edgar/full-index/"
+        f"cgi-bin/browse-edgar?action=getcompany&CIK={cik}"
+        f"&type=4&dateb=&owner=include&count=5"
+    )
+    # Abordagem directa: buscar o documento XML do filing
+    doc_url = (
+        f"https://www.sec.gov/Archives/edgar/data/{int(cik)}"
+        f"/{acc_clean}/{acc_clean}.txt"
+    )
+    try:
+        r = requests.get(doc_url, headers=_EDGAR_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return {}
+        # Encontrar bloco XML dentro do ficheiro SGML
+        text = r.text
+        start = text.find("<ownershipDocument>")
+        end   = text.find("</ownershipDocument>")
+        if start == -1 or end == -1:
+            return {}
+        xml_str = text[start:end + len("</ownershipDocument>")]
+        root = ET.fromstring(xml_str)
+    except Exception:
+        return {}
+
+    total_amount = 0.0
+    has_purchase = False
+    for txn in root.findall(".//nonDerivativeTransaction"):
+        code = txn.findtext(".//transactionAcquiredDisposedCode/value", "").strip()
+        if code != "A":  # A = Acquired (compra); D = Disposed (venda)
             continue
+        has_purchase = True
         try:
-            if date.fromisoformat(filed_str[:10]) >= cutoff:
-                # Form 4 encontrado no período — presumir compra
-                # (refinamento futuro: parsear XML para verificar transaction code P)
-                return 1.0
-        except ValueError:
-            continue
+            shares = float(txn.findtext(".//transactionShares/value", "0") or 0)
+            price  = float(txn.findtext(".//transactionPricePerShare/value", "0") or 0)
+            total_amount += shares * price
+        except (ValueError, TypeError):
+            pass
 
-    return 0.0
+    return {"amount_usd": total_amount, "is_purchase": has_purchase}
+
+
+def insider_buy_recent(ticker: str, lookback_days: int = 30) -> float:
+    """1.0 se houve compra de insider (Form 4) nos últimos lookback_days, 0.0 se não.
+
+    Retorna NaN se o ticker não tiver cobertura SEC (tickers não-US).
+    """
+    try:
+        data   = _edgar_submissions(ticker)
+        recent = data.get("filings", {}).get("recent", {})
+        forms       = recent.get("form", [])
+        dates_filed = recent.get("filingDate", [])
+        cutoff = date.today() - timedelta(days=lookback_days)
+        for form, filed_str in zip(forms, dates_filed):
+            if form not in ("4", "4/A"):
+                continue
+            try:
+                if date.fromisoformat(filed_str[:10]) >= cutoff:
+                    return 1.0
+            except ValueError:
+                continue
+        return 0.0
+    except Exception:
+        return NaN
+
+
+def insider_buy_amount_score(ticker: str, lookback_days: int = 60) -> float:
+    """Score normalizado da MAGNITUDE das compras de insiders [0, 1].
+
+    0.0 = sem compras recentes
+    0.3 = compras pequenas (<$100k)
+    0.7 = compras significativas ($100k-$1M)
+    1.0 = compras muito grandes (>$1M) — executives a apostar forte
+
+    Um CEO que compra $2M em ações pós-dip é o sinal mais forte de todos.
+    Usa Form 4 + parsing XML do SEC EDGAR (gratuito).
+    """
+    try:
+        data   = _edgar_submissions(ticker)
+        cik    = data.get("cik", "")
+        if not cik:
+            return NaN
+        cik_str = str(cik).zfill(10)
+        recent  = data.get("filings", {}).get("recent", {})
+        forms        = recent.get("form", [])
+        dates_filed  = recent.get("filingDate", [])
+        accessions   = recent.get("accessionNumber", [])
+        cutoff = date.today() - timedelta(days=lookback_days)
+
+        total_purchase = 0.0
+        for form, filed_str, acc in zip(forms, dates_filed, accessions):
+            if form not in ("4", "4/A"):
+                continue
+            try:
+                if date.fromisoformat(filed_str[:10]) < cutoff:
+                    continue
+            except ValueError:
+                continue
+            parsed = _parse_form4_xml(acc, cik_str)
+            if parsed.get("is_purchase"):
+                total_purchase += parsed.get("amount_usd", 0)
+
+        if total_purchase <= 0:
+            return 0.0
+        # Normalizar: escala logarítmica [$1k, $10M]
+        import math
+        score = math.log10(max(total_purchase, 1000)) / math.log10(10_000_000)
+        return round(float(min(score, 1.0)), 3)
+    except Exception as e:
+        log.debug(f"[insider_amount] {ticker}: {e}")
+        return NaN
+
+
+# ── 8-K Classification ────────────────────────────────────────────────────────
+
+# Mapeamento de item codes SEC → impacto para dip hunting
+# Items completos: https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&type=8-K
+_8K_ITEM_SCORES: dict[str, float] = {
+    "1.01": +0.2,   # Material Definitive Agreement (contrato importante)
+    "1.02": -0.2,   # Termination of Material Agreement
+    "1.05": -0.5,   # Cybersecurity Incident
+    "2.01": +0.4,   # Completion of Acquisition (consolidação)
+    "2.02":  0.0,   # Results of Operations (earnings — neutro sem contexto)
+    "2.04": -0.8,   # Triggering Events (covenant breach, default)
+    "2.06": -0.3,   # Material Impairment
+    "3.01": -0.6,   # Notice of Delisting
+    "4.01": -0.5,   # Change in Auditor (sinal de problemas)
+    "4.02": -0.9,   # Non-Reliance on Prior Financials (RESTATEMENT — estrutural)
+    "5.01": +0.1,   # Change in Control (aquisição geralmente positiva)
+    "5.02": -0.3,   # Departure of Executive (incerteza)
+    "5.03": -0.1,   # Amendments to AoI
+    "7.01":  0.0,   # Regulation FD Disclosure (neutro)
+    "8.01":  0.0,   # Other Events (neutro sem contexto)
+    "9.01":  0.0,   # Financial Statements (acompanha outros itens)
+}
+
+
+def classify_recent_8k(ticker: str, lookback_days: int = 30) -> float:
+    """Score de risco do 8-K mais recente: -1 (muito mau) a +1 (muito bom).
+
+    Usa os item codes do 8-K para classificar sem parsear o texto completo:
+      -0.9 → Restatement (4.02) — quase sempre estrutural, evitar
+      -0.8 → Default/covenant breach (2.04) — muito negativo
+      +0.4 → Aquisição completada (2.01) — frequentemente positivo
+      0.0  → Earnings/outros (contexto necessário)
+
+    Retorna NaN se sem cobertura EDGAR ou sem 8-K recente.
+    """
+    try:
+        data   = _edgar_submissions(ticker)
+        recent = data.get("filings", {}).get("recent", {})
+        forms        = recent.get("form", [])
+        dates_filed  = recent.get("filingDate", [])
+        items_list   = recent.get("items", [])
+        cutoff = date.today() - timedelta(days=lookback_days)
+
+        # Encontrar o 8-K mais recente dentro do período
+        for form, filed_str, items in zip(forms, dates_filed, items_list):
+            if form not in ("8-K", "8-K/A"):
+                continue
+            try:
+                if date.fromisoformat(filed_str[:10]) < cutoff:
+                    continue
+            except ValueError:
+                continue
+
+            # items é uma string como "2.02, 9.01" ou lista
+            if isinstance(items, list):
+                item_codes = [str(x).strip() for x in items]
+            else:
+                item_codes = [x.strip() for x in str(items).split(",")]
+
+            # Score = soma ponderada dos item codes (mais negativo domina)
+            scores = [_8K_ITEM_SCORES.get(code, 0.0) for code in item_codes if code]
+            if not scores:
+                return 0.0
+            # O item mais extremo domina o score (red flags são absolutos)
+            min_score = min(scores)
+            max_score = max(scores)
+            final = min_score if abs(min_score) > abs(max_score) else max_score
+            return round(float(max(-1.0, min(1.0, final))), 2)
+
+        return NaN  # sem 8-K recente
+    except Exception as e:
+        log.debug(f"[8k_class] {ticker}: {e}")
+        return NaN
+
+
+# ── Short Interest Trend ──────────────────────────────────────────────────────
+
+def short_interest_trend(ticker: str) -> float:
+    """Variação do short interest no último mês (Δ fracção).
+
+    Positivo = mais shorts este mês vs mês anterior.
+      > +0.20 : shorts a aumentar muito — mais potencial de squeeze se recuperar
+      ≈ 0     : estável
+      < -0.20 : shorts a cobrir — smart money a fechar posições curtas
+
+    Para dip hunting, short_interest_trend positivo + dip = setup de squeeze potencial.
+    Usa yfinance info (sharesShort + sharesShortPriorMonth). Gratuito, sem API key.
+    """
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info or {}
+        current = info.get("sharesShort")
+        prior   = info.get("sharesShortPriorMonth")
+        if current is None or prior is None or prior <= 0:
+            return NaN
+        trend = (float(current) - float(prior)) / float(prior)
+        return round(float(max(-1.0, min(1.0, trend))), 4)
+    except Exception as e:
+        log.debug(f"[short_trend] {ticker}: {e}")
+        return NaN
 
 
 # ── Camada 4: Alpha Vantage ────────────────────────────────────────────────────
@@ -368,14 +567,36 @@ def compute_fundamental_signals(
         result.setdefault("short_interest_pct", NaN)
 
     # Camada 3: SEC EDGAR (só para tickers US)
-    if "." not in ticker.split("/")[-1]:
+    _is_us = "." not in ticker.split("/")[-1]
+    if _is_us:
         try:
             result["insider_buy_recent"] = insider_buy_recent(ticker)
         except Exception as e:
             log.error(f"[signals] insider_buy_recent {ticker}: {e}")
             result["insider_buy_recent"] = NaN
+
+        try:
+            result["insider_buy_amount_score"] = insider_buy_amount_score(ticker)
+        except Exception as e:
+            log.error(f"[signals] insider_buy_amount {ticker}: {e}")
+            result["insider_buy_amount_score"] = NaN
+
+        try:
+            result["recent_8k_score"] = classify_recent_8k(ticker)
+        except Exception as e:
+            log.error(f"[signals] 8k_class {ticker}: {e}")
+            result["recent_8k_score"] = NaN
     else:
-        result["insider_buy_recent"] = NaN  # tickers não-US sem EDGAR coverage
+        result["insider_buy_recent"]      = NaN
+        result["insider_buy_amount_score"] = NaN
+        result["recent_8k_score"]          = NaN
+
+    # Short interest trend (yfinance, US + alguns internacionais)
+    try:
+        result["short_interest_trend"] = short_interest_trend(ticker)
+    except Exception as e:
+        log.error(f"[signals] short_interest_trend {ticker}: {e}")
+        result["short_interest_trend"] = NaN
 
     # Camada 4: Alpha Vantage
     if use_alphavantage:

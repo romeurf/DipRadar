@@ -76,6 +76,10 @@ FEATURE_COLUMNS: list[str] = [
     "earnings_beat_rate",    # % de últimos 4 trimestres onde bateu EPS estimativas
     "analyst_rating",        # consenso analistas: 1=Strong Buy … 5=Strong Sell
     "short_interest_pct",    # short interest como % do float — squeeze potential
+    # Fase 5b: sinais avançados (Form 4 montante + 8-K + short trend)
+    "insider_buy_amount_score",  # magnitude normalizada das compras insider [0,1]
+    "recent_8k_score",           # tipo de evento 8-K: -1=restatement, +1=M&A target
+    "short_interest_trend",      # variação do short interest vs mês anterior
 ]
 # PR #28 (Phase A): drop 14 dead features after IC profiling on full parquet:
 #   • 9 CONSTANTES (std=0, IC indefinida — _FALLBACK em todas as linhas):
@@ -167,13 +171,17 @@ _FALLBACK: dict[str, float] = {
     "close_in_range_20d": 0.5,   # 0.5 = neutral (closing mid-range)
     "up_days_pct_20d": 0.5,      # 50% — random walk baseline
     "true_range_pct_20d": 0.02,  # 2% intraday — typical equity
-    # Fase 5: novos sinais de qualidade e sentimento
-    "consecutive_red_days": 3.0,  # 3 dias consecutivos — neutro para um dip típico
-    "ma_200d_ratio": 0.90,        # 10% abaixo da MA200 — dip típico
-    "insider_buy_recent": 0.0,    # sem compra insider — caso mais comum
-    "earnings_beat_rate": 0.50,   # 50% — neutro (random)
-    "analyst_rating": 2.5,        # entre Buy e Hold — neutro
-    "short_interest_pct": 0.05,   # 5% — short interest típico
+    # Fase 5: sinais de qualidade e sentimento
+    "consecutive_red_days": 3.0,      # 3 dias consecutivos — neutro
+    "ma_200d_ratio": 0.90,            # 10% abaixo da MA200 — dip típico
+    "insider_buy_recent": 0.0,        # sem compra insider — caso mais comum
+    "earnings_beat_rate": 0.50,       # 50% — neutro (random)
+    "analyst_rating": 2.5,            # entre Buy e Hold — neutro
+    "short_interest_pct": 0.05,       # 5% — short interest típico
+    # Fase 5b: sinais avançados
+    "insider_buy_amount_score": 0.0,  # sem compras — caso mais comum
+    "recent_8k_score": 0.0,           # sem 8-K recente ou neutro
+    "short_interest_trend": 0.0,      # estável
 }
 
 def _tz_normalize(ts: Any) -> pd.Timestamp:

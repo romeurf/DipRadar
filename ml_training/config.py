@@ -75,6 +75,10 @@ FEATURE_COLS: list[str] = [
     "earnings_beat_rate",
     "analyst_rating",
     "short_interest_pct",
+    # Fase 5b: sinais avançados SEC + mercado
+    "insider_buy_amount_score",
+    "recent_8k_score",
+    "short_interest_trend",
 ]
 # Features removidas vs PR #25 (Spearman IC profiling sobre o parquet completo
 # 36929 rows confirmou 14 features inúteis):
