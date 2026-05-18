@@ -1942,10 +1942,14 @@ def main() -> None:
 
     # ── Verificação de configuração crítica ──────────────────────────────────
     _missing_config: list[str] = []
-    if not os.environ.get("FLIP_FUND_EUR") or float(os.environ.get("FLIP_FUND_EUR", "0")) <= 0:
+    # FLIP_FUND_EUR é opcional — deriva automaticamente de MONTHLY_BUDGET_EUR × 10%.
+    # Só alertar se AMBOS estiverem a 0 (Tesoureiro completamente sem capital).
+    _flip_eur    = float(os.environ.get("FLIP_FUND_EUR", "0") or "0")
+    _monthly_eur = float(os.environ.get("MONTHLY_BUDGET_EUR", "0") or "0")
+    if _flip_eur <= 0 and _monthly_eur <= 0:
         _missing_config.append(
-            "FLIP_FUND_EUR — capital do Flip Fund em euros "
-            "(ex: FLIP_FUND_EUR=1000). Sem isto, o Tesoureiro nao gera sizing."
+            "MONTHLY_BUDGET_EUR — orcamento mensal em euros "
+            "(ex: MONTHLY_BUDGET_EUR=850). O Tesoureiro precisa disto para sizing."
         )
     if not os.environ.get("ALPHAVANTAGE_API_KEY"):
         _missing_config.append(
