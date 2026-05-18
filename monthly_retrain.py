@@ -356,10 +356,17 @@ def _compute_alpha_90d_inline(df: pd.DataFrame) -> pd.DataFrame:
     _cache_dir.mkdir(parents=True, exist_ok=True)
     _spy_hist: Optional[pd.DataFrame] = None
 
+    _TICKER_TIMEOUT  = 20   # segundos por ticker (yfinance sem timeout = hang infinito)
+    _TOTAL_BUDGET    = 45 * 60  # 45 minutos máximo para toda a fase inline
+    _t_start_inline  = time.time()
+
     def _get_hist(ticker: str) -> Optional[pd.DataFrame]:
-        """Lê do cache ou descarrega via yfinance (sem raise_errors)."""
+        """Lê do cache ou descarrega via yfinance com timeout de 20s por ticker."""
+        import threading
         safe = ticker.replace("^", "_idx_").replace("/", "_")
-        pq = _cache_dir / f"{safe}.parquet"
+        pq   = _cache_dir / f"{safe}.parquet"
+
+        # 1. Tentar cache em disco
         if pq.exists():
             try:
                 h = pd.read_parquet(pq)
@@ -370,25 +377,38 @@ def _compute_alpha_90d_inline(df: pd.DataFrame) -> pd.DataFrame:
                 return h
             except Exception:
                 pass
-        try:
-            import yfinance as yf
-            h = yf.Ticker(ticker).history(start="1995-01-01", auto_adjust=True)
-            if h is None or h.empty:
-                return None
-            idx = pd.DatetimeIndex(h.index)
-            h.index = idx.tz_convert(None) if idx.tz is not None else idx
-            h = h[["Open", "High", "Low", "Close", "Volume"]]
+
+        # 2. Descarregar com timeout via thread
+        result_holder: list = [None]
+        def _fetch():
+            try:
+                import yfinance as yf
+                h = yf.Ticker(ticker).history(start="1995-01-01", auto_adjust=True)
+                if h is not None and not h.empty:
+                    idx = pd.DatetimeIndex(h.index)
+                    h.index = idx.tz_convert(None) if idx.tz is not None else idx
+                    h = h[["Open", "High", "Low", "Close", "Volume"]]
+                    result_holder[0] = h
+            except Exception as e:
+                log.debug(f"[inline_90d] fetch {ticker}: {e}")
+
+        t = threading.Thread(target=_fetch, daemon=True)
+        t.start()
+        t.join(timeout=_TICKER_TIMEOUT)
+        if t.is_alive():
+            log.warning(f"[inline_90d] {ticker}: timeout de {_TICKER_TIMEOUT}s — a saltar")
+            return None
+
+        h = result_holder[0]
+        if h is not None:
             try:
                 h.to_parquet(pq)
             except Exception:
                 pass
-            time.sleep(0.3)
-            return h
-        except Exception as e:
-            log.debug(f"[inline_90d] {ticker}: {e}")
-            return None
+            time.sleep(0.15)  # rate limit gentil
+        return h
 
-    # SPY para benchmark
+    # SPY para benchmark (com timeout também)
     _spy_hist = _get_hist("SPY")
 
     df = df.copy()
@@ -400,12 +420,26 @@ def _compute_alpha_90d_inline(df: pd.DataFrame) -> pd.DataFrame:
     if not needs_mask.any():
         return df
 
-    unique_tickers = df.loc[needs_mask, "ticker"].astype(str).unique() if "ticker" in df.columns else []
+    unique_tickers = (
+        df.loc[needs_mask, "ticker"].astype(str).unique()
+        if "ticker" in df.columns else []
+    )
+
     price_cache: dict = {}
-    for t in unique_tickers:
+    for i, t in enumerate(unique_tickers):
+        # Budget total: se ultrapassar 45 minutos, treina com o que temos
+        elapsed = time.time() - _t_start_inline
+        if elapsed > _TOTAL_BUDGET:
+            log.warning(
+                f"[inline_90d] Budget de {_TOTAL_BUDGET//60}min esgotado após "
+                f"{i}/{len(unique_tickers)} tickers — a treinar com dados parciais."
+            )
+            break
         h = _get_hist(t)
         if h is not None:
             price_cache[t] = h
+        if (i + 1) % 50 == 0:
+            log.info(f"[inline_90d] {i+1}/{len(unique_tickers)} tickers em cache")
 
     resolved = 0
     for idx_val in df.index[needs_mask]:

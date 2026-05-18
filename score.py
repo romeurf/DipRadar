@@ -682,9 +682,31 @@ def calculate_score(
         logging.warning(f"[score] divergence hemisphere error: {exc}")
         divergence = 0.0
       
+    # ── Dividend safety penalty ──────────────────────────────────────────────
+    # Para stocks que pagam dividendos, verificar se o FCF cobre o payout.
+    # Dividend yield > 0 + FCF/dividend < 0.8 = risco de corte → penalidade.
+    # (REITs e Utilities são excluídos porque usam FFO, não FCF GAAP)
+    _sector_lc = str(features.get("sector", "")).lower()
+    _is_reit_like = any(s in _sector_lc for s in ("real estate", "utilities", "mortgage"))
+    _div_yield_f = _safe_float(features.get("dividend_yield"), 0.0)
+    _dividend_safety = 1.0  # multiplicador (1.0 = sem penalidade)
+    if _div_yield_f > 0.015 and not _is_reit_like:  # só para stocks com yield significativo
+        _fcf = _safe_float(features.get("freeCashflow") or features.get("fcf_yield"), None)
+        _mc  = _safe_float(features.get("market_cap"), None)
+        if _fcf is not None and _mc is not None and _mc > 0:
+            _annual_div_payout = _div_yield_f * _mc
+            if _annual_div_payout > 0 and _fcf is not None:
+                _fcf_abs = _fcf if abs(_fcf) > 1000 else _fcf * _mc  # fcf pode ser ratio ou absoluto
+                _coverage = _fcf_abs / max(_annual_div_payout, 1)
+                if _coverage < 0.8:
+                    _dividend_safety = 0.85   # penalidade: dividendo provavelmente vai ser cortado
+                    logging.debug(f"[score] dividend safety penalty: coverage={_coverage:.2f}")
+                elif _coverage < 1.0:
+                    _dividend_safety = 0.93
+
     # Score final — multiplica pelo quality_multiplier (penalty pós-zscore)
     base_score  = (0.40 * quality) + (0.20 * value) + (0.20 * timing) + (0.20 * divergence)
-    raw_final   = base_score * ml_weight * confidence * 100.0
+    raw_final   = base_score * ml_weight * confidence * _dividend_safety * 100.0
     final_score = float(np.clip(raw_final, 0.0, 100.0))
 
     # Score "puro fundamental" — sem o ml_weight, para o conflict resolver

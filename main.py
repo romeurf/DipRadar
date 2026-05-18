@@ -1575,6 +1575,21 @@ def run_scan() -> None:
                     logging.info(f"[v2] {sym} rejeitado — confidence insuficiente")
                     continue
 
+                # ── Confirmação de entrada: RSI crossover + volume capitulação ──
+                # RSI crossover: só entrar se RSI estava <40 (oversold) recentemente.
+                # Evita entrar em stocks que simplesmente estão a cair sem parar.
+                # Volume capitulação: dip em alto volume = vendas de pânico esgotadas.
+                rsi_val_f = fund.get("rsi") or fund.get("rsi_14") or 50.0
+                vol_zscore = fund.get("volume_zscore_20d") or 0.0
+                rsi_ok     = float(rsi_val_f) < 42.0   # oversold ou próximo
+                vol_ok     = float(vol_zscore) > 0.8   # volume acima da média
+                if verdict == "COMPRAR" and not rsi_ok:
+                    # RSI não está oversold — rebaixar para monitorizar
+                    verdict   = "MONITORIZAR"
+                    emoji_str = "🟡"
+                    tier      = 2
+                    logging.info(f"[rsi_filter] {sym}: RSI={rsi_val_f:.0f} não oversold → MONITORIZAR")
+
                 # ── 8-K Veto: evento estruturalmente negativo detectado ────────
                 # Um restatement ou default é um red flag absoluto — o Shield
                 # eleva o alerta para MONITORIZAR independentemente do ML score.

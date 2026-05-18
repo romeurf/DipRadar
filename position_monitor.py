@@ -164,12 +164,18 @@ def _fetch_fundamentals_snapshot(ticker: str, current_price: float = 0.0) -> dic
 # ─────────────────────────────────────────────────────────────────────────────
 
 TRIGGER_TAKE_PROFIT        = "TAKE_PROFIT"
+TRIGGER_STOP_LOSS          = "STOP_LOSS"            # preço caiu X% do entry — sair
 TRIGGER_EARLY_ALPHA        = "EARLY_ALPHA_CAPTURE"  # 70%+ do alpha em <50% do tempo
 TRIGGER_STRUCTURAL_DECLINE = "STRUCTURAL_DECLINE"   # dip virou queda estrutural
 TRIGGER_DETERIORATION      = "DETERIORATION"
 TRIGGER_TIME_DECAY         = "TIME_DECAY"
 TRIGGER_IMPROVEMENT        = "IMPROVEMENT"
 TRIGGER_ROUTINE            = "ROUTINE"
+
+# Stop-loss: se o preço cair STOP_LOSS_PCT% abaixo do preço de entrada, sair.
+# Configurável via env var POSITION_STOP_LOSS_PCT (default 12%).
+# Protege contra quedas estruturais que o modelo não detectou a tempo.
+_STOP_LOSS_PCT = float(os.getenv("POSITION_STOP_LOSS_PCT", "0.12"))
 
 
 def _detect_structural_decline(
@@ -266,7 +272,15 @@ def _classify_trigger(
     if current_price >= record.current_sell_target:
         return TRIGGER_TAKE_PROFIT
 
-    # 1b. Early Alpha Capture: 70%+ do alpha em <50% do tempo → saída parcial
+    # 1b. Stop-loss: preço caiu >STOP_LOSS_PCT% abaixo do entry → sair
+    # Protege contra quedas estruturais que o modelo não detectou.
+    # Só activa após 5 dias para não sair em volatilidade normal de curto prazo.
+    if (record.alert_price > 0
+            and record.days_held >= 5
+            and current_price < record.alert_price * (1 - _STOP_LOSS_PCT)):
+        return TRIGGER_STOP_LOSS
+
+    # 1c. Early Alpha Capture: 70%+ do alpha em <50% do tempo → saída parcial
     if _check_early_alpha(record, current_price):
         return TRIGGER_EARLY_ALPHA
 
@@ -316,6 +330,7 @@ def _build_early_alpha_alert(
 def _resolve_thesis_health(trigger: str, delta: float) -> str:
     mapping = {
         TRIGGER_TAKE_PROFIT:        "STRONG",
+        TRIGGER_STOP_LOSS:          "STRUCTURAL_DECLINE",
         TRIGGER_EARLY_ALPHA:        "STRONG",
         TRIGGER_IMPROVEMENT:        "IMPROVING",
         TRIGGER_ROUTINE:            "STRONG" if delta < 0.05 else "WEAKENING",
@@ -548,6 +563,22 @@ def _monitor_one(
 
     if trigger == TRIGGER_TAKE_PROFIT:
         msg = _build_take_profit_alert(record, current_price)
+
+    elif trigger == TRIGGER_STOP_LOSS:
+        pnl_pct = (current_price / record.alert_price - 1) * 100
+        msg = "\n".join([
+            f"STOP-LOSS atingido — {record.ticker}  [Dia {record.days_held}]",
+            f"Preco caiu {abs(pnl_pct):.1f}% abaixo do entry (limite: {_STOP_LOSS_PCT*100:.0f}%).",
+            "",
+            f"Entry: ${record.alert_price:.2f}  |  Actual: ${current_price:.2f}  |  P&L: {_pct(pnl_pct)}",
+            "",
+            "Acao: Fechar posicao. Proteger capital para proxima oportunidade.",
+            "_O stop-loss existe para que uma posicao errada nao destrua multiplas certas._",
+        ])
+        record.status       = "CLOSED"
+        record.close_reason = "STOP_LOSS"
+        record.closed_at    = datetime.utcnow().isoformat()
+        record.close_price  = current_price
 
     elif trigger == TRIGGER_EARLY_ALPHA:
         msg = _build_early_alpha_alert(record, current_price)

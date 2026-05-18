@@ -76,10 +76,11 @@ FEATURE_COLUMNS: list[str] = [
     "earnings_beat_rate",    # % de últimos 4 trimestres onde bateu EPS estimativas
     "analyst_rating",        # consenso analistas: 1=Strong Buy … 5=Strong Sell
     "short_interest_pct",    # short interest como % do float — squeeze potential
-    # Fase 5b: sinais avançados (Form 4 montante + 8-K + short trend)
+    # Fase 5b: sinais avançados (Form 4 montante + 8-K + short trend + earnings tone)
     "insider_buy_amount_score",  # magnitude normalizada das compras insider [0,1]
     "recent_8k_score",           # tipo de evento 8-K: -1=restatement, +1=M&A target
     "short_interest_trend",      # variação do short interest vs mês anterior
+    "earnings_call_tone",        # sentimento da última earnings call [-1=pessimista, +1=confiante]
 ]
 # PR #28 (Phase A): drop 14 dead features after IC profiling on full parquet:
 #   • 9 CONSTANTES (std=0, IC indefinida — _FALLBACK em todas as linhas):
@@ -182,6 +183,7 @@ _FALLBACK: dict[str, float] = {
     "insider_buy_amount_score": 0.0,  # sem compras — caso mais comum
     "recent_8k_score": 0.0,           # sem 8-K recente ou neutro
     "short_interest_trend": 0.0,      # estável
+    "earnings_call_tone": 0.0,        # neutro — sem earnings call recente
 }
 
 def _tz_normalize(ts: Any) -> pd.Timestamp:

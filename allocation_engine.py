@@ -126,6 +126,67 @@ def _score_multiplier(fund_score: float, ml_label: str) -> float:
 
 # ── Dataclasses ───────────────────────────────────────────────────────────────
 
+def portfolio_var_pct(
+    positions: "list[dict]",
+    confidence: float = 0.95,
+    lookback_days: int = 252,
+) -> float:
+    """Calcula o Value at Risk diário do portfolio actual (método histórico).
+
+    Retorna a perda máxima em % do portfolio que pode ocorrer num dia com
+    `confidence`% de probabilidade. Ex: VaR 95% = 3% → em 95% dos dias
+    a perda não excede 3%.
+
+    Usa os últimos `lookback_days` dias de retornos históricos via yfinance.
+    """
+    if not positions:
+        return 0.0
+    try:
+        import yfinance as yf
+        import numpy as np
+        import pandas as pd
+
+        tickers = [p.get("symbol", "") for p in positions if p.get("symbol")]
+        if not tickers:
+            return 0.0
+
+        weights = []
+        total_val = sum(float(p.get("value_eur", 0) or 0) for p in positions)
+        if total_val <= 0:
+            return 0.0
+
+        data = yf.download(
+            tickers, period=f"{lookback_days}d",
+            auto_adjust=True, progress=False
+        )
+        if data is None or data.empty:
+            return 0.0
+
+        closes = data["Close"] if "Close" in data.columns else data.iloc[:, 0]
+        if isinstance(closes, pd.Series):
+            closes = closes.to_frame()
+
+        rets = closes.pct_change().dropna()
+        if len(rets) < 20:
+            return 0.0
+
+        # Portfolio return = soma ponderada dos retornos
+        port_rets = pd.Series(0.0, index=rets.index)
+        for pos in positions:
+            sym = pos.get("symbol", "")
+            val = float(pos.get("value_eur", 0) or 0)
+            if sym not in rets.columns or total_val <= 0:
+                continue
+            w = val / total_val
+            port_rets = port_rets + w * rets[sym].fillna(0)
+
+        # VaR histórico: percentil (1-confidence) das perdas
+        var = float(np.percentile(port_rets.dropna(), (1 - confidence) * 100))
+        return round(abs(var) * 100, 2)  # em percentagem
+    except Exception:
+        return 0.0
+
+
 @dataclass
 class AllocationContext:
     """Tudo que o motor precisa para decidir, num único objecto."""
@@ -138,6 +199,9 @@ class AllocationContext:
     is_bluechip:           bool                 = False    # is_bluechip(fund) — derivado
     sector:                str                  = ""
     company_name:          str                  = ""       # para match de temas por keyword
+    # VaR actual do portfolio (antes de adicionar esta posição)
+    # Se VaR > 15% e categoria não é CORE/HIGH_CONVICTION, reduz sizing
+    current_portfolio_var:  float                = 0.0      # % (ex: 3.5 = 3.5%)
     # Sector concentration (% do portfolio total já neste sector)
     # A visão: "não compres mais do que isto porque já atingiste o teu limite de
     # exposição ao setor Tecnológico." Cap sector: 35% portfolio por defeito.
@@ -414,6 +478,20 @@ def _size(ctx: AllocationContext, category: str) -> tuple[float, float, list[str
     if ctx.sector in HIGH_CONVICTION_SECTORS and category != CAT_CORE:
         amount *= _SECTOR_BONUS
         notes.append(f"Sector premium ×{_SECTOR_BONUS:.2f}")
+
+    # 4b) Portfolio VaR — se o portfolio já está com risco elevado, reduzir sizing.
+    # VaR > 15%/dia (extremo) ou > 5%/dia (stress normal): apply brake.
+    _var = float(ctx.current_portfolio_var)
+    if category not in (CAT_CORE, CAT_HIGH_CONVICTION) and _var > 0:
+        if _var > 15.0:
+            notes.append(f"Portfolio VaR {_var:.1f}% — risco extremo, sizing ×0.3")
+            amount *= 0.3
+        elif _var > 8.0:
+            notes.append(f"Portfolio VaR {_var:.1f}% — risco elevado, sizing ×0.6")
+            amount *= 0.6
+        elif _var > 5.0:
+            notes.append(f"Portfolio VaR {_var:.1f}% — atenção ao risco, sizing ×0.8")
+            amount *= 0.8
 
     # 5) Correlação de retornos com posições existentes.
     # Se o novo stock se move muito em sincronia com o que já tens, o risco

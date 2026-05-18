@@ -483,6 +483,79 @@ def short_interest_trend(ticker: str) -> float:
         return NaN
 
 
+def earnings_call_tone(ticker: str, lookback_days: int = 90) -> float:
+    """Score de sentimento de earnings calls [-1, +1] por análise de keywords.
+
+    Usa transcrições 8-K de earnings (Item 2.02) como proxy quando disponível.
+    Analisa palavras-chave positivas vs negativas no texto do filing.
+
+    +1 = management confiante ("strong", "accelerating", "raised guidance")
+     0 = neutro ou sem dados
+    -1 = management pessimista ("challenging", "headwinds", "below expectations")
+
+    Completamente gratuito via SEC EDGAR — sem API key adicional.
+    """
+    _POSITIVE = {
+        "strong", "accelerating", "raised", "outperformed", "beat",
+        "record", "growth", "confident", "robust", "exceeded",
+        "improved", "momentum", "ahead", "positive", "strength",
+    }
+    _NEGATIVE = {
+        "challenging", "headwinds", "uncertain", "cautious", "difficult",
+        "below", "missed", "declined", "weak", "softness",
+        "pressure", "slowdown", "reduced", "revised down", "disappointing",
+    }
+    try:
+        data   = _edgar_submissions(ticker)
+        cik    = str(data.get("cik", "")).zfill(10)
+        recent = data.get("filings", {}).get("recent", {})
+        forms        = recent.get("form", [])
+        dates_filed  = recent.get("filingDate", [])
+        accessions   = recent.get("accessionNumber", [])
+        items_list   = recent.get("items", [])
+        cutoff = date.today() - timedelta(days=lookback_days)
+
+        import requests
+        for form, filed_str, acc, items in zip(forms, dates_filed, accessions, items_list):
+            if form not in ("8-K", "8-K/A"):
+                continue
+            # Procurar earnings release (item 2.02)
+            items_str = ",".join(items) if isinstance(items, list) else str(items)
+            if "2.02" not in items_str:
+                continue
+            try:
+                if date.fromisoformat(filed_str[:10]) < cutoff:
+                    continue
+            except ValueError:
+                continue
+
+            # Fetch documento
+            acc_clean = acc.replace("-", "")
+            url = (
+                f"https://www.sec.gov/Archives/edgar/data/{int(cik)}"
+                f"/{acc_clean}/{acc_clean}.txt"
+            )
+            r = requests.get(url, headers=_EDGAR_HEADERS, timeout=15)
+            if r.status_code != 200:
+                continue
+            text = r.text.lower()[:50_000]  # primeiros 50k chars são suficientes
+
+            # Contar keywords (normalizado pelo tamanho do texto)
+            words     = set(text.split())
+            pos_count = sum(1 for kw in _POSITIVE if kw in text)
+            neg_count = sum(1 for kw in _NEGATIVE if kw in text)
+            total     = pos_count + neg_count
+            if total == 0:
+                return 0.0
+            score = (pos_count - neg_count) / total
+            return round(float(max(-1.0, min(1.0, score))), 3)
+
+        return NaN  # sem earnings call recente
+    except Exception as e:
+        log.debug(f"[earnings_tone] {ticker}: {e}")
+        return NaN
+
+
 # ── Camada 4: Alpha Vantage ────────────────────────────────────────────────────
 
 def alphavantage_earnings_revision(ticker: str) -> float:
@@ -664,6 +737,16 @@ def compute_fundamental_signals(
     except Exception as e:
         log.error(f"[signals] short_interest_trend {ticker}: {e}")
         result["short_interest_trend"] = NaN
+
+    # Earnings call tone (SEC EDGAR 8-K, só US)
+    if _is_us:
+        try:
+            result["earnings_call_tone"] = earnings_call_tone(ticker)
+        except Exception as e:
+            log.error(f"[signals] earnings_call_tone {ticker}: {e}")
+            result["earnings_call_tone"] = NaN
+    else:
+        result["earnings_call_tone"] = NaN
 
     # Camada 4: Alpha Vantage
     if use_alphavantage:

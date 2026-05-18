@@ -294,6 +294,49 @@ def build_feature_lists() -> tuple[list[str], list[str]]:
     return full, baseline
 
 
+def build_sector_model_configs(
+    feature_cols: list[str],
+) -> dict[str, dict]:
+    """Configurações de modelos sector-específicos.
+
+    Stocks de sectores diferentes têm dinâmicas completamente distintas:
+    - Tech/Healthcare: crescimento, FCF, multiples altos → RSI + momentum dominam
+    - Financials/Industrials: cíclicos, dependem de crédito → macro features dominam
+    - Energy/Materials: commodity-driven → VIX, credit spread, sector ETF dominam
+    - Defensivos (Utilities/Consumer Defensive): dividend yield → timing features dominam
+
+    Um único modelo para todos os sectores é um compromisso que perde edge.
+    Estes modelos complementam o modelo global — o score final pode ser uma
+    combinação ponderada do modelo global + modelo sectorial.
+    """
+    return {
+        # Tech + Healthcare — momentum e FCF são preditores fortes
+        "Ridge-Tech-Healthcare": {
+            "factory": ridge_factory,
+            "feats":   feature_cols,
+            "sectors": {"Technology", "Healthcare", "Communication Services"},
+        },
+        # Financials + Industrials — macro regime é o factor dominante
+        "Ridge-Fin-Industrial": {
+            "factory": ridge_factory,
+            "feats":   feature_cols,
+            "sectors": {"Financial Services", "Financials", "Industrials", "Real Estate"},
+        },
+        # Energy + Materials — commodity cycle
+        "Ridge-Commodity": {
+            "factory": ridge_factory,
+            "feats":   feature_cols,
+            "sectors": {"Energy", "Basic Materials"},
+        },
+        # Defensivos — dividend yield e estabilidade
+        "Ridge-Defensive": {
+            "factory": ridge_factory,
+            "feats":   feature_cols,
+            "sectors": {"Consumer Defensive", "Consumer Cyclical", "Utilities"},
+        },
+    }
+
+
 def build_model_configs(
     feature_cols_v33: list[str],
     feature_cols_baseline: list[str],
