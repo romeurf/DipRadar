@@ -1080,6 +1080,31 @@ def build_alert(
     if ml_result is not None:
         ml_line = f"\n{ml_badge(ml_result)}"
 
+    # Narrativa de sinais (Chunk 6b) — explica o PORQUÊ em linguagem natural
+    signal_narrative_text = ""
+    try:
+        from signal_narrative import generate_signal_narrative, generate_8k_veto
+        from ml_features import _FALLBACK as _mf_fallback
+        _feats = {**fundamentals} if fundamentals else {}
+        _eight_k = _feats.get("recent_8k_score") or _mf_fallback.get("recent_8k_score")
+        _narrative = generate_signal_narrative(
+            pred_alpha_90d  = ml_result.pred_up     if ml_result and ml_result.model_ready else None,
+            win_prob        = ml_result.win_prob     if ml_result and ml_result.model_ready else None,
+            pred_drawdown   = ml_result.pred_down    if ml_result and ml_result.model_ready else None,
+            insider_recent  = _feats.get("insider_buy_recent"),
+            insider_amount_score = _feats.get("insider_buy_amount_score"),
+            eight_k_score   = _eight_k,
+            short_trend     = _feats.get("short_interest_trend"),
+            consecutive_red = _feats.get("consecutive_red_days"),
+            ma_200d_ratio   = _feats.get("ma_200d_ratio"),
+            stock_type      = ml_result.stock_type if ml_result and ml_result.model_ready else "SPECULATIVE",
+            ticker          = symbol,
+        )
+        if _narrative:
+            signal_narrative_text = f"\n\n{_narrative}"
+    except Exception:
+        pass
+
     # Tema/trend (Chunk 7) — identifica se o stock está num sector em trend
     theme_line = ""
     try:
@@ -1112,7 +1137,8 @@ def build_alert(
         f"\n*Categoria:* {category}\n"
         f"{score_line}"
         f"{theme_line}"
-        f"{ml_line}\n"
+        f"{ml_line}"
+        f"{signal_narrative_text}\n"
         f"{score_breakdown}\n"
         f"\n*Estratégia:* {strategy}"
         f"{macro_ctx}"
@@ -1535,6 +1561,21 @@ def run_scan() -> None:
                     })
                     logging.info(f"[v2] {sym} rejeitado — confidence insuficiente")
                     continue
+
+                # ── 8-K Veto: evento estruturalmente negativo detectado ────────
+                # Um restatement ou default é um red flag absoluto — o Shield
+                # eleva o alerta para MONITORIZAR independentemente do ML score.
+                _8k_val = fund.get("recent_8k_score")
+                try:
+                    from signal_narrative import generate_8k_veto
+                    _veto = generate_8k_veto(_8k_val) if _8k_val is not None else None
+                    if _veto and verdict == "COMPRAR":
+                        verdict    = "MONITORIZAR"
+                        emoji_str  = "🟡"
+                        tier       = 2
+                        logging.warning(f"[8k_veto] {sym}: {_veto}")
+                except Exception:
+                    pass
 
                 score = score_data["final_score"]
                 logging.info(
