@@ -217,8 +217,8 @@ _SECTOR_TYPE: dict[str, str] = {
     "Basic Materials":        "commodity",
     "Consumer Defensive":     "defensive",
     "Utilities":              "defensive",
-    "Consumer Cyclical":      "defensive",
-    "Unknown":                "cyclical",  # fallback neutro
+    "Consumer Cyclical":      "cyclical",   # cíclico por definição — reage negativamente ao VIX
+    "Unknown":                "cyclical",   # fallback neutro
 }
 
 # Limiar de "oversold" varia por sector:

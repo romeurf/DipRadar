@@ -982,6 +982,7 @@ def run_monthly_retrain_v3(
         "elapsed_s":      round(elapsed, 1),
         "outcome_stats":  outcome_stats,
         "dataset_health": dataset_health,
+        "train_result":   train_result,  # inclui report com sector_models IC
     }
 
 

@@ -971,29 +971,71 @@ def run_training(
         fold_metrics=results.get(single_champion_name, []),
     )
 
-    # Modelos por sector individual (11 sectores GICS): um ScaledRidge por sector,
-    # treinado apenas nos alertas desse sector. Complementa o modelo global —
-    # score final em inference = 0.70 × global + 0.30 × sector model.
-    # Bundle guarda {sector_name: {"model": fitted_ridge, "n_train": int}}.
+    # Modelos por sector individual (11 sectores GICS): um ScaledRidge por sector.
+    # Protocolo de validação temporal (evita look-ahead):
+    #   1. Ordenar por data; split 80/20 cronológico
+    #   2. Treinar no primeiro 80% → calcular IC Spearman no último 20%
+    #   3. Só aceitar modelo se IC hold-out > -0.02 (não piora activamente)
+    #   4. Retrain no dataset completo para produção
+    # ScaledRidge tem baixo overfit (solução analítica, sem hiperparâmetros de
+    # árvore), pelo que o hold-out IC é proxy fiável do IC real em produção.
     from ml_training.models import build_sector_model_configs
     _sector_cfgs   = build_sector_model_configs(feats_used)
     _sector_models: dict = {}
     _MIN_SECTOR_ROWS = 150
+    _MIN_SECTOR_VAL  = 30    # mínimo de rows no conjunto de validação
+    _IC_REJECT_FLOOR = -0.02 # rejeitar sector model se IC hold-out < este valor
+
     for _sector_name, _scfg in _sector_cfgs.items():
         _mask   = df["sector"] == _sector_name
-        _df_sec = df[_mask].reset_index(drop=True)
+        _df_sec = df[_mask].sort_values("alert_date").reset_index(drop=True)
         if len(_df_sec) < _MIN_SECTOR_ROWS:
             log.warning(f"[sector] {_sector_name}: {len(_df_sec)} rows < {_MIN_SECTOR_ROWS} — a saltar")
             continue
-        _X_sec  = _df_sec[feats_used].fillna(0).values.astype(np.float32)
-        _y_sec  = winsorize(_df_sec[_active_target].values.astype(float))
-        _sw_sec = temporal_weights(_df_sec["alert_date"], _df_sec["alert_date"].max())
-        _m = _scfg["factory"]()
-        _m.fit(_X_sec, _y_sec, sample_weight=_sw_sec)
-        _sector_models[_sector_name] = {"model": _m, "n_train": len(_df_sec)}
-        log.info(f"[sector] {_sector_name}: {len(_df_sec)} rows | IC estimado em produção")
+
+        # Split temporal 80/20 para IC hold-out
+        _split     = max(_MIN_SECTOR_ROWS - _MIN_SECTOR_VAL, int(len(_df_sec) * 0.80))
+        _df_tr     = _df_sec.iloc[:_split]
+        _df_val    = _df_sec.iloc[_split:]
+
+        _ic_holdout: float = float("nan")
+        if len(_df_val) >= _MIN_SECTOR_VAL:
+            _X_tr  = _df_tr[feats_used].fillna(0).values.astype(np.float32)
+            _y_tr  = winsorize(_df_tr[_active_target].values.astype(float))
+            _sw_tr = temporal_weights(_df_tr["alert_date"], _df_tr["alert_date"].max())
+            _m_val = _scfg["factory"]()
+            _m_val.fit(_X_tr, _y_tr, sample_weight=_sw_tr)
+
+            _X_val = _df_val[feats_used].fillna(0).values.astype(np.float32)
+            _pred_val = _m_val.predict(_X_val)
+            _ic_holdout = float(spearman_safe(_pred_val, _df_val[_active_target].values))
+
+            if _ic_holdout < _IC_REJECT_FLOOR:
+                log.warning(
+                    f"[sector] {_sector_name}: IC hold-out={_ic_holdout:.4f} < {_IC_REJECT_FLOOR} "
+                    f"— modelo sectorial rejeitado, fallback para global"
+                )
+                continue
+
+        # Retrain no dataset completo para produção
+        _X_full = _df_sec[feats_used].fillna(0).values.astype(np.float32)
+        _y_full = winsorize(_df_sec[_active_target].values.astype(float))
+        _sw_full = temporal_weights(_df_sec["alert_date"], _df_sec["alert_date"].max())
+        _m_prod = _scfg["factory"]()
+        _m_prod.fit(_X_full, _y_full, sample_weight=_sw_full)
+
+        _sector_models[_sector_name] = {
+            "model":      _m_prod,
+            "n_train":    len(_df_sec),
+            "ic_holdout": round(_ic_holdout, 4),
+        }
+        log.info(
+            f"[sector] {_sector_name}: n={len(_df_sec)} | "
+            f"IC hold-out={_ic_holdout:.4f} (n_val={len(_df_val)})"
+        )
+
     bundle.sector_models = _sector_models
-    log.info(f"[sector] {len(_sector_models)}/{len(_sector_cfgs)} modelos sectoriais treinados")
+    log.info(f"[sector] {len(_sector_models)}/{len(_sector_cfgs)} modelos sectoriais aceites")
 
     # Baseline de features para drift detection em produção.
     # health_monitor.check_feature_drift() compara distribuições live vs este baseline.
@@ -1040,6 +1082,11 @@ def run_training(
     report["robustness"]["ensemble_ic_oof"]        = ensemble_ic_oof
     report["robustness"]["ensemble_ic_per_fold_mean"] = ensemble_ic_per_fold_mean
     report["robustness"]["single_best_name"]       = single_champion_name
+    # IC hold-out por sector model — visível em /backtest e notificação de retrain
+    report["sector_models"] = {
+        name: {"n_train": info["n_train"], "ic_holdout": info.get("ic_holdout")}
+        for name, info in _sector_models.items()
+    }
     report["robustness"]["single_best_rho_alpha"]  = float(single_champion_row["rho_alpha_mean"])
 
     # Persist

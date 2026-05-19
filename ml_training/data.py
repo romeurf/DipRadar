@@ -236,8 +236,19 @@ def build_dataset(base_df: pd.DataFrame, price_cache: dict[str, pd.DataFrame], e
                 use_fmp=False,
             )
             for _k, _v in _fase5.items():
-                if _k in FEATURE_COLUMNS and _k not in fv:
-                    fv[_k] = float(_v) if math.isfinite(float(_v)) else float("nan")
+                if _k not in FEATURE_COLUMNS:
+                    continue
+                # BUG FIX: a condição anterior era "_k not in fv" que é sempre
+                # False porque fv é inicializado com todos os FEATURE_COLUMNS.
+                # Resultado: earnings_call_tone, short_interest_trend,
+                # insider_buy_amount_score, recent_8k_score ficavam sempre em 0.0
+                # (fallback) mesmo quando os sinais reais estavam disponíveis.
+                try:
+                    _vf = float(_v)
+                    if math.isfinite(_vf):
+                        fv[_k] = _vf  # sobrescreve o fallback com o valor real
+                except (TypeError, ValueError):
+                    pass  # mantém o fallback existente
         except Exception as _e:
             log.debug(f"[data] Fase5 signals {ticker}@{alert_date}: {_e}")
         entry_price = float(row.get("price", 0.0))

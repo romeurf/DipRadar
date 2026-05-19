@@ -1925,7 +1925,7 @@ def run_monthly_retrain() -> None:
 
     if cand_rho is not None or prod_rho is not None:
         lines += [
-            "*ρ_α (Spearman alpha_60d):*",
+            "*ρ_α (Spearman alpha_90d):*",
             f"  candidate : *{_fmt(cand_rho)}*",
             f"  produção  : *{_fmt(prod_rho)}*",
         ]
@@ -1963,6 +1963,18 @@ def run_monthly_retrain() -> None:
 
     if decision == "PENDING":
         lines.append("_Bundle guardado como `dip_models_pending.pkl` — revisão manual._")
+        lines.append("")
+
+    # IC dos sector models (novo — mostra quais sectores têm modelo válido)
+    _train_result = result.get("train_result") or {}
+    _sreport = (_train_result.get("report") or {}).get("sector_models") or {}
+    if _sreport:
+        lines.append("*Modelos sectoriais (IC hold-out):*")
+        for _sname, _sinfo in sorted(_sreport.items()):
+            _ic = _sinfo.get("ic_holdout")
+            _n  = _sinfo.get("n_train", 0)
+            _ic_str = f"{_ic:.4f}" if _ic is not None and not (isinstance(_ic, float) and __import__('math').isnan(_ic)) else "N/A"
+            lines.append(f"  {_sname}: IC={_ic_str} (n={_n})")
         lines.append("")
 
     lines.append("_Próximo retreino: dia 1 do mês seguinte às 06h_")
