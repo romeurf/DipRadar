@@ -297,7 +297,7 @@ def _ml_label_or_derive(ctx: AllocationContext) -> str:
 
 
 def _is_ml_bull(label: str) -> bool:
-    return label in ("WIN", "WIN_STRONG", "WIN_40")
+    return label in ("WIN", "WIN_STRONG")
 
 
 def _regime_multiplier(category: str, regime_color: str) -> float:
@@ -406,7 +406,6 @@ def _flip_ml_multiplier(label: str) -> float:
     return {
         "WIN_STRONG": 1.20,
         "WIN":        1.00,
-        "WIN_40":     1.00,
         "WEAK":       0.50,
         "NO_WIN":     0.00,
         "NO_MODEL":   0.50,

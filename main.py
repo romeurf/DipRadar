@@ -1448,7 +1448,7 @@ def allocate_ticker(symbol: str) -> str:
             macro_regime_color    = regime_color,
             macro_multiplier      = regime_mult,
             cash_available_eur    = cash_eur,
-            monthly_budget_eur    = float(os.environ.get("MONTHLY_BUDGET_EUR", "1050")),
+            monthly_budget_eur    = float(os.environ["MONTHLY_BUDGET_EUR"]),
             existing_position_pct = existing_pct,
             existing_sector_pct   = _get_sector_pct(fund.get("sector", ""), usd_eur=get_usdeur()),
             portfolio_correlation  = _get_portfolio_correlation(symbol),
@@ -1793,7 +1793,7 @@ def run_ml_outcomes_job() -> None:
 
     outcome_lines = []
     for label, count in sorted(outcomes.items(), key=lambda x: x[1], reverse=True):
-        emoji_map = {"WIN_40": "🟢", "WIN_20": "✅", "NEUTRAL": "🟡", "LOSS_15": "🔴"}
+        emoji_map = {"WIN_STRONG": "🟢", "WIN": "✅", "NEUTRAL": "🟡", "LOSS": "🔴"}
         e = emoji_map.get(label, "📊")
         pct = count / labeled * 100 if labeled > 0 else 0
         outcome_lines.append(f"  {e} {label}: {count} ({pct:.0f}%)")

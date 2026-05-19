@@ -160,15 +160,10 @@ def _fetch_fundamentals_snapshot(ticker: str, current_price: float = 0.0) -> dic
 
 
 def _calc_rsi_momentum(close: "pd.Series", period: int = 14) -> float:
-    """RSI simples para confirmar reversão de momentum em posições MOMENTUM."""
+    """RSI — delega para momentum_scanner._calc_rsi (fonte única)."""
     try:
-        import pandas as pd
-        delta = close.diff().dropna()
-        gain  = delta.clip(lower=0).ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-        loss  = (-delta.clip(upper=0)).ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-        rs    = gain / loss.replace(0, float("nan"))
-        rsi   = 100 - (100 / (1 + rs))
-        return float(rsi.iloc[-1]) if not rsi.empty else 50.0
+        from momentum_scanner import _calc_rsi
+        return _calc_rsi(close, period)
     except Exception:
         return 50.0
 

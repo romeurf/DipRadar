@@ -591,7 +591,7 @@ def _handle_admin_backfill_ml() -> None:
                     lbl = row.get("outcome_label") or "pending"
                     label_counts[lbl] = label_counts.get(lbl, 0) + 1
 
-                em_map   = {"WIN_40": "🟢", "WIN_20": "✅", "NEUTRAL": "🟡", "LOSS_15": "🔴", "pending": "⏳"}
+                em_map   = {"WIN_STRONG": "🟢", "WIN": "✅", "NEUTRAL": "🟡", "LOSS": "🔴", "pending": "⏳"}
                 lbl_str  = " | ".join(
                     f"{em_map.get(k,'📊')}{k}:{v}"
                     for k, v in sorted(label_counts.items(), key=lambda x: x[1], reverse=True)
@@ -619,7 +619,7 @@ def _handle_admin_backfill_ml() -> None:
             lbl = row.get("outcome_label") or "pending"
             label_counts_total[lbl] = label_counts_total.get(lbl, 0) + 1
 
-        em_map = {"WIN_40": "🟢", "WIN_20": "✅", "NEUTRAL": "🟡", "LOSS_15": "🔴", "pending": "⏳"}
+        em_map = {"WIN_STRONG": "🟢", "WIN": "✅", "NEUTRAL": "🟡", "LOSS": "🔴", "pending": "⏳"}
         lines = [
             "✅ *Backfill ML concluído!*",
             f"_{datetime.now().strftime('%d/%m/%Y %H:%M')} — {mins}m{secs:02d}s_", "",

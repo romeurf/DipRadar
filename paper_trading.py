@@ -119,7 +119,7 @@ def _get_monthly_budget() -> float:
     explicit = os.environ.get("PAPER_BUDGET_EUR")
     if explicit:
         return float(explicit)
-    total    = float(os.environ.get("MONTHLY_BUDGET_EUR", "1050"))
+    total    = float(os.environ["MONTHLY_BUDGET_EUR"])
     etf_dca  = float(os.environ.get("ETF_DCA_EUR", "0"))  # ex: 200 (EUNL + IS3N)
     return max(0.0, total - etf_dca)
 

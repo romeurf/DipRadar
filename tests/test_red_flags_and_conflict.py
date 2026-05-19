@@ -245,8 +245,8 @@ class TestConflictResolver(unittest.TestCase):
         state, _ = self._rc(40, "NO_MODEL")
         self.assertEqual(state, ConflictState.CONSENSUS_BEAR)
 
-    def test_win_40_counts_as_bull(self):
-        state, _ = self._rc(70, "WIN_40")
+    def test_win_strong_counts_as_bull(self):
+        state, _ = self._rc(70, "WIN_STRONG")
         self.assertEqual(state, ConflictState.CONSENSUS_BULL)
 
 

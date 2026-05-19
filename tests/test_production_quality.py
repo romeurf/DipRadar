@@ -257,7 +257,7 @@ class TestLoadAlertDb(unittest.TestCase):
                     "score": "72.0",
                     "verdict": "COMPRAR",
                     "category": "Rotacao",
-                    "outcome_label": "WIN_20",
+                    "outcome_label": "WIN",
                     "return_60d": "18.5",
                     "return_3m": "22.1",
                     "return_6m": "30.0",
@@ -288,7 +288,7 @@ class TestLoadAlertDb(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "alert_db.csv"
             rows = [
-                {"date_iso": "2025-01-15", "symbol": "AAPL", "outcome_label": "WIN_20",
+                {"date_iso": "2025-01-15", "symbol": "AAPL", "outcome_label": "WIN",
                  "score": "70"},
                 {"date_iso": "2025-02-10", "symbol": "MSFT", "outcome_label": "",
                  "score": "68"},

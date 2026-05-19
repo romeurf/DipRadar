@@ -31,7 +31,7 @@ _FIELDS = [
     "name",
     "sector",
     # Classificação
-    "category",            # Hold Forever | Apartamento | Rotação
+    "category",            # HIGH_CONVICTION | GROWTH | FLIP | CORE
     "verdict",             # COMPRAR | MONITORIZAR | EVITAR
     "score",               # 0-100
     # Preço e mercado

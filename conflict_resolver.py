@@ -11,7 +11,7 @@ recebe um veredicto cinzento e não sabe o que fazer. Este módulo arbitra:
   fund_score ≥ 65 + ml_bear                          →  FUNDAMENTAL_ONLY            (DCA gradual)
   caso contrário                                     →  NEUTRAL                     (zona cinzenta)
 
-ML labels considerados bull: WIN, WIN_STRONG, WIN_40
+ML labels considerados bull: WIN, WIN_STRONG
 
 API pública:
   ConflictState (Enum)
@@ -41,7 +41,7 @@ _STATE_META: dict[ConflictState, tuple[str, str, str]] = {
     ConflictState.NEUTRAL:                    ("NEUTRO",       "⚪", "0%"),
 }
 
-_BULL_LABELS = frozenset({"WIN", "WIN_STRONG", "WIN_40"})
+_BULL_LABELS = frozenset({"WIN", "WIN_STRONG"})
 
 
 def resolve_conflict(
@@ -54,7 +54,7 @@ def resolve_conflict(
     Cruza Score V2 com label ML e devolve (estado, mensagem, emoji, sizing).
 
     fund_score      : 0-100 (saída de calculate_score['final_score'])
-    ml_label        : WIN_STRONG / WIN / WIN_40 / WEAK / NO_WIN / NO_MODEL / None
+    ml_label        : WIN_STRONG / WIN / WEAK / NO_WIN / NO_MODEL / None
     has_dislocation : True se quality_dislocation > 0.30
     is_preprofit    : True se fcf_yield < 0 e revenue_growth > 0.20
     """

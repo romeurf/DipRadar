@@ -897,14 +897,14 @@ def classify_dip_category(fundamentals: dict, dip_score: float, is_bluechip_flag
     sector           = fundamentals.get("sector", "")
     margin_threshold = _MARGIN_THRESHOLD.get(sector, 0.40)
 
-    # Hold Forever
+    # HIGH_CONVICTION: blue chip com qualidade, hold longo prazo
     hf_fcf_ok    = (fcf_yield is None) or (fcf_yield > -0.01)
     hf_margin_ok = gross_margin >= margin_threshold
     hf_de_ok     = (debt_equity is None) or (debt_equity < 150)
     if is_bluechip_flag and dip_score >= 70 and hf_fcf_ok and hf_margin_ok and hf_de_ok:
         return CAT_HIGH_CONVICTION
 
-    # Apartamento
+    # HIGH_CONVICTION via dividendo: drawdown estrutural + yield sectorial
     apt_yield_min = _HIGH_CONVICTION_YIELD_THRESHOLD.get(sector, 0.020)
     apt_fcf_ok    = (fcf_yield is None) or (fcf_yield > -0.03)
     if (
