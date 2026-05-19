@@ -426,10 +426,10 @@ def _handle_mldata(force_update: bool = False) -> None:
             lines.append("")
         if outcomes:
             lines.append("*🎯 Outcomes:*")
-            em_map = {"WIN_40": "🟢", "WIN_20": "✅", "NEUTRAL": "🟡", "LOSS_15": "🔴"}
+            em_map = {"WIN_STRONG": "🟢", "WIN": "✅", "NEUTRAL": "🟡", "LOSS": "🔴"}
             for lbl, cnt in sorted(outcomes.items(), key=lambda x: x[1], reverse=True):
                 lines.append(f"  {em_map.get(lbl,'📊')} {lbl}: *{cnt}* ({cnt/labeled*100:.0f}%)" if labeled else f"  {lbl}: {cnt}")
-            wins = outcomes.get("WIN_40", 0) + outcomes.get("WIN_20", 0)
+            wins = outcomes.get("WIN_STRONG", 0) + outcomes.get("WIN", 0)
             if labeled > 0:
                 lines.append(f"\n  📈 *Win rate:* {wins/labeled*100:.0f}% ({wins}/{labeled})")
             lines.append("")

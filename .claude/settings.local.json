@@ -9,7 +9,8 @@
       "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\Romeu\\\\OneDrive\\\\Documentos\\\\GitHub\\\\DipRadar\" -Filter \"*.py\" -File)",
       "Bash(Select-Object FullName)",
       "Bash(python -c \"import ast; ast.parse\\(open\\('position_monitor.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('main.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('main.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('bot_commands.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }
