@@ -82,7 +82,8 @@ def _parse_tiingo_response(data: list[dict], ticker: str) -> pd.DataFrame:
         return pd.DataFrame()
     try:
         df = pd.DataFrame(data)
-        df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+        _d = pd.to_datetime(df["date"])
+        df["date"] = _d.dt.tz_convert(None) if _d.dt.tz is not None else _d
         df = df.sort_values("date").reset_index(drop=True)
         rename = {
             "adjClose":  "Adj Close",
@@ -154,48 +155,33 @@ def _tiingo_fetch(ticker: str, lookback_days: int) -> pd.DataFrame:
 
 
 def _yfinance_fetch(ticker: str, lookback_days: int) -> pd.DataFrame:
-    """Fallback yfinance — nunca crasha, devolve DataFrame vazio em falha."""
+    """Fallback yfinance — usa Ticker.history() (sem MultiIndex) em vez de yf.download().
+
+    yf.download() com ticker único muda a estrutura de MultiIndex entre versões
+    (≥0.2.50 pode devolver ticker como level-0 em vez dos nomes de coluna), fazendo
+    get_level_values(0) devolver ["AAPL","AAPL",...] em vez de ["Open","High",...].
+    yf.Ticker.history() devolve sempre colunas planas — mais estável para ticker único.
+    """
     try:
         import yfinance as yf
         start_date, end_date = _date_range(lookback_days)
-        # `show_errors` foi removido em yfinance ≥0.2.40 — wrap em try p/ compat ambas versões
-        try:
-            raw = yf.download(
-                ticker,
-                start=start_date,
-                end=end_date,
-                auto_adjust=True,
-                progress=False,
-            )
-        except TypeError:
-            raw = yf.download(
-                ticker,
-                start=start_date,
-                end=end_date,
-                progress=False,
-            )
+        raw = yf.Ticker(ticker).history(
+            start=start_date,
+            end=end_date,
+            auto_adjust=True,
+        )
         if raw is None or raw.empty:
             log.debug(f"[data_feed] yfinance devolveu dados vazios para {ticker}")
             return pd.DataFrame()
 
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
-
-        # yfinance mudou o nome do índice entre versões:
-        #   < 0.2.x : "Date"
-        #   ≥ 0.2.x : "Datetime" (timezone-aware)
-        #   alguns builds: "Price Date"
-        # Sem este rename, a coluna data fica com o nome errado, o cols filter
-        # exclui "date" e o DataFrame volta sem índice temporal → 0 tickers no snapshot.
-        raw = raw.reset_index().rename(columns={
+        # Ticker.history() devolve DatetimeIndex (sem coluna "date") — normalizar.
+        raw = raw.reset_index()
+        raw = raw.rename(columns={
             "Date":       "date",
             "Datetime":   "date",
             "Price Date": "date",
             "index":      "date",
         })
-        # tz_localize(None) num Series já timezone-naive lança TypeError.
-        # tz_convert(None) remove timezone de Series tz-aware (yfinance ≥0.2 devolve UTC).
-        # Esta verificação cobre ambos os casos sem exceções.
         _dates = pd.to_datetime(raw["date"])
         raw["date"] = _dates.dt.tz_convert(None) if _dates.dt.tz is not None else _dates
 
@@ -205,6 +191,10 @@ def _yfinance_fetch(ticker: str, lookback_days: int) -> pd.DataFrame:
         raw["ticker"] = ticker
         cols = [c for c in ["date", "Open", "High", "Low", "Close", "Adj Close", "Volume", "ticker"] if c in raw.columns]
         result = raw[cols]
+
+        if "Close" not in result.columns:
+            log.warning(f"[data_feed] yfinance: coluna 'Close' ausente para {ticker} — colunas: {list(raw.columns)}")
+            return pd.DataFrame()
 
         if len(result) < 2:
             log.debug(f"[data_feed] yfinance dados insuficientes para {ticker} ({len(result)} linhas)")

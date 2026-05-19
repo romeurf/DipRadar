@@ -334,7 +334,7 @@ def _fetch_history(symbol: str, lookback_days: int = 280) -> pd.DataFrame:
     try:
         from data_feed import get_eod_prices
         df = get_eod_prices(symbol, lookback_days=lookback_days)
-        if df is not None and not df.empty:
+        if df is not None and not df.empty and "Close" in df.columns:
             if "date" in df.columns:
                 df = df.set_index(pd.DatetimeIndex(pd.to_datetime(df["date"])))
                 df = df.drop(columns=["date"])
