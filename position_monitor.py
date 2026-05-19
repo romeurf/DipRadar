@@ -160,9 +160,9 @@ def _fetch_fundamentals_snapshot(ticker: str, current_price: float = 0.0) -> dic
 
 
 def _calc_rsi_momentum(close: "pd.Series", period: int = 14) -> float:
-    """RSI — delega para momentum_scanner._calc_rsi (fonte única)."""
+    """RSI — delega para momentum_radar.scanner._calc_rsi (fonte única)."""
     try:
-        from momentum_scanner import _calc_rsi
+        from momentum_radar.scanner import _calc_rsi
         return _calc_rsi(close, period)
     except Exception:
         return 50.0
@@ -762,7 +762,7 @@ def _monitor_one(
     if _is_early and _is_dip:
         _momentum_score = 0.0
         try:
-            from momentum_scanner import _calc_momentum_signals, score_momentum
+            from momentum_radar.scanner import _calc_momentum_signals, score_momentum
             import yfinance as _yf
             import pandas as _pd
             _mhist = _yf.Ticker(record.ticker).history(period="60d", auto_adjust=True)

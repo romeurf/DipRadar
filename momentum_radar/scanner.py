@@ -1,5 +1,5 @@
 """
-momentum_scanner.py — Detector de breakouts e momentum plays.
+momentum_radar/scanner.py — Detector de breakouts e momentum plays.
 
 Complemento do DipRadar: enquanto o dip scanner procura quedas para recuperação,
 o momentum scanner procura stocks em aceleração de upside (Micron, NOW, SanDisk...).

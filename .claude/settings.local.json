@@ -10,7 +10,8 @@
       "Bash(Select-Object FullName)",
       "Bash(python -c \"import ast; ast.parse\\(open\\('position_monitor.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('main.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('bot_commands.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('bot_commands.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/build_momentum_dataset.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }

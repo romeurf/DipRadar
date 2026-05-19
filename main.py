@@ -79,7 +79,7 @@ from watchlist import run_watchlist_scan, build_watchlist_morning_summary, WATCH
 from alert_db import log_alert_snapshot, get_db_stats, fill_db_outcomes
 import bot_commands
 from position_monitor import run_daily_check
-from momentum_scanner import scan_momentum_universe, format_momentum_alert, clear_sector_cache
+from momentum_radar.scanner import scan_momentum_universe, format_momentum_alert, clear_sector_cache
 
 # Chunk 3a — data feed
 from data_feed import get_eod_prices, get_latest_price, is_tiingo_available

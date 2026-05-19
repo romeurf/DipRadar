@@ -2655,7 +2655,7 @@ def _handle_command(text: str) -> None:
         _reply("_🚀 A procurar momentum plays... (pode demorar 2-3 min)_")
         def _run_momentum():
             try:
-                from momentum_scanner import scan_momentum_universe, format_momentum_alert
+                from momentum_radar.scanner import scan_momentum_universe, format_momentum_alert
                 candidates = scan_momentum_universe(min_score=60.0, max_results=5)
                 if not candidates:
                     _reply("Nenhum momentum play encontrado hoje.")
