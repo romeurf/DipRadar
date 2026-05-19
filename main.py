@@ -1451,7 +1451,7 @@ def allocate_ticker(symbol: str) -> str:
             monthly_budget_eur    = float(os.environ.get("MONTHLY_BUDGET_EUR", "1050")),
             existing_position_pct = existing_pct,
             existing_sector_pct   = _get_sector_pct(fund.get("sector", ""), usd_eur=get_usdeur()),
-            portfolio_correlation = _get_portfolio_correlation(symbol),
+            portfolio_correlation  = _get_portfolio_correlation(symbol),
         )
         decision = suggest_allocation(ctx)
 
