@@ -185,11 +185,17 @@ TRIGGER_DETERIORATION      = "DETERIORATION"
 TRIGGER_TIME_DECAY         = "TIME_DECAY"
 TRIGGER_IMPROVEMENT        = "IMPROVEMENT"
 TRIGGER_ROUTINE            = "ROUTINE"
+TRIGGER_EDGE_GONE          = "EDGE_GONE"   # modelo diz: alpha < threshold → edge evaporou
 
 # Stop-loss: se o preço cair STOP_LOSS_PCT% abaixo do preço de entrada, sair.
 # Configurável via env var POSITION_STOP_LOSS_PCT (default 12%).
-# Protege contra quedas estruturais que o modelo não detectou a tempo.
 _STOP_LOSS_PCT = float(os.getenv("POSITION_STOP_LOSS_PCT", "0.12"))
+
+# Threshold de edge mínima: se pred_up cair abaixo deste valor, o modelo
+# não encontra alpha suficiente para justificar manter a posição.
+# Usa o mesmo _SCORE_FLOOR do ml_predictor — uma única fonte de verdade.
+# Configurável via env var ML_SCORE_FLOOR (default 0.01 = 1pp sobre SPY).
+_EDGE_FLOOR = float(os.getenv("ML_SCORE_FLOOR", "0.01"))
 
 
 def _detect_structural_decline(
@@ -370,7 +376,23 @@ def _classify_trigger(
             and current_price < record.alert_price * (1 - _STOP_LOSS_PCT)):
         return TRIGGER_STOP_LOSS
 
-    # 1c. Early Alpha Capture: 70%+ do alpha em <50% do tempo → saída parcial
+    # 1c. Edge check diário: o modelo reavalia se ainda há alpha suficiente.
+    # pred_up é recalculado ao preço actual — não usa o pred_up da entrada.
+    # Se o modelo diz que o alpha esperado caiu abaixo de _EDGE_FLOOR, a edge
+    # evaporou. Não há percentagens de ganho — é o modelo a decidir.
+    # Só activa após 7 dias (evitar ruído nos primeiros dias).
+    if record.days_held >= 7:
+        _current_pred_up = feature_row_today.get("pred_up") if feature_row_today else None
+        if _current_pred_up is not None:
+            try:
+                _pu = float(_current_pred_up)
+                import math as _m
+                if _m.isfinite(_pu) and _pu < _EDGE_FLOOR:
+                    return TRIGGER_EDGE_GONE
+            except (TypeError, ValueError):
+                pass
+
+    # 1d. Early Alpha Capture: 70%+ do alpha em <50% do tempo → saída parcial
     if _check_early_alpha(record, current_price):
         return TRIGGER_EARLY_ALPHA
 
@@ -395,6 +417,22 @@ def _classify_trigger(
         return TRIGGER_IMPROVEMENT
 
     return TRIGGER_ROUTINE
+
+
+def _build_edge_gone_alert(record: PositionRecord, current_price: float, pred_up: float) -> str:
+    """Mensagem quando o modelo detecta que a edge desapareceu."""
+    pnl_pct = (current_price / record.alert_price - 1) * 100
+    sign    = "+" if pnl_pct >= 0 else ""
+    return "\n".join([
+        f"🔬 *EDGE GONE — {record.ticker}*  [Dia {record.days_held}]",
+        f"_O modelo reavaliou {record.ticker} ao preço actual e já não encontra alpha suficiente._",
+        "",
+        f"Alpha previsto agora: *{pred_up*100:.1f}pp* sobre SPY (mínimo: {_EDGE_FLOOR*100:.1f}pp)",
+        f"P&L desde entrada: *{sign}{pnl_pct:.1f}%*  |  Entry: ${record.alert_price:.2f}  →  ${current_price:.2f}",
+        "",
+        "💡 *Ação sugerida:* Sair da posição. A edge evaporou — capital melhor aproveitado noutras oportunidades.",
+        f"_Threshold configurável via env var ML_SCORE_FLOOR (actual: {_EDGE_FLOOR:.3f})._",
+    ])
 
 
 def _build_early_alpha_alert(
@@ -427,6 +465,7 @@ def _resolve_thesis_health(trigger: str, delta: float) -> str:
         TRIGGER_DETERIORATION:      "DETERIORATING",
         TRIGGER_STRUCTURAL_DECLINE: "STRUCTURAL_DECLINE",
         TRIGGER_TIME_DECAY:         "WEAKENING",
+        TRIGGER_EDGE_GONE:          "STRUCTURAL_DECLINE",
     }
     return mapping.get(trigger, "WEAKENING")
 
@@ -790,6 +829,16 @@ def _monitor_one(
             ])
         record.status       = "CLOSED"
         record.close_reason = "STOP_LOSS"
+        record.closed_at    = datetime.utcnow().isoformat()
+        record.close_price  = current_price
+
+    elif trigger == TRIGGER_EDGE_GONE:
+        _pu = feature_row_today.get("pred_up", 0.0) if feature_row_today else 0.0
+        try: _pu = float(_pu)
+        except (TypeError, ValueError): _pu = 0.0
+        msg = _build_edge_gone_alert(record, current_price, _pu)
+        record.status       = "CLOSED"
+        record.close_reason = "EDGE_GONE"
         record.closed_at    = datetime.utcnow().isoformat()
         record.close_price  = current_price
 
