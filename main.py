@@ -2164,6 +2164,16 @@ def main() -> None:
             clear_alerts(),
             globals().update(_alerted_today=set()),
         ),
+        # Callbacks necessários para comandos do bot
+        get_db_stats=get_db_stats,
+        fill_db_outcomes=fill_db_outcomes,
+        run_scan=run_scan,
+        is_market_open=is_market_open,
+        get_fundamentals=get_fundamentals,
+        get_earnings_days=get_earnings_days,
+        load_rejected_log=load_rejected_log,
+        get_snapshot=_get_snapshot,
+        build_backtest_summary=build_backtest_summary,
     )
 
     scheduler = BlockingScheduler(timezone=LISBON_TZ)
