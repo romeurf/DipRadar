@@ -61,7 +61,7 @@ def _header_fields() -> list[str]:
         "coverage",
     ]
     outcome = [
-        "outcome_label",   # preenchido depois (WIN_40 / WIN_20 / NEUTRAL / LOSS_15)
+        "outcome_label",   # preenchido depois (WIN_STRONG / WIN / NEUTRAL / LOSS)
         "return_3m",
         "return_6m",
         "outcome_resolved_at",
@@ -152,7 +152,7 @@ def compute_ml_accuracy() -> dict:
         return {"skipped": True, "reason": "predictions log nao encontrado"}
     try:
         import pandas as pd
-        df = pd.read_csv(PREDICTIONS_PATH)
+        df = pd.read_csv(PREDICTIONS_PATH, on_bad_lines="skip")
         required = ["win_prob", "outcome_label"]
         if not all(c in df.columns for c in required):
             return {"skipped": True, "reason": "colunas em falta"}
@@ -165,8 +165,8 @@ def compute_ml_accuracy() -> dict:
         if len(resolved) < 10:
             return {"skipped": True, "reason": f"apenas {len(resolved)} outcomes resolvidos (min 10)"}
 
-        # Mapear outcome_label → binário
-        _WIN_LABELS = {"WIN_40", "WIN_20"}
+        # Mapear outcome_label → binário (suporta labels antigos e novos)
+        _WIN_LABELS = {"WIN_40", "WIN_20", "WIN_STRONG", "WIN"}
         resolved["actual_win"] = resolved["outcome_label"].isin(_WIN_LABELS).astype(int)
         resolved["predicted_win"] = (resolved["win_prob"].astype(float) > 0.55).astype(int)
 
@@ -220,7 +220,7 @@ def compute_win_prob_drift(
         import pandas as pd
         from datetime import timedelta
 
-        df = pd.read_csv(PREDICTIONS_PATH)
+        df = pd.read_csv(PREDICTIONS_PATH, on_bad_lines="skip")
         if "win_prob" not in df.columns or "ts" not in df.columns or df.empty:
             return {"skipped": True, "reason": "colunas win_prob/ts ausentes"}
 

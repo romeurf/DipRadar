@@ -108,19 +108,26 @@ def migrate_schema() -> bool:
             f"A arquivar e recriar limpo."
         )
 
-        # Recuperar linhas do schema novo E do schema antigo.
-        # Linhas antigas (schema anterior) são preservadas com "" nos campos novos.
-        # Isto evita perder alertas históricos quando o schema cresce.
+        # Recuperar linhas de QUALQUER schema anterior.
+        # Estratégia tolerante: para cada linha, tentar mapear campos pelo nome
+        # (usando o header que estava no CSV quando foi escrita). Se a linha
+        # tem mais campos que o header, truncar. Se tem menos, preencher com "".
+        # Isto lida com corrupção onde linhas têm campo counts inconsistentes.
         recovered: list[dict] = []
         for row in all_rows:
-            if len(row) == n_target:
-                # Schema actual — recuperação directa
+            if len(row) == n_target and not current_header:
                 recovered.append(dict(zip(_FIELDS, row)))
-            elif len(row) == n_current and current_header:
-                # Schema antigo — mapear campos conhecidos e preencher novos com ""
-                old_dict = dict(zip(current_header, row))
-                new_dict = {f: old_dict.get(f, "") for f in _FIELDS}
+            elif current_header:
+                # Usar o header conhecido para mapear, depois projectar em _FIELDS
+                # Truncar linhas com campos extra (evita IndexError no zip)
+                row_trimmed = row[:len(current_header)]
+                row_padded  = row_trimmed + [""] * (len(current_header) - len(row_trimmed))
+                old_dict    = dict(zip(current_header, row_padded))
+                new_dict    = {f: old_dict.get(f, "") for f in _FIELDS}
                 recovered.append(new_dict)
+            elif len(row) >= n_target:
+                # Sem header mas linha suficientemente longa — tentar recuperar directa
+                recovered.append(dict(zip(_FIELDS, row[:n_target])))
 
         # Recriar CSV limpo com schema correcto
         with _DB_PATH.open("w", newline="", encoding="utf-8") as f:
