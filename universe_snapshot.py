@@ -232,8 +232,10 @@ def _save_fund_cache(df: pd.DataFrame) -> None:
 def _fetch_live_fundamentals(symbol: str) -> dict:
     """
     Tenta yfinance.Ticker(...).info — fallback gracioso a defaults se falhar.
+    Inclui "sector" (string GICS) para sector-conditioned features no modelo ML.
     """
     out = dict(_FUND_FALLBACK)
+    out["sector"] = "Unknown"
     try:
         import yfinance as yf
         info = yf.Ticker(symbol).info or {}
@@ -276,6 +278,9 @@ def _fetch_live_fundamentals(symbol: str) -> dict:
     de_norm = max(0.0, min(1.0, 1.0 - de / 200.0))
     raw = (max(0.0, gm) + max(0.0, rg) + de_norm) / 3.0
     out["quality_score"] = round(max(0.0, min(1.0, raw)), 3)
+
+    sector = info.get("sector") or ""
+    out["sector"] = str(sector) if sector else "Unknown"
 
     return out
 
@@ -408,6 +413,8 @@ def _build_row(
         "vix":                macro.get("vix", 20.0),
         "spy_drawdown_5d":    macro.get("spy_drawdown_5d", 0.0),
         "sector_drawdown_5d": macro.get("sector_drawdown_5d", 0.0),
+        # Sector GICS — necessário para sector-conditioned features em add_derived_features
+        "sector":             fund.get("sector", "Unknown") or "Unknown",
         # Fundamentais (live ou cache 7d)
         **{k: float(fund[k]) for k in _FUND_FALLBACK.keys()},
         # Telemetria

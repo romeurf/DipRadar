@@ -145,7 +145,8 @@ _PKL_V3 = next((p for p in _BUNDLE_CANDIDATES if p.exists()), _BUNDLE_CANDIDATES
 # devolve erro explícito (bundle['feature_cols'] é obrigatório após retrain).
 try:
     from ml_features import FEATURE_COLUMNS as _FEATURE_COLS
-except Exception:
+except Exception as _e:
+    logging.warning(f"[ml_predictor] Falha ao importar FEATURE_COLUMNS: {_e} — fallback vazio")
     _FEATURE_COLS = []
 
 # Aliases de features — campo externo → nome interno
