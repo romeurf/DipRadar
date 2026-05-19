@@ -39,7 +39,7 @@ from typing import Any
 import pytz
 import yfinance as yf
 from state import load_alerts, save_alerts
-from score import CATEGORY_HOLD_FOREVER, CATEGORY_APARTAMENTO, CATEGORY_ROTACAO
+from allocation_engine import CAT_HIGH_CONVICTION, CAT_GROWTH
 from data_feed import get_tiingo_confirmation
 
 LISBON_TZ = pytz.timezone("Europe/Lisbon")
@@ -59,7 +59,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "symbol":   "IEMA.L",
         "name":     "iShares MSCI EM IMI UCITS ETF",
         "slot":     "P1",
-        "category": CATEGORY_ROTACAO,
+        "category": CAT_GROWTH,
         "criteria": [
             {"type": "drawdown_52w_pct", "value": 12.0},
         ],
@@ -71,7 +71,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "symbol":   "O",
         "name":     "Realty Income",
         "slot":     "P2",
-        "category": CATEGORY_APARTAMENTO,
+        "category": CAT_HIGH_CONVICTION,
         "criteria": [
             {"type": "dividend_yield", "value": 5.5},
             {"type": "price_below",    "value": 50.0},
@@ -82,7 +82,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "symbol":   "MDT",
         "name":     "Medtronic",
         "slot":     "P2",
-        "category": CATEGORY_APARTAMENTO,
+        "category": CAT_HIGH_CONVICTION,
         "criteria": [
             {"type": "dividend_yield", "value": 4.0},
             {"type": "price_below",    "value": 80.0},
@@ -93,7 +93,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "symbol":   "ABBV",
         "name":     "AbbVie",
         "slot":     "P2",
-        "category": CATEGORY_APARTAMENTO,
+        "category": CAT_HIGH_CONVICTION,
         "criteria": [
             {"type": "dividend_yield",  "value": 4.0},
             {"type": "change_day_pct",  "value": 15.0},
@@ -104,7 +104,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "symbol":   "LMT",
         "name":     "Lockheed Martin",
         "slot":     "P3",
-        "category": CATEGORY_ROTACAO,
+        "category": CAT_GROWTH,
         "criteria": [
             {"type": "change_day_pct",   "value": 10.0},
             {"type": "drawdown_52w_pct", "value": 20.0},
@@ -115,7 +115,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "symbol":   "RTX",
         "name":     "RTX (Raytheon)",
         "slot":     "P3",
-        "category": CATEGORY_ROTACAO,
+        "category": CAT_GROWTH,
         "criteria": [
             {"type": "change_day_pct",   "value": 10.0},
             {"type": "drawdown_52w_pct", "value": 20.0},
@@ -128,7 +128,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "symbol":   "CRWD",
         "name":     "CrowdStrike",
         "slot":     "P3",
-        "category": CATEGORY_ROTACAO,
+        "category": CAT_GROWTH,
         "criteria": [
             {"type": "drawdown_52w_pct", "value": 20.0},
         ],
@@ -138,7 +138,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "symbol":   "PANW",
         "name":     "Palo Alto Networks",
         "slot":     "P3",
-        "category": CATEGORY_ROTACAO,
+        "category": CAT_GROWTH,
         "criteria": [
             {"type": "drawdown_52w_pct", "value": 20.0},
         ],
@@ -148,7 +148,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "symbol":   "TSM",
         "name":     "Taiwan Semiconductor",
         "slot":     "P2",
-        "category": CATEGORY_ROTACAO,
+        "category": CAT_GROWTH,
         "criteria": [
             {"type": "drawdown_52w_pct", "value": 15.0},
             {"type": "change_day_pct",   "value": 12.0},
@@ -159,7 +159,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "symbol":   "AVGO",
         "name":     "Broadcom",
         "slot":     "P3",
-        "category": CATEGORY_ROTACAO,
+        "category": CAT_GROWTH,
         "criteria": [
             {"type": "drawdown_52w_pct", "value": 30.0},
         ],
@@ -171,7 +171,7 @@ WATCHLIST: list[dict[str, Any]] = [
         "symbol":   "ALV.DE",
         "name":     "Allianz",
         "slot":     "P3",
-        "category": CATEGORY_APARTAMENTO,
+        "category": CAT_HIGH_CONVICTION,
         "criteria": [
             {"type": "drawdown_52w_pct", "value": 15.0},
         ],

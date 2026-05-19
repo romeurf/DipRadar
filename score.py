@@ -26,8 +26,7 @@ API pública (compatível com toda a base de código existente):
   calculate_dip_score(fund, sym, ..., ml_prob)          — shim retro-compat
   build_score_breakdown(fund, sym, ..., ml_prob)        — shim retro-compat
   is_bluechip(fund)                                     — mantido sem alterações
-  classify_dip_category(fund, score, bc_flag)           — mantido sem alterações
-  CATEGORY_HOLD_FOREVER / APARTAMENTO / ROTACAO
+  classify_dip_category(fund, score, bc_flag) → CAT_HIGH_CONVICTION | CAT_GROWTH
 """
 
 from __future__ import annotations
@@ -39,13 +38,7 @@ from typing import Any
 import numpy as np
 
 
-# ---------------------------------------------------------------------------
-# 0. Constantes de categoria — fonte da verdade única
-# ---------------------------------------------------------------------------
-
-CATEGORY_HOLD_FOREVER = "🏗️ Hold Forever"
-CATEGORY_APARTAMENTO  = "🏠 Apartamento"
-CATEGORY_ROTACAO      = "🔄 Rotação"
+from allocation_engine import CAT_HIGH_CONVICTION, CAT_GROWTH
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +59,7 @@ _MARGIN_THRESHOLD: dict[str, float] = {
     "Basic Materials":        0.25,
 }
 
-_APARTAMENTO_YIELD_THRESHOLD: dict[str, float] = {
+_HIGH_CONVICTION_YIELD_THRESHOLD: dict[str, float] = {
     "Technology":             0.025,
     "Communication Services": 0.030,
     "Healthcare":             0.020,
@@ -889,12 +882,12 @@ def is_bluechip(fundamentals: dict) -> bool:
 
 def classify_dip_category(fundamentals: dict, dip_score: float, is_bluechip_flag: bool) -> str:
     """
-    Classifica o dip em uma de 3 categorias estratégicas.
-    Devolve sempre uma das constantes CATEGORY_* definidas neste módulo.
+    Classifica o dip numa categoria estratégica (valores canónicos da allocation_engine).
 
-    🏗️ Hold Forever — blue chip, score ≥70, margens e balanço excelentes.
-    🏠 Apartamento  — drawdown estrutural + dividendo sectorial acima do threshold.
-    🔄 Rotação       — fallback táctico para o resto.
+    "HIGH_CONVICTION" — blue chip, score ≥70, ou dividendo sectorial acima do threshold.
+    "GROWTH"          — stock pick activo, horizonte 90d (fallback).
+
+    Os valores retornados correspondem directamente aos CAT_* da allocation_engine.
     """
     dividend_yield   = fundamentals.get("dividend_yield") or 0
     drawdown         = fundamentals.get("drawdown_from_high") or 0
@@ -909,10 +902,10 @@ def classify_dip_category(fundamentals: dict, dip_score: float, is_bluechip_flag
     hf_margin_ok = gross_margin >= margin_threshold
     hf_de_ok     = (debt_equity is None) or (debt_equity < 150)
     if is_bluechip_flag and dip_score >= 70 and hf_fcf_ok and hf_margin_ok and hf_de_ok:
-        return CATEGORY_HOLD_FOREVER
+        return CAT_HIGH_CONVICTION
 
     # Apartamento
-    apt_yield_min = _APARTAMENTO_YIELD_THRESHOLD.get(sector, 0.020)
+    apt_yield_min = _HIGH_CONVICTION_YIELD_THRESHOLD.get(sector, 0.020)
     apt_fcf_ok    = (fcf_yield is None) or (fcf_yield > -0.03)
     if (
         dividend_yield >= apt_yield_min
@@ -920,9 +913,9 @@ def classify_dip_category(fundamentals: dict, dip_score: float, is_bluechip_flag
         and apt_fcf_ok
         and dip_score >= 45
     ):
-        return CATEGORY_APARTAMENTO
+        return CAT_HIGH_CONVICTION
 
-    return CATEGORY_ROTACAO
+    return CAT_GROWTH
 
 
 # ---------------------------------------------------------------------------

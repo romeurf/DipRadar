@@ -41,8 +41,7 @@ Filosofia de design (Fase 4)
 8. Concentration cap: HIGH_CONVICTION até 30% portfolio, restantes 12%;
    slowdown ×0.5 quando posição actual >8% (para não saltar limites).
 
-Backward compat: aliases CAT_ETF_CORE / CAT_HOLD_FOREVER / CAT_APARTAMENTO
-mantidos como aliases dos novos nomes para não quebrar consumers externos.
+Categorias canónicas — CAT_* são a única fonte de verdade em todo o sistema.
 """
 
 from __future__ import annotations
@@ -69,17 +68,12 @@ _MONTHLY_BUDGET_EUR: float = float(_raw_budget)
 
 # ── Constantes ────────────────────────────────────────────────────────────────
 
-# Categorias activas (4 + PASS)
+# Categorias (fonte única — usadas em todo o sistema)
 CAT_CORE             = "CORE"             # ETFs (passive DCA)
-CAT_HIGH_CONVICTION  = "HIGH_CONVICTION"  # bluechip saudável (derivado de fundamentals)
-CAT_GROWTH           = "GROWTH"           # active stock pick (fund_score>=55)
-CAT_FLIP             = "FLIP"             # CONFLICT_TECH (fund<55 + ml bull)
+CAT_HIGH_CONVICTION  = "HIGH_CONVICTION"  # bluechip saudável — hold longo prazo
+CAT_GROWTH           = "GROWTH"           # active stock pick, horizonte 90d
+CAT_FLIP             = "FLIP"             # oportunidade táctica (fund<55 + ml bull)
 CAT_PASS             = "PASS"             # sem encaixe — esperar cash
-
-# Aliases backward-compat (não usar em código novo)
-CAT_ETF_CORE     = CAT_CORE
-CAT_HOLD_FOREVER = CAT_HIGH_CONVICTION
-CAT_APARTAMENTO  = CAT_HIGH_CONVICTION
 
 # Pesos-alvo (fracção do orçamento mensal). Soma = 100%.
 _TARGET_PCT: dict[str, float] = {
@@ -216,7 +210,7 @@ class AllocationContext:
     portfolio_correlation: float                = 0.0      # [0, 1]
     drawdown_52w:          float | None         = None     # negativo (-0.35) ou None
     dividend_yield:        float | None         = None     # 0.025 = 2.5%
-    classify_category:     str | None           = None     # legado — output de classify_dip_category
+    # classify_category removido — era campo morto nunca lido pela lógica de sizing
     # ML
     pred_up:               float | None         = None
     pred_down:             float | None         = None

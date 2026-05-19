@@ -414,7 +414,7 @@ def _forward_outcomes(
     category: str,
 ) -> dict:
     from alert_db import _resolve_outcome_label
-    from score import CATEGORY_APARTAMENTO, CATEGORY_HOLD_FOREVER
+    from allocation_engine import CAT_HIGH_CONVICTION
 
     total_rows  = len(df)
     max_forward = total_rows - dip_iloc - 1
@@ -456,10 +456,11 @@ def _forward_outcomes(
         result["price_6m"]  = round(p6m, 4)
         result["return_6m"] = round((p6m - price_entry) / price_entry * 100, 2)
 
-    if CATEGORY_HOLD_FOREVER not in category:
+    if category != CAT_HIGH_CONVICTION:
+        # HIGH_CONVICTION: horizonte mais longo → priorizar return_6m
         prio = (
             ("return_6m", "return_3m", "return_1m")
-            if CATEGORY_APARTAMENTO in category
+            if category == CAT_HIGH_CONVICTION
             else ("return_3m", "return_6m", "return_1m")
         )
         for field in prio:

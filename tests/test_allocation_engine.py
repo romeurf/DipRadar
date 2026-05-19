@@ -29,10 +29,6 @@ from allocation_engine import (
     CAT_GROWTH,
     CAT_FLIP,
     CAT_PASS,
-    # backward-compat aliases
-    CAT_ETF_CORE,
-    CAT_HOLD_FOREVER,
-    CAT_APARTAMENTO,
     suggest_allocation,
     format_allocation_telegram,
 )
@@ -82,8 +78,6 @@ def test_etf_core_priority():
     assert d.category == CAT_CORE, f"Esperava CORE, got {d.category}"
     assert d.amount_eur > 0, "Core sempre tem allocation positiva"
     assert d.exit_rule == "NEVER"
-    # Backward compat: alias deve apontar para o mesmo
-    assert CAT_ETF_CORE == CAT_CORE
     print(f"  ok:Core priority: {d.category}, €{d.amount_eur:.0f}, exit={d.exit_rule}")
 
 
@@ -99,9 +93,6 @@ def test_high_conviction_bluechip_healthy():
     assert d.category == CAT_HIGH_CONVICTION, f"Esperava HIGH_CONVICTION, got {d.category}"
     assert d.exit_rule == "THESIS_BREAK"
     assert d.amount_eur > 0
-    # Backward compat: aliases mapeiam todos para HIGH_CONVICTION
-    assert CAT_HOLD_FOREVER == CAT_HIGH_CONVICTION
-    assert CAT_APARTAMENTO == CAT_HIGH_CONVICTION
     print(f"  ok:High Conviction (bluechip saudável): {d.category}, €{d.amount_eur:.0f}")
 
 

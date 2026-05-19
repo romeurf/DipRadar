@@ -2079,8 +2079,8 @@ def _handle_allocate(parts: list[str]) -> None:
         _reply(
             "⚠️ Usa: `/allocate <TICKER>`\n"
             "_Exemplo: `/allocate NVO`_\n"
-            "_Sugere categoria (ETF Core / Hold Forever / Apartamento /\n"
-            "Growth / Flip) + sizing em €. Não executa nenhuma ordem._"
+            "_Sugere categoria (Core / High Conviction / Growth / Flip)\n"
+            "+ sizing em €. Não executa nenhuma ordem._"
         )
         return
     symbol = parts[1].upper().strip()

@@ -295,10 +295,10 @@ def fill_db_outcomes() -> dict:
     outcome_label usa return_60d como referência primária.
     Fallback: return_3m -> return_6m -> return_1m.
 
-    Hold Forever nunca recebe label.
+    HIGH_CONVICTION nunca recebe outcome_label (hold de longo prazo, sem target).
     Só actualiza linhas onde os campos ainda estão vazios.
     """
-    from score import CATEGORY_HOLD_FOREVER
+    from allocation_engine import CAT_HIGH_CONVICTION
 
     # Tentar Tiingo primeiro; fallback para yfinance se indisponível.
     # Encapsula o acesso a preços para não abortar toda a função se Tiingo falhar.
@@ -488,7 +488,7 @@ def fill_db_outcomes() -> dict:
 
         # ── outcome_label — baseado em alpha_90d (alinhado com target do modelo) ─
         if changed and row.get("outcome_label") == "":
-            if CATEGORY_HOLD_FOREVER in category:
+            if CAT_HIGH_CONVICTION in category:
                 pass
             elif days_elapsed >= _MIN_DAYS_90D:
                 alpha = row.get("alpha_90d_label")

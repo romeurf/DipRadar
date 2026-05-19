@@ -52,8 +52,17 @@ from score import (
     calculate_dip_score, build_score_breakdown, classify_dip_category,
     is_bluechip,
     score_from_fundamentals, format_score_v2_breakdown,
-    CATEGORY_HOLD_FOREVER, CATEGORY_APARTAMENTO, CATEGORY_ROTACAO,
 )
+from allocation_engine import CAT_HIGH_CONVICTION, CAT_GROWTH
+
+# Display labels para as categorias canónicas (emojis só aqui, nunca em lógica)
+_CAT_DISPLAY = {
+    "CORE":             "📦 Core / ETF",
+    "HIGH_CONVICTION":  "💎 Blue Chip",
+    "GROWTH":           "🌱 Crescimento",
+    "FLIP":             "⚡ Flip",
+    "PASS":             "⏸ Aguardar",
+}
 from state import (
     load_alerts, save_alerts, clear_alerts,
     load_weekly_log, save_weekly_log, append_weekly_log,
@@ -841,8 +850,8 @@ def calculate_flip_target(
     if not price or price <= 0:
         return "N/D", "SEM DADOS"
 
-    if category == CATEGORY_HOLD_FOREVER or (is_bluechip(fundamentals) and dip_score >= 60):
-        return "HOLD ETERNO", "💎 Hold Forever — Acumular em dips, nunca vender"
+    if category == CAT_HIGH_CONVICTION or (is_bluechip(fundamentals) and dip_score >= 60):
+        return "HOLD ETERNO", "💎 Blue Chip — Acumular em dips, horizonte longo"
 
     sector         = fundamentals.get("sector", "")
     sector_cfg     = get_sector_config(sector)
@@ -877,12 +886,10 @@ def calculate_flip_target(
     else:
         cat_flag = " | ⚠️ Sem catalisador identificado"
 
-    if category == CATEGORY_APARTAMENTO:
-        dividend_yield = fundamentals.get("dividend_yield") or 0
-        dy_str = f" | 💰 Yield {dividend_yield*100:.1f}%/ano" if dividend_yield > 0 else ""
-        strategy = f"🏠 Apartamento: ${final_target:.1f} (+{final_upside*100:.0f}%){dy_str}{cat_flag}{macro_flag}"
-    else:
-        strategy = f"🔄 Flip: ${final_target:.1f} (+{final_upside*100:.0f}%){cat_flag}{macro_flag}"
+    cat_label = _CAT_DISPLAY.get(category, category)
+    dividend_yield = fundamentals.get("dividend_yield") or 0
+    dy_str = f" | 💰 Yield {dividend_yield*100:.1f}%/ano" if (category == CAT_HIGH_CONVICTION and dividend_yield > 0) else ""
+    strategy = f"{cat_label}: ${final_target:.1f} (+{final_upside*100:.0f}%){dy_str}{cat_flag}{macro_flag}"
 
     return f"${final_target:.1f} (+{final_upside*100:.0f}%)", strategy
 
@@ -909,7 +916,7 @@ def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None, exc
         earnings      = entry.get("earnings_date")
         earnings_days = entry.get("earnings_days")
         catalyst      = entry.get("catalyst")
-        category      = entry.get("category", CATEGORY_ROTACAO)
+        category      = entry.get("category", CAT_GROWTH)
         price         = f.get("price", 0)
         mc_b          = (f.get("market_cap") or 0) / 1e9
         beta          = f.get("beta")
@@ -986,7 +993,7 @@ def _build_plain_summary(
 def build_alert(
     stock, fundamentals, historical_pe, news,
     verdict, emoji, reasons, dip_score, rsi_str,
-    category: str = CATEGORY_ROTACAO,
+    category: str = CAT_GROWTH,
     ml_result: MLResult | None = None,
 ) -> str:
     sector       = fundamentals.get("sector", "")
@@ -1432,7 +1439,7 @@ def allocate_ticker(symbol: str) -> str:
             sector                = fund.get("sector", "") or "",
             drawdown_52w          = drawdown_52w,
             dividend_yield        = fund.get("dividend_yield"),
-            classify_category     = category_str,
+            # classify_category removido — campo morto na allocation_engine
             pred_up               = ml_result.pred_up if ml_result.model_ready else None,
             pred_down             = ml_result.pred_down if ml_result.model_ready else None,
             win_prob              = ml_result.win_prob if ml_result.model_ready else None,
