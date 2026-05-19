@@ -2282,11 +2282,43 @@ def main() -> None:
         id="ml_outcomes", name="ML Outcomes domingo",
     )
 
-    # ── Monthly ML Retrain: dia 1, 06:00 Lisboa ───────────────────────────────
+    # ── Monthly ML Retrain — DipRadar: dia 1, 06:00 Lisboa ────────────────────
     scheduler.add_job(
         run_monthly_retrain,
         CronTrigger(day=1, hour=6, minute=0, timezone=LISBON_TZ),
-        id="monthly_retrain", name="Monthly ML Retrain",
+        id="monthly_retrain", name="Monthly ML Retrain (DipRadar)",
+    )
+
+    # ── Monthly Retrain — MomentumRadar: dia 1, 08:00 Lisboa ──────────────────
+    # Corre 2h após o DipRadar retrain para não competir por recursos.
+    # Dataset incremental: nunca apaga dados históricos.
+    def _run_momentum_monthly():
+        try:
+            from momentum_radar.trainer import run_momentum_training
+            import subprocess, sys
+            from pathlib import Path
+            logging.info("[momentum_retrain] A actualizar dataset + treinar...")
+            # Actualizar dataset (incremental — só últimas semanas)
+            script = Path(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py"
+            subprocess.run([sys.executable, str(script)], timeout=7200)
+            # Treinar modelo
+            result = run_momentum_training()
+            dec = result.get("decision", "?")
+            ic  = result.get("ic_new", 0)
+            logging.info(f"[momentum_retrain] {dec} | IC={ic:.4f}")
+            send_telegram(
+                f"🌙 *MomentumRadar Retrain — {dec}*\n"
+                f"IC: {ic:.4f} | {result.get('n_train',0):,} amostras | "
+                f"{result.get('n_sectors',0)} sector models"
+            )
+        except Exception as e:
+            logging.error(f"[momentum_retrain] {e}", exc_info=True)
+            send_telegram(f"❌ MomentumRadar retrain falhou: {e}")
+
+    scheduler.add_job(
+        _run_momentum_monthly,
+        CronTrigger(day=1, hour=8, minute=0, timezone=LISBON_TZ),
+        id="momentum_retrain", name="Monthly Retrain (MomentumRadar)",
     )
 
     # ── Paper Trading: update diário de posições abertas (22:50 Lisboa) ───────

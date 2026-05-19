@@ -273,21 +273,54 @@ def main() -> int:
         log.error("SPY não disponível — abortar")
         return 1
 
-    log.info(f"A construir dataset de momentum desde {args.start}...")
-    df = build_dataset(tickers, spy_hist, start=args.start)
+    out_path = Path(args.out)
 
-    if df.empty:
+    # Modo incremental: nunca apagar dados históricos.
+    # Se o parquet já existe, só computar datas novas (após o último registo).
+    existing_df = None
+    incremental_start = args.start
+    if out_path.exists() and not args.tickers:  # modo teste não é incremental
+        try:
+            existing_df = pd.read_parquet(out_path)
+            if "date" in existing_df.columns and not existing_df.empty:
+                last_date = existing_df["date"].max()
+                # Recuar 35 dias para garantir forward_return_30d dos últimos registos
+                cutoff = (pd.Timestamp(last_date) - pd.Timedelta(days=35)).strftime("%Y-%m-%d")
+                incremental_start = cutoff
+                log.info(f"Dataset existente: {len(existing_df)} amostras até {last_date}")
+                log.info(f"Modo incremental: a computar desde {incremental_start}")
+        except Exception as e:
+            log.warning(f"Parquet existente ilegível ({e}) — a reconstruir de raiz")
+            existing_df = None
+
+    log.info(f"A construir dataset de momentum desde {incremental_start}...")
+    new_df = build_dataset(tickers, spy_hist, start=incremental_start)
+
+    if new_df.empty:
+        if existing_df is not None and not existing_df.empty:
+            log.info("Nenhum dado novo — dataset existente mantido sem alterações")
+            return 0
         log.error("Dataset vazio — nenhum dia de momentum encontrado")
         return 1
 
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(out_path, index=False)
+    # Merge: dados existentes + novos, dedup por (ticker, date)
+    if existing_df is not None and not existing_df.empty:
+        combined = pd.concat([existing_df, new_df], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["ticker", "date"], keep="last")
+        combined = combined.sort_values(["date", "ticker"]).reset_index(drop=True)
+        n_new = len(combined) - len(existing_df)
+        log.info(f"Merge: {len(existing_df)} existentes + {len(new_df)} novos → {len(combined)} total ({n_new} adicionados)")
+    else:
+        combined = new_df
+        log.info(f"Dataset novo: {len(combined)} amostras")
 
-    log.info(f"Dataset: {len(df)} amostras | {df['ticker'].nunique()} tickers | {df['sector'].nunique()} sectores")
-    log.info(f"Forward return 30d: mean={df['forward_return_30d'].mean():.2%} std={df['forward_return_30d'].std():.2%}")
-    if "alpha_30d" in df.columns:
-        valid_alpha = df["alpha_30d"].dropna()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_parquet(out_path, index=False)
+
+    log.info(f"Dataset: {len(combined)} amostras | {combined['ticker'].nunique()} tickers | {combined['sector'].nunique()} sectores")
+    log.info(f"Forward return 30d: mean={combined['forward_return_30d'].mean():.2%} std={combined['forward_return_30d'].std():.2%}")
+    if "alpha_30d" in combined.columns:
+        valid_alpha = combined["alpha_30d"].dropna()
         log.info(f"Alpha 30d vs SPY: mean={valid_alpha.mean():.2%} | positivos: {(valid_alpha>0).mean():.0%}")
     log.info(f"Guardado em: {out_path}")
     return 0

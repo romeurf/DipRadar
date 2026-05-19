@@ -1463,6 +1463,161 @@ def _handle_admin_regen_parquet(parts: list[str]) -> None:
     threading.Thread(target=_run, daemon=True, name="regen-parquet").start()
 
 
+# ── /admin_momentum_dataset ─────────────────────────────────────────────────────
+
+def _handle_admin_momentum_dataset(parts: list[str]) -> None:
+    """/admin_momentum_dataset [--start YYYY-MM-DD] [--tickers TICK1,TICK2]
+
+    Constrói o dataset histórico para treinar o Breakout ML (MomentumRadar).
+
+    Varre os ~780 tickers desde 2019, encontra dias com momentum forte
+    (return_20d ≥ 10%, volume 1.3×, RSI 50-78) e calcula o retorno futuro
+    a 30 dias (forward_return_30d + alpha_30d vs SPY).
+
+    Output: /data/momentum_training.parquet
+
+    Flags:
+      --start 2021-01-01  → data de início (default: 2019-01-01)
+      --tickers AAPL,MSFT → testar com subset (rápido, ~2 min)
+
+    Duração: ~2-3h (780 tickers × histórico 5 anos) | ~2 min (teste com 5 tickers)
+    """
+    flags     = [p for p in parts[1:] if p.startswith("--")]
+    start_val = "2019-01-01"
+    ticker_val = None
+
+    for i, p in enumerate(parts[1:]):
+        if p == "--start" and i + 2 < len(parts):
+            start_val = parts[i + 2]
+        if p == "--tickers" and i + 2 < len(parts):
+            ticker_val = parts[i + 2]
+
+    is_test = ticker_val is not None
+    dur_str = "~2 min (modo teste)" if is_test else "~2-3h (universo completo)"
+
+    _reply(
+        f"*MomentumRadar — Dataset Builder*\n"
+        f"Desde: {start_val}\n"
+        + (f"Tickers: {ticker_val}\n" if is_test else "") +
+        f"Output: /data/momentum\\_training.parquet\n"
+        f"Duração: {dur_str}\n"
+        f"Podes continuar a usar o bot."
+    )
+
+    def _run():
+        import subprocess, sys
+        from pathlib import Path
+        try:
+            script = Path(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py"
+            cmd    = [sys.executable, str(script), "--start", start_val]
+            if ticker_val:
+                cmd += ["--tickers", ticker_val]
+
+            _TIMEOUT = 4 * 3600  # 4h
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=_TIMEOUT)
+
+            if result.returncode == 0:
+                try:
+                    import pandas as pd
+                    from pathlib import Path as _P
+                    data_dir = _P("/data") if _P("/data").exists() else _P("/tmp")
+                    df = pd.read_parquet(data_dir / "momentum_training.parquet")
+                    n_rows    = len(df)
+                    n_tickers = df["ticker"].nunique() if "ticker" in df.columns else "?"
+                    n_sectors = df["sector"].nunique() if "sector" in df.columns else "?"
+                    avg_fwd   = df["forward_return_30d"].mean() * 100 if "forward_return_30d" in df.columns else 0
+                    pct_pos   = (df["forward_return_30d"] > 0).mean() * 100 if "forward_return_30d" in df.columns else 0
+                    _reply(
+                        f"*MomentumRadar Dataset — Concluído!*\n"
+                        f"  Amostras: {n_rows:,}\n"
+                        f"  Tickers: {n_tickers} | Sectores: {n_sectors}\n"
+                        f"  Retorno médio 30d: {avg_fwd:+.1f}%\n"
+                        f"  % positivos: {pct_pos:.0f}%\n\n"
+                        f"Próximo passo: treinar o Breakout ML quando tiveres tempo."
+                    )
+                except Exception as e:
+                    _reply(f"Dataset gerado. (verificação: {e})")
+            else:
+                stderr = (result.stderr or "")[-500:]
+                _reply(f"❌ Dataset falhou (exit {result.returncode})\n`{stderr}`")
+
+        except subprocess.TimeoutExpired:
+            _reply("⏰ Dataset excedeu 4h. O processo foi terminado.")
+        except Exception as e:
+            logging.error(f"[momentum_dataset] {e}", exc_info=True)
+            _reply(f"❌ Erro: `{e}`")
+
+    threading.Thread(target=_run, daemon=True, name="momentum-dataset").start()
+
+
+# ── /admin_momentum_retrain ─────────────────────────────────────────────────────
+
+def _handle_admin_momentum_retrain(parts: list[str]) -> None:
+    """/admin_momentum_retrain
+
+    Treina o Breakout ML com todos os dados históricos acumulados.
+    Corre automaticamente no dia 1 de cada mês (após o DipRadar retrain).
+
+    Pipeline:
+      1. Actualiza o dataset com os últimos 30 dias (incremental, nunca apaga dados)
+      2. Treina ScaledRidge + sector models
+      3. Gating: promove só se IC ≥ IC actual × 0.90
+    """
+    _reply(
+        "*MomentumRadar — Retrain*\n"
+        "1. Actualizar dataset (incremental)\n"
+        "2. Treinar Breakout ML + sector models\n"
+        "3. Gating vs modelo actual\n"
+        "Duração: ~20-40 min\n"
+        "Podes continuar a usar o bot."
+    )
+
+    def _run():
+        import subprocess, sys
+        from pathlib import Path
+        try:
+            # Passo 1: actualizar dataset (só últimos 35 dias — incremental)
+            script = Path(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py"
+            result = subprocess.run(
+                [sys.executable, str(script)],
+                capture_output=True, text=True, timeout=7200
+            )
+            if result.returncode != 0:
+                _reply(f"⚠️ Dataset update falhou:\n`{(result.stderr or '')[-300:]}`\n_A tentar treinar com dados existentes..._")
+
+            # Passo 2 + 3: treinar e fazer gating
+            from momentum_radar.trainer import run_momentum_training
+            result_train = run_momentum_training()
+            decision = result_train.get("decision", "?")
+            ic_new  = result_train.get("ic_new")
+            ic_prod = result_train.get("ic_prod")
+            n_train = result_train.get("n_train", 0)
+            n_sec   = result_train.get("n_sectors", 0)
+            elapsed = result_train.get("elapsed_s", 0)
+
+            if decision == "PROMOTED":
+                _reply(
+                    f"🚀 *MomentumRadar Retrain — PROMOVIDO*\n"
+                    f"IC novo: *{ic_new:.4f}*"
+                    + (f" (anterior: {ic_prod:.4f})" if ic_prod else "") +
+                    f"\n{n_train:,} amostras | {n_sec} sector models | {elapsed:.0f}s"
+                )
+            elif decision == "KEPT":
+                _reply(
+                    f"⚠️ *MomentumRadar Retrain — MANTIDO*\n"
+                    f"_{result_train.get('reason', '')}_\n"
+                    f"IC novo: {ic_new:.4f} | Produção: {ic_prod:.4f}"
+                )
+            else:
+                _reply(f"❌ *MomentumRadar Retrain — FALHOU*\n_{result_train.get('reason', '')}_")
+
+        except Exception as e:
+            logging.error(f"[momentum_retrain] {e}", exc_info=True)
+            _reply(f"❌ Erro: `{e}`")
+
+    threading.Thread(target=_run, daemon=True, name="momentum-retrain").start()
+
+
 # ── /admin_retrain ──────────────────────────────────────────────────────────────
 
 def _handle_admin_retrain(parts: list[str]) -> None:
@@ -2788,6 +2943,12 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_retrain":
         _handle_admin_retrain(parts)
+
+    elif cmd == "/admin_momentum_dataset":
+        _handle_admin_momentum_dataset(parts)
+
+    elif cmd == "/admin_momentum_retrain":
+        _handle_admin_momentum_retrain(parts)
 
     elif cmd == "/admin_set_floor":
         _handle_admin_set_floor(parts)
