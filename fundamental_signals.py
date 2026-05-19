@@ -260,9 +260,11 @@ def _parse_form4_xml(accession_no: str, cik: str) -> dict:
     }
 
 
-def insider_buy_recent(ticker: str, lookback_days: int = 30) -> float:
+def insider_buy_recent(ticker: str, lookback_days: int = 30, as_of_date: "date | None" = None) -> float:
     """1.0 se houve compra de insider (Form 4) nos últimos lookback_days, 0.0 se não.
 
+    as_of_date: se fornecido, usa como referência temporal (PIT training).
+                None = hoje (produção live).
     Retorna NaN se o ticker não tiver cobertura SEC (tickers não-US).
     """
     try:
@@ -270,12 +272,14 @@ def insider_buy_recent(ticker: str, lookback_days: int = 30) -> float:
         recent = data.get("filings", {}).get("recent", {})
         forms       = recent.get("form", [])
         dates_filed = recent.get("filingDate", [])
-        cutoff = date.today() - timedelta(days=lookback_days)
+        as_of  = as_of_date or date.today()
+        cutoff = as_of - timedelta(days=lookback_days)
         for form, filed_str in zip(forms, dates_filed):
             if form not in ("4", "4/A"):
                 continue
             try:
-                if date.fromisoformat(filed_str[:10]) >= cutoff:
+                filed = date.fromisoformat(filed_str[:10])
+                if cutoff <= filed <= as_of:
                     return 1.0
             except ValueError:
                 continue
@@ -284,7 +288,7 @@ def insider_buy_recent(ticker: str, lookback_days: int = 30) -> float:
         return NaN
 
 
-def insider_buy_amount_score(ticker: str, lookback_days: int = 60) -> tuple[float, float]:
+def insider_buy_amount_score(ticker: str, lookback_days: int = 60, as_of_date: "date | None" = None) -> tuple[float, float]:
     """Score normalizado + montante raw das compras de insiders.
 
     Devolve (score [0,1], amount_usd) para que a narrativa possa mostrar
@@ -308,7 +312,8 @@ def insider_buy_amount_score(ticker: str, lookback_days: int = 60) -> tuple[floa
         forms        = recent.get("form", [])
         dates_filed  = recent.get("filingDate", [])
         accessions   = recent.get("accessionNumber", [])
-        cutoff = date.today() - timedelta(days=lookback_days)
+        as_of  = as_of_date or date.today()
+        cutoff = as_of - timedelta(days=lookback_days)
 
         total_purchase = 0.0
         top_name  = ""
@@ -319,7 +324,8 @@ def insider_buy_amount_score(ticker: str, lookback_days: int = 60) -> tuple[floa
             if form not in ("4", "4/A"):
                 continue
             try:
-                if date.fromisoformat(filed_str[:10]) < cutoff:
+                filed = date.fromisoformat(filed_str[:10])
+                if not (cutoff <= filed <= as_of):
                     continue
             except ValueError:
                 continue
@@ -393,7 +399,7 @@ _8K_ITEMS: dict[str, tuple[float, str]] = {
 _8K_ITEM_SCORES: dict[str, float] = {k: v[0] for k, v in _8K_ITEMS.items()}
 
 
-def classify_recent_8k(ticker: str, lookback_days: int = 30) -> float:
+def classify_recent_8k(ticker: str, lookback_days: int = 30, as_of_date: "date | None" = None) -> float:
     """Score de risco do 8-K mais recente: -1 (muito mau) a +1 (muito bom).
 
     Usa os item codes do 8-K para classificar sem parsear o texto completo:
@@ -410,14 +416,16 @@ def classify_recent_8k(ticker: str, lookback_days: int = 30) -> float:
         forms        = recent.get("form", [])
         dates_filed  = recent.get("filingDate", [])
         items_list   = recent.get("items", [])
-        cutoff = date.today() - timedelta(days=lookback_days)
+        as_of  = as_of_date or date.today()
+        cutoff = as_of - timedelta(days=lookback_days)
 
         # Encontrar o 8-K mais recente dentro do período
         for form, filed_str, items in zip(forms, dates_filed, items_list):
             if form not in ("8-K", "8-K/A"):
                 continue
             try:
-                if date.fromisoformat(filed_str[:10]) < cutoff:
+                filed = date.fromisoformat(filed_str[:10])
+                if not (cutoff <= filed <= as_of):
                     continue
             except ValueError:
                 continue
@@ -483,7 +491,7 @@ def short_interest_trend(ticker: str) -> float:
         return NaN
 
 
-def earnings_call_tone(ticker: str, lookback_days: int = 90) -> float:
+def earnings_call_tone(ticker: str, lookback_days: int = 90, as_of_date: "date | None" = None) -> float:
     """Score de sentimento de earnings calls [-1, +1] por análise de keywords.
 
     Usa transcrições 8-K de earnings (Item 2.02) como proxy quando disponível.
@@ -513,11 +521,18 @@ def earnings_call_tone(ticker: str, lookback_days: int = 90) -> float:
         dates_filed  = recent.get("filingDate", [])
         accessions   = recent.get("accessionNumber", [])
         items_list   = recent.get("items", [])
-        cutoff = date.today() - timedelta(days=lookback_days)
+        as_of  = as_of_date or date.today()
+        cutoff = as_of - timedelta(days=lookback_days)
 
         import requests
         for form, filed_str, acc, items in zip(forms, dates_filed, accessions, items_list):
             if form not in ("8-K", "8-K/A"):
+                continue
+            try:
+                filed = date.fromisoformat(filed_str[:10])
+                if not (cutoff <= filed <= as_of):
+                    continue
+            except ValueError:
                 continue
             # Procurar earnings release (item 2.02)
             items_str = ",".join(items) if isinstance(items, list) else str(items)

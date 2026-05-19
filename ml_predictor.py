@@ -500,7 +500,9 @@ def ml_score(
     # exclusivamente. O modelo global serve de fallback para sectores sem
     # dados suficientes (< 150 rows históricos) ou sector "Unknown".
     _sector_models = (_bundle.get("sector_models") or {}) if _bundle else {}
+    _SECTOR_ALIASES = {"Financials": "Financial Services", "Materials": "Basic Materials"}
     _stock_sector  = str(features.get("sector") or "Unknown")
+    _stock_sector  = _SECTOR_ALIASES.get(_stock_sector, _stock_sector)
     _sector_entry  = _sector_models.get(_stock_sector)
     if _sector_entry is not None:
         try:

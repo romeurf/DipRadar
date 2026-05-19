@@ -983,6 +983,10 @@ def run_training(
     _sector_cfgs   = build_sector_model_configs(feats_used)
     _sector_models: dict = {}
     _MIN_SECTOR_ROWS = 150
+    # Normalizar aliases de sector antes do treino (yfinance antigo usava "Financials"
+    # em vez de "Financial Services"; SECTOR_ETF só tem "Financial Services").
+    _SECTOR_ALIASES = {"Financials": "Financial Services", "Materials": "Basic Materials"}
+    df["sector"] = df["sector"].replace(_SECTOR_ALIASES)
     _MIN_SECTOR_VAL  = 30    # mínimo de rows no conjunto de validação
     _IC_REJECT_FLOOR = -0.02 # rejeitar sector model se IC hold-out < este valor
 
