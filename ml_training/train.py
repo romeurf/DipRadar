@@ -120,7 +120,6 @@ def run_walk_forward_cv(
     """
     df_v31 = df_v31.sort_values("alert_date").reset_index(drop=True)
     df_v31["alert_date"] = pd.to_datetime(df_v31["alert_date"])
-    max_date = df_v31["alert_date"].max()
 
     if train_target not in df_v31.columns:
         raise KeyError(
@@ -154,7 +153,10 @@ def run_walk_forward_cv(
         y_down_tr  = winsorize(df_tr["max_drawdown_60d"].values)
         y_down_te  = df_te["max_drawdown_60d"].values
 
-        sw_tr = temporal_weights(df_tr["alert_date"], max_date)
+        # Usar train_end (não max_date do dataset global) para que o sample mais
+        # recente do fold tenha peso 1.0. max_date global punha amostras de folds
+        # antigos com pesos demasiado baixos (look-ahead sobre a extensão temporal).
+        sw_tr = temporal_weights(df_tr["alert_date"], pd.Timestamp(train_end))
 
         for name, cfg in model_configs.items():
             feats = [f for f in cfg["feats"] if f in df_tr.columns]

@@ -149,10 +149,10 @@ def _fetch_fundamentals_snapshot(ticker: str, current_price: float = 0.0) -> dic
             "market_cap":       market_cap,
             "fcf_yield":        fcf_yield,
             "analyst_upside":   analyst_upside,
-            # current_price pode entrar no dict para build_features e cair em fallback
             "price":            current_price if current_price else None,
-            # Para detecção de deterioração estrutural (guardado na entry se disponível)
             "quality_score":    quality_score,
+            # Sector necessário para sector-conditioned features no modelo ML
+            "sector":           info.get("sector") or "Unknown",
         }
     except Exception as e:
         logger.debug(f"[monitor] Fundamentals snapshot falhou para {ticker}: {e}")
@@ -505,12 +505,31 @@ def _monitor_one(
     # ── 1. Fetch current price (yfinance directo, sem MarketClient) ────────────
     current_price = _fetch_current_price(record.ticker, fallback=record.alert_price)
 
-    # ── 2. Fetch fundamentals snapshot e construir o dict de features ao dia ────
-    # build_features(ticker, fundamentals) → dict com 23 keys (FEATURE_COLUMNS).
-    # Sem price_history/sector → atr/volume/momentum caem em fallback determinístico,
-    # o que é aceitável para vigilância diária (não exige PIT exacto).
+    # ── 2. Fetch fundamentals + price history e construir features do dia ────────
     fundamentals = _fetch_fundamentals_snapshot(record.ticker, current_price=current_price)
-    feature_row_today = build_features(record.ticker, fundamentals)
+
+    # Fetch price history para RSI, ATR, momentum, MA200 correctos.
+    # Sem price_history, ~15 features técnicas ficam em fallback → modelo não detecta
+    # deterioração de momentum nem oversold/overbought em tempo real.
+    _price_hist = None
+    try:
+        import yfinance as yf
+        _raw = yf.Ticker(record.ticker).history(period="1y", auto_adjust=True)
+        if _raw is not None and not _raw.empty:
+            import pandas as pd
+            _idx = pd.DatetimeIndex(_raw.index)
+            if _idx.tz is not None:
+                _raw.index = _idx.tz_convert(None)
+            _price_hist = _raw
+    except Exception as _he:
+        logger.debug(f"[monitor] price_history {record.ticker}: {_he}")
+
+    feature_row_today = build_features(
+        record.ticker,
+        fundamentals,
+        price_history=_price_hist,
+        sector=fundamentals.get("sector") or "Unknown",
+    )
 
     # ── 3. Re-run inference ───────────────────────────────────────────────────
     pred = predict_dip(
