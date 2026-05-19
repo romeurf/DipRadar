@@ -47,6 +47,10 @@ class DipModelsV3:
     rho_down:         Optional[float] = None
     topk_pnl:         Optional[float] = None
     fold_metrics:     list = field(default_factory=list)
+    # Modelos por grupo de sector (Tech/HC, Fin/Industrial, Commodity, Defensive).
+    # Cada entrada: {"model": <fitted ScaledRidge>, "sectors": set[str], "n_train": int}
+    # Ausente em bundles antigos → inference usa apenas modelo global.
+    sector_models:    dict = field(default_factory=dict)
 
 
 def _register_in_main() -> None:

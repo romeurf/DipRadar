@@ -4,7 +4,7 @@ Inclui também ``run_training()`` — orchestrator end-to-end usado por
 ``monthly_retrain.py`` (drop-in para o legacy ``train_v31.run_training``):
 
   1. Carregar parquet base (já com features e targets pré-computados)
-  2. Adicionar alpha_60d_rank (cross-section por data) — target robusto
+  2. Adicionar alpha_90d_rank (cross-section por data) — target robusto
   3. (opcional) Neutralizar target por sector
   4. Walk-forward CV
   5. Seleccionar champion (IC máximo com PnL>0)
@@ -627,7 +627,7 @@ def run_training(
     input_parquet : Path
         Parquet com features + targets já computados. Esquema esperado:
         - Colunas FEATURE_COLUMNS (ml_features.py)
-        - Targets: ``alpha_60d``, ``max_drawdown_60d``
+        - Targets: ``alpha_90d``, ``max_drawdown_60d``
         - Metadados: ``alert_date``, ``ticker``, ``sector``
     output_bundle : Path | None
         Onde escrever o ``dip_models.pkl``. ``None`` = não escreve.
@@ -636,15 +636,15 @@ def run_training(
     n_folds, purge_days, horizon_days : int
         Parâmetros do walk-forward CV.
     use_rank_target : bool
-        Se True, computa ``alpha_60d_rank`` para uso pelo CV/full train
+        Se True, computa ``alpha_90d_rank`` para uso pelo CV/full train
         (também útil como coluna de diagnóstico). Default True.
     use_sector_neutral : bool
-        Se True, adiciona ``alpha_60d_neutral`` ao DataFrame (apenas
+        Se True, adiciona ``alpha_90d_neutral`` ao DataFrame (apenas
         diagnóstico — modelo nunca treina sobre este target).
     use_rank_target_train : bool
         Se True E ``use_rank_target=True``, modelos são treinados sobre
-        ``alpha_60d_rank`` em vez do bruto. Evaluation continua em
-        ``alpha_60d`` para comparabilidade. **Default False** (PR #25
+        ``alpha_90d_rank`` em vez do bruto. Evaluation continua em
+        ``alpha_90d`` para comparabilidade. **Default False** (PR #25
         descobriu que rank-within-date training degrada IC cross-date
         global — flag mantido para experimentação futura, e.g. quando
         avaliação for também rank-within-date).
@@ -971,6 +971,34 @@ def run_training(
         fold_metrics=results.get(single_champion_name, []),
     )
 
+    # Modelos por grupo de sector (Tech/HC, Fin/Industrial, Commodity, Defensive).
+    # Cada modelo é um ScaledRidge treinado apenas em stocks do seu grupo sectorial.
+    # Dados suficientes por grupo (>200 rows): Tech/HC ~35%, Fin/Industrial ~25%,
+    # Commodity ~12%, Defensive ~18% de ~36k alertas históricos.
+    from ml_training.models import build_sector_model_configs
+    _sector_cfgs = build_sector_model_configs(feats_used)
+    _sector_models: dict = {}
+    for _sname, _scfg in _sector_cfgs.items():
+        _sectors = _scfg["sectors"]
+        _mask    = df["sector"].isin(_sectors)
+        _df_sec  = df[_mask].reset_index(drop=True)
+        if len(_df_sec) < 200:
+            log.warning(f"[sector] {_sname}: {len(_df_sec)} rows — insuficiente, a saltar")
+            continue
+        _X_sec  = _df_sec[feats_used].fillna(0).values.astype(np.float32)
+        _y_sec  = winsorize(_df_sec[_active_target].values.astype(float))
+        _sw_sec = temporal_weights(_df_sec["alert_date"], _df_sec["alert_date"].max())
+        _m = _scfg["factory"]()
+        _m.fit(_X_sec, _y_sec, sample_weight=_sw_sec)
+        _sector_models[_sname] = {
+            "model":   _m,
+            "sectors": _sectors,
+            "n_train": len(_df_sec),
+        }
+        log.info(f"[sector] {_sname}: treinado em {len(_df_sec)} rows | sectors={_sectors}")
+    bundle.sector_models = _sector_models
+    log.info(f"[sector] {len(_sector_models)}/{len(_sector_cfgs)} modelos sectoriais treinados")
+
     # Baseline de features para drift detection em produção.
     # health_monitor.check_feature_drift() compara distribuições live vs este baseline.
     _feature_stats: dict = {}
@@ -1006,7 +1034,7 @@ def run_training(
     # Robustness diagnostic fields (sem quebrar o schema legacy)
     report.setdefault("robustness", {})
     report["robustness"]["use_rank_target"]        = use_rank_target
-    report["robustness"]["use_rank_target_train"]  = use_rank_target_train and train_target_col == "alpha_60d_rank"
+    report["robustness"]["use_rank_target_train"]  = use_rank_target_train and train_target_col == "alpha_90d_rank"
     report["robustness"]["use_sector_neutral"]     = use_sector_neutral
     report["robustness"]["train_target_column"]    = train_target_col
     report["robustness"]["winsorize_features"]     = winsorize_features
