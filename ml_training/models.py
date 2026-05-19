@@ -297,43 +297,39 @@ def build_feature_lists() -> tuple[list[str], list[str]]:
 def build_sector_model_configs(
     feature_cols: list[str],
 ) -> dict[str, dict]:
-    """Configurações de modelos sector-específicos.
+    """Configurações de modelos por sector individual (11 sectores GICS).
 
-    Stocks de sectores diferentes têm dinâmicas completamente distintas:
-    - Tech/Healthcare: crescimento, FCF, multiples altos → RSI + momentum dominam
-    - Financials/Industrials: cíclicos, dependem de crédito → macro features dominam
-    - Energy/Materials: commodity-driven → VIX, credit spread, sector ETF dominam
-    - Defensivos (Utilities/Consumer Defensive): dividend yield → timing features dominam
+    Um ScaledRidge por sector. Ridge tem apenas n_features parâmetros → treina
+    de forma estável com 150+ linhas. O sector mais pequeno no universo do bot
+    (ex: Utilities, Real Estate) tem tipicamente 900-1800 alertas históricos,
+    mais do que suficiente.
 
-    Um único modelo para todos os sectores é um compromisso que perde edge.
-    Estes modelos complementam o modelo global — o score final pode ser uma
-    combinação ponderada do modelo global + modelo sectorial.
+    Agrupar sectores em 4 blocos contaminaria modelos com dinâmicas opostas
+    (ex: Consumer Cyclical vs Consumer Defensive, Real Estate vs Financials).
+    Modelos individuais aprendem pesos completamente distintos por sector:
+    - Technology:          momentum e FCF dominam, VIX negativo
+    - Healthcare:          earnings beat rate e insider buying dominam
+    - Financial Services:  macro regime e yield curve dominam
+    - Consumer Cyclical:   RSI + drawdown dominam, sensível a VIX
+    - Consumer Defensive:  dividend safety e estabilidade
+    - Energy:              VIX neutro-positivo, short interest relevante
+    - Basic Materials:     correlação com commodity cycle
+    - Industrials:         macro regime, beta moderado
+    - Real Estate (REITs): dividend yield, FCF/FFO dominam
+    - Communication Svcs:  similar a Tech mas menos FCF-driven
+    - Utilities:           dividend safety, inversamente correlado com yields
+
+    O score final em inference é: 0.70 × global + 0.30 × sector model.
+    Se o sector não tiver dados suficientes (< 150 rows), usa só o global.
     """
+    from ml_training.config import SECTOR_ETF
     return {
-        # Tech + Healthcare — momentum e FCF são preditores fortes
-        "Ridge-Tech-Healthcare": {
+        sector: {
             "factory": ridge_factory,
             "feats":   feature_cols,
-            "sectors": {"Technology", "Healthcare", "Communication Services"},
-        },
-        # Financials + Industrials — macro regime é o factor dominante
-        "Ridge-Fin-Industrial": {
-            "factory": ridge_factory,
-            "feats":   feature_cols,
-            "sectors": {"Financial Services", "Financials", "Industrials", "Real Estate"},
-        },
-        # Energy + Materials — commodity cycle
-        "Ridge-Commodity": {
-            "factory": ridge_factory,
-            "feats":   feature_cols,
-            "sectors": {"Energy", "Basic Materials"},
-        },
-        # Defensivos — dividend yield e estabilidade
-        "Ridge-Defensive": {
-            "factory": ridge_factory,
-            "feats":   feature_cols,
-            "sectors": {"Consumer Defensive", "Consumer Cyclical", "Utilities"},
-        },
+        }
+        for sector in SECTOR_ETF
+        if sector != "Unknown"
     }
 
 

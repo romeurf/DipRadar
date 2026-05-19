@@ -500,18 +500,14 @@ def ml_score(
     # do seu grupo (ex: RSI + FCF dominam em Tech, macro domina em Financials).
     _sector_models = (_bundle.get("sector_models") or {}) if _bundle else {}
     _stock_sector  = str(features.get("sector") or "Unknown")
-    _sector_pred   = None
-    for _sname, _scfg in _sector_models.items():
-        if _stock_sector in _scfg.get("sectors", set()):
-            try:
-                _sector_pred = float(_scfg["model"].predict(X)[0])
-                _sector_pred = _inverse_transform_up(_sector_pred)
-            except Exception as _se:
-                logging.debug(f"[ml_predictor] sector model {_sname} falhou: {_se}")
-                _sector_pred = None
-            break
-    if _sector_pred is not None:
-        pred_up = 0.70 * pred_up + 0.30 * _sector_pred
+    _sector_entry  = _sector_models.get(_stock_sector)
+    if _sector_entry is not None:
+        try:
+            _sector_pred = float(_sector_entry["model"].predict(X)[0])
+            _sector_pred = _inverse_transform_up(_sector_pred)
+            pred_up = 0.70 * pred_up + 0.30 * _sector_pred
+        except Exception as _se:
+            logging.debug(f"[ml_predictor] sector model '{_stock_sector}' falhou: {_se}")
 
     # Score = alpha_90d previsto (log-return excess sobre SPY).
     score = float(pred_up)

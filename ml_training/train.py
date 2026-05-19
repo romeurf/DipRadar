@@ -971,31 +971,27 @@ def run_training(
         fold_metrics=results.get(single_champion_name, []),
     )
 
-    # Modelos por grupo de sector (Tech/HC, Fin/Industrial, Commodity, Defensive).
-    # Cada modelo é um ScaledRidge treinado apenas em stocks do seu grupo sectorial.
-    # Dados suficientes por grupo (>200 rows): Tech/HC ~35%, Fin/Industrial ~25%,
-    # Commodity ~12%, Defensive ~18% de ~36k alertas históricos.
+    # Modelos por sector individual (11 sectores GICS): um ScaledRidge por sector,
+    # treinado apenas nos alertas desse sector. Complementa o modelo global —
+    # score final em inference = 0.70 × global + 0.30 × sector model.
+    # Bundle guarda {sector_name: {"model": fitted_ridge, "n_train": int}}.
     from ml_training.models import build_sector_model_configs
-    _sector_cfgs = build_sector_model_configs(feats_used)
+    _sector_cfgs   = build_sector_model_configs(feats_used)
     _sector_models: dict = {}
-    for _sname, _scfg in _sector_cfgs.items():
-        _sectors = _scfg["sectors"]
-        _mask    = df["sector"].isin(_sectors)
-        _df_sec  = df[_mask].reset_index(drop=True)
-        if len(_df_sec) < 200:
-            log.warning(f"[sector] {_sname}: {len(_df_sec)} rows — insuficiente, a saltar")
+    _MIN_SECTOR_ROWS = 150
+    for _sector_name, _scfg in _sector_cfgs.items():
+        _mask   = df["sector"] == _sector_name
+        _df_sec = df[_mask].reset_index(drop=True)
+        if len(_df_sec) < _MIN_SECTOR_ROWS:
+            log.warning(f"[sector] {_sector_name}: {len(_df_sec)} rows < {_MIN_SECTOR_ROWS} — a saltar")
             continue
         _X_sec  = _df_sec[feats_used].fillna(0).values.astype(np.float32)
         _y_sec  = winsorize(_df_sec[_active_target].values.astype(float))
         _sw_sec = temporal_weights(_df_sec["alert_date"], _df_sec["alert_date"].max())
         _m = _scfg["factory"]()
         _m.fit(_X_sec, _y_sec, sample_weight=_sw_sec)
-        _sector_models[_sname] = {
-            "model":   _m,
-            "sectors": _sectors,
-            "n_train": len(_df_sec),
-        }
-        log.info(f"[sector] {_sname}: treinado em {len(_df_sec)} rows | sectors={_sectors}")
+        _sector_models[_sector_name] = {"model": _m, "n_train": len(_df_sec)}
+        log.info(f"[sector] {_sector_name}: {len(_df_sec)} rows | IC estimado em produção")
     bundle.sector_models = _sector_models
     log.info(f"[sector] {len(_sector_models)}/{len(_sector_cfgs)} modelos sectoriais treinados")
 
