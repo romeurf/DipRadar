@@ -340,7 +340,7 @@ def _load_alert_db_as_training() -> pd.DataFrame:
         fair = pd.to_numeric(df["pe_fair"], errors="coerce")
         df["pe_vs_fair"] = (pe / fair).clip(0.1, 5.0).fillna(1.0)
 
-    df["label_win"] = df["outcome_label"].isin(["WIN_40", "WIN_20"]).astype(int)
+    df["label_win"] = df["outcome_label"].isin(["WIN_STRONG", "WIN"]).astype(int)
     df["label_further_drop"] = None
     df["return_3m"] = pd.to_numeric(df.get("return_3m"), errors="coerce")
     df["return_6m"] = pd.to_numeric(df.get("return_6m"), errors="coerce")

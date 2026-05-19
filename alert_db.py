@@ -65,16 +65,17 @@ _FIELDS = [
     "return_1m",
     "return_3m",
     "return_6m",
-    # Target alinhado com o treino do XGB-v2 (max_return_60d)
-    "return_60d",          # retorno no dia ~60 a contar do alerta
-    "spy_return_60d",      # retorno SPY na mesma janela (para alpha_60d futuro)
+    # Target alinhado com o treino ML (alpha_90d = excesso sobre SPY em 90 dias)
+    "return_90d",          # retorno do stock no dia ~90 a contar do alerta
+    "spy_return_90d",      # retorno SPY na mesma janela
+    "alpha_90d_label",     # alpha_90d aproximado = return_90d - spy_return_90d (para diagnóstico)
     "mfe_3m",
     "mae_3m",
-    "outcome_label",       # WIN_40 | WIN_20 | NEUTRAL | LOSS_15
+    "outcome_label",       # WIN_STRONG | WIN | NEUTRAL | LOSS (baseado em alpha_90d)
 ]
 
-# Maturidade mínima (dias) para preencher return_60d e rotular
-_MIN_DAYS_60D = 62  # 60 dias de calendário + 2 dias de buffer para fecho de mercado
+# Maturidade mínima (dias) para preencher return_90d e rotular
+_MIN_DAYS_90D = 93  # 90 dias + 3 dias de buffer para fecho de mercado
 
 
 def migrate_schema() -> bool:
@@ -107,12 +108,19 @@ def migrate_schema() -> bool:
             f"A arquivar e recriar limpo."
         )
 
-        # Recuperar linhas que já estão no schema novo (37 campos)
-        # — estas são os alertas mais recentes, escritos com o schema actual.
+        # Recuperar linhas do schema novo E do schema antigo.
+        # Linhas antigas (schema anterior) são preservadas com "" nos campos novos.
+        # Isto evita perder alertas históricos quando o schema cresce.
         recovered: list[dict] = []
         for row in all_rows:
             if len(row) == n_target:
+                # Schema actual — recuperação directa
                 recovered.append(dict(zip(_FIELDS, row)))
+            elif len(row) == n_current and current_header:
+                # Schema antigo — mapear campos conhecidos e preencher novos com ""
+                old_dict = dict(zip(current_header, row))
+                new_dict = {f: old_dict.get(f, "") for f in _FIELDS}
+                recovered.append(new_dict)
 
         # Recriar CSV limpo com schema correcto
         with _DB_PATH.open("w", newline="", encoding="utf-8") as f:
@@ -168,23 +176,23 @@ def _safe_volume_ratio(vol: float | None, avg_vol: float | None) -> float | str:
     return round(vol / avg_vol, 2)
 
 
-def _resolve_outcome_label(ref_return: float) -> str:
+def _resolve_outcome_label(alpha_90d: float) -> str:
+    """Classifica um alerta com base no alpha_90d (excesso sobre SPY em 90 dias).
+
+    Thresholds alinhados com os do modelo ML (ml_predictor._SCORE_HIGH/MED):
+      WIN_STRONG : alpha >= +10pp sobre SPY (IC > SCORE_HIGH × 1.5)
+      WIN        : alpha >= +5pp sobre SPY
+      NEUTRAL    : alpha >= -5pp (perdeu menos que o mercado)
+      LOSS       : alpha < -5pp (perdeu mais que o mercado)
     """
-    Converte um retorno percentual num label de outcome para treino ML.
-    Thresholds:
-      WIN_40  : >= +40%
-      WIN_20  : >= +20%
-      NEUTRAL : >= -15%
-      LOSS_15 : < -15%
-    """
-    if ref_return >= 40:
-        return "WIN_40"
-    elif ref_return >= 20:
-        return "WIN_20"
-    elif ref_return >= -15:
+    if alpha_90d >= 10.0:
+        return "WIN_STRONG"
+    elif alpha_90d >= 5.0:
+        return "WIN"
+    elif alpha_90d >= -5.0:
         return "NEUTRAL"
     else:
-        return "LOSS_15"
+        return "LOSS"
 
 
 def log_alert_snapshot(
@@ -251,11 +259,12 @@ def log_alert_snapshot(
             "analyst_upside":     round(fundamentals.get("analyst_upside") or 0, 1),
             "spy_change":         round(spy_change, 2) if spy_change is not None else "",
             "sector_etf_change":  round(sector_etf_change, 2) if sector_etf_change is not None else "",
-            # Resultado — a preencher pelo fill_db_outcomes
+            # Resultado — a preencher pelo fill_db_outcomes (90d alinhado com modelo)
             "price_1m": "", "price_3m": "", "price_6m": "",
             "return_1m": "", "return_3m": "", "return_6m": "",
-            "return_60d": "",
-            "spy_return_60d": "",
+            "return_90d": "",
+            "spy_return_90d": "",
+            "alpha_90d_label": "",
             "mfe_3m": "", "mae_3m": "", "outcome_label": "",
         }
         with _DB_PATH.open("a", newline="", encoding="utf-8") as f:
@@ -369,8 +378,8 @@ def fill_db_outcomes() -> dict:
         needs_1m  = row.get("return_1m")   == ""
         needs_3m  = row.get("return_3m")   == ""
         needs_6m  = row.get("return_6m")   == ""
-        needs_60d = row.get("return_60d")  == ""
-        if not (needs_1m or needs_3m or needs_6m or needs_60d):
+        needs_90d = row.get("return_90d")  == ""
+        if not (needs_1m or needs_3m or needs_6m or needs_90d):
             skipped += 1
             continue
 
@@ -420,31 +429,35 @@ def fill_db_outcomes() -> dict:
                 row["return_1m"] = round((p1m - price_entry) / price_entry * 100, 2)
                 changed = True
 
-        # ── T+60d ─────────────────────────────────────────────────────────────
-        if needs_60d and days_elapsed >= _MIN_DAYS_60D:
-            p60d = _get_price_at(candles, alert_date + timedelta(days=60))
-            if p60d is not None and price_entry > 0:
-                row["return_60d"] = round((p60d - price_entry) / price_entry * 100, 2)
+        # ── T+90d (target principal — alinhado com alpha_90d do modelo ML) ──────
+        if needs_90d and days_elapsed >= _MIN_DAYS_90D:
+            p90d = _get_price_at(candles, alert_date + timedelta(days=90))
+            if p90d is not None and price_entry > 0:
+                row["return_90d"] = round((p90d - price_entry) / price_entry * 100, 2)
                 changed = True
-            if row.get("spy_return_60d") == "":
+            if row.get("spy_return_90d") == "":
                 try:
-                    from tiingo_client import get_ohlcv as _get_ohlcv, get_price_at as _get_price_at
                     spy_candles = sym_cache.get("SPY")
                     if spy_candles is None:
                         spy_candles = _get_candles(
                             "SPY",
                             alert_date - timedelta(days=1),
-                            min(today, alert_date + timedelta(days=70)),
+                            min(today, alert_date + timedelta(days=100)),
                         )
                         sym_cache["SPY"] = spy_candles
                     spy_entry = _get_price_at(spy_candles, alert_date)
-                    spy_exit  = _get_price_at(spy_candles, alert_date + timedelta(days=60))
+                    spy_exit  = _get_price_at(spy_candles, alert_date + timedelta(days=90))
                     if spy_entry and spy_exit and spy_entry > 0:
-                        row["spy_return_60d"] = round(
+                        row["spy_return_90d"] = round(
                             (spy_exit - spy_entry) / spy_entry * 100, 2
                         )
+                        # alpha_90d aproximado (diferença de retornos em %)
+                        r90 = row.get("return_90d")
+                        s90 = row["spy_return_90d"]
+                        if r90 not in ("", None):
+                            row["alpha_90d_label"] = round(float(r90) - float(s90), 2)
                 except Exception as e:
-                    logging.debug(f"[fill_db] SPY 60d para {symbol}: {e}")
+                    logging.debug(f"[fill_db] SPY 90d para {symbol}: {e}")
 
         # ── T+3m ─────────────────────────────────────────────────────────────
         if needs_3m and days_elapsed >= 90:
@@ -473,25 +486,17 @@ def fill_db_outcomes() -> dict:
                 row["return_6m"] = round((p6m - price_entry) / price_entry * 100, 2)
                 changed = True
 
-        # ── outcome_label ─────────────────────────────────────────────────────
+        # ── outcome_label — baseado em alpha_90d (alinhado com target do modelo) ─
         if changed and row.get("outcome_label") == "":
             if CATEGORY_HOLD_FOREVER in category:
                 pass
-            else:
-                ref_return = None
-                for field in ("return_60d", "return_3m", "return_6m", "return_1m"):
-                    val = row.get(field)
-                    if val not in ("", None):
-                        try:
-                            ref_return = float(val)
-                            break
-                        except ValueError:
-                            pass
-                if ref_return is not None and (
-                    row.get("return_60d") not in ("", None)
-                    or days_elapsed >= _MIN_DAYS_60D
-                ):
-                    row["outcome_label"] = _resolve_outcome_label(ref_return)
+            elif days_elapsed >= _MIN_DAYS_90D:
+                alpha = row.get("alpha_90d_label")
+                if alpha not in ("", None):
+                    try:
+                        row["outcome_label"] = _resolve_outcome_label(float(alpha))
+                    except (ValueError, TypeError):
+                        pass
 
         if changed:
             rows[i] = row
