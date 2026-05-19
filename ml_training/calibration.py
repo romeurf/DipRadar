@@ -17,7 +17,7 @@ Uso no notebook de treino (colab_bootstrap.ipynb):
   calibrator.fit(
       oof_upside_scores   = oof_preds['upside'],
       oof_downside_scores = oof_preds['downside'],
-      y_upside_rank       = df.loc[oof_idx, 'alpha_60d_rank'],
+      y_upside_rank       = df.loc[oof_idx, 'alpha_90d_rank'],
       y_downside_rank     = df.loc[oof_idx, 'max_drawdown_20d_rank'],
   )
 
@@ -37,7 +37,7 @@ class DualHeadCalibrator:
     Calibra os scores raw de upside e downside para probabilidades reais.
 
     upside_threshold  — percentil acima do qual consideramos 'bom trade'
-                        (default: 0.70 → top 30% de alpha_60d_rank)
+                        (default: 0.70 → top 30% de alpha_90d_rank)
     downside_threshold — percentil abaixo do qual consideramos 'perigoso'
                         (default: 0.30 → pior 30% de max_drawdown_20d_rank)
     """

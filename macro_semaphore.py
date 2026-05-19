@@ -199,7 +199,7 @@ def get_macro_regime() -> dict:
         color       = "RED"
         label       = "🔴 Vermelho"
         multiplier  = 0.0
-        summary     = "Risco sistémico. Novas entradas bloqueadas (exceto Hold Forever)."
+        summary     = "Risco sistémico. Novas entradas bloqueadas (exceto HIGH_CONVICTION)."
 
     # ── Explanation XAI ───────────────────────────────────────────────────
     explanation = (

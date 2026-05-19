@@ -1829,7 +1829,7 @@ def run_monthly_retrain() -> None:
     Delega para `monthly_retrain.run_monthly_retrain_v3` que faz:
       1. Build training input (bootstrap + alert_db + universe_snapshot)
       2. Treina candidate via `ml_training.train.run_training`
-         (regressor alpha_60d + isotonic, 10 folds purgados)
+         (regressor alpha_90d + isotonic, 10 folds purgados)
       3. Gating ρ_α: candidate só substitui produção se
          ρ_α(cand) ≥ ρ_α(prod) × 0.90 e ρ_α(cand) ≥ floor (default 0.20).
          Caso contrário guardado como `dip_models_pending.pkl`.

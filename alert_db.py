@@ -286,7 +286,7 @@ def fill_db_outcomes() -> dict:
       return_1m  / price_1m  : >= 30 dias
       return_3m  / price_3m  : >= 90 dias (+ MFE/MAE)
       return_6m  / price_6m  : >= 180 dias
-      return_60d             : >= 62 dias (alinhado com max_return_60d do treino)
+      return_90d             : >= 93 dias (alinhado com alpha_90d do modelo)
       spy_return_60d         : >= 62 dias (referência SPY para alpha futuro)
 
     TRAVA DE MATURIDADE: return_60d só é preenchido se
