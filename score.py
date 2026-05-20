@@ -806,7 +806,7 @@ def format_score_v2_breakdown(
 
     badge = "🔥" if fs >= 80 else ("⭐" if fs >= 55 else "📊")
     lines = [
-        f"{badge} *Score V2: {fs:.1f}/100*",
+        f"{badge} *Score: {fs:.1f}/100*",
         f"  🏗️  Quality *{q*100:.0f}%*  ·  💰 Value *{v*100:.0f}%*  ·  ⏱️ Timing *{t*100:.0f}%*  ·  🎯 Divergência *{d*100:.0f}%*",
         f"  📊 Confiança: *{conf*100:.0f}%* (cobertura: {data_cov*100:.0f}% × qualidade: {qual_conf*100:.0f}%)" + (" ⚠️" if skip else ""),
     ]

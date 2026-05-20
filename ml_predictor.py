@@ -109,9 +109,7 @@ def _to_dict(obj: Any) -> dict:
     """
     if isinstance(obj, dict):
         return obj
-    if is_dataclass(obj):
-        d = {f.name: getattr(obj, f.name) for f in fields(obj)}
-    elif hasattr(obj, "__dict__"):
+    if is_dataclass(obj) or hasattr(obj, "__dict__"):
         d = {k: v for k, v in vars(obj).items() if not k.startswith("_")}
     else:
         return {}
