@@ -1424,9 +1424,9 @@ def _handle_admin_regen_parquet(parts: list[str]) -> None:
             cache_dir = data_dir / "price_cache"
             args += ["--cache", str(cache_dir)]
 
-            # Timeout generoso: full regen com EDGAR + 700 tickers demora 3-5h
-            # na 1ª execução; com cache (re-runs) demora ~20-30 min.
-            _TIMEOUT = 6 * 3600  # 6 horas
+            # Com cache EDGAR em memória (corrigido): ~45-90 min para regen completo.
+            # Aumentado para 4h como margem de segurança.
+            _TIMEOUT = 4 * 3600  # 4 horas
             result = subprocess.run(
                 args, capture_output=True, text=True, timeout=_TIMEOUT
             )
@@ -1461,6 +1461,85 @@ def _handle_admin_regen_parquet(parts: list[str]) -> None:
             _reply(f"❌ *Erro na regeneração:*\n`{_md_safe(e)}`")
 
     threading.Thread(target=_run, daemon=True, name="regen-parquet").start()
+
+
+# ── /admin_disk ─────────────────────────────────────────────────────────────────
+
+def _handle_admin_disk(parts: list[str]) -> None:
+    """/admin_disk          → ver utilização do volume /data/
+    /admin_disk clean     → apagar EDGAR cache antigo (>30d) e libertar espaço
+    """
+    import os, time
+    from pathlib import Path
+
+    data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
+    clean = len(parts) > 1 and parts[1].lower() == "clean"
+
+    def _human(b: int) -> str:
+        for unit in ("B", "KB", "MB", "GB"):
+            if b < 1024:
+                return f"{b:.1f} {unit}"
+            b /= 1024
+        return f"{b:.1f} TB"
+
+    def _dir_size(p: Path) -> int:
+        return sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) if p.exists() else 0
+
+    if clean:
+        # Apagar EDGAR facts cache com mais de 30 dias (edgar_*.json em price_cache)
+        cache_dir = data_dir / "price_cache"
+        cutoff    = time.time() - 30 * 86400
+        removed   = 0
+        freed     = 0
+        if cache_dir.exists():
+            for f in cache_dir.glob("edgar_*.json"):
+                if f.stat().st_mtime < cutoff:
+                    freed += f.stat().st_size
+                    f.unlink()
+                    removed += 1
+        # Apagar universe_snapshot com mais de 180 dias (linhas antigas)
+        snap_path = data_dir / "universe_snapshot.parquet"
+        snap_pruned = 0
+        if snap_path.exists():
+            try:
+                import pandas as pd
+                snap = pd.read_parquet(snap_path)
+                if "snapshot_date" in snap.columns:
+                    cutoff_date = (pd.Timestamp.now() - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
+                    before = len(snap)
+                    snap = snap[snap["snapshot_date"] >= cutoff_date]
+                    snap_pruned = before - len(snap)
+                    if snap_pruned > 0:
+                        snap.to_parquet(snap_path, index=False)
+            except Exception as e:
+                logging.debug(f"[disk] snapshot prune: {e}")
+
+        _reply(
+            f"*Limpeza concluída:*\n"
+            f"  EDGAR cache apagado: {removed} ficheiros ({_human(freed)})\n"
+            f"  Universe snapshot: {snap_pruned} linhas antigas removidas\n"
+            f"Corre `/admin_disk` para ver o espaço actual."
+        )
+        return
+
+    # Listagem de tamanhos
+    items = [
+        ("price_cache/edgar_*.json", sum(f.stat().st_size for f in (data_dir / "price_cache").glob("edgar_*.json")) if (data_dir / "price_cache").exists() else 0),
+        ("price_cache/ (total)",     _dir_size(data_dir / "price_cache")),
+        ("universe_snapshot.parquet",(data_dir / "universe_snapshot.parquet").stat().st_size if (data_dir / "universe_snapshot.parquet").exists() else 0),
+        ("ml_training_base.parquet", (data_dir / "ml_training_base.parquet").stat().st_size if (data_dir / "ml_training_base.parquet").exists() else 0),
+        ("momentum_training.parquet",(data_dir / "momentum_training.parquet").stat().st_size if (data_dir / "momentum_training.parquet").exists() else 0),
+        ("dip_models.pkl",           (data_dir / "dip_models.pkl").stat().st_size if (data_dir / "dip_models.pkl").exists() else 0),
+        ("alert_db.csv",             (data_dir / "alert_db.csv").stat().st_size if (data_dir / "alert_db.csv").exists() else 0),
+    ]
+    total = _dir_size(data_dir)
+
+    lines = ["*Utilização do volume /data/:*", ""]
+    for name, size in sorted(items, key=lambda x: x[1], reverse=True):
+        if size > 0:
+            lines.append(f"  `{name}`: {_human(size)}")
+    lines += ["", f"*Total: {_human(total)}*", "", "_/admin\\_disk clean → apagar EDGAR cache antigo e snapshot >180d_"]
+    _reply("\n".join(lines))
 
 
 # ── /admin_momentum_dataset ─────────────────────────────────────────────────────
@@ -2946,6 +3025,9 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_momentum_dataset":
         _handle_admin_momentum_dataset(parts)
+
+    elif cmd == "/admin_disk":
+        _handle_admin_disk(parts)
 
     elif cmd == "/admin_momentum_retrain":
         _handle_admin_momentum_retrain(parts)

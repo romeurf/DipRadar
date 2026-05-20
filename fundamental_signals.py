@@ -174,12 +174,23 @@ def _ensure_cik_map() -> None:
         _CIK_MAP = {}  # vazio — insider_buy_recent retorna NaN para todos
 
 
+_edgar_submissions_cache: dict[str, dict] = {}  # cache em memória por sessão
+
+
 def _edgar_submissions(ticker: str) -> dict:
-    """Retorna o JSON de submissions EDGAR para um ticker US. Raises se falhar."""
+    """Retorna o JSON de submissions EDGAR para um ticker US. Raises se falhar.
+
+    Cache em memória por sessão — evita 147k HTTP requests no regen ao carregar
+    os dados de cada ticker apenas uma vez independentemente do número de linhas.
+    """
     import requests
     base = ticker.upper().split(".")[0]
     if "." in ticker:
         raise ValueError(f"{ticker} não é um ticker US (sem cobertura EDGAR)")
+
+    if base in _edgar_submissions_cache:
+        return _edgar_submissions_cache[base]
+
     _ensure_cik_map()
     cik = _CIK_MAP.get(base)
     if not cik:
@@ -191,7 +202,9 @@ def _edgar_submissions(ticker: str) -> dict:
     if r.status_code == 404:
         raise ValueError(f"{base} sem cobertura EDGAR (404)")
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    _edgar_submissions_cache[base] = data
+    return data
 
 
 def _parse_form4_xml(accession_no: str, cik: str) -> dict:
