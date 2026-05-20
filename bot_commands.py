@@ -1514,11 +1514,31 @@ def _handle_admin_disk(parts: list[str]) -> None:
             except Exception as e:
                 logging.debug(f"[disk] snapshot prune: {e}")
 
+        # Apagar parquet incompleto do /data/ — o regen usa a versão limpa do repo
+        pq_removed = ""
+        pq_path = data_dir / "ml_training_base.parquet"
+        repo_pq = Path(__file__).parent / "ml_training_base.parquet"
+        if pq_path.exists() and repo_pq.exists():
+            # Só apaga se a versão do repo existe como fallback
+            freed += pq_path.stat().st_size
+            pq_path.unlink()
+            pq_removed = "\n  Parquet incompleto (/data/): apagado — regen usa versão limpa do repo"
+
+        # Apagar bundle ML corrompido (< 100KB = não é um bundle real)
+        bundle_removed = ""
+        bundle_path = data_dir / "dip_models.pkl"
+        if bundle_path.exists() and bundle_path.stat().st_size < 100 * 1024:
+            freed += bundle_path.stat().st_size
+            bundle_path.unlink()
+            bundle_removed = "\n  Bundle ML corrompido (< 100KB): apagado"
+
         _reply(
             f"*Limpeza concluída:*\n"
             f"  EDGAR cache apagado: {removed} ficheiros ({_human(freed)})\n"
-            f"  Universe snapshot: {snap_pruned} linhas antigas removidas\n"
-            f"Corre `/admin_disk` para ver o espaço actual."
+            f"  Universe snapshot: {snap_pruned} linhas antigas removidas"
+            f"{pq_removed}"
+            f"{bundle_removed}\n\n"
+            f"Corre `/admin\\_regen\\_parquet` para reconstruir tudo limpo."
         )
         return
 
