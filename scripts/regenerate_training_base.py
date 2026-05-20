@@ -619,6 +619,24 @@ def regenerate(
             f"({n_edgar/len(df):.0%})"
         )
 
+    # ── Limpar colunas — só ficam metadados + features actuais + targets ─────
+    # Remove colunas legadas (alpha_60d, features antigas com schema diferente)
+    # para garantir que o output é limpo e não contém lixo de versões anteriores.
+    try:
+        from ml_training.config import FEATURE_COLS, PRIMARY_TARGET
+        _META_COLS   = ["ticker", "symbol", "alert_date", "sector", "price",
+                        "market_cap", "market_cap_b", "_source"]
+        _TARGET_COLS = [PRIMARY_TARGET, "alpha_60d", "close_90d", "spy_close_90d",
+                        "max_drawdown_60d", "max_drawdown_20d", "max_return_60d",
+                        "return_3m", "return_6m", "label_win", "label_further_drop"]
+        _keep = set(_META_COLS) | set(FEATURE_COLS) | set(_TARGET_COLS)
+        _drop = [c for c in df.columns if c not in _keep]
+        if _drop:
+            df = df.drop(columns=_drop)
+            log.info(f"[clean] {len(_drop)} colunas legadas removidas: {_drop[:5]}{'...' if len(_drop)>5 else ''}")
+    except Exception as e:
+        log.warning(f"[clean] Falha ao limpar colunas ({e}) — a guardar tudo")
+
     # ── Save ──────────────────────────────────────────────────────────────────
     log.info(f"[out] a escrever {out_path}...")
     out_path.parent.mkdir(parents=True, exist_ok=True)

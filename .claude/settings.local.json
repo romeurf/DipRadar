@@ -13,7 +13,8 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\('bot_commands.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/build_momentum_dataset.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('ml_predictor.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
-      "Bash(python -c \"import os; print\\(f'{os.path.getsize\\(\\\\\"ml_training_base.parquet\\\\\"\\)/1e6:.1f} MB'\\)\")"
+      "Bash(python -c \"import os; print\\(f'{os.path.getsize\\(\\\\\"ml_training_base.parquet\\\\\"\\)/1e6:.1f} MB'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/regenerate_training_base.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }
