@@ -175,6 +175,7 @@ def _ensure_cik_map() -> None:
 
 
 _edgar_submissions_cache: dict[str, dict] = {}  # cache em memória por sessão
+_EDGAR_CACHE_MAX = 250  # máximo de tickers em cache — evita OOM em Railway (512MB)
 
 
 def _edgar_submissions(ticker: str) -> dict:
@@ -203,6 +204,10 @@ def _edgar_submissions(ticker: str) -> dict:
         raise ValueError(f"{base} sem cobertura EDGAR (404)")
     r.raise_for_status()
     data = r.json()
+    # LRU simples: se o cache atingiu o limite, remove os 50 mais antigos
+    if len(_edgar_submissions_cache) >= _EDGAR_CACHE_MAX:
+        for k in list(_edgar_submissions_cache.keys())[:50]:
+            del _edgar_submissions_cache[k]
     _edgar_submissions_cache[base] = data
     return data
 
