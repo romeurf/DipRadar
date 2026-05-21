@@ -1425,31 +1425,37 @@ def _handle_admin_regen_parquet(parts: list[str]) -> None:
             args += ["--cache", str(cache_dir)]
 
             # Com cache EDGAR em memória (corrigido): ~45-90 min para regen completo.
-            # Aumentado para 4h como margem de segurança.
-            _TIMEOUT = 4 * 3600  # 4 horas
-            result = subprocess.run(
-                args, capture_output=True, text=True, timeout=_TIMEOUT
-            )
+            _TIMEOUT = 4 * 3600
+            log_file = data_dir / "regen_progress.log"
+
+            # Redirigir stdout+stderr para ficheiro — permite /admin_regen_status
+            with open(log_file, "w", encoding="utf-8") as lf:
+                result = subprocess.run(
+                    args, stdout=lf, stderr=lf, timeout=_TIMEOUT
+                )
+
             if result.returncode == 0:
                 try:
                     import pandas as pd
                     df_check = pd.read_parquet(out_pq)
                     n_90d  = int(df_check["alpha_90d"].notna().sum()) if "alpha_90d" in df_check.columns else 0
-                    n_fund = int((df_check.get("gross_margin", pd.Series()) != 0.35).sum()) if "gross_margin" in df_check.columns else 0
                     total  = len(df_check)
                     pct = f"{n_90d/total:.0%}" if total else "0%"
                     _reply(
                         f"*Parquet regenerado!*\n"
                         f"  Shape: {df_check.shape[0]:,} x {df_check.shape[1]} colunas\n"
-                        f"  alpha-90d resolvido: {n_90d:,}/{total:,} ({pct})\n"
-                        f"  Fundamentais PIT: {n_fund:,}/{total:,} linhas\n\n"
+                        f"  alpha-90d resolvido: {n_90d:,}/{total:,} ({pct})\n\n"
                         f"Faz /admin\\_retrain para treinar o modelo."
                     )
                 except Exception as e:
                     _reply(f"Parquet regenerado. (verificacao: {e})\nFaz /admin\\_retrain")
             else:
-                stderr = (result.stderr or "")[-500:]
-                _reply(f"Regeneracao falhou (exit {result.returncode})\n{stderr}")
+                # Mostrar últimas linhas do log para diagnóstico
+                try:
+                    last_lines = log_file.read_text(encoding="utf-8", errors="replace")[-800:]
+                except Exception:
+                    last_lines = "(sem log)"
+                _reply(f"Regeneracao falhou (exit {result.returncode})\n`{last_lines}`")
         except subprocess.TimeoutExpired:
             _reply(
                 "Regeneracao excedeu 6h. O Railway pode ter reiniciado o container.\n"
@@ -3048,6 +3054,20 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_disk":
         _handle_admin_disk(parts)
+
+    elif cmd == "/admin_regen_status":
+        from pathlib import Path as _P
+        _dd = _P("/data") if _P("/data").exists() else _P("/tmp")
+        _log = _dd / "regen_progress.log"
+        if not _log.exists():
+            _reply("Nenhum regen em curso ou log não encontrado.")
+        else:
+            try:
+                _txt = _log.read_text(encoding="utf-8", errors="replace")
+                _last = _txt[-1200:].strip()
+                _reply(f"*Regen log (últimas linhas):*\n```\n{_last}\n```")
+            except Exception as e:
+                _reply(f"Erro ao ler log: {e}")
 
     elif cmd == "/admin_momentum_retrain":
         _handle_admin_momentum_retrain(parts)
