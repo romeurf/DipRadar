@@ -57,8 +57,11 @@ _BASE  = "https://api.tiingo.com/tiingo/fundamentals"
 _TOKEN = os.getenv("TIINGO_API_KEY", "")
 _SLEEP = 0.25   # 4 req/s — bem abaixo do rate limit do plano Starter
 
+# Flag de sessão: True quando Tiingo fundamentals atinge rate limit ou retorna
+# 403 (plano sem acesso). Evita loop infinito de retries que bloqueia o regen.
+_tiingo_fund_disabled: bool = False
+
 # Cache em memória para evitar pedidos repetidos ao mesmo ticker/trimestre
-# O LRU limita a 512 entradas (~512 ticker-trimestres em memória)
 _STATEMENT_CACHE: dict[str, list[dict]] = {}
 _DAILY_CACHE:     dict[str, list[dict]] = {}
 
@@ -72,8 +75,8 @@ def _get(
     GET com retry e tratamento de rate-limit.
     Retorna None se 403 (plano sem acesso), [] se 404 (ticker sem dados).
     """
-    if not _TOKEN:
-        log.warning("[tiingo_fund] TIINGO_API_KEY não definida.")
+    global _tiingo_fund_disabled
+    if not _TOKEN or _tiingo_fund_disabled:
         return None
 
     params["token"] = _TOKEN
@@ -82,10 +85,11 @@ def _get(
         try:
             resp = requests.get(url, params=params, timeout=20)
 
-            if resp.status_code == 403:
+            if resp.status_code in (403, 401):
+                _tiingo_fund_disabled = True
                 log.warning(
-                    "[tiingo_fund] 403 Forbidden — plano sem acesso a Fundamentals. "
-                    "Upgrade para Starter em api.tiingo.com."
+                    f"[tiingo_fund] {resp.status_code} — plano sem acesso a Fundamentals. "
+                    "A desactivar para esta sessão. Fallback: EDGAR XBRL + yfinance."
                 )
                 return None
 
@@ -94,10 +98,12 @@ def _get(
                 return []
 
             if resp.status_code == 429:
-                wait = 60 * attempt
-                log.warning(f"[tiingo_fund] Rate limit — a aguardar {wait}s")
-                time.sleep(wait)
-                continue
+                _tiingo_fund_disabled = True
+                log.warning(
+                    "[tiingo_fund] Rate limit (429) — a desactivar Tiingo fundamentals "
+                    "para esta sessão. Fallback: EDGAR XBRL + yfinance."
+                )
+                return None
 
             resp.raise_for_status()
             time.sleep(_SLEEP)
@@ -322,10 +328,9 @@ def clear_cache() -> None:
 def check_fundamentals_access(ticker: str = "AAPL") -> bool:
     """
     Verifica se a API key tem acesso ao endpoint de Fundamentals.
-    Retorna True se acessível, False se plano gratuito ou key inválida.
+    Retorna True se acessível, False se plano gratuito, key inválida, ou rate limited.
     """
-    if not _TOKEN:
-        log.warning("[tiingo_fund] TIINGO_API_KEY não definida.")
+    if not _TOKEN or _tiingo_fund_disabled:
         return False
 
     url  = f"{_BASE}/{ticker}/daily"
