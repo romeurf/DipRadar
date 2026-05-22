@@ -396,7 +396,7 @@ def _compute_alpha_targets_row(
 
     close_90d = float(fwd["Close"].iloc[-1])
     stock_ret = close_90d / price - 1.0
-    if not math.isfinite(stock_ret) or abs(stock_ret) > 2.0:   # cap a ±200%
+    if not math.isfinite(stock_ret) or stock_ret <= -1.0 or abs(stock_ret) > 2.0:
         return result
 
     # SPY no mesmo período
@@ -408,7 +408,7 @@ def _compute_alpha_targets_row(
             spy_close = float(spy_exit_slice["Close"].iloc[-1])
             if spy_price > 0:
                 spy_ret = spy_close / spy_price - 1.0
-                if math.isfinite(spy_ret) and abs(spy_ret) <= 1.0:
+                if math.isfinite(spy_ret) and -1.0 < spy_ret <= 1.0:
                     result["alpha_90d"]     = round(math.log1p(stock_ret) - math.log1p(spy_ret), 6)
                     result["close_90d"]     = round(stock_ret, 6)
                     result["spy_close_90d"] = round(spy_ret, 6)
