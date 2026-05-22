@@ -724,39 +724,51 @@ def regenerate(
                 df[col] = fase5_df[col].values
         log.info(f"[compute] Fase5: {n_edgar}/{len(df)} linhas processadas em {time.time()-t2:.0f}s")
 
-    # ── 5. Features yfinance por ticker (earnings_beat_rate, analyst_rating, etc.) ─
+    # ── 5. Features yfinance por ticker — paralelo (earnings, analyst, short) ──
     if add_features:
-        log.info("[compute] features yfinance por ticker (analyst_rating, short_interest...)...")
         unique_tickers_yf = df["ticker"].astype(str).unique().tolist()
+        log.info(f"[compute] features yfinance por ticker ({len(unique_tickers_yf)} tickers, paralelo)...")
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         yf_cache: dict[str, dict] = {}
-        for tk in unique_tickers_yf:
-            yf_cache[tk] = _compute_yf_features(tk)
-            time.sleep(0.05)
+        _N_WORKERS = 8  # yfinance suporta paralelismo moderado
+        with ThreadPoolExecutor(max_workers=_N_WORKERS) as pool:
+            futures = {pool.submit(_compute_yf_features, tk): tk for tk in unique_tickers_yf}
+            done = 0
+            for fut in as_completed(futures):
+                tk = futures[fut]
+                try:
+                    yf_cache[tk] = fut.result()
+                except Exception:
+                    yf_cache[tk] = {}
+                done += 1
+                if done % 100 == 0 or done == len(unique_tickers_yf):
+                    log.info(f"  [yf] [{done:>3}/{len(unique_tickers_yf)}] tickers processados")
         for col in YF_TICKER_COLS:
-            df[col] = df["ticker"].astype(str).map(lambda t: yf_cache.get(t, {}).get(col, float("nan")))
-        log.info(f"[compute] yfinance features: {len(unique_tickers_yf)} tickers processados")
+            df[col] = df["ticker"].astype(str).map(lambda t, c=col: yf_cache.get(t, {}).get(c, float("nan")))
+        log.info(f"[compute] yfinance features: {len(unique_tickers_yf)} tickers")
 
-    # ── 6. Features sector-conditioned (add_derived_features) ─────────────────
+    # ── 6. Features sector-conditioned — vectorizado (sem iterrows, ~1s) ──────
     if add_features:
-        log.info("[compute] sector-conditioned features (rsi_sector_adjusted, vix_sector_signal...)...")
+        log.info("[compute] sector-conditioned features (vectorizado)...")
         try:
-            from ml_features import add_derived_features, _FALLBACK
-            sector_derived_results = []
-            for _, row in df.iterrows():
-                fv = {
-                    "sector":      str(row.get("sector", "Unknown") or "Unknown"),
-                    "rsi_14":      float(row.get("rsi_14", 40.0) or 40.0),
-                    "drawdown_52w":float(row.get("drawdown_52w", -15.0) or -15.0),
-                    "vix":         float(row.get("vix", 20.0) or 20.0),
-                }
-                add_derived_features(fv)
-                sector_derived_results.append({
-                    k: fv.get(k, _FALLBACK.get(k, 0.0)) for k in SECTOR_DERIVED_COLS
-                })
-            sd_df = pd.DataFrame(sector_derived_results, index=df.index)
-            for col in SECTOR_DERIVED_COLS:
-                df[col] = sd_df[col].values
-            log.info(f"[compute] sector-conditioned features: {len(df)} linhas")
+            from ml_features import _SECTOR_TYPE, _RSI_OVERSOLD_THRESHOLD
+
+            _VIX_FACTOR   = {"growth": -1.0, "cyclical": -0.5, "commodity": 0.0, "defensive": +0.5}
+            _DD_TYPICAL    = {"growth": -25.0, "cyclical": -30.0, "commodity": -40.0, "defensive": -20.0}
+
+            sec_type = df["sector"].astype(str).map(lambda s: _SECTOR_TYPE.get(s, "cyclical"))
+            rsi      = df["rsi_14"].fillna(40.0).astype(float)
+            dd52     = df["drawdown_52w"].fillna(-15.0).astype(float)
+            vix      = df["vix"].fillna(20.0).astype(float)
+
+            rsi_thr  = sec_type.map(lambda t: _RSI_OVERSOLD_THRESHOLD.get(t, 32.0))
+            vix_fac  = sec_type.map(lambda t: _VIX_FACTOR.get(t, -0.5))
+            dd_typ   = sec_type.map(lambda t: abs(_DD_TYPICAL.get(t, -30.0)))
+
+            df["rsi_sector_adjusted"]       = (rsi_thr - rsi).clip(lower=0).round(4)
+            df["vix_sector_signal"]         = (vix * vix_fac / 40.0).round(4)
+            df["drawdown_sector_normalized"]= (dd52 / dd_typ).clip(lower=-3.0, upper=0.0).round(4)
+            log.info(f"[compute] sector-conditioned features: OK ({len(df)} linhas, ~0s)")
         except Exception as e:
             log.warning(f"[compute] sector-conditioned features falhou: {e}")
 
