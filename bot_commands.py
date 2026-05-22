@@ -3141,6 +3141,52 @@ def _handle_command(text: str) -> None:
                 return
         _reply("Nenhum processo em curso.")
 
+    elif cmd == "/admin_momentum_bootstrap":
+        _year  = parts[1] if len(parts) > 1 and parts[1].isdigit() else "1993"
+        _start = f"{_year}-01-01"
+        _reply(
+            f"*Bootstrap Momentum — desde {_year}*\n"
+            f"Detecta dias de breakout em cada ticker desde {_year}.\n"
+            f"Target: forward\\_return\\_30d (retorno 30 dias após o breakout)\n\n"
+            f"Pipeline automático:\n"
+            f"  1. Bootstrap momentum ~30 min\n"
+            f"  2. Treino modelo + sector models ~10 min\n\n"
+            f"_Notificações automáticas em cada etapa._"
+        )
+        def _run_mom_bootstrap():
+            import subprocess, sys
+            from pathlib import Path as _P
+            _log = (_P("/data") if _P("/data").exists() else _P("/tmp")) / "bootstrap_progress.log"
+            try:
+                script = _P(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py"
+                with open(_log, "w", encoding="utf-8") as _lf:
+                    result = subprocess.run(
+                        [sys.executable, str(script), "--start", _start],
+                        stdout=_lf, stderr=_lf, timeout=4*3600
+                    )
+                if result.returncode == 0:
+                    # Pipeline automático: dataset → retrain
+                    from momentum_radar.trainer import run_momentum_training
+                    res = run_momentum_training()
+                    dec = res.get("decision", "?")
+                    ic  = res.get("ic_new", 0)
+                    n   = res.get("n_train", 0)
+                    _reply(
+                        f"*MomentumRadar — {dec}*\n"
+                        f"IC: {ic:.4f} | {n:,} amostras\n"
+                        + ("_Usa `/admin\\_promote` para activar._" if dec == "PENDING" else "")
+                    )
+                else:
+                    try: last = _log.read_text(errors="replace")[-400:]
+                    except Exception: last = ""
+                    _reply(f"❌ Bootstrap momentum falhou:\n`{last}`")
+            except subprocess.TimeoutExpired:
+                _reply("⏰ Bootstrap momentum excedeu 4h.")
+            except Exception as e:
+                _reply(f"❌ Erro: `{e}`")
+        import threading
+        threading.Thread(target=_run_mom_bootstrap, daemon=True, name="momentum-bootstrap").start()
+
     elif cmd == "/admin_momentum_dataset":
         _handle_admin_momentum_dataset(parts)
 

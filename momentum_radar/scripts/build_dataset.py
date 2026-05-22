@@ -249,7 +249,7 @@ def build_dataset(
 def main() -> int:
     p = argparse.ArgumentParser(description="Constrói dataset de treino para Breakout ML")
     p.add_argument("--tickers", help="Lista de tickers separados por vírgula (teste rápido)")
-    p.add_argument("--start",   default="2019-01-01", help="Data de início (YYYY-MM-DD)")
+    p.add_argument("--start",   default="1993-01-01", help="Data de início (YYYY-MM-DD). Default: 1993 (mesmo que DipRadar)")
     p.add_argument("--out",     default=str(_OUTPUT),  help="Caminho de output do parquet")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
@@ -258,6 +258,22 @@ def main() -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s | %(message)s", datefmt="%H:%M:%S",
     )
+
+    # Notificações Telegram
+    _send_fn = None
+    try:
+        import importlib, os
+        if os.getenv("TELEGRAM_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"):
+            _bc = importlib.import_module("bot_commands")
+            _send_fn = getattr(_bc, "_reply", None) or getattr(_bc, "_cb_send_telegram", None)
+    except Exception:
+        pass
+
+    def _notify(msg: str) -> None:
+        log.info(msg)
+        if _send_fn:
+            try: _send_fn(msg)
+            except Exception: pass
 
     if args.tickers:
         tickers = [t.strip().upper() for t in args.tickers.split(",")]
@@ -293,6 +309,7 @@ def main() -> int:
             log.warning(f"Parquet existente ilegível ({e}) — a reconstruir de raiz")
             existing_df = None
 
+    _notify(f"🚀 *Bootstrap Momentum {args.start[:4]}–hoje* iniciado — {len(tickers)} tickers")
     log.info(f"A construir dataset de momentum desde {incremental_start}...")
     new_df = build_dataset(tickers, spy_hist, start=incremental_start)
 
@@ -322,7 +339,16 @@ def main() -> int:
     if "alpha_30d" in combined.columns:
         valid_alpha = combined["alpha_30d"].dropna()
         log.info(f"Alpha 30d vs SPY: mean={valid_alpha.mean():.2%} | positivos: {(valid_alpha>0).mean():.0%}")
-    log.info(f"Guardado em: {out_path}")
+    size_mb = out_path.stat().st_size / 1e6
+    log.info(f"Guardado em: {out_path} ({size_mb:.1f}MB)")
+    _notify(
+        f"✅ *Bootstrap Momentum concluído!*\n"
+        f"  {len(combined):,} amostras | {combined['ticker'].nunique()} tickers\n"
+        f"  {combined['date'].min()} → {combined['date'].max()}\n"
+        f"  fwd\\_return\\_30d: mean {combined['forward_return_30d'].mean():.1%}\n"
+        f"  {size_mb:.1f}MB\n\n"
+        f"_A iniciar treino do modelo de momentum..._"
+    )
     return 0
 
 
