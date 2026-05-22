@@ -402,35 +402,40 @@ def main() -> int:
         tickers = get_ml_universe()
         log.info(f"Universo completo: {len(tickers)} tickers")
 
-    # Carregar SPY e macro (VIX, TNX, sector ETFs) — necessários para features PIT
-    spy_hist = _load_ticker("SPY", _CACHE_DIR)
-    if spy_hist is None:
-        log.error("SPY não disponível no cache. Corre /admin_regen_parquet primeiro.")
-        return 1
+    # Notificações Telegram — definir ANTES de qualquer uso
+    _send_fn = None
+    try:
+        import importlib, os as _os
+        if _os.getenv("TELEGRAM_TOKEN") and _os.getenv("TELEGRAM_CHAT_ID"):
+            _bot = importlib.import_module("bot_commands")
+            _send_fn = getattr(_bot, "_reply", None) or getattr(_bot, "_cb_send_telegram", None)
+    except Exception:
+        pass
+
+    def _notify(msg: str) -> None:
+        log.info(msg)
+        if _send_fn:
+            try: _send_fn(msg)
+            except Exception: pass
 
     # Garantir que o price cache tem dados desde start_date para todos os tickers.
-    # Sem isto, o bootstrap só encontra dips a partir da data do cache existente.
-    _ALL_NEEDED = tickers + ["SPY", "^VIX", "^TNX",
-                             "XLK", "XLF", "XLV", "XLY", "XLP",
-                             "XLI", "XLE", "XLU", "XLRE", "XLB", "XLC"]
-    _notify(f"⏳ A verificar/actualizar price cache desde {args.start}...")
+    _MACRO_TICKERS = ["SPY", "^VIX", "^TNX", "XLK", "XLF", "XLV", "XLY",
+                      "XLP", "XLI", "XLE", "XLU", "XLRE", "XLB", "XLC"]
+    _ALL_NEEDED = tickers + _MACRO_TICKERS
+    _notify(f"⏳ A verificar/actualizar price cache desde {args.start} ({len(_ALL_NEEDED)} séries)...")
     _ensure_price_cache(_ALL_NEEDED, _CACHE_DIR, start=args.start)
 
-    # Recarregar SPY após possível actualização
+    # Carregar SPY e macro após garantir cache actualizado
     spy_hist = _load_ticker("SPY", _CACHE_DIR)
     if spy_hist is None:
-        log.error("SPY não disponível após download. Verifica a rede.")
+        log.error("SPY não disponível. Verifica a rede.")
         return 1
 
-    # Macro cache: VIX, TNX e sector ETFs para features PIT honestas
-    _MACRO_TICKERS = ["^VIX", "^TNX", "XLK", "XLF", "XLV", "XLY", "XLP",
-                      "XLI", "XLE", "XLU", "XLRE", "XLB", "XLC"]
     macro_cache: dict = {}
     for _mt in _MACRO_TICKERS:
         _mh = _load_ticker(_mt, _CACHE_DIR)
         if _mh is not None:
             macro_cache[_mt] = _mh
-    macro_cache["SPY"] = spy_hist
     log.info(f"Macro cache: {len(macro_cache)} séries históricas carregadas")
 
     # Sector mapping
@@ -449,24 +454,6 @@ def main() -> int:
             time.sleep(0.02)
     except Exception as e:
         log.warning(f"Erro a obter sectores: {e} — a usar 'Unknown'")
-
-    # Notificações Telegram (via send_fn se disponível)
-    _send_fn = None
-    try:
-        import importlib, os
-        if os.getenv("TELEGRAM_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"):
-            _bot = importlib.import_module("bot_commands")
-            _send_fn = getattr(_bot, "_reply", None) or getattr(_bot, "_cb_send_telegram", None)
-    except Exception:
-        pass
-
-    def _notify(msg: str) -> None:
-        log.info(msg)
-        if _send_fn:
-            try:
-                _send_fn(msg)
-            except Exception:
-                pass
 
     # Pré-calcular séries macro uma vez — lookup O(1) no loop em vez de O(n) por linha
     log.info("A pré-calcular séries macro (VIX, SPY RSI, sector ETFs)...")
