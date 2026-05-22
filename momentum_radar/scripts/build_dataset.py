@@ -32,7 +32,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent  # scripts/ → momentum_radar/ → repo root
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
