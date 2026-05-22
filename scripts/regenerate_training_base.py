@@ -557,8 +557,16 @@ def regenerate(
     log.info(f"[in] shape={df.shape}  unique tickers={df['ticker'].nunique()}")
     log.info(f"[in] date range: {df['alert_date'].min()} → {df['alert_date'].max()}")
 
-    # ── Fetch macro + ETFs ──────────────────────────────────────────────────
-    log.info("[fetch] macro + sector ETFs...")
+    # ── Fetch macro + ETFs — força refresh nos macro críticos (SPY, VIX, TNX) ──
+    # Estes ficheiros são pequenos mas críticos para alpha_90d. Cache corrompida
+    # ou incompleta do SPY provoca 66% de falhas no cálculo do target.
+    log.info("[fetch] macro + sector ETFs (force_refresh para SPY/VIX/TNX)...")
+    for _critical in MACRO_TICKERS:  # ["SPY", "^VIX", "^TNX"]
+        _crit_safe = _critical.replace("^", "_idx_")
+        _crit_cache = cache_dir / f"{_crit_safe}.parquet"
+        if _crit_cache.exists():
+            _crit_cache.unlink()
+            log.info(f"[fetch] cache {_critical} removido para re-download fresco")
     macro_etf_cache = _fetch_batch(MACRO_TICKERS + SECTOR_ETFS, cache_dir, start=start_date)
     macro_cache      = {k: v for k, v in macro_etf_cache.items() if k in MACRO_TICKERS}
     sector_etf_cache = {k: v for k, v in macro_etf_cache.items() if k in SECTOR_ETFS}
@@ -616,17 +624,32 @@ def regenerate(
             f"({n_has_data/len(df):.0%})"
         )
 
-    # ── 3. Targets alpha_90d ──────────────────────────────────────────────────
+    # ── 3. Targets alpha_90d — apenas linhas em falta (não sobrescreve) ────────
+    # Se alpha_90d já estiver calculado (de um regen anterior), não recalcular.
+    # Isto evita perder 99% dos targets quando o price cache do SPY está incompleto.
     if add_targets:
-        log.info("[compute] targets alpha_90d...")
+        import math as _math
+        _needs_target = df.get("alpha_90d", pd.Series(float("nan"), index=df.index)).isna()
+        n_needs = int(_needs_target.sum())
+        n_already = len(df) - n_needs
+        if n_already > 0:
+            log.info(f"[compute] alpha_90d: {n_already} já calculados — só a calcular os {n_needs} em falta")
+        else:
+            log.info("[compute] targets alpha_90d (todas as linhas)...")
+
         target_results = []
         n_resolved = 0
-        for i, (_, row) in enumerate(df.iterrows()):
-            r = _compute_alpha_targets_row(row, price_cache, spy_hist, horizon_days=90)
-            target_results.append(r)
-            import math
-            if math.isfinite(r.get("alpha_90d", float("nan"))):
+        for i, (idx, row) in enumerate(df.iterrows()):
+            # Manter valor existente se já calculado
+            existing = row.get("alpha_90d") if "alpha_90d" in df.columns else float("nan")
+            if _math.isfinite(float(existing)) if existing is not None else False:
+                target_results.append({col: row.get(col, float("nan")) for col in TARGET_COLS})
                 n_resolved += 1
+            else:
+                r = _compute_alpha_targets_row(row, price_cache, spy_hist, horizon_days=90)
+                target_results.append(r)
+                if _math.isfinite(r.get("alpha_90d", float("nan"))):
+                    n_resolved += 1
             if (i + 1) % 2000 == 0 or (i + 1) == len(df):
                 log.info(
                     f"  [targets] [{i+1:>5}/{len(df)}] resolved={n_resolved} "
