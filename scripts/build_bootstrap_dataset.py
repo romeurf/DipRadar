@@ -162,7 +162,9 @@ def precompute_macro_series(macro_cache: dict) -> dict:
     result: dict = {}
 
     # VIX: valor, percentile 1 ano, regime
-    vix_hist = macro_cache.get("^VIX") or macro_cache.get("_idx_VIX")
+    vix_hist = macro_cache.get("^VIX")
+    if vix_hist is None:
+        vix_hist = macro_cache.get("_idx_VIX")
     if vix_hist is not None and not vix_hist.empty:
         vix_close = vix_hist["Close"]
         result["vix"]       = vix_close
@@ -181,7 +183,9 @@ def precompute_macro_series(macro_cache: dict) -> dict:
         result["spy_rsi"] = _calc_rsi(spy_hist["Close"])
 
     # TNX yield — mudança em 5 dias
-    tnx_hist = macro_cache.get("^TNX") or macro_cache.get("_idx_TNX")
+    tnx_hist = macro_cache.get("^TNX")
+    if tnx_hist is None:
+        tnx_hist = macro_cache.get("_idx_TNX")
     if tnx_hist is not None and not tnx_hist.empty:
         tnx_close = tnx_hist["Close"]
         result["tnx_5d"] = tnx_close - tnx_close.shift(5)
@@ -323,18 +327,36 @@ def find_historical_dips(
         except Exception:
             pass
 
-        # Macro features PIT — lookup O(1) em séries pré-calculadas
-        # NaN se genuinamente não disponíveis (sem inventar nada)
-        pm = precomputed_macro or {}
-        vix_val         = pm.get("vix", pd.Series(dtype=float)).get(dt, float("nan")) if "vix" in pm else float("nan")
-        spy_rsi         = pm.get("spy_rsi", pd.Series(dtype=float)).get(dt, float("nan")) if "spy_rsi" in pm else float("nan")
-        vix_percentile  = pm.get("vix_pct", pd.Series(dtype=float)).get(dt, float("nan")) if "vix_pct" in pm else float("nan")
-        vix_regime_val  = pm.get("vix_regime", pd.Series(dtype=float)).get(dt, float("nan")) if "vix_regime" in pm else float("nan")
-        yield_5d_change = pm.get("tnx_5d", pd.Series(dtype=float)).get(dt, float("nan")) if "tnx_5d" in pm else float("nan")
-        # Sector relative: stock_ret_3m - sector_etf_ret_3m
-        etf_key = f"sector_{sector}"
-        etf_ret3m = pm.get(etf_key, pd.Series(dtype=float)).get(dt, float("nan")) if etf_key in pm else float("nan")
-        sector_relative = round(ret_3m - etf_ret3m, 4) if not np.isnan(etf_ret3m) else float("nan")
+        # Macro features PIT — lookup em séries pré-calculadas, tolerante a datas
+        def _mlookup(series_key: str) -> float:
+            """Lookup seguro: tenta data exacta, depois ±3 dias úteis."""
+            if precomputed_macro is None or series_key not in precomputed_macro:
+                return float("nan")
+            s = precomputed_macro[series_key]
+            try:
+                # Data exacta
+                if dt in s.index:
+                    v = s.loc[dt]
+                    return float(v) if pd.notna(v) else float("nan")
+                # Data mais próxima dentro de 3 dias úteis
+                idx_pos = s.index.searchsorted(dt)
+                for off in [0, -1, 1, -2, 2, -3, 3]:
+                    p = idx_pos + off
+                    if 0 <= p < len(s):
+                        v = s.iloc[p]
+                        if pd.notna(v) and abs((s.index[p] - dt).days) <= 4:
+                            return float(v)
+            except Exception:
+                pass
+            return float("nan")
+
+        vix_val        = _mlookup("vix")
+        spy_rsi        = _mlookup("spy_rsi")
+        vix_percentile = _mlookup("vix_pct")
+        vix_regime_val = _mlookup("vix_regime")
+        yield_5d_change= _mlookup("tnx_5d")
+        etf_ret3m      = _mlookup(f"sector_{sector}")
+        sector_relative= round(ret_3m - etf_ret3m, 4) if not np.isnan(etf_ret3m) else float("nan")
 
         rows.append({
             "ticker":         ticker,
