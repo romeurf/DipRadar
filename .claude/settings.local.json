@@ -17,7 +17,8 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/regenerate_training_base.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('fundamental_signals.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('ml_training/train.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
-      "Bash(xargs -I{} git show {} --stat)"
+      "Bash(xargs -I{} git show {} --stat)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/build_bootstrap_dataset.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }

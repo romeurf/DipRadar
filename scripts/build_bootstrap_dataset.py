@@ -97,6 +97,53 @@ def _calc_rsi(close: pd.Series, period: int = 14) -> pd.Series:
 # Detecção histórica de dips
 # ─────────────────────────────────────────────────────────────────────────────
 
+def precompute_macro_series(macro_cache: dict) -> dict:
+    """Pré-calcula TODAS as séries macro uma única vez.
+
+    Converte cada série histórica em pd.Series indexed by date para lookup O(1).
+    Sem isto, cada linha do loop recalcularia RSI e percentis em O(n) — levaria horas.
+    """
+    result: dict = {}
+
+    # VIX: valor, percentile 1 ano, regime
+    vix_hist = macro_cache.get("^VIX") or macro_cache.get("_idx_VIX")
+    if vix_hist is not None and not vix_hist.empty:
+        vix_close = vix_hist["Close"]
+        result["vix"]       = vix_close
+        # Rolling percentile 252d (1 ano)
+        result["vix_pct"]   = vix_close.rolling(252, min_periods=60).apply(
+            lambda x: (x[:-1] < x[-1]).mean(), raw=True
+        )
+        # VIX regime: 0=low(<15), 1=normal(15-25), 2=high(>25)
+        result["vix_regime"] = vix_close.apply(
+            lambda v: 0.0 if v < 15 else (1.0 if v < 25 else 2.0)
+        )
+
+    # SPY RSI 14d
+    spy_hist = macro_cache.get("SPY")
+    if spy_hist is not None and not spy_hist.empty:
+        result["spy_rsi"] = _calc_rsi(spy_hist["Close"])
+
+    # TNX yield — mudança em 5 dias
+    tnx_hist = macro_cache.get("^TNX") or macro_cache.get("_idx_TNX")
+    if tnx_hist is not None and not tnx_hist.empty:
+        tnx_close = tnx_hist["Close"]
+        result["tnx_5d"] = tnx_close - tnx_close.shift(5)
+
+    # Sector ETFs — retorno 63d (≈3 meses) por sector
+    from ml_training.config import SECTOR_ETF as _SE
+    for sector, etf in _SE.items():
+        if sector == "Unknown":
+            continue
+        etf_hist = macro_cache.get(etf)
+        if etf_hist is not None and not etf_hist.empty:
+            etf_close = etf_hist["Close"]
+            result[f"sector_{sector}"] = etf_close.pct_change(63)  # retorno 3m
+
+    log.info(f"[macro] Séries pré-calculadas: {list(result.keys())}")
+    return result
+
+
 def find_historical_dips(
     ticker: str,
     hist: pd.DataFrame,
@@ -104,7 +151,7 @@ def find_historical_dips(
     sector: str,
     start_date: str,
     end_date: str,
-    macro_cache: dict | None = None,  # VIX, ^TNX, sector ETFs
+    precomputed_macro: dict | None = None,  # séries pré-calculadas por data — lookup O(1)
 ) -> list[dict]:
     """Encontra todos os dias de dip para um ticker num período histórico.
 
@@ -220,56 +267,18 @@ def find_historical_dips(
         except Exception:
             pass
 
-        # Macro features PIT — VIX, SPY RSI, sector relative, vix_regime
-        # Dados genuínos na data do alerta. Se não disponíveis → NaN (não inventar).
-        vix_val          = float("nan")
-        spy_rsi          = float("nan")
-        vix_percentile   = float("nan")
-        vix_regime_val   = float("nan")
-        sector_relative  = float("nan")
-        yield_5d_change  = float("nan")
-
-        try:
-            if macro_cache:
-                # VIX PIT
-                vix_hist = macro_cache.get("^VIX") or macro_cache.get("_idx_VIX")
-                if vix_hist is not None:
-                    vix_slice = vix_hist[vix_hist.index <= dt]["Close"]
-                    if not vix_slice.empty:
-                        vix_val = float(vix_slice.iloc[-1])
-                        # VIX percentile 1 ano
-                        vix_1y = vix_slice.iloc[-252:] if len(vix_slice) >= 252 else vix_slice
-                        if len(vix_1y) >= 20:
-                            vix_percentile = float((vix_1y < vix_val).mean())
-                        # VIX regime: 0=low(<15), 1=normal(15-25), 2=high(>25)
-                        if not np.isnan(vix_val):
-                            vix_regime_val = 0.0 if vix_val < 15 else (1.0 if vix_val < 25 else 2.0)
-
-                # SPY RSI PIT
-                if not spy_hist.empty:
-                    spy_slice = spy_hist[spy_hist.index <= dt]["Close"]
-                    if len(spy_slice) >= 14:
-                        spy_rsi_s = _calc_rsi(spy_slice)
-                        spy_rsi = float(spy_rsi_s.iloc[-1])
-
-                # Sector relative (stock vs sector ETF) — retorno 3m relativo
-                from ml_training.config import SECTOR_ETF as _SE
-                etf = _SE.get(sector, "SPY")
-                etf_hist = macro_cache.get(etf)
-                if etf_hist is not None and not etf_hist.empty:
-                    etf_slice = etf_hist[etf_hist.index <= dt]["Close"]
-                    if len(etf_slice) >= 63:
-                        etf_r3m = float(etf_slice.iloc[-1] / etf_slice.iloc[-64] - 1)
-                        sector_relative = round(ret_3m - etf_r3m, 4)
-
-                # TNX yield 5d change
-                tnx = macro_cache.get("^TNX") or macro_cache.get("_idx_TNX")
-                if tnx is not None and not tnx.empty:
-                    tnx_s = tnx[tnx.index <= dt]["Close"]
-                    if len(tnx_s) >= 6:
-                        yield_5d_change = float(tnx_s.iloc[-1] - tnx_s.iloc[-6])
-        except Exception:
-            pass  # macro features genuinamente indisponíveis → NaN
+        # Macro features PIT — lookup O(1) em séries pré-calculadas
+        # NaN se genuinamente não disponíveis (sem inventar nada)
+        pm = precomputed_macro or {}
+        vix_val         = pm.get("vix", pd.Series(dtype=float)).get(dt, float("nan")) if "vix" in pm else float("nan")
+        spy_rsi         = pm.get("spy_rsi", pd.Series(dtype=float)).get(dt, float("nan")) if "spy_rsi" in pm else float("nan")
+        vix_percentile  = pm.get("vix_pct", pd.Series(dtype=float)).get(dt, float("nan")) if "vix_pct" in pm else float("nan")
+        vix_regime_val  = pm.get("vix_regime", pd.Series(dtype=float)).get(dt, float("nan")) if "vix_regime" in pm else float("nan")
+        yield_5d_change = pm.get("tnx_5d", pd.Series(dtype=float)).get(dt, float("nan")) if "tnx_5d" in pm else float("nan")
+        # Sector relative: stock_ret_3m - sector_etf_ret_3m
+        etf_key = f"sector_{sector}"
+        etf_ret3m = pm.get(etf_key, pd.Series(dtype=float)).get(dt, float("nan")) if etf_key in pm else float("nan")
+        sector_relative = round(ret_3m - etf_ret3m, 4) if not np.isnan(etf_ret3m) else float("nan")
 
         rows.append({
             "ticker":         ticker,
@@ -389,6 +398,11 @@ def main() -> int:
             except Exception:
                 pass
 
+    # Pré-calcular séries macro uma vez — lookup O(1) no loop em vez de O(n) por linha
+    log.info("A pré-calcular séries macro (VIX, SPY RSI, sector ETFs)...")
+    precomputed_macro = precompute_macro_series(macro_cache)
+    log.info(f"Séries macro prontas: {len(precomputed_macro)} séries")
+
     _notify(f"🔄 *Bootstrap {args.start[:4]}–{end_date[:4]}* iniciado — {len(tickers)} tickers")
 
     # Gerar dips históricos
@@ -404,7 +418,7 @@ def main() -> int:
         sector = sector_map.get(ticker, "Unknown")
         rows = find_historical_dips(
             ticker, hist, spy_hist, sector, args.start, end_date,
-            macro_cache=macro_cache,
+            precomputed_macro=precomputed_macro,
         )
         all_rows.extend(rows)
 
