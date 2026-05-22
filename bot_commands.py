@@ -1425,7 +1425,7 @@ def _handle_admin_regen_parquet(parts: list[str]) -> None:
             args += ["--cache", str(cache_dir)]
 
             # Com cache EDGAR em memória (corrigido): ~45-90 min para regen completo.
-            _TIMEOUT = 4 * 3600
+            _TIMEOUT = 8 * 3600
             log_file = data_dir / "regen_progress.log"
 
             # Redirigir stdout+stderr para ficheiro — permite /admin_regen_status
@@ -1618,7 +1618,7 @@ def _handle_admin_momentum_dataset(parts: list[str]) -> None:
             if ticker_val:
                 cmd += ["--tickers", ticker_val]
 
-            _TIMEOUT = 4 * 3600  # 4h
+            _TIMEOUT = 8 * 3600  # 4h
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=_TIMEOUT)
 
             if result.returncode == 0:

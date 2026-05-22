@@ -594,30 +594,89 @@ def regenerate(
             f"({n_resolved/len(df):.0%})"
         )
 
-    # ── 4. Sinais Fase 5 (EDGAR + preços) — PIT correcto ─────────────────────
+    # ── 4. Sinais Fase 5 (EDGAR + preços) — processamento por ticker único ────
+    # OPTIMIZAÇÃO CRÍTICA: agrupar por ticker antes de chamar EDGAR.
+    # Sem agrupamento: 36,929 linhas × 4 chamadas EDGAR = 147k HTTP requests.
+    # Com agrupamento: 700 tickers × 1 download EDGAR + parsing por data = ~700 HTTP.
+    # Redução de 200x no número de chamadas à API SEC.
     if add_fase5 and add_features:
-        log.info("[compute] sinais Fase 5 (EDGAR Form4/8-K + preços)...")
-        log.info("  EDGAR calls com cache 30d — rápido em re-runs, ~2-4h primeira vez")
-        fase5_results = []
+        log.info("[compute] sinais Fase 5 (EDGAR Form4/8-K + preços) — por ticker único...")
+        from ml_features import _FALLBACK
+        fase5_results = {idx: {k: _FALLBACK.get(k, 0.0) for k in FASE5_COLS}
+                         for idx in df.index}
         n_edgar = 0
         t2 = time.time()
-        for i, (_, row) in enumerate(df.iterrows()):
-            r = _compute_fase5_row(row, price_cache)
-            fase5_results.append(r)
-            if r.get("insider_buy_recent", 0.0) != 0.0 or r.get("recent_8k_score", 0.0) != 0.0:
-                n_edgar += 1
-            if (i + 1) % 2000 == 0 or (i + 1) == len(df):
-                log.info(
-                    f"  [fase5] [{i+1:>5}/{len(df)}] edgar_signal={n_edgar} "
-                    f"({n_edgar/(i+1):.0%}) {time.time()-t2:.0f}s"
+        unique_tickers = df["ticker"].astype(str).unique().tolist()
+        n_tickers = len(unique_tickers)
+
+        for ti, ticker in enumerate(unique_tickers):
+            ticker_mask = df["ticker"].astype(str) == ticker
+            ticker_rows = df[ticker_mask]
+
+            # Calcular features de preço (PIT) para todas as datas deste ticker
+            hist_full = price_cache.get(ticker)
+            for idx, row in ticker_rows.iterrows():
+                alert_date = pd.Timestamp(row["alert_date"])
+                if alert_date.tz is not None:
+                    alert_date = alert_date.tz_localize(None)
+                hist = _slice_history(hist_full, alert_date)
+                if hist is not None and len(hist) >= 2:
+                    try:
+                        closes = hist["Close"]
+                        rets = closes.pct_change().dropna()
+                        if len(rets) > 0:
+                            red = 0
+                            for r_val in reversed(rets.values.tolist()):
+                                if r_val < 0: red += 1
+                                else: break
+                            fase5_results[idx]["consecutive_red_days"] = float(min(red, 30))
+                        if len(closes) >= 20:
+                            ma200 = closes.rolling(200, min_periods=20).mean().iloc[-1]
+                            if ma200 > 0:
+                                fase5_results[idx]["ma_200d_ratio"] = round(float(closes.iloc[-1] / float(ma200)), 4)
+                    except Exception:
+                        pass
+
+            # EDGAR calls — uma vez por ticker, aplica a todas as datas
+            try:
+                from fundamental_signals import (
+                    insider_buy_recent, insider_buy_amount_score,
+                    classify_recent_8k, earnings_call_tone as _et,
                 )
-        fase5_df = pd.DataFrame(fase5_results, index=df.index)
+                for idx, row in ticker_rows.iterrows():
+                    alert_date = pd.Timestamp(row["alert_date"])
+                    if alert_date.tz is not None:
+                        alert_date = alert_date.tz_localize(None)
+                    alert_dt = alert_date.date()
+                    try:
+                        v = insider_buy_recent(ticker, lookback_days=30, as_of_date=alert_dt)
+                        if v is not None: fase5_results[idx]["insider_buy_recent"] = float(v or 0.0)
+                    except Exception: pass
+                    try:
+                        score, _ = insider_buy_amount_score(ticker, lookback_days=30, as_of_date=alert_dt)
+                        if score is not None: fase5_results[idx]["insider_buy_amount_score"] = float(score)
+                    except Exception: pass
+                    try:
+                        s8k = classify_recent_8k(ticker, lookback_days=60, as_of_date=alert_dt)
+                        if s8k is not None: fase5_results[idx]["recent_8k_score"] = float(s8k)
+                    except Exception: pass
+                    try:
+                        tone = _et(ticker, lookback_days=90, as_of_date=alert_dt)
+                        if tone is not None: fase5_results[idx]["earnings_call_tone"] = float(tone)
+                    except Exception: pass
+                    n_edgar += 1
+            except Exception:
+                pass
+
+            if (ti + 1) % 50 == 0 or (ti + 1) == n_tickers:
+                elapsed = time.time() - t2
+                log.info(f"  [fase5] ticker [{ti+1:>3}/{n_tickers}] | linhas={int(ticker_mask.sum())} | {elapsed:.0f}s")
+
+        fase5_df = pd.DataFrame(fase5_results).T.reindex(df.index)
         for col in FASE5_COLS:
-            df[col] = fase5_df[col].values
-        log.info(
-            f"[compute] Fase5: {n_edgar}/{len(df)} linhas com sinal EDGAR "
-            f"({n_edgar/len(df):.0%})"
-        )
+            if col in fase5_df.columns:
+                df[col] = fase5_df[col].values
+        log.info(f"[compute] Fase5: {n_edgar}/{len(df)} linhas processadas em {time.time()-t2:.0f}s")
 
     # ── Limpar colunas — só ficam metadados + features actuais + targets ─────
     # Remove colunas legadas (alpha_60d, features antigas com schema diferente)
