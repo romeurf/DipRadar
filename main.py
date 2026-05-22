@@ -1853,12 +1853,30 @@ def run_monthly_retrain() -> None:
     _result_holder: list = [None]
     _error_holder:  list = [None]
 
+    # Redirigir logging do retrain para ficheiro — permite /admin_retrain_status
+    _retrain_log = (Path("/data") if Path("/data").exists() else Path("/tmp")) / "retrain_progress.log"
+    _retrain_log_handler = None
+    try:
+        import logging as _lg
+        _retrain_log_handler = _lg.FileHandler(str(_retrain_log), mode="w", encoding="utf-8")
+        _retrain_log_handler.setFormatter(_lg.Formatter("%(asctime)s | %(message)s", datefmt="%H:%M:%S"))
+        _lg.getLogger().addHandler(_retrain_log_handler)
+    except Exception:
+        pass
+
     def _run_retrain():
         try:
             from monthly_retrain import run_monthly_retrain_v3
             _result_holder[0] = run_monthly_retrain_v3()
         except Exception as e:
             _error_holder[0] = e
+        finally:
+            if _retrain_log_handler:
+                try:
+                    logging.getLogger().removeHandler(_retrain_log_handler)
+                    _retrain_log_handler.close()
+                except Exception:
+                    pass
 
     t = threading.Thread(target=_run_retrain, daemon=True)
     t.start()
@@ -1970,20 +1988,24 @@ def run_monthly_retrain() -> None:
         ]
 
     if decision == "PENDING":
-        lines.append("_Bundle guardado como `dip_models_pending.pkl` — revisão manual._")
+        lines.append("_Bundle guardado como `dip_models_pending.pkl`._")
+        lines.append("_Usa `/admin\\_promote` para promover manualmente._")
         lines.append("")
 
-    # IC dos sector models (novo — mostra quais sectores têm modelo válido)
+    # Sector models — sempre mostrar, mesmo se rejeitados
     _train_result = result.get("train_result") or {}
     _sreport = (_train_result.get("report") or {}).get("sector_models") or {}
+    lines.append("*Modelos sectoriais:*")
     if _sreport:
-        lines.append("*Modelos sectoriais (IC hold-out):*")
         for _sname, _sinfo in sorted(_sreport.items()):
             _ic = _sinfo.get("ic_holdout")
             _n  = _sinfo.get("n_train", 0)
-            _ic_str = f"{_ic:.4f}" if isinstance(_ic, (int, float)) else "N/A"
+            _ic_str = f"{_ic:.4f}" if isinstance(_ic, (int, float)) else "sem dados"
             lines.append(f"  {_sname}: IC={_ic_str} (n={_n})")
-        lines.append("")
+    else:
+        lines.append("  Nenhum sector model aceite (IC < -0.02 em todos).")
+        lines.append("  O modelo global cobre todos os sectores.")
+    lines.append("")
 
     lines.append("_Próximo retreino: dia 1 do mês seguinte às 06h_")
     send_telegram("\n".join(lines))

@@ -1442,33 +1442,16 @@ def _handle_admin_regen_parquet(parts: list[str]) -> None:
                     total  = len(df_check)
                     pct = f"{n_90d/total:.0%}" if total else "0%"
 
-                    # Copiar para o repo (/app/) para persistir entre deploys Railway.
-                    # O /data/ volume é persistente mas pode demorar a montar num redeploy
-                    # imediato. Ter a cópia no repo garante que o retrain sempre encontra
-                    # um parquet válido e actualizado.
+                    # Copiar para /app/ como backup imediato (mesmo container).
+                    # O /data/ volume é persistente — é a fonte de verdade.
+                    # /app/ serve de fallback se /data/ não estiver montado ainda.
                     repo_pq = Path(__file__).parent / "ml_training_base.parquet"
                     try:
                         import shutil
                         shutil.copy2(str(out_pq), str(repo_pq))
-                        logging.info(f"[regen] Parquet copiado para repo: {repo_pq}")
-                        # Commit ao repo
-                        import subprocess as _sp
-                        _sp.run(
-                            ["git", "-C", str(Path(__file__).parent), "add", "ml_training_base.parquet"],
-                            capture_output=True, timeout=30
-                        )
-                        _sp.run(
-                            ["git", "-C", str(Path(__file__).parent), "commit", "-m",
-                             f"data: update ml_training_base.parquet ({total} rows, {df_check.shape[1]} cols)"],
-                            capture_output=True, timeout=30
-                        )
-                        _sp.run(
-                            ["git", "-C", str(Path(__file__).parent), "push"],
-                            capture_output=True, timeout=60
-                        )
-                        logging.info("[regen] Parquet committed e pushed ao repo")
-                    except Exception as git_e:
-                        logging.warning(f"[regen] Git push falhou (não crítico): {git_e}")
+                        logging.info(f"[regen] Backup copiado para /app/: {repo_pq} ({repo_pq.stat().st_size/1e6:.1f}MB)")
+                    except Exception as cp_e:
+                        logging.warning(f"[regen] Backup /app/ falhou: {cp_e}")
 
                     _reply(
                         f"*Parquet regenerado e guardado!*\n"
@@ -3095,6 +3078,111 @@ def _handle_command(text: str) -> None:
                 _txt = _log.read_text(encoding="utf-8", errors="replace")
                 _last = _txt[-1200:].strip()
                 _reply(f"*Regen log (últimas linhas):*\n```\n{_last}\n```")
+            except Exception as e:
+                _reply(f"Erro ao ler log: {e}")
+
+    elif cmd == "/admin_pending_info":
+        from pathlib import Path as _P
+        import json as _json
+        _dd = _P("/data") if _P("/data").exists() else _P("/tmp")
+        _pending = _dd / "dip_models_pending.pkl"
+        _report  = _dd / "ml_report_pending.json"
+        if not _pending.exists():
+            _reply("Nenhum modelo pending. Corre `/admin\\_retrain` primeiro.")
+        else:
+            try:
+                lines = ["*Modelo Pending — Relatório Completo*", ""]
+                if _report.exists():
+                    r = _json.loads(_report.read_text())
+                    m = r.get("metrics", {})
+                    lines += [
+                        f"  IC (ρ_α):   *{m.get('rho_alpha_mean', '?'):.4f}*",
+                        f"  Brier OOF:  *{m.get('brier_oof', '?'):.4f}*",
+                        f"  Top-K PnL:  *{m.get('topk_pnl_mean', '?'):.4f}*",
+                        f"  Win rate:   *{m.get('win_rate_alpha', '?'):.1%}*",
+                        f"  Champion:   {r.get('champion', '?')}",
+                        f"  Features:   {r.get('n_features', '?')}",
+                        f"  Treino:     {r.get('n_train', '?'):,} amostras",
+                        "",
+                    ]
+                    # Sector models
+                    sector_m = r.get("sector_models", {})
+                    if sector_m:
+                        lines.append("*Modelos sectoriais:*")
+                        for sname, sinfo in sorted(sector_m.items()):
+                            ic   = sinfo.get("ic_holdout")
+                            n    = sinfo.get("n_train", 0)
+                            ic_s = f"{ic:.4f}" if isinstance(ic, (int, float)) else "N/A"
+                            ok   = "✅" if isinstance(ic, (int, float)) and ic >= 0.02 else "⚠️"
+                            lines.append(f"  {ok} {sname}: IC={ic_s} (n={n:,})")
+                        lines.append("")
+                    else:
+                        lines.append("_Nenhum sector model aceite no gating (IC < -0.02)._")
+                        lines.append("")
+                    lines.append("Usa `/admin\\_promote` para colocar em produção.")
+                else:
+                    lines.append(f"Modelo pending existe ({_pending.stat().st_size/1e6:.1f}MB) mas sem report.")
+                    lines.append("Usa `/admin\\_promote` para promover.")
+                _reply("\n".join(lines))
+            except Exception as e:
+                _reply(f"Erro: `{e}`")
+
+    elif cmd == "/admin_promote":
+        # Promove o modelo pending para produção
+        from pathlib import Path as _P
+        _dd = _P("/data") if _P("/data").exists() else _P("/tmp")
+        _pending = _dd / "dip_models_pending.pkl"
+        _prod    = _dd / "dip_models.pkl"
+        _report_pending = _dd / "ml_report_pending.json"
+        _report_prod    = _dd / "ml_report.json"
+        if not _pending.exists():
+            _reply("Nenhum modelo pending encontrado. Corre `/admin\\_retrain` primeiro.")
+        else:
+            try:
+                import shutil, json
+                # Arquivar modelo actual se existir
+                if _prod.exists():
+                    shutil.copy2(str(_prod), str(_dd / "dip_models_archived.pkl"))
+                # Promover pending
+                shutil.copy2(str(_pending), str(_prod))
+                _pending.unlink()
+                if _report_pending.exists():
+                    shutil.copy2(str(_report_pending), str(_report_prod))
+                    _report_pending.unlink()
+                # Forçar reload do bundle em memória
+                try:
+                    import ml_predictor as _mp
+                    _mp._bundle = None
+                    _mp._load_bundle(force=True)
+                except Exception:
+                    pass
+                # Ler IC do report
+                _ic_str = ""
+                try:
+                    _rdata = json.loads(_report_prod.read_text()) if _report_prod.exists() else {}
+                    _ic = _rdata.get("metrics", {}).get("rho_alpha_mean")
+                    if _ic: _ic_str = f"\n  IC: {_ic:.4f}"
+                except Exception:
+                    pass
+                _reply(
+                    f"*Modelo promovido para producao!*{_ic_str}\n"
+                    f"Modelo anterior arquivado em `dip\\_models\\_archived.pkl`.\n"
+                    f"O proximo `/analisar` ja usa o novo modelo."
+                )
+            except Exception as e:
+                _reply(f"Erro ao promover: `{e}`")
+
+    elif cmd == "/admin_retrain_status":
+        from pathlib import Path as _P
+        _dd = _P("/data") if _P("/data").exists() else _P("/tmp")
+        _log = _dd / "retrain_progress.log"
+        if not _log.exists():
+            _reply("Nenhum retrain em curso ou log não encontrado. Usa /admin\\_retrain para iniciar.")
+        else:
+            try:
+                _txt = _log.read_text(encoding="utf-8", errors="replace")
+                _last = _txt[-1200:].strip()
+                _reply(f"*Retrain log (últimas linhas):*\n```\n{_last}\n```")
             except Exception as e:
                 _reply(f"Erro ao ler log: {e}")
 
