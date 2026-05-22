@@ -2884,21 +2884,36 @@ def _handle_command(text: str) -> None:
             _reply("_Snapshot não disponível._")
             return
         try:
-            snap  = get_snap()
-            total = snap.get("total_eur", 0)
-            pnl_d = snap.get("pnl_day", 0)
-            pnl_w = snap.get("pnl_week", 0)
-            pnl_m = snap.get("pnl_month", 0)
-            fx    = snap.get("usd_eur", 0)
+            snap      = get_snap()
+            total     = snap.get("total_eur", 0)
+            pnl_d     = snap.get("pnl_day", 0)
+            pnl_w     = snap.get("pnl_week", 0)
+            pnl_m     = snap.get("pnl_month", 0)
+            fx        = snap.get("usd_eur", 0)
+            positions = snap.get("positions", [])
             def _e(v): return "🟢" if v > 0 else ("🔴" if v < 0 else "⚪")
-            _reply(
-                f"*💼 Carteira — {datetime.now().strftime('%d/%m %H:%M')}*\n"
-                f"_USD/EUR: {fx:.4f}_\n\n*Total: €{total:,.2f}*\n\n"
-                f"  {_e(pnl_d)} Hoje:   €{pnl_d:+,.2f}\n"
-                f"  {_e(pnl_w)} Semana: €{pnl_w:+,.2f}\n"
-                f"  {_e(pnl_m)} Mês:    €{pnl_m:+,.2f}\n"
-                f"  📊 PPR: €{snap.get('ppr_value',0):,.2f}"
-            )
+            lines = [
+                f"*💼 Carteira — {datetime.now().strftime('%d/%m %H:%M')}*",
+                f"_USD/EUR: {fx:.4f}_",
+                "",
+                f"*Total: €{total:,.2f}*",
+                f"  {_e(pnl_d)} Hoje:   €{pnl_d:+,.2f}",
+                f"  {_e(pnl_w)} Semana: €{pnl_w:+,.2f}",
+                f"  {_e(pnl_m)} Mês:    €{pnl_m:+,.2f}",
+                f"  📊 PPR: €{snap.get('ppr_value',0):,.2f}",
+            ]
+            if positions:
+                lines.append("")
+                lines.append("*Posições:*")
+                for p in sorted(positions, key=lambda x: x.get("value_eur", 0), reverse=True):
+                    sym   = p.get("symbol","")
+                    val   = p.get("value_eur", 0)
+                    pd_   = p.get("pnl_day")
+                    pt_   = p.get("pnl_total")
+                    pd_s  = f" {_e(pd_)} €{pd_:+.0f}" if pd_ is not None else ""
+                    pt_s  = f" | total €{pt_:+.0f}" if pt_ is not None else ""
+                    lines.append(f"  *{sym}* €{val:,.0f}{pd_s}{pt_s}")
+            _reply("\n".join(lines))
         except Exception as e:
             _reply(f"_Erro ao calcular carteira: {e}_")
 

@@ -992,6 +992,7 @@ def build_alert(
     verdict, emoji, reasons, dip_score, rsi_str,
     category: str = CAT_GROWTH,
     ml_result: MLResult | None = None,
+    no_liquidity: bool = False,
 ) -> str:
     sector       = fundamentals.get("sector", "")
     sector_cfg   = get_sector_config(sector)
@@ -1159,7 +1160,9 @@ def build_alert(
         f"\n*Estratégia:* {strategy}"
         f"{macro_ctx}"
     )
-    if sizing_str:
+    if no_liquidity:
+        body += "\n⚠️ _Sem liquidez disponível — alerta para referência e monitorização. Sem compra executada._"
+    elif sizing_str:
         body += f"\n💶 *Sizing:* {sizing_str}"
     return body
 
@@ -1660,11 +1663,23 @@ def run_scan() -> None:
                     sector_etf_change=sector_chg,
                 )
 
+                # Verificar liquidez disponível — o alerta dispara sempre,
+                # mas se não há budget o utilizador é avisado explicitamente.
+                _monthly_budget = float(os.environ.get("MONTHLY_BUDGET_EUR", "0") or 0)
+                _capital_used   = 0.0
+                try:
+                    from paper_trading import _capital_used_this_month as _cup
+                    _capital_used = _cup()
+                except Exception:
+                    pass
+                _no_liquidity = (verdict == "COMPRAR") and (_monthly_budget - _capital_used < 20)
+
                 alert_text = build_alert(
                     stock, fund, hist_pe, news,
                     verdict, emoji_str, [], score, rsi_str,
                     category=category,
                     ml_result=ml_result,
+                    no_liquidity=_no_liquidity,
                 )
 
                 ranked_entries.append({
@@ -1677,19 +1692,22 @@ def run_scan() -> None:
                 _alerted_today.add(sym)
                 save_alerts(_alerted_today)
 
-                # ── Paper trading: regista posição simulada para cada COMPRAR ──
-                # O bot investe "em papel" para medir se bate o mercado sozinho.
+                # ── Paper trading: regista sempre para COMPRAR (dados de treino) ──
+                # Mesmo sem liquidez real, o paper trade é criado com amount mínimo.
+                # Isto garante que o modelo aprende com TODOS os alertas, não só
+                # aqueles em que havia dinheiro disponível (selection bias).
                 if verdict == "COMPRAR":
                     try:
                         from paper_trading import record_paper_buy
                         from portfolio import FLIP_FUND_EUR
-                        # Sizing: usa a sugestão do allocation engine ou fallback
                         paper_amount = float(
                             decision.amount_eur
                             if "decision" in dir() and hasattr(decision, "amount_eur") and decision.amount_eur > 0
-                            else FLIP_FUND_EUR * (score / 100.0) * 0.5
+                            else max(50.0, FLIP_FUND_EUR * (score / 100.0) * 0.5)
                         )
-                        if paper_amount > 5:
+                        if paper_amount < 5:
+                            paper_amount = 50.0  # mínimo para tracking
+                        if True:  # sempre criar, independentemente do budget
                             _, strat = calculate_flip_target(
                                 fund, score,
                                 earnings_date=get_earnings_date(sym),
@@ -1716,6 +1734,40 @@ def run_scan() -> None:
                                 )
                     except Exception as _pe:
                         logging.debug(f"[paper] {sym}: {_pe}")
+
+                # Auto-track no position_db quando COMPRAR.
+                # O monitor diário acompanha stop-loss, target e deterioração.
+                # Não requer intervenção manual — nunca perdes o tracking de uma posição.
+                if verdict == "COMPRAR":
+                    try:
+                        import position_db as _pdb
+                        from ml_engine import predict_dip as _predict
+                        _price_now  = float(fund.get("price") or stock.get("price") or 0)
+                        _feat_row   = {**fund, "score": score, "sector": fund.get("sector",""), "change_day_pct": stock["change_pct"]}
+                        _pred       = _predict(_feat_row, current_price=_price_now, ticker=sym, bundle=None)
+                        _target     = _pred.sell_target if _pred and _pred.sell_target > _price_now > 0 else _price_now * 1.15
+                        _existing   = _pdb.get_by_ticker(sym)
+                        if not _existing or _existing.status != "ACTIVE":
+                            _pdb.add_position(_pdb.PositionRecord(
+                                ticker             = sym,
+                                status             = "ACTIVE",
+                                alert_date         = datetime.now(LISBON_TZ).date().isoformat(),
+                                alert_price        = _price_now,
+                                alert_win_prob     = float(ml_result.win_prob if ml_result.model_ready else 0.5),
+                                alert_feature_row  = [],
+                                initial_buy_target = _price_now * 0.97,
+                                initial_sell_target= round(_target, 2),
+                                initial_hold_days  = 90,
+                                dip_score          = float(score),
+                                fundamentals_snap  = {k: fund.get(k) for k in ("sector","quality_score","analyst_upside","fcf_yield")},
+                                current_sell_target= round(_target, 2),
+                                current_hold_days  = 90,
+                                last_win_prob      = float(ml_result.win_prob if ml_result.model_ready else 0.5),
+                                initial_pred_alpha = float(ml_result.pred_up or 0) if ml_result.model_ready else None,
+                            ))
+                            logging.info(f"[portfolio] {sym}: posição criada automaticamente (target=${_target:.2f})")
+                    except Exception as _ae:
+                        logging.debug(f"[portfolio] auto-add {sym}: {_ae}")
 
                 if verdict == "COMPRAR":
                     comprar_syms.add(sym)

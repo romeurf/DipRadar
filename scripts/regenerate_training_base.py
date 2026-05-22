@@ -557,16 +557,43 @@ def regenerate(
     log.info(f"[in] shape={df.shape}  unique tickers={df['ticker'].nunique()}")
     log.info(f"[in] date range: {df['alert_date'].min()} → {df['alert_date'].max()}")
 
-    # ── Fetch macro + ETFs — força refresh nos macro críticos (SPY, VIX, TNX) ──
-    # Estes ficheiros são pequenos mas críticos para alpha_90d. Cache corrompida
-    # ou incompleta do SPY provoca 66% de falhas no cálculo do target.
+    # ── Calcular start_date real a partir das datas do parquet ────────────────
+    # O start_date deve cobrir: min(alert_date) - 90 dias (para forward prices)
+    # Se o start_date passado como argumento não chega, usar o mínimo necessário.
+    # Esta é a causa raiz do 50%: cache construído de 2019 mas alertas de 2015.
+    _min_alert = df["alert_date"].min()
+    _required_start = (_min_alert - pd.Timedelta(days=100)).strftime("%Y-%m-%d")
+    if _required_start < start_date:
+        log.warning(
+            f"[fetch] start_date={start_date} insuficiente — parquet tem alertas desde "
+            f"{_min_alert.date()} que precisam de preços desde {_required_start}. "
+            f"A usar {_required_start} e a limpar cache desactualizada."
+        )
+        start_date = _required_start
+        # Apagar cache de preços que pode ter start_date errada
+        n_deleted = 0
+        for _cf in cache_dir.glob("*.parquet"):
+            if _cf.name.startswith("edgar_"):
+                continue  # não apagar EDGAR cache
+            try:
+                _old = pd.read_parquet(_cf)
+                _old_start = pd.to_datetime(_old.index.min() if hasattr(_old.index, 'min') else _old.iloc[:,0].min())
+                if str(_old_start.date()) > _required_start:
+                    _cf.unlink()
+                    n_deleted += 1
+            except Exception:
+                _cf.unlink()  # ficheiro corrompido — apagar
+                n_deleted += 1
+        if n_deleted:
+            log.info(f"[fetch] {n_deleted} ficheiros de cache com history insuficiente apagados — a re-descarregar")
+
+    # ── Fetch macro + ETFs — força refresh sempre nos macro críticos ──────────
     log.info("[fetch] macro + sector ETFs (force_refresh para SPY/VIX/TNX)...")
-    for _critical in MACRO_TICKERS:  # ["SPY", "^VIX", "^TNX"]
+    for _critical in MACRO_TICKERS:
         _crit_safe = _critical.replace("^", "_idx_")
         _crit_cache = cache_dir / f"{_crit_safe}.parquet"
         if _crit_cache.exists():
             _crit_cache.unlink()
-            log.info(f"[fetch] cache {_critical} removido para re-download fresco")
     macro_etf_cache = _fetch_batch(MACRO_TICKERS + SECTOR_ETFS, cache_dir, start=start_date)
     macro_cache      = {k: v for k, v in macro_etf_cache.items() if k in MACRO_TICKERS}
     sector_etf_cache = {k: v for k, v in macro_etf_cache.items() if k in SECTOR_ETFS}
