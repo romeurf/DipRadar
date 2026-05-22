@@ -84,9 +84,20 @@ def _walk_forward_ic(df: pd.DataFrame, feats: list[str], target: str) -> tuple[f
         if len(tr) < 50 or len(te) < 20:
             continue
 
-        X_tr = tr[feats].fillna(0).values.astype(np.float32)
+        # Mean imputation honesta: médias do training fold, não zeros fabricados
+        _col_means = {
+            col: float(tr[col].dropna().mean()) if col in tr.columns and tr[col].notna().any() else 0.0
+            for col in feats
+        }
+        def _prep(df_):
+            r = df_[feats].copy()
+            for c in feats:
+                if c in r.columns and r[c].isna().any():
+                    r[c] = r[c].fillna(_col_means.get(c, 0.0))
+            return r.values.astype(np.float32)
+        X_tr = _prep(tr)
         y_tr = tr[target].values.astype(float)
-        X_te = te[feats].fillna(0).values.astype(np.float32)
+        X_te = _prep(te)
         y_te = te[target].values
 
         m = ScaledRidge(alpha=10.0)
@@ -152,9 +163,19 @@ def run_momentum_training(dataset_path: Path = _DATASET) -> dict:
             "elapsed_s": round(time.time() - t0, 1),
         }
 
-    # Treinar modelo final no dataset completo
+    # Treinar modelo final no dataset completo — mean imputation honesta
     log.info("[momentum_train] A treinar modelo final no dataset completo...")
-    X_full = df[FEATURE_COLS].fillna(0).values.astype(np.float32)
+    _full_means = {
+        col: float(df[col].dropna().mean()) if col in df.columns and df[col].notna().any() else 0.0
+        for col in FEATURE_COLS
+    }
+    def _prep_full(df_):
+        r = df_[FEATURE_COLS].copy()
+        for c in FEATURE_COLS:
+            if c in r.columns and r[c].isna().any():
+                r[c] = r[c].fillna(_full_means.get(c, 0.0))
+        return r.values.astype(np.float32)
+    X_full = _prep_full(df)
     y_full = df[TARGET_COL].values.astype(float)
     model  = ScaledRidge(alpha=10.0)
     model.fit(X_full, y_full)

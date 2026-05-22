@@ -104,6 +104,7 @@ def find_historical_dips(
     sector: str,
     start_date: str,
     end_date: str,
+    macro_cache: dict | None = None,  # VIX, ^TNX, sector ETFs
 ) -> list[dict]:
     """Encontra todos os dias de dip para um ticker num período histórico.
 
@@ -219,25 +220,83 @@ def find_historical_dips(
         except Exception:
             pass
 
+        # Macro features PIT — VIX, SPY RSI, sector relative, vix_regime
+        # Dados genuínos na data do alerta. Se não disponíveis → NaN (não inventar).
+        vix_val          = float("nan")
+        spy_rsi          = float("nan")
+        vix_percentile   = float("nan")
+        vix_regime_val   = float("nan")
+        sector_relative  = float("nan")
+        yield_5d_change  = float("nan")
+
+        try:
+            if macro_cache:
+                # VIX PIT
+                vix_hist = macro_cache.get("^VIX") or macro_cache.get("_idx_VIX")
+                if vix_hist is not None:
+                    vix_slice = vix_hist[vix_hist.index <= dt]["Close"]
+                    if not vix_slice.empty:
+                        vix_val = float(vix_slice.iloc[-1])
+                        # VIX percentile 1 ano
+                        vix_1y = vix_slice.iloc[-252:] if len(vix_slice) >= 252 else vix_slice
+                        if len(vix_1y) >= 20:
+                            vix_percentile = float((vix_1y < vix_val).mean())
+                        # VIX regime: 0=low(<15), 1=normal(15-25), 2=high(>25)
+                        if not np.isnan(vix_val):
+                            vix_regime_val = 0.0 if vix_val < 15 else (1.0 if vix_val < 25 else 2.0)
+
+                # SPY RSI PIT
+                if not spy_hist.empty:
+                    spy_slice = spy_hist[spy_hist.index <= dt]["Close"]
+                    if len(spy_slice) >= 14:
+                        spy_rsi_s = _calc_rsi(spy_slice)
+                        spy_rsi = float(spy_rsi_s.iloc[-1])
+
+                # Sector relative (stock vs sector ETF) — retorno 3m relativo
+                from ml_training.config import SECTOR_ETF as _SE
+                etf = _SE.get(sector, "SPY")
+                etf_hist = macro_cache.get(etf)
+                if etf_hist is not None and not etf_hist.empty:
+                    etf_slice = etf_hist[etf_hist.index <= dt]["Close"]
+                    if len(etf_slice) >= 63:
+                        etf_r3m = float(etf_slice.iloc[-1] / etf_slice.iloc[-64] - 1)
+                        sector_relative = round(ret_3m - etf_r3m, 4)
+
+                # TNX yield 5d change
+                tnx = macro_cache.get("^TNX") or macro_cache.get("_idx_TNX")
+                if tnx is not None and not tnx.empty:
+                    tnx_s = tnx[tnx.index <= dt]["Close"]
+                    if len(tnx_s) >= 6:
+                        yield_5d_change = float(tnx_s.iloc[-1] - tnx_s.iloc[-6])
+        except Exception:
+            pass  # macro features genuinamente indisponíveis → NaN
+
         rows.append({
             "ticker":         ticker,
             "alert_date":     dt.date().isoformat(),
             "sector":         sector,
             "price":          round(c_now, 4),
-            # Features técnicas — computadas PIT
-            "drop_pct_today": round(day_ch, 4),
-            "drawdown_52w":   round(drawdown, 4),
-            "rsi_14":         round(rsi, 2),
-            "return_1m":      round(ret_1m, 4),
-            "return_3m_pre":  round(ret_3m, 4),
-            "return_6m_pre":  round(ret_6m, 4),
-            "bb_width":       round(bb_width, 4),
-            "volume_zscore_20d": round(vol_ratio - 1.0, 4),
+            # Features técnicas PIT
+            "drop_pct_today":   round(day_ch, 4),
+            "drawdown_52w":     round(drawdown, 4),
+            "rsi_14":           round(rsi, 2),
+            "return_1m":        round(ret_1m, 4),
+            "return_3m_pre":    round(ret_3m, 4),
+            "return_6m_pre":    round(ret_6m, 4),
+            "bb_width":         round(bb_width, 4),
+            "volume_zscore_20d":round(vol_ratio - 1.0, 4),
+            # Macro features PIT — NaN se genuinamente indisponíveis
+            "vix":              vix_val if not np.isnan(vix_val) else float("nan"),
+            "spy_rsi_14":       spy_rsi if not np.isnan(spy_rsi) else float("nan"),
+            "vix_percentile_1y":vix_percentile if not np.isnan(vix_percentile) else float("nan"),
+            "vix_regime":       vix_regime_val if not np.isnan(vix_regime_val) else float("nan"),
+            "sector_relative":  sector_relative if not np.isnan(sector_relative) else float("nan"),
+            "yield_10y_change_5d": yield_5d_change if not np.isnan(yield_5d_change) else float("nan"),
             # Targets
-            "alpha_90d":      alpha_90d,
-            "close_90d":      close_90d,
-            "spy_close_90d":  spy_close_90d,
-            "max_drawdown_60d": float("nan"),  # a preencher pelo regen
+            "alpha_90d":        alpha_90d,
+            "close_90d":        close_90d,
+            "spy_close_90d":    spy_close_90d,
+            "max_drawdown_60d": float("nan"),
         })
 
     return rows
@@ -278,11 +337,22 @@ def main() -> int:
         tickers = get_ml_universe()
         log.info(f"Universo completo: {len(tickers)} tickers")
 
-    # Carregar SPY
+    # Carregar SPY e macro (VIX, TNX, sector ETFs) — necessários para features PIT
     spy_hist = _load_ticker("SPY", _CACHE_DIR)
     if spy_hist is None:
         log.error("SPY não disponível no cache. Corre /admin_regen_parquet primeiro.")
         return 1
+
+    # Macro cache: VIX, TNX e sector ETFs para features PIT honestas
+    _MACRO_TICKERS = ["^VIX", "^TNX", "XLK", "XLF", "XLV", "XLY", "XLP",
+                      "XLI", "XLE", "XLU", "XLRE", "XLB", "XLC"]
+    macro_cache: dict = {}
+    for _mt in _MACRO_TICKERS:
+        _mh = _load_ticker(_mt, _CACHE_DIR)
+        if _mh is not None:
+            macro_cache[_mt] = _mh
+    macro_cache["SPY"] = spy_hist
+    log.info(f"Macro cache: {len(macro_cache)} séries históricas carregadas")
 
     # Sector mapping
     sector_map: dict[str, str] = {}
@@ -333,7 +403,8 @@ def main() -> int:
 
         sector = sector_map.get(ticker, "Unknown")
         rows = find_historical_dips(
-            ticker, hist, spy_hist, sector, args.start, end_date
+            ticker, hist, spy_hist, sector, args.start, end_date,
+            macro_cache=macro_cache,
         )
         all_rows.extend(rows)
 

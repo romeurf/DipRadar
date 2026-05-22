@@ -37,6 +37,62 @@ log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Mean imputation — sem valores inventados
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_tree_model(model) -> bool:
+    """True se o modelo é tree-based e suporta NaN nativamente."""
+    name = type(model).__name__.lower()
+    return any(x in name for x in ("xgb", "lgbm", "lightgbm", "forest", "tree", "dart"))
+
+
+def _prepare_X(df: pd.DataFrame, feats: list[str], col_means: dict[str, float], model=None) -> np.ndarray:
+    """Prepara a matriz X com tratamento de NaN honesto.
+
+    Tree models (XGB, LGBM, RF): passam NaN directamente — o algoritmo
+    aprendeu durante treino o que fazer quando um dado está ausente.
+    Não se inventa nenhum valor.
+
+    Linear models (Ridge): NaN é matematicamente impossível. Usa a média
+    calculada APENAS das linhas com dados reais (sem data leakage, sem zeros
+    artificiais). Para features com cobertura < 20%, loga um aviso.
+    """
+    if model is not None and _is_tree_model(model):
+        # Trees tratam NaN nativamente — não alterar nada
+        return df[feats].values.astype(np.float32)
+    # Linear: mean imputation com médias do training set
+    result = df[feats].copy()
+    for col in feats:
+        if col in result.columns and result[col].isna().any():
+            result[col] = result[col].fillna(col_means.get(col, 0.0))
+    return result.values.astype(np.float32)
+
+
+def _compute_col_means(df: pd.DataFrame, feats: list[str]) -> dict[str, float]:
+    """Médias calculadas APENAS das linhas com dados reais (sem inventar nada)."""
+    means = {}
+    for col in feats:
+        if col not in df.columns:
+            means[col] = 0.0
+            continue
+        valid = df[col].dropna()
+        if len(valid) == 0:
+            log.warning(f"[impute] '{col}': sem dados reais — fallback 0.0")
+            means[col] = 0.0
+        else:
+            pct = len(valid) / len(df) * 100
+            if pct < 20:
+                log.info(f"[impute] '{col}': {pct:.0f}% cobertura ({len(valid)} linhas)")
+            means[col] = float(valid.mean())
+    return means
+
+
+def _apply_mean_imputation(df: pd.DataFrame, feats: list[str], means: dict[str, float]) -> np.ndarray:
+    """Alias para compatibilidade — usa _prepare_X com model=None (linear)."""
+    return _prepare_X(df, feats, means, model=None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Helpers internos
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -159,9 +215,11 @@ def run_walk_forward_cv(
         sw_tr = temporal_weights(df_tr["alert_date"], pd.Timestamp(train_end))
 
         for name, cfg in model_configs.items():
-            feats = [f for f in cfg["feats"] if f in df_tr.columns]
-            X_tr = df_tr[feats].fillna(0).values.astype(np.float32)
-            X_te = df_te[feats].fillna(0).values.astype(np.float32)
+            feats    = [f for f in cfg["feats"] if f in df_tr.columns]
+            _means   = _compute_col_means(df_tr, feats)   # médias só do training fold
+            _probe   = cfg["factory"]()                    # instância para detectar tipo
+            X_tr     = _prepare_X(df_tr, feats, _means, _probe)
+            X_te     = _prepare_X(df_te, feats, _means, _probe)   # mesmas médias — sem leakage
 
             X_t, y_t, sw_t, X_v, y_v = _split_val(X_tr, y_alpha_tr, sw_tr)
             m_alpha = cfg["factory"]()
@@ -466,7 +524,9 @@ def train_full_champion(
             f"Target '{train_target}' ausente no DataFrame. "
             f"Regenera o parquet via /admin_regen_parquet."
         )
-    X_full        = df_v31[feats].fillna(0).values.astype(np.float32)
+    _champ_probe  = champion_cfg["factory"]()
+    _means_full   = _compute_col_means(df_v31, feats)
+    X_full        = _prepare_X(df_v31, feats, _means_full, _champ_probe)
     y_alpha_full  = winsorize(df_v31[train_target].values.astype(float))
     y_down_full   = winsorize(df_v31["max_drawdown_60d"].values)
     sw_full       = temporal_weights(df_v31["alert_date"], max_date)
@@ -525,7 +585,10 @@ def train_full_ensemble(
             f"Target '{train_target}' ausente no DataFrame. "
             f"Regenera o parquet via /admin_regen_parquet."
         )
-    X_full        = df_v31[feats].fillna(0).values.astype(np.float32)
+    # Ensemble: factory cria várias instâncias — detectar tipo pelo primeiro
+    _ens_probe    = next(iter(model_configs.values()))["factory"]() if model_configs else None
+    _means_ens    = _compute_col_means(df_v31, feats)
+    X_full        = _prepare_X(df_v31, feats, _means_ens, _ens_probe)
     y_alpha_full  = winsorize(df_v31[train_target].values.astype(float))
     y_down_full   = winsorize(df_v31["max_drawdown_60d"].values)
     sw_full       = temporal_weights(df_v31["alert_date"], max_date)
@@ -1007,15 +1070,18 @@ def run_training(
         _df_tr     = _df_sec.iloc[:_split]
         _df_val    = _df_sec.iloc[_split:]
 
+        _sec_probe    = _scfg["factory"]()
+        _sec_means_tr = _compute_col_means(_df_tr, feats_used)
+
         _ic_holdout: float = float("nan")
         if len(_df_val) >= _MIN_SECTOR_VAL:
-            _X_tr  = _df_tr[feats_used].fillna(0).values.astype(np.float32)
+            _X_tr  = _prepare_X(_df_tr, feats_used, _sec_means_tr, _sec_probe)
             _y_tr  = winsorize(_df_tr[_active_target].values.astype(float))
             _sw_tr = temporal_weights(_df_tr["alert_date"], _df_tr["alert_date"].max())
             _m_val = _scfg["factory"]()
             _m_val.fit(_X_tr, _y_tr, sample_weight=_sw_tr)
 
-            _X_val = _df_val[feats_used].fillna(0).values.astype(np.float32)
+            _X_val = _prepare_X(_df_val, feats_used, _sec_means_tr, _m_val)
             _pred_val = _m_val.predict(_X_val)
             _ic_holdout = float(spearman_safe(_pred_val, _df_val[_active_target].values))
 
@@ -1027,7 +1093,8 @@ def run_training(
                 continue
 
         # Retrain no dataset completo para produção
-        _X_full = _df_sec[feats_used].fillna(0).values.astype(np.float32)
+        _sec_means_full = _compute_col_means(_df_sec, feats_used)
+        _X_full = _prepare_X(_df_sec, feats_used, _sec_means_full, _sec_probe)
         _y_full = winsorize(_df_sec[_active_target].values.astype(float))
         _sw_full = temporal_weights(_df_sec["alert_date"], _df_sec["alert_date"].max())
         _m_prod = _scfg["factory"]()
@@ -1046,6 +1113,32 @@ def run_training(
 
     bundle.sector_models = _sector_models
     log.info(f"[sector] {len(_sector_models)}/{len(_sector_cfgs)} modelos sectoriais aceites")
+
+    # Feature importance — quais features explicam mais a variância.
+    # Usa o champion model: Ridge → |coef| normalizado; XGB/LGBMscore/RF → feature_importances_.
+    # Ajuda a perceber o que o modelo realmente aprendeu e detectar features inúteis.
+    _feature_importance: dict = {}
+    try:
+        _champ_model = bundle.model_up
+        if hasattr(_champ_model, "feature_importance_dict"):
+            # ScaledRidge tem este método
+            _feature_importance = _champ_model.feature_importance_dict(feats_used)
+        elif hasattr(_champ_model, "feature_importances_"):
+            # XGB, LGBM, RF
+            _fi = _champ_model.feature_importances_
+            _total = _fi.sum() or 1.0
+            _feature_importance = {
+                f: round(float(v / _total), 6)
+                for f, v in zip(feats_used, _fi)
+            }
+        if _feature_importance:
+            # Log top 10 features
+            _top = sorted(_feature_importance.items(), key=lambda x: x[1], reverse=True)[:10]
+            log.info("[feature_importance] Top 10:")
+            for _fname, _fimp in _top:
+                log.info(f"  {_fname:35s}: {_fimp:.4f} ({_fimp*100:.1f}%)")
+    except Exception as _fie:
+        log.debug(f"[feature_importance] falhou: {_fie}")
 
     # Baseline de features para drift detection em produção.
     # health_monitor.check_feature_drift() compara distribuições live vs este baseline.
@@ -1092,6 +1185,11 @@ def run_training(
     report["robustness"]["ensemble_ic_oof"]        = ensemble_ic_oof
     report["robustness"]["ensemble_ic_per_fold_mean"] = ensemble_ic_per_fold_mean
     report["robustness"]["single_best_name"]       = single_champion_name
+    # Feature importance — quais features explicam mais a variância do modelo
+    if _feature_importance:
+        report["feature_importance"] = dict(
+            sorted(_feature_importance.items(), key=lambda x: x[1], reverse=True)
+        )
     # IC hold-out por sector model — visível em /backtest e notificação de retrain
     report["sector_models"] = {
         name: {"n_train": info["n_train"], "ic_holdout": info.get("ic_holdout")}
