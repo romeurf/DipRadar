@@ -965,27 +965,24 @@ def _build_plain_summary(
     # Plain text para a frase 2, bold apenas onde seguro.
     frase1 = f"*{name}* {queda} hoje."
 
-    if verdict == "COMPRAR" and ml_result is not None and ml_result.model_ready:
-        wp = ml_result.win_prob
-        hold = {"LONG_TERM": "longo prazo", "6M": "~6 meses", "90D": "~90 dias"}.get(
-            ml_result.recommended_hold, "90 dias"
-        )
-        sz = (f"Sugiro alocar ~{ml_result.position_size_pct*100:.0f}% do portfolio, hold {hold}."
-              if ml_result.position_size_pct > 0 else f"Hold {hold}.")
-        frase2 = f"Modelo ve {wp:.0%} de probabilidade de bater o mercado. {sz}"
-
-    elif verdict == "COMPRAR":
-        frase2 = ("Score fundamental forte." if dip_score >= 85
-                  else f"Score {dip_score:.0f}/100, queda com suporte fundamental.")
+    # Frase 2 — o que fazer, em linguagem simples, sem repetir o score
+    if verdict == "COMPRAR":
+        if ml_result is not None and ml_result.model_ready and ml_result.win_prob >= 0.60:
+            frase2 = f"Oportunidade de entrada — modelo confiante ({ml_result.win_prob:.0%})."
+        else:
+            frase2 = "Fundamentos suportam a queda. Momento de analisar entrada."
 
     elif verdict == "MONITORIZAR":
         if ml_result is not None and ml_result.model_ready and ml_result.win_prob > 0.55:
-            frase2 = f"Score {dip_score:.0f}/100, ML optimista ({ml_result.win_prob:.0%}). Monitorizar."
+            frase2 = "Na watchlist — modelo optimista mas aguardar confirmacao."
         else:
-            frase2 = f"Score {dip_score:.0f}/100. Ainda nao reune todos os criterios. Aguardar."
+            frase2 = "Ainda nao reune todos os criterios. Aguardar clareza."
 
     else:
-        frase2 = f"Score fraco ({dip_score:.0f}/100). Sem suporte fundamental."
+        if ml_result is not None and ml_result.model_ready:
+            frase2 = "O modelo nao ve vantagem clara neste momento."
+        else:
+            frase2 = "Sem suporte suficiente para entrada agora."
 
     return f"{frase1}\n{frase2}"
 
@@ -1150,17 +1147,15 @@ def build_alert(
     body = (
         f"{emoji} *{name} ({symbol})*{region_part}{in_portfolio}\n"
         f"{plain_summary}\n"
-        f"Sector: {sector_cfg.get('label', sector)} | ≈{mc_b:.1f}B\n"
+        f"{sector_cfg.get('label', sector)} | ≈{mc_b:.1f}B\n"
         f"Hoje: *{change:+.1f}%* — ${price}{drawdown_str}{vol_flag}{insider_flag}{short_flag}{rsi_part}{sector_warn}\n"
         f"{payout_warn}"
         f"{earn_warn}"
         f"{valuation_block}"
-        f"\n*Categoria:* {category}\n"
-        f"{score_line}"
         f"{theme_line}"
-        f"{ml_line}"
+        f"\n{score_breakdown}"   # Score V2 como score único — imediato após fundamentais
+        f"{ml_line}"             # ML logo após o score
         f"{signal_narrative_text}\n"
-        f"{score_breakdown}\n"
         f"\n*Estratégia:* {strategy}"
         f"{macro_ctx}"
     )

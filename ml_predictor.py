@@ -579,49 +579,38 @@ def ml_score(
 
 
 def ml_badge(result: MLResult) -> str:
-    """Linha formatada para o alerta Telegram (v4.1).
-
-    Exemplos:
-      🤖 ML:🟢 WIN_STRONG 💎 | α₉₀ +8.2% | dn -6.1% | P(win) 76% | R:R 1.37 | Hold: Longo prazo
-      🤖 ML:✅ WIN ⭐ | α₉₀ +5.1% | dn -9.2% | P(win) 62% | Size: 4% | Hold: ~6 meses
-      🤖 ML:🔄 WEAK | α₉₀ +2.1% | dn -14% | P(win) 45% | Hold: ~90 dias
-      🤖 ML:modelo não treinado
-    """
+    """Linha ML em linguagem natural — legível para qualquer investidor."""
     if not result.model_ready:
-        return "🤖 ML:_modelo não treinado_"
+        return "🤖 _Modelo não treinado ainda_"
 
-    emoji_map = {
-        "WIN_STRONG": "🟢",
-        "WIN":        "✅",
-        "WEAK":       "🟡",
-        "NO_WIN":     "🔴",
-        "ERROR":      "⚠️",
-        "NO_MODEL":   "⚫",
-    }
-    type_emoji = {"BLUE_CHIP": "💎", "QUALITY": "⭐", "SPECULATIVE": "🔄"}.get(result.stock_type, "")
-    hold_label = {"LONG_TERM": "Longo prazo", "6M": "~6 meses", "90D": "~90 dias"}.get(
-        result.recommended_hold, result.recommended_hold
-    )
+    wp   = result.win_prob or 0.0
+    up   = (result.pred_up or 0.0) * 100
+    down = abs((result.pred_down or 0.0) * 100)
 
-    em   = emoji_map.get(result.label, "📊")
-    sign = "+" if (result.pred_up or 0.0) >= 0 else ""
-    alpha_str = f"{sign}{(result.pred_up or 0.0)*100:.1f}%" if result.pred_up is not None else "?"
-    down_str  = f"{(result.pred_down or 0.0)*100:.1f}%" if result.pred_down is not None else "?"
-    prob_str  = f"{result.win_prob:.0%}"
+    # Descrição do sinal em linguagem simples
+    if result.label == "WIN_STRONG":
+        sinal = "MUITO OPTIMISTA"
+    elif result.label == "WIN":
+        sinal = "OPTIMISTA"
+    elif result.label == "WEAK":
+        sinal = "NEUTRO"
+    else:
+        sinal = "NÃO RECOMENDA"
 
-    parts = [
-        f"🤖 *ML:* {em} `{result.label}` {type_emoji}",
-        f"| α₉₀ *{alpha_str}* | dn {down_str} | P(win) *{prob_str}*",
-    ]
+    # Linha principal
+    up_str = f"+{up:.1f}%" if up >= 0 else f"{up:.1f}%"
+    linha = f"🤖 *Modelo:* {sinal} — {wp:.0%} de probabilidade de bater o mercado"
 
-    if result.position_size_pct > 0:
-        parts.append(f"| Size: *{result.position_size_pct*100:.0f}%*")
-    if result.risk_reward_ratio > 0:
-        parts.append(f"| R:R *{result.risk_reward_ratio:.2f}*")
+    # Contexto de upside/downside em linguagem simples
+    contexto = ""
+    if up > 3 and wp >= 0.5:
+        contexto = f"\n  Prevê *{up_str}* acima do SPY nos próximos 90 dias"
+    elif up > 0:
+        contexto = f"\n  Upside previsto: *{up_str}* vs SPY — confiança baixa"
+    else:
+        contexto = f"\n  Modelo não vê vantagem clara face ao SPY agora"
 
-    parts.append(f"| Hold: {hold_label}")
+    if down > 8:
+        contexto += f" | risco de queda adicional até *{down:.0f}%* antes de recuperar"
 
-    if result.vix_regime:
-        parts.append(f"| VIX:{result.vix_regime[:3]}")
-
-    return " ".join(parts)
+    return linha + contexto
