@@ -53,6 +53,62 @@ if str(_REPO_ROOT) not in sys.path:
 
 log = logging.getLogger("bootstrap")
 
+
+def _ensure_price_cache(tickers: list[str], cache_dir: Path, start: str) -> None:
+    """Garante que o price cache tem dados desde `start` para todos os tickers.
+
+    Para cada ticker, verifica se o ficheiro de cache existe E se começa antes
+    de `start`. Se não, apaga e re-descarrega via yfinance.
+    Sem este passo, o bootstrap só encontra dips a partir da data do cache existente.
+    """
+    import yfinance as yf
+    start_ts = pd.Timestamp(start)
+    to_download = []
+
+    for ticker in tickers:
+        safe = ticker.replace("^", "_idx_").replace("/", "_").replace(".", "_")
+        cache_file = cache_dir / f"{safe}.parquet"
+        needs_download = True
+        if cache_file.exists():
+            try:
+                df = pd.read_parquet(cache_file)
+                idx_min = pd.to_datetime(df.index.min())
+                if idx_min.tz is not None:
+                    idx_min = idx_min.tz_convert(None)
+                if idx_min <= start_ts + pd.Timedelta(days=30):  # 30d buffer
+                    needs_download = False  # cache cobre o período
+            except Exception:
+                pass
+        if needs_download:
+            to_download.append(ticker)
+
+    if not to_download:
+        log.info(f"[cache] Price cache OK desde {start} — nenhum re-download necessário")
+        return
+
+    log.info(f"[cache] {len(to_download)}/{len(tickers)} tickers sem histórico desde {start} — a descarregar...")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    done = 0
+    for ticker in to_download:
+        safe = ticker.replace("^", "_idx_").replace("/", "_").replace(".", "_")
+        cache_file = cache_dir / f"{safe}.parquet"
+        if cache_file.exists():
+            cache_file.unlink()  # remover cache incompleto
+        try:
+            df = yf.Ticker(ticker).history(start=start, auto_adjust=True)
+            if df is not None and not df.empty:
+                idx = pd.DatetimeIndex(df.index)
+                df.index = idx.tz_convert(None) if idx.tz is not None else idx
+                df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+                df.to_parquet(cache_file)
+                done += 1
+        except Exception as e:
+            log.debug(f"  {ticker}: {e}")
+        time.sleep(0.05)
+        if (done + 1) % 100 == 0:
+            log.info(f"  [cache] {done}/{len(to_download)} re-descarregados")
+    log.info(f"[cache] Download completo: {done}/{len(to_download)} tickers actualizados")
+
 _DATA_DIR  = Path("/data") if Path("/data").exists() else Path("/tmp")
 _CACHE_DIR = _DATA_DIR / "price_cache"
 _OUTPUT    = _DATA_DIR / "ml_training_base.parquet"
@@ -350,6 +406,20 @@ def main() -> int:
     spy_hist = _load_ticker("SPY", _CACHE_DIR)
     if spy_hist is None:
         log.error("SPY não disponível no cache. Corre /admin_regen_parquet primeiro.")
+        return 1
+
+    # Garantir que o price cache tem dados desde start_date para todos os tickers.
+    # Sem isto, o bootstrap só encontra dips a partir da data do cache existente.
+    _ALL_NEEDED = tickers + ["SPY", "^VIX", "^TNX",
+                             "XLK", "XLF", "XLV", "XLY", "XLP",
+                             "XLI", "XLE", "XLU", "XLRE", "XLB", "XLC"]
+    _notify(f"⏳ A verificar/actualizar price cache desde {args.start}...")
+    _ensure_price_cache(_ALL_NEEDED, _CACHE_DIR, start=args.start)
+
+    # Recarregar SPY após possível actualização
+    spy_hist = _load_ticker("SPY", _CACHE_DIR)
+    if spy_hist is None:
+        log.error("SPY não disponível após download. Verifica a rede.")
         return 1
 
     # Macro cache: VIX, TNX e sector ETFs para features PIT honestas
