@@ -212,7 +212,19 @@ def _edgar_submissions(ticker: str) -> dict:
     return data
 
 
-def _parse_form4_xml(accession_no: str, cik: str) -> dict:
+def _filing_primary_url(cik_int: int, acc_clean: str, primary_doc: str = "") -> str:
+    """Constrói URL do documento principal de uma filing EDGAR.
+
+    Usa primaryDocument do submissions JSON se disponível.
+    Fallback: tenta {acc_clean}.txt (antigo) e depois o índice JSON.
+    """
+    base = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_clean}"
+    if primary_doc:
+        return f"{base}/{primary_doc}"
+    return f"{base}/{acc_clean}.txt"
+
+
+def _parse_form4_xml(accession_no: str, cik: str, primary_doc: str = "") -> dict:
     """Parseia um Form 4 XML e devolve {amount_usd, is_purchase, name, title}.
 
     Extrai:
@@ -227,10 +239,9 @@ def _parse_form4_xml(accession_no: str, cik: str) -> dict:
     import xml.etree.ElementTree as ET
 
     acc_clean = accession_no.replace("-", "")
-    doc_url   = (
-        f"https://www.sec.gov/Archives/edgar/data/{int(cik)}"
-        f"/{acc_clean}/{acc_clean}.txt"
-    )
+    cik_int   = int(cik)
+    doc_url   = _filing_primary_url(cik_int, acc_clean, primary_doc)
+
     try:
         r = requests.get(doc_url, headers=_EDGAR_HEADERS, timeout=10)
         if r.status_code != 200:
@@ -327,9 +338,10 @@ def insider_buy_amount_score(ticker: str, lookback_days: int = 60, as_of_date: "
             return NaN, 0.0
         cik_str = str(cik).zfill(10)
         recent  = data.get("filings", {}).get("recent", {})
-        forms        = recent.get("form", [])
-        dates_filed  = recent.get("filingDate", [])
-        accessions   = recent.get("accessionNumber", [])
+        forms           = recent.get("form", [])
+        dates_filed     = recent.get("filingDate", [])
+        accessions      = recent.get("accessionNumber", [])
+        primary_docs    = recent.get("primaryDocument", [""] * len(forms))  # nome real do ficheiro
         as_of  = as_of_date or date.today()
         cutoff = as_of - timedelta(days=lookback_days)
 
@@ -338,7 +350,7 @@ def insider_buy_amount_score(ticker: str, lookback_days: int = 60, as_of_date: "
         top_title = ""
         top_amount = 0.0
 
-        for form, filed_str, acc in zip(forms, dates_filed, accessions):
+        for form, filed_str, acc, pdoc in zip(forms, dates_filed, accessions, primary_docs):
             if form not in ("4", "4/A"):
                 continue
             try:
@@ -347,7 +359,7 @@ def insider_buy_amount_score(ticker: str, lookback_days: int = 60, as_of_date: "
                     continue
             except ValueError:
                 continue
-            parsed = _parse_form4_xml(acc, cik_str)
+            parsed = _parse_form4_xml(acc, cik_str, primary_doc=str(pdoc or ""))
             if parsed.get("is_purchase"):
                 amt = parsed.get("amount_usd", 0)
                 total_purchase += amt
@@ -535,15 +547,16 @@ def earnings_call_tone(ticker: str, lookback_days: int = 90, as_of_date: "date |
         data   = _edgar_submissions(ticker)
         cik    = str(data.get("cik", "")).zfill(10)
         recent = data.get("filings", {}).get("recent", {})
-        forms        = recent.get("form", [])
-        dates_filed  = recent.get("filingDate", [])
-        accessions   = recent.get("accessionNumber", [])
-        items_list   = recent.get("items", [])
+        forms           = recent.get("form", [])
+        dates_filed     = recent.get("filingDate", [])
+        accessions      = recent.get("accessionNumber", [])
+        items_list      = recent.get("items", [])
+        primary_docs    = recent.get("primaryDocument", [""] * len(forms))
         as_of  = as_of_date or date.today()
         cutoff = as_of - timedelta(days=lookback_days)
 
         import requests
-        for form, filed_str, acc, items in zip(forms, dates_filed, accessions, items_list):
+        for form, filed_str, acc, items, pdoc in zip(forms, dates_filed, accessions, items_list, primary_docs):
             if form not in ("8-K", "8-K/A"):
                 continue
             try:
@@ -556,18 +569,10 @@ def earnings_call_tone(ticker: str, lookback_days: int = 90, as_of_date: "date |
             items_str = ",".join(items) if isinstance(items, list) else str(items)
             if "2.02" not in items_str:
                 continue
-            try:
-                if date.fromisoformat(filed_str[:10]) < cutoff:
-                    continue
-            except ValueError:
-                continue
 
-            # Fetch documento
+            # Fetch documento usando primaryDocument (nome real, não .txt genérico)
             acc_clean = acc.replace("-", "")
-            url = (
-                f"https://www.sec.gov/Archives/edgar/data/{int(cik)}"
-                f"/{acc_clean}/{acc_clean}.txt"
-            )
+            url = _filing_primary_url(int(cik), acc_clean, str(pdoc or ""))
             r = requests.get(url, headers=_EDGAR_HEADERS, timeout=15)
             if r.status_code != 200:
                 continue
