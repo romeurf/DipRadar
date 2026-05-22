@@ -119,10 +119,7 @@ TARGET_COLS: list[str] = [
     "spy_close_90d",
 ]
 
-# Features Fase 5 que são computadas point-in-time a partir de SEC EDGAR + preços.
-# Nota: short_interest_trend, short_interest_pct, analyst_rating, earnings_beat_rate
-# dependem de dados yfinance que NÃO são PIT → ficam em fallback no treino.
-# Os EDGAR-based são totalmente PIT (filed_date <= alert_date).
+# Features Fase 5 — EDGAR PIT + preços
 FASE5_COLS: list[str] = [
     "consecutive_red_days",    # PIT via price_cache
     "ma_200d_ratio",           # PIT via price_cache
@@ -130,6 +127,21 @@ FASE5_COLS: list[str] = [
     "insider_buy_amount_score",# PIT via SEC Form 4 (EDGAR)
     "recent_8k_score",         # PIT via SEC 8-K (EDGAR)
     "earnings_call_tone",      # PIT via SEC 8-K texto (EDGAR)
+]
+
+# Features yfinance — valores actuais por ticker (não PIT, mas melhor que fallback 0)
+YF_TICKER_COLS: list[str] = [
+    "earnings_beat_rate",   # % trimestres com EPS beat (yfinance earningsHistory)
+    "analyst_rating",       # consenso analistas 1-5 (yfinance recommendationMean)
+    "short_interest_pct",   # short interest % do float (yfinance shortPercentOfFloat)
+    "short_interest_trend", # variação short interest (yfinance sharesShort)
+]
+
+# Features sector-conditioned — derivadas de features existentes no parquet
+SECTOR_DERIVED_COLS: list[str] = [
+    "rsi_sector_adjusted",       # max(0, rsi_threshold_sector - rsi_14)
+    "vix_sector_signal",         # vix × factor_sector / 40
+    "drawdown_sector_normalized",# drawdown_52w / typical_drawdown_sector
 ]
 
 
@@ -491,6 +503,40 @@ def _compute_fase5_row(
     return {k: fv.get(k, _FALLBACK.get(k, 0.0)) for k in FASE5_COLS}
 
 
+def _compute_yf_features(ticker: str) -> dict:
+    """Features yfinance por ticker único (não PIT — valores actuais)."""
+    result = {k: float("nan") for k in YF_TICKER_COLS}
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info or {}
+
+        # earnings_beat_rate
+        hist = info.get("earningsHistory") or {}
+        quarters = hist.get("history", []) if isinstance(hist, dict) else []
+        if quarters:
+            beats = sum(1 for q in quarters if (q.get("epsActual") or 0) > (q.get("epsEstimate") or 0))
+            result["earnings_beat_rate"] = round(beats / len(quarters), 4)
+
+        # analyst_rating
+        rec = info.get("recommendationMean")
+        if rec is not None:
+            result["analyst_rating"] = round(float(rec), 2)
+
+        # short_interest_pct
+        sip = info.get("shortPercentOfFloat") or info.get("shortRatio")
+        if sip is not None:
+            result["short_interest_pct"] = round(float(sip), 4)
+
+        # short_interest_trend (usa sharesShort vs sharesShortPriorMonth)
+        ss  = info.get("sharesShort")
+        ssp = info.get("sharesShortPriorMonth")
+        if ss and ssp and ssp > 0:
+            result["short_interest_trend"] = round((ss - ssp) / ssp, 4)
+    except Exception as e:
+        log.debug(f"  yf_features {ticker}: {e}")
+    return result
+
+
 def regenerate(
     in_path: Path,
     out_path: Path,
@@ -677,6 +723,42 @@ def regenerate(
             if col in fase5_df.columns:
                 df[col] = fase5_df[col].values
         log.info(f"[compute] Fase5: {n_edgar}/{len(df)} linhas processadas em {time.time()-t2:.0f}s")
+
+    # ── 5. Features yfinance por ticker (earnings_beat_rate, analyst_rating, etc.) ─
+    if add_features:
+        log.info("[compute] features yfinance por ticker (analyst_rating, short_interest...)...")
+        unique_tickers_yf = df["ticker"].astype(str).unique().tolist()
+        yf_cache: dict[str, dict] = {}
+        for tk in unique_tickers_yf:
+            yf_cache[tk] = _compute_yf_features(tk)
+            time.sleep(0.05)
+        for col in YF_TICKER_COLS:
+            df[col] = df["ticker"].astype(str).map(lambda t: yf_cache.get(t, {}).get(col, float("nan")))
+        log.info(f"[compute] yfinance features: {len(unique_tickers_yf)} tickers processados")
+
+    # ── 6. Features sector-conditioned (add_derived_features) ─────────────────
+    if add_features:
+        log.info("[compute] sector-conditioned features (rsi_sector_adjusted, vix_sector_signal...)...")
+        try:
+            from ml_features import add_derived_features, _FALLBACK
+            sector_derived_results = []
+            for _, row in df.iterrows():
+                fv = {
+                    "sector":      str(row.get("sector", "Unknown") or "Unknown"),
+                    "rsi_14":      float(row.get("rsi_14", 40.0) or 40.0),
+                    "drawdown_52w":float(row.get("drawdown_52w", -15.0) or -15.0),
+                    "vix":         float(row.get("vix", 20.0) or 20.0),
+                }
+                add_derived_features(fv)
+                sector_derived_results.append({
+                    k: fv.get(k, _FALLBACK.get(k, 0.0)) for k in SECTOR_DERIVED_COLS
+                })
+            sd_df = pd.DataFrame(sector_derived_results, index=df.index)
+            for col in SECTOR_DERIVED_COLS:
+                df[col] = sd_df[col].values
+            log.info(f"[compute] sector-conditioned features: {len(df)} linhas")
+        except Exception as e:
+            log.warning(f"[compute] sector-conditioned features falhou: {e}")
 
     # ── Limpar colunas — só ficam metadados + features actuais + targets ─────
     # Remove colunas legadas (alpha_60d, features antigas com schema diferente)

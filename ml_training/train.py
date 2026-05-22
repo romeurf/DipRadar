@@ -744,19 +744,14 @@ def run_training(
     else:
         log.info(f"[run_training] Training target: {train_target_col} (raw alpha)")
 
-    # Verificar features — preencher ausentes com fallbacks em vez de crashar.
-    # Features computadas por regen recente estarão presentes; features de
-    # versões mais antigas do parquet recebem o valor neutro da _FALLBACK.
+    # Verificar features — todas devem estar presentes no parquet.
     feats_full, feats_baseline = build_feature_lists()
     missing = [c for c in feats_full if c not in df.columns]
     if missing:
-        from ml_features import _FALLBACK
-        log.warning(
-            f"[run_training] {len(missing)} features ausentes no parquet "
-            f"— preenchendo com fallbacks: {missing}"
+        raise ValueError(
+            f"FEATURE_COLUMNS em falta no parquet: {missing}. "
+            f"Regenera o parquet via /admin_regen_parquet."
         )
-        for c in missing:
-            df[c] = _FALLBACK.get(c, 0.0)
 
     # Walk-forward CV
     log.info(

@@ -1441,8 +1441,37 @@ def _handle_admin_regen_parquet(parts: list[str]) -> None:
                     n_90d  = int(df_check["alpha_90d"].notna().sum()) if "alpha_90d" in df_check.columns else 0
                     total  = len(df_check)
                     pct = f"{n_90d/total:.0%}" if total else "0%"
+
+                    # Copiar para o repo (/app/) para persistir entre deploys Railway.
+                    # O /data/ volume é persistente mas pode demorar a montar num redeploy
+                    # imediato. Ter a cópia no repo garante que o retrain sempre encontra
+                    # um parquet válido e actualizado.
+                    repo_pq = Path(__file__).parent / "ml_training_base.parquet"
+                    try:
+                        import shutil
+                        shutil.copy2(str(out_pq), str(repo_pq))
+                        logging.info(f"[regen] Parquet copiado para repo: {repo_pq}")
+                        # Commit ao repo
+                        import subprocess as _sp
+                        _sp.run(
+                            ["git", "-C", str(Path(__file__).parent), "add", "ml_training_base.parquet"],
+                            capture_output=True, timeout=30
+                        )
+                        _sp.run(
+                            ["git", "-C", str(Path(__file__).parent), "commit", "-m",
+                             f"data: update ml_training_base.parquet ({total} rows, {df_check.shape[1]} cols)"],
+                            capture_output=True, timeout=30
+                        )
+                        _sp.run(
+                            ["git", "-C", str(Path(__file__).parent), "push"],
+                            capture_output=True, timeout=60
+                        )
+                        logging.info("[regen] Parquet committed e pushed ao repo")
+                    except Exception as git_e:
+                        logging.warning(f"[regen] Git push falhou (não crítico): {git_e}")
+
                     _reply(
-                        f"*Parquet regenerado!*\n"
+                        f"*Parquet regenerado e guardado!*\n"
                         f"  Shape: {df_check.shape[0]:,} x {df_check.shape[1]} colunas\n"
                         f"  alpha-90d resolvido: {n_90d:,}/{total:,} ({pct})\n\n"
                         f"Faz /admin\\_retrain para treinar o modelo."
