@@ -16,7 +16,8 @@
       "Bash(python -c \"import os; print\\(f'{os.path.getsize\\(\\\\\"ml_training_base.parquet\\\\\"\\)/1e6:.1f} MB'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/regenerate_training_base.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('fundamental_signals.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('ml_training/train.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('ml_training/train.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(xargs -I{} git show {} --stat)"
     ]
   }
 }

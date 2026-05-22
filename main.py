@@ -2060,6 +2060,24 @@ def run_monthly_retrain() -> None:
         f"[monthly_retrain] decision={decision} cand_rho={cand_rho} prod_rho={prod_rho}"
     )
 
+    # Push automático ao GitHub quando promovido — elimina dependência do Colab.
+    # O bundle, parquet e report ficam versionados no repo para auditoria e
+    # persistência entre deploys do Railway.
+    if decision == "PROMOTED":
+        try:
+            from github_sync import sync_training_artifacts
+            _data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
+            sync_results = sync_training_artifacts(_data_dir)
+            _ok = sum(1 for v in sync_results.values() if v == "ok")
+            _total = len(sync_results)
+            if _ok == _total and _total > 0:
+                send_telegram(f"_GitHub sync: {_ok}/{_total} artefactos guardados no repo ✓_")
+                logging.info(f"[github_sync] sync completo: {sync_results}")
+            elif _total > 0:
+                logging.warning(f"[github_sync] sync parcial: {sync_results}")
+        except Exception as _gs_e:
+            logging.warning(f"[github_sync] falhou (não crítico): {_gs_e}")
+
 
 # ── Momentum Scan (breakouts e upside plays) ──────────────────────────────────
 

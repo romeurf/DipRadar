@@ -1457,8 +1457,15 @@ def _handle_admin_regen_parquet(parts: list[str]) -> None:
                         f"*Parquet regenerado e guardado!*\n"
                         f"  Shape: {df_check.shape[0]:,} x {df_check.shape[1]} colunas\n"
                         f"  alpha-90d resolvido: {n_90d:,}/{total:,} ({pct})\n\n"
-                        f"Faz /admin\\_retrain para treinar o modelo."
+                        f"A iniciar retrain automaticamente..."
                     )
+                    # Pipeline automático: regen → retrain sem intervenção manual
+                    import threading as _t
+                    _t.Thread(
+                        target=lambda: _handle_admin_retrain(["admin_retrain"]),
+                        daemon=True,
+                        name="auto-retrain-after-regen"
+                    ).start()
                 except Exception as e:
                     _reply(f"Parquet regenerado. (verificacao: {e})\nFaz /admin\\_retrain")
             else:
@@ -3075,6 +3082,64 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_retrain":
         _handle_admin_retrain(parts)
+
+    elif cmd == "/admin_bootstrap":
+        # /admin_bootstrap [ano]  — gera dataset histórico desde o ano dado
+        # Default: 1993 (máximo cobertura yfinance para S&P 500)
+        _year  = parts[1] if len(parts) > 1 and parts[1].isdigit() else "1993"
+        _start = f"{_year}-01-01"
+        _reply(
+            f"*Bootstrap histórico — desde {_year}*\n"
+            f"Simula o DipRadar desde {_year}: dot-com, 2008, COVID, 2022...\n"
+            f"Notificações a 25%, 50%, 75% e conclusão de cada etapa.\n\n"
+            f"Pipeline completo:\n"
+            f"  1. Bootstrap (dips históricos) ~30 min\n"
+            f"  2. Regen (features completas) ~50 min\n"
+            f"  3. Retrain automático ~90 min\n"
+            f"  4. Push para GitHub\n\n"
+            f"_Total estimado: 3-4 horas. Recebes notificação em cada etapa._"
+        )
+        def _run_bootstrap():
+            import subprocess, sys
+            from pathlib import Path as _P
+            _log_file = (_P("/data") if _P("/data").exists() else _P("/tmp")) / "bootstrap_progress.log"
+            try:
+                script = _P(__file__).parent / "scripts" / "build_bootstrap_dataset.py"
+                with open(_log_file, "w", encoding="utf-8") as _lf:
+                    result = subprocess.run(
+                        [sys.executable, str(script), "--start", _start],
+                        stdout=_lf, stderr=_lf, timeout=6*3600
+                    )
+                if result.returncode == 0:
+                    # Etapa 2: regen automático (enriquecer com todas as features)
+                    _handle_admin_regen_parquet(["admin_regen_parquet"])
+                else:
+                    try:
+                        last = _log_file.read_text(encoding="utf-8", errors="replace")[-500:]
+                    except Exception:
+                        last = "(sem log)"
+                    _reply(f"❌ Bootstrap falhou:\n`{last}`")
+            except subprocess.TimeoutExpired:
+                _reply("⏰ Bootstrap excedeu 6h.")
+            except Exception as e:
+                _reply(f"❌ Erro: `{e}`")
+        import threading
+        threading.Thread(target=_run_bootstrap, daemon=True, name="bootstrap").start()
+
+    elif cmd == "/admin_bootstrap_status":
+        from pathlib import Path as _P
+        _dd = _P("/data") if _P("/data").exists() else _P("/tmp")
+        for _log_name in ["bootstrap_progress.log", "regen_progress.log", "retrain_progress.log"]:
+            _log = _dd / _log_name
+            if _log.exists():
+                try:
+                    _txt  = _log.read_text(encoding="utf-8", errors="replace")
+                    _last = _txt[-800:].strip()
+                    _reply(f"*{_log_name}:*\n```\n{_last}\n```")
+                except Exception as e:
+                    _reply(f"Erro: {e}")
+                return
+        _reply("Nenhum processo em curso.")
 
     elif cmd == "/admin_momentum_dataset":
         _handle_admin_momentum_dataset(parts)
