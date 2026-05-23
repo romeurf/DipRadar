@@ -88,6 +88,18 @@ _bot_start_time: datetime = datetime.now()
 # Flags de segurança para operações longas
 _retrain_running:  bool = False
 
+# Log de progresso do pipeline — consultável via /admin_pipeline_status
+_pipeline_log: list[str] = []
+
+def _plog(msg: str) -> None:
+    """Regista uma linha de progresso com timestamp."""
+    ts = datetime.now().strftime("%H:%M")
+    entry = f"{ts} {msg}"
+    _pipeline_log.append(entry)
+    if len(_pipeline_log) > 30:
+        _pipeline_log.pop(0)
+    logging.info(f"[pipeline] {msg}")
+
 # Callbacks injectados pelo main.py via register_callbacks() ou poll()
 _cb_send_telegram    = None
 _cb_run_scan         = None
@@ -1468,6 +1480,9 @@ def _handle_admin_full_pipeline(parts: list[str]) -> None:
     def _run():
         import subprocess, sys, time as _t
         from pathlib import Path
+        global _pipeline_log
+        _pipeline_log.clear()
+        _plog("Pipeline iniciado")
 
         data_dir    = Path("/data") if Path("/data").exists() else Path("/tmp")
         dip_parquet = data_dir / "ml_training_base.parquet"
@@ -1501,6 +1516,7 @@ def _handle_admin_full_pipeline(parts: list[str]) -> None:
 
         def _regen_dip():
             nonlocal dip_regen_ok, dip_regen_err
+            _plog("Fase 1 DipRadar: regen parquet iniciado")
             try:
                 script = Path(__file__).parent / "scripts" / "regenerate_training_base.py"
                 r = subprocess.run(
@@ -1509,13 +1525,17 @@ def _handle_admin_full_pipeline(parts: list[str]) -> None:
                 )
                 if r.returncode == 0:
                     dip_regen_ok = True
+                    _plog("Fase 1 DipRadar: parquet OK")
                 else:
                     dip_regen_err = (r.stderr or r.stdout or "")[-300:]
+                    _plog(f"Fase 1 DipRadar: FALHOU — {dip_regen_err[:100]}")
             except Exception as e:
                 dip_regen_err = str(e)
+                _plog(f"Fase 1 DipRadar: excepção — {e}")
 
         def _regen_mom():
             nonlocal mom_regen_ok, mom_regen_err
+            _plog("Fase 1 Momentum: build dataset iniciado")
             try:
                 script = Path(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py"
                 r = subprocess.run(
@@ -1524,10 +1544,13 @@ def _handle_admin_full_pipeline(parts: list[str]) -> None:
                 )
                 if r.returncode == 0:
                     mom_regen_ok = True
+                    _plog("Fase 1 Momentum: parquet OK")
                 else:
                     mom_regen_err = (r.stderr or r.stdout or "")[-300:]
+                    _plog(f"Fase 1 Momentum: FALHOU — {mom_regen_err[:100]}")
             except Exception as e:
                 mom_regen_err = str(e)
+                _plog(f"Fase 1 Momentum: excepção — {e}")
 
         phase1_threads = []
         if run_dip: phase1_threads.append(threading.Thread(target=_regen_dip, daemon=True, name="pipeline-dip-regen"))
@@ -1564,24 +1587,33 @@ def _handle_admin_full_pipeline(parts: list[str]) -> None:
 
         def _train_dip():
             nonlocal dip_train_res, dip_train_err2
+            _plog("Fase 2 DipRadar: treino iniciado")
             try:
                 from monthly_retrain import run_monthly_retrain_v3
                 dip_train_res = run_monthly_retrain_v3() or {}
+                dec = dip_train_res.get("decision", "?")
+                _plog(f"Fase 2 DipRadar: {dec}")
             except Exception as e:
                 dip_train_err2 = str(e)
+                _plog(f"Fase 2 DipRadar: excepção — {e}")
                 logging.error(f"[pipeline] DipRadar train: {e}", exc_info=True)
 
         def _train_mom():
             nonlocal mom_train_res, mom_train_err2
+            _plog("Fase 2 Momentum: treino iniciado")
             try:
                 from momentum_radar.trainer import run_momentum_training
                 mom_train_res = run_momentum_training() or {}
+                dec = mom_train_res.get("decision", "?")
+                ic  = mom_train_res.get("ic_ensemble")
+                _plog(f"Fase 2 Momentum: {dec} | IC={ic:.4f}" if isinstance(ic, float) else f"Fase 2 Momentum: {dec}")
             except Exception as e:
                 mom_train_err2 = str(e)
+                _plog(f"Fase 2 Momentum: excepção — {e}")
                 logging.error(f"[pipeline] Momentum train: {e}", exc_info=True)
 
         n_models = (1 if train_dip else 0) + (1 if train_mom else 0)
-        _reply(f"*Fase 2 — {n_models} modelo(s) a treinar sequencialmente...*")
+        _reply(f"*Fase 2 — {n_models} modelo(s) a treinar sequencialmente...*\n_Usa /admin\\_pipeline\\_status para ver progresso._")
         if train_dip:
             _reply("  ⏳ DipRadar a treinar...")
             _train_dip()
@@ -1590,36 +1622,58 @@ def _handle_admin_full_pipeline(parts: list[str]) -> None:
             _train_mom()
 
         # ── Relatório final ───────────────────────────────────────────────────
+        def _f(v): return f"{float(v):.4f}" if isinstance(v, (int, float)) else "N/A"
+
         final_lines = ["*Pipeline concluído!*", ""]
 
         if train_dip:
             if dip_train_err2:
-                final_lines.append(f"  ❌ DipRadar: {dip_train_err2[:150]}")
+                final_lines += [f"  ❌ *DipRadar: excepção*", f"  `{dip_train_err2[:200]}`"]
             else:
-                dec     = dip_train_res.get("decision", "?")
-                rho     = dip_train_res.get("candidate_rho_alpha")
-                p_rho   = dip_train_res.get("production_rho_alpha")
-                icon    = {"PROMOTED": "🚀", "PENDING": "⚠️", "KEPT_FLOOR": "🛑"}.get(dec, "❌")
-                rho_s   = f"{rho:.4f}" if isinstance(rho, float) else "N/A"
-                prod_s  = f" (prod: {p_rho:.4f})" if isinstance(p_rho, float) else ""
-                final_lines.append(f"  {icon} DipRadar: *{dec}* | ρ={rho_s}{prod_s}")
+                dec    = dip_train_res.get("decision", "?")
+                rho    = dip_train_res.get("candidate_rho_alpha")
+                p_rho  = dip_train_res.get("production_rho_alpha")
+                brier  = dip_train_res.get("candidate_brier")
+                reason = dip_train_res.get("reason", "")
+                icon   = {"PROMOTED": "🚀", "PENDING": "⚠️", "KEPT_FLOOR": "🛑"}.get(dec, "❌")
+                prod_s = f" (prod: {_f(p_rho)})" if p_rho is not None else ""
+                brier_s = f" | Brier={_f(brier)}" if brier is not None else ""
+                final_lines.append(f"  {icon} *DipRadar: {dec}* | ρ={_f(rho)}{prod_s}{brier_s}")
+                if reason:
+                    final_lines.append(f"    _{reason[:200]}_")
         else:
             final_lines.append("  ⏩ DipRadar retrain: saltado")
 
         if train_mom:
             if mom_train_err2:
-                final_lines.append(f"  ❌ MomentumRadar: {mom_train_err2[:150]}")
+                final_lines += [f"  ❌ *MomentumRadar: excepção*", f"  `{mom_train_err2[:200]}`"]
             else:
-                dec_m  = mom_train_res.get("decision", "?")
-                ic_m   = mom_train_res.get("ic_ensemble")
-                n_m    = mom_train_res.get("n_train", 0)
-                ns_m   = mom_train_res.get("n_sectors", 0)
-                icon_m = {"PROMOTED": "🚀", "KEPT": "⚠️", "FAILED": "❌"}.get(dec_m, "❌")
-                ic_s   = f"{ic_m:.4f}" if isinstance(ic_m, float) else "N/A"
-                final_lines.append(f"  {icon_m} MomentumRadar: *{dec_m}* | IC={ic_s} | {n_m:,} amostras | {ns_m} sectors")
+                dec_m     = mom_train_res.get("decision", "?")
+                ic_m      = mom_train_res.get("ic_ensemble")
+                ic_prod_m = mom_train_res.get("ic_prod")
+                n_m       = mom_train_res.get("n_train", 0)
+                horizons  = mom_train_res.get("horizons", {})
+                sec_ics   = mom_train_res.get("sector_ics", {})
+                reason_m  = mom_train_res.get("reason", "")
+                icon_m    = {"PROMOTED": "🚀", "KEPT": "⚠️", "FAILED": "❌"}.get(dec_m, "❌")
+                prod_m_s  = f" (prod: {_f(ic_prod_m)})" if ic_prod_m is not None else ""
+                final_lines.append(f"  {icon_m} *MomentumRadar: {dec_m}* | IC={_f(ic_m)}{prod_m_s} | {n_m:,} amostras")
+                if reason_m:
+                    final_lines.append(f"    _{reason_m[:200]}_")
+                if horizons:
+                    h_str = "  |  ".join(f"{k}: {_f(v)}" for k, v in sorted(horizons.items()))
+                    final_lines.append(f"    Horizontes: {h_str}")
+                if sec_ics:
+                    sec_sorted = sorted(sec_ics.items(), key=lambda x: -(x[1] or -99))
+                    sec_lines = [f"    *Sectores (IC train):*"]
+                    for s, ic in sec_sorted:
+                        ok = "✅" if isinstance(ic, float) and ic >= 0.05 else "⚠️"
+                        sec_lines.append(f"      {ok} {s}: {_f(ic)}")
+                    final_lines.extend(sec_lines)
         else:
             final_lines.append("  ⏩ Momentum retrain: saltado")
 
+        _plog("Pipeline concluído")
         _reply("\n".join(final_lines))
 
     threading.Thread(target=_run, daemon=True, name="admin-full-pipeline").start()
@@ -3055,6 +3109,16 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_momentum_dataset":
         _handle_admin_momentum_dataset(parts)
+
+    elif cmd in ("/admin_pipeline_status", "/pipeline_status"):
+        if _pipeline_log:
+            lines = ["*Pipeline — Log de Progresso:*", ""]
+            lines += [f"  {e}" for e in _pipeline_log]
+            if _retrain_running:
+                lines += ["", "_A correr..._"]
+            _reply("\n".join(lines))
+        else:
+            _reply("_Nenhum pipeline em curso (ou ainda não iniciado)._")
 
     elif cmd == "/admin_disk":
         _handle_admin_disk(parts)

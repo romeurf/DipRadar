@@ -58,7 +58,9 @@ log = logging.getLogger("regen")
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-_DATA_VOL = Path("/data") if Path("/data").exists() else Path("/tmp")
+_DATA_VOL   = Path("/data") if Path("/data").exists() else Path("/tmp")
+_REPO_ROOT  = Path(__file__).resolve().parent.parent
+_REPO_FALLBACK = _REPO_ROOT / "ml_training_base.parquet"
 
 DEFAULT_IN  = _DATA_VOL / "ml_training_base.parquet"
 DEFAULT_OUT = _DATA_VOL / "ml_training_base.parquet"
@@ -969,6 +971,18 @@ def main() -> int:
         f"Modo: features={add_features} fundamentais={add_fundamentals} "
         f"targets={add_targets} fase5={add_fase5}"
     )
+
+    # Cold-start: se o parquet de input não existe, copiar do repo como base.
+    # Acontece no primeiro deploy ou se o volume Railway for resetado.
+    if not args.in_path.exists() and _REPO_FALLBACK.exists():
+        import shutil
+        log.info(f"[cold-start] {args.in_path} ausente — a copiar base do repo ({_REPO_FALLBACK}, {_REPO_FALLBACK.stat().st_size/1e6:.1f}MB)...")
+        args.in_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(_REPO_FALLBACK, args.in_path)
+        log.info("[cold-start] Base copiada — o regen vai agora enriquecer com features novas.")
+    elif not args.in_path.exists():
+        log.error(f"[cold-start] {args.in_path} ausente e sem fallback no repo. Abortado.")
+        return 1
 
     regenerate(
         args.in_path, args.out_path, args.cache_dir, args.start_date,

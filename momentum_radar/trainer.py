@@ -236,6 +236,7 @@ def run_momentum_training(dataset_path: Path = _DATASET) -> dict:
     # Sector models por L2 (horizonte principal)
     sector_models: dict = {}
     if "sector" in df.columns and "forward_return_90d" in df.columns:
+        from scipy.stats import spearmanr as _spr
         df_l2 = df.dropna(subset=["forward_return_90d"])
         for sector, grp in df_l2.groupby("sector"):
             if len(grp) < 100:
@@ -245,8 +246,14 @@ def run_momentum_training(dataset_path: Path = _DATASET) -> dict:
             from ml_training.models import ScaledRidge
             sm = ScaledRidge(alpha=10.0)
             sm.fit(Xs, ys)
-            sector_models[sector] = {"model": sm, "n_train": len(grp)}
-            log.info(f"[momentum_train] Sector L2 {sector}: {len(grp)} amostras")
+            # IC indicativo no train set (não cross-validado — serve para triagem)
+            try:
+                preds = sm.predict(Xs)
+                ic_train = round(float(_spr(preds, ys).statistic), 4)
+            except Exception:
+                ic_train = None
+            sector_models[sector] = {"model": sm, "n_train": len(grp), "ic_train": ic_train}
+            log.info(f"[momentum_train] Sector L2 {sector}: {len(grp)} amostras | IC_train={ic_train}")
 
     bundle = {
         "models":        models,         # {"L1": {...}, "L2": {...}, "L3": {...}}
@@ -275,7 +282,7 @@ def run_momentum_training(dataset_path: Path = _DATASET) -> dict:
         "ic_prod":       ic_prod,
         "horizons":      {lbl: {"ic": r["ic"], "ic_sr": r["ic_sr"], "weight": r["weight"]} for lbl, r in horizon_results.items()},
         "feature_cols":  FEATURE_COLS,
-        "sector_models": {s: v["n_train"] for s, v in sector_models.items()},
+        "sector_models": {s: {"n_train": v["n_train"], "ic_train": v.get("ic_train")} for s, v in sector_models.items()},
     }
     _REPORT_PATH.write_text(json.dumps(report, indent=2))
 
@@ -287,6 +294,7 @@ def run_momentum_training(dataset_path: Path = _DATASET) -> dict:
         "ic_ensemble": ic_ensemble,
         "ic_prod":     ic_prod,
         "horizons":    {lbl: r["ic"] for lbl, r in horizon_results.items()},
+        "sector_ics":  {s: v.get("ic_train") for s, v in sector_models.items()},
         "n_train":     len(df),
         "n_sectors":   len(sector_models),
         "elapsed_s":   elapsed,
