@@ -3034,11 +3034,12 @@ def _handle_command(text: str) -> None:
                     from momentum_radar.trainer import run_momentum_training
                     res = run_momentum_training()
                     dec = res.get("decision", "?")
-                    ic  = res.get("ic_new", 0)
+                    ic  = res.get("ic_ensemble", 0)
                     n   = res.get("n_train", 0)
+                    ic_str = f"{ic:.4f}" if isinstance(ic, float) else "N/A"
                     _reply(
                         f"*MomentumRadar — {dec}*\n"
-                        f"IC: {ic:.4f} | {n:,} amostras\n"
+                        f"IC: {ic_str} | {n:,} amostras\n"
                         + ("_Usa `/admin\\_promote` para activar._" if dec == "PENDING" else "")
                     )
                 else:
