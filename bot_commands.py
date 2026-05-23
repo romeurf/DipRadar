@@ -3087,11 +3087,12 @@ def _handle_command(text: str) -> None:
                 if _report.exists():
                     r = _json.loads(_report.read_text())
                     m = r.get("metrics", {})
+                    def _fmt(v, spec): return format(v, spec) if isinstance(v, (int, float)) else "N/A"
                     lines += [
-                        f"  IC (ρ_α):   *{m.get('rho_alpha_mean', '?'):.4f}*",
-                        f"  Brier OOF:  *{m.get('brier_oof', '?'):.4f}*",
-                        f"  Top-K PnL:  *{m.get('topk_pnl_mean', '?'):.4f}*",
-                        f"  Win rate:   *{m.get('win_rate_alpha', '?'):.1%}*",
+                        f"  IC (ρ_α):   *{_fmt(m.get('rho_alpha_mean'), '.4f')}*",
+                        f"  Brier OOF:  *{_fmt(m.get('brier_oof'), '.4f')}*",
+                        f"  Top-K PnL:  *{_fmt(m.get('topk_pnl_mean'), '.4f')}*",
+                        f"  Win rate:   *{_fmt(m.get('win_rate_alpha'), '.1%')}*",
                         f"  Champion:   {r.get('champion', '?')}",
                         f"  Features:   {r.get('n_features', '?')}",
                         f"  Treino:     {r.get('n_train', '?'):,} amostras",

@@ -210,11 +210,12 @@ def run_momentum_training(dataset_path: Path = _DATASET) -> dict:
     if ic_prod is not None and ic_ensemble < ic_prod * 0.90:
         log.warning(f"[momentum_train] IC ({ic_ensemble:.4f}) < prod ({ic_prod:.4f}) × 0.90 — a manter modelo actual")
         return {
-            "decision": "KEPT",
-            "reason":   f"IC novo ({ic_ensemble:.4f}) não melhora sobre produção ({ic_prod:.4f})",
+            "decision":    "KEPT",
+            "reason":      f"IC novo ({ic_ensemble:.4f}) não melhora sobre produção ({ic_prod:.4f})",
             "ic_ensemble": ic_ensemble,
-            "ic_prod":  ic_prod,
-            "elapsed_s": round(time.time() - t0, 1),
+            "ic_prod":     ic_prod,
+            "n_train":     len(df),
+            "elapsed_s":   round(time.time() - t0, 1),
         }
 
     # Treinar modelo final por horizonte

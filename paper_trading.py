@@ -281,9 +281,11 @@ def update_open_positions() -> dict:
         t["alpha_pct"]     = alpha
 
         updated += 1
+        spy_s   = f"{spy_ret:.1f}%" if spy_ret is not None else "N/A"
+        alpha_s = f"{alpha:.1f}%" if alpha is not None else "N/A"
         log.info(
             f"[paper] CLOSED {t['ticker']} {t['status']} "
-            f"ret={ret_pct:.1f}% spy={spy_ret:.1f}% alpha={alpha:.1f}%"
+            f"ret={ret_pct:.1f}% spy={spy_s} alpha={alpha_s}"
         )
 
     _save(trades)
