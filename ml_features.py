@@ -11,7 +11,7 @@ Architecture: 4-stage pipeline
   Stage 2 — Timing:   drop today, drawdown 52w, RSI, ATR ratio, volume spike, BB width
   Stage 3 — Engineered: non-linear interactions (rsi_oversold_strength, etc.)
   Stage 3b — Momentum: multi-window momentum (1m, 3m, 6m, 12m),
-                        sector-relative (3m and 6m), beta_60d, vol_of_vol
+                        sector-relative (3m and 6m), beta_90d, vol_of_vol
   Stage 3c — Dislocation: quality_dislocation, peg_implicit, relative_drop,
                         month_of_year
   Stage 3d — Context: sector_alert_count_7d, days_since_52w_high
@@ -51,7 +51,7 @@ FEATURE_COLUMNS: list[str] = [
     "return_3m_pre",
     "return_6m_pre",
     "sector_relative",
-    "beta_60d",
+    "beta_90d",
     "vol_of_vol",
     "quality_dislocation",
     "month_of_year",
@@ -87,6 +87,13 @@ FEATURE_COLUMNS: list[str] = [
     "rsi_sector_adjusted",       # max(0, threshold_sector - rsi) — quão oversold vs norma do sector
     "vix_sector_signal",         # VIX × factor_sector / 40 — growth reage negativamente, defensive positivamente
     "drawdown_sector_normalized",# drawdown / typical_drawdown_sector — 0=normal, -3=capitulação extrema
+    # ── Market Structure (v4.3): Anchored VWAP + Volume Profile + Liquidity Sweep ──
+    # Capturam onde o volume realmente negociou (POC), o custo médio institucional
+    # desde o topo (VWAP ancorado) e se houve stop-hunt recente (liquidity sweep).
+    # Ortogonais às features técnicas existentes — adicionam dimensão de microestrutura.
+    "vwap_from_high_ratio",      # (price - VWAP_desde_52w_high) / VWAP — negativo = abaixo custo institucional
+    "volume_poc_ratio",          # (price - POC_90d) / POC — negativo = abaixo do nível de maior volume
+    "liquidity_sweep_score",     # recência do último stop-hunt: 1=hoje, decai 0 em 10 dias
 ]
 # PR #28 (Phase A): drop 14 dead features after IC profiling on full parquet:
 #   • 9 CONSTANTES (std=0, IC indefinida — _FALLBACK em todas as linhas):
@@ -152,7 +159,7 @@ _FALLBACK: dict[str, float] = {
     "return_12m_pre": 0.0,
     "sector_relative": 0.0,
     "sector_relative_6m": 0.0,
-    "beta_60d": 1.0,
+    "beta_90d": 1.0,
     "vol_of_vol": 0.01,
     "quality_dislocation": 0.08,
     "peg_implicit": 2.0,
@@ -187,6 +194,10 @@ _FALLBACK: dict[str, float] = {
     "rsi_sector_adjusted": 0.0,       # 0 = RSI na norma do sector (sem sinal de oversold)
     "vix_sector_signal": 0.0,         # 0 = VIX neutro ou sector tipo desconhecido
     "drawdown_sector_normalized": -1.0,  # -1 = drawdown leve (metade do típico)
+    # Market Structure (v4.3)
+    "vwap_from_high_ratio": -0.12,   # ~12% abaixo do VWAP desde pico — dip típico
+    "volume_poc_ratio": 0.0,         # neutro — sem info de volume profile
+    "liquidity_sweep_score": 0.0,    # sem sweep recente — caso mais comum
 }
 
 def _tz_normalize(ts: Any) -> pd.Timestamp:
@@ -404,10 +415,11 @@ def build_features(
     # do dict actual; o resto fica em fallback.
     add_derived_features(features, alert_date=alert_date)
 
-    # Stage 4 — Raw OHLCV (PR #30). Opt-in: só corre se o caller passar
-    # price_history; caso contrário cai nos fallbacks neutros.
+    # Stage 4 — Raw OHLCV + Market Structure. Opt-in: só corre se o caller
+    # passar price_history; caso contrário cai nos fallbacks neutros.
     if price_history is not None:
         add_raw_ohlcv_features(features, price_history)
+        add_market_structure_features(features, price_history)
 
     # Stage 5 — Sinais de qualidade e sentimento (Fase 5).
     # NaN onde não disponível — o modelo trata NaN como "informação em falta",
@@ -684,8 +696,115 @@ def _bb_width(prices: np.ndarray, window: int = 20, n_std: float = 2.0) -> float
     except Exception:
         return _FALLBACK["bb_width"]
 
+def _anchored_vwap_ratio(hist: pd.DataFrame, use_high: bool = True) -> float:
+    """VWAP ancorado no máximo (use_high=True) ou mínimo (False) de 52 semanas.
+
+    Para dips: ancoramos no HIGH — mede o desconto face ao custo médio
+    das instituições que compraram desde o topo (quase sempre negativo).
+    Para momentum: ancoramos no LOW — mede quanto subiu acima do custo
+    médio desde o fundo (positivo = momentum confirmado).
+    """
+    if hist is None or len(hist) < 10 or "Volume" not in hist.columns:
+        return 0.0
+    try:
+        lookback = hist.iloc[-min(252, len(hist)):]
+        anchor_idx = lookback["Close"].idxmax() if use_high else lookback["Close"].idxmin()
+        sliced = hist[hist.index >= anchor_idx]
+        if len(sliced) < 2:
+            return 0.0
+        tp  = (sliced["High"] + sliced["Low"] + sliced["Close"]) / 3
+        vol = sliced["Volume"].clip(lower=0)
+        if vol.sum() <= 0:
+            return 0.0
+        vwap  = float((tp * vol).sum() / vol.sum())
+        price = float(hist["Close"].iloc[-1])
+        return round((price - vwap) / vwap, 4) if vwap > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _volume_poc_ratio(hist: pd.DataFrame, lookback: int = 90, n_bins: int = 24) -> float:
+    """Rácio (preço − POC) / POC onde POC é o Point of Control do Volume Profile.
+
+    O POC é o preço onde mais volume negociou nos últimos `lookback` dias.
+    Negativo = preço abaixo do POC (overhead supply); positivo = acima.
+    Computado via distribuição proporcional do volume diário pelos bins de preço.
+    """
+    if hist is None or len(hist) < 10 or "Volume" not in hist.columns:
+        return 0.0
+    try:
+        recent    = hist.iloc[-min(lookback, len(hist)):]
+        lows      = recent["Low"].values.astype(float)
+        highs     = recent["High"].values.astype(float)
+        vols      = recent["Volume"].values.astype(float)
+        p_min, p_max = lows.min(), highs.max()
+        if p_max <= p_min:
+            return 0.0
+        bins     = np.linspace(p_min, p_max, n_bins + 1)
+        bin_vol  = np.zeros(n_bins)
+        for i in range(len(recent)):
+            d_range = highs[i] - lows[i]
+            overlaps = np.clip(
+                np.minimum(highs[i], bins[1:]) - np.maximum(lows[i], bins[:-1]),
+                0, None,
+            )
+            if d_range > 0:
+                bin_vol += vols[i] * overlaps / d_range
+            else:
+                b = int(np.clip(np.searchsorted(bins[1:], lows[i]), 0, n_bins - 1))
+                bin_vol[b] += vols[i]
+        poc_bin   = int(np.argmax(bin_vol))
+        poc_price = float((bins[poc_bin] + bins[poc_bin + 1]) / 2)
+        price     = float(hist["Close"].iloc[-1])
+        return round((price - poc_price) / poc_price, 4) if poc_price > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _liquidity_sweep_score(hist: pd.DataFrame, lookback: int = 20) -> float:
+    """Deteta stop-hunts: barra que perfura o mínimo de `lookback` dias mas
+    fecha acima dele (inversão — compradores absorveram a liquidez).
+
+    Devolve recência normalizada: 1.0 = hoje, decai linearmente a 0 em 10 barras.
+    Sinal positivo para dips — sweeps frequentemente marcam reversões.
+    """
+    if hist is None or len(hist) < lookback + 3:
+        return 0.0
+    try:
+        lows   = hist["Low"].values.astype(float)
+        closes = hist["Close"].values.astype(float)
+        n      = len(hist)
+        last_sweep = -1
+        for i in range(lookback, n):
+            support = lows[max(0, i - lookback):i].min()
+            if lows[i] < support and closes[i] > support:
+                last_sweep = i
+        if last_sweep < 0:
+            return 0.0
+        return round(max(0.0, 1.0 - (n - 1 - last_sweep) / 10.0), 4)
+    except Exception:
+        return 0.0
+
+
+def add_market_structure_features(features: dict, hist: pd.DataFrame) -> dict:
+    """Anchored VWAP (desde 52w high), Volume Profile POC e Liquidity Sweep.
+
+    Todas as features são PIT (hist já deve estar sliced até alert_date).
+    Fallbacks aplicados quando hist é None ou demasiado curto.
+    """
+    _keys = ("vwap_from_high_ratio", "volume_poc_ratio", "liquidity_sweep_score")
+    if hist is None or hist.empty or len(hist) < 10:
+        for k in _keys:
+            features.setdefault(k, _FALLBACK[k])
+        return features
+    features["vwap_from_high_ratio"] = _anchored_vwap_ratio(hist, use_high=True)
+    features["volume_poc_ratio"]     = _volume_poc_ratio(hist, lookback=90)
+    features["liquidity_sweep_score"]= _liquidity_sweep_score(hist, lookback=20)
+    return features
+
+
 def add_momentum_features(features: dict, price_history: Optional[pd.DataFrame], sector_history: Optional[pd.DataFrame] = None, spy_history: Optional[pd.DataFrame] = None) -> dict:
-    keys = ["return_1m", "return_3m_pre", "return_6m_pre", "return_12m_pre", "sector_relative", "sector_relative_6m", "beta_60d", "vol_of_vol", "bb_width"]
+    keys = ["return_1m", "return_3m_pre", "return_6m_pre", "return_12m_pre", "sector_relative", "sector_relative_6m", "beta_90d", "vol_of_vol", "bb_width"]
     if price_history is None or price_history.empty:
         for k in keys:
             features.setdefault(k, _FALLBACK[k])
@@ -705,11 +824,11 @@ def add_momentum_features(features: dict, price_history: Optional[pd.DataFrame],
     else:
         features["sector_relative"] = _FALLBACK["sector_relative"]
         features["sector_relative_6m"] = _FALLBACK["sector_relative_6m"]
-    features["beta_60d"] = _FALLBACK["beta_60d"]
+    features["beta_90d"] = _FALLBACK["beta_90d"]
     if spy_history is not None and not spy_history.empty:
         try:
             spy_closes = spy_history["Close"].dropna().values
-            n = 60
+            n = 90
             if len(closes) >= n + 1 and len(spy_closes) >= n + 1:
                 stock_rets = np.diff(closes[-n - 1:]) / closes[-n - 1:-1]
                 spy_rets = np.diff(spy_closes[-n - 1:]) / spy_closes[-n - 1:-1]
@@ -719,7 +838,7 @@ def add_momentum_features(features: dict, price_history: Optional[pd.DataFrame],
                 cov = np.cov(stock_rets, spy_rets)
                 var_spy = float(cov[1, 1])
                 if var_spy > 1e-10:
-                    features["beta_60d"] = round(float(cov[0, 1]) / var_spy, 4)
+                    features["beta_90d"] = round(float(cov[0, 1]) / var_spy, 4)
         except Exception:
             pass
     features["vol_of_vol"] = _vol_of_vol(closes)

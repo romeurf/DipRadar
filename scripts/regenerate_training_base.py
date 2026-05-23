@@ -94,6 +94,7 @@ NEW_FEATURE_COLS: list[str] = [
     "sector_relative_6m",
     "vol_of_vol",
     "bb_width",
+    "beta_90d",
     "vix_percentile_1y",
     "spy_rsi_14",
     "yield_10y_change_5d",
@@ -101,6 +102,10 @@ NEW_FEATURE_COLS: list[str] = [
     "close_in_range_20d",
     "up_days_pct_20d",
     "true_range_pct_20d",
+    # Market Structure (v4.3)
+    "vwap_from_high_ratio",
+    "volume_poc_ratio",
+    "liquidity_sweep_score",
 ]
 
 # Colunas fundamentais corrigidas (PIT) — substituem valores constantes do bootstrap
@@ -258,12 +263,13 @@ def _compute_row_features(
     sector_etf_cache: dict[str, pd.DataFrame],
     macro_cache: dict[str, pd.DataFrame],
 ) -> dict[str, float]:
-    """Compute the new features (8 momentum/regime + 4 raw-OHLCV)."""
+    """Compute the new features (momentum/regime/OHLCV/market-structure)."""
     from ml_features import (
         _FALLBACK,
         add_momentum_features,
         add_raw_ohlcv_features,
         add_regime_features,
+        add_market_structure_features,
     )
 
     ticker = str(row["ticker"])
@@ -304,6 +310,15 @@ def _compute_row_features(
         except Exception as e:
             log.debug(f"  raw_ohlcv failed {ticker}@{alert_date.date()}: {e}")
     for k in ("volume_zscore_20d", "close_in_range_20d", "up_days_pct_20d", "true_range_pct_20d"):
+        fv.setdefault(k, _FALLBACK.get(k, 0.0))
+
+    # Market Structure (v4.3) — Anchored VWAP + Volume POC + Liquidity Sweep
+    if hist is not None:
+        try:
+            add_market_structure_features(fv, hist)
+        except Exception as e:
+            log.debug(f"  market_structure failed {ticker}@{alert_date.date()}: {e}")
+    for k in ("vwap_from_high_ratio", "volume_poc_ratio", "liquidity_sweep_score"):
         fv.setdefault(k, _FALLBACK.get(k, 0.0))
 
     # Devolver só as colunas de interesse
@@ -821,6 +836,38 @@ def regenerate(
             log.info(f"[compute] sector-conditioned features: OK ({len(df)} linhas, ~0s)")
         except Exception as e:
             log.warning(f"[compute] sector-conditioned features falhou: {e}")
+
+    # ── 7. Features derivadas — vectorizado a partir das colunas existentes ─────
+    # rsi_oversold_strength, drop_x_drawdown, vol_x_drop, quality_dislocation
+    # são fórmulas simples sobre colunas já presentes no parquet.
+    # sector_alert_count_7d é derivado da janela de 7 dias por sector.
+    # Estas features são obrigatórias pelo training check em train.py.
+    if add_features:
+        log.info("[compute] features derivadas (vectorizado)...")
+        try:
+            _rsi  = df["rsi_14"].fillna(40.0).astype(float)
+            _drop = df["drop_pct_today"].fillna(-8.0).astype(float)
+            _dd52 = df["drawdown_52w"].fillna(-15.0).astype(float)
+            _volsp = df["volume_spike"].fillna(1.0).astype(float) if "volume_spike" in df.columns else pd.Series(1.0, index=df.index)
+            _gm   = df["gross_margin"].fillna(0.35).astype(float) if "gross_margin" in df.columns else pd.Series(0.35, index=df.index)
+            _fcf  = df["fcf_yield"].fillna(0.04).astype(float) if "fcf_yield" in df.columns else pd.Series(0.04, index=df.index)
+
+            df["rsi_oversold_strength"] = (_rsi.rsub(40.0).clip(lower=0.0)).round(4)
+            df["drop_x_drawdown"]       = (_drop * _dd52 / 100.0).round(4)
+            df["vol_x_drop"]            = (_volsp * _drop.abs()).round(4)
+            df["quality_dislocation"]   = np.where(_fcf >= 0, (_gm * _dd52.abs() / 100.0).round(4), 0.0)
+
+            # sector_alert_count_7d: nº de alertas no mesmo sector nos 7 dias anteriores
+            sys.path.insert(0, str(_REPO_ROOT))
+            from ml_training.data import compute_sector_alert_count_7d
+            _lookup = compute_sector_alert_count_7d(df)
+            df["sector_alert_count_7d"] = [
+                float(_lookup.get((r["ticker"], pd.Timestamp(r["alert_date"])), 0.0))
+                for _, r in df.iterrows()
+            ]
+            log.info("[compute] features derivadas: OK (rsi_oversold_strength, drop_x_drawdown, vol_x_drop, quality_dislocation, sector_alert_count_7d)")
+        except Exception as e:
+            log.warning(f"[compute] features derivadas falhou: {e}")
 
     # ── Limpar colunas — só ficam metadados + features actuais + targets ─────
     # Remove colunas legadas (alpha_60d, features antigas com schema diferente)

@@ -96,13 +96,48 @@ def _calc_momentum_signals(hist: pd.DataFrame) -> dict:
     high_52w = close.rolling(252, min_periods=20).max().iloc[-1] if len(close) >= 20 else close.max()
     pct_from_52w_high = float(close.iloc[-1] / high_52w - 1)
 
+    # Market Structure: VWAP ancorado no mínimo 52w e Volume Profile POC
+    try:
+        from ml_features import _anchored_vwap_ratio, _volume_poc_ratio
+        vwap_low_ratio = _anchored_vwap_ratio(hist, use_high=False)
+        poc_ratio      = _volume_poc_ratio(hist, lookback=60)
+    except Exception:
+        vwap_low_ratio = 0.0
+        poc_ratio      = 0.0
+
+    # return_60d_pre (retorno dos 60d antes dos últimos 20d — impulso prévio)
+    ret_60d_pre = float(close.iloc[-21] / close.iloc[-81] - 1) if len(close) >= 81 else 0.0
+
+    # ATR % (volatilidade relativa ao preço)
+    if len(close) >= 15 and "High" in hist.columns and "Low" in hist.columns:
+        h14 = hist["High"].iloc[-14:].values
+        l14 = hist["Low"].iloc[-14:].values
+        atr_pct = float(np.mean(h14 - l14)) / float(close.iloc[-1]) if close.iloc[-1] > 0 else 0.02
+    else:
+        atr_pct = 0.02
+
+    # close_in_range_20d (força: fechamentos perto dos máximos de 20d)
+    if len(close) >= 20 and "High" in hist.columns and "Low" in hist.columns:
+        h20 = hist["High"].iloc[-20:].values
+        l20 = hist["Low"].iloc[-20:].values
+        c20 = close.iloc[-20:].values
+        ranges = h20 - l20
+        close_in_range_20d = float(np.mean((c20 - l20) / np.where(ranges > 0, ranges, 1)))
+    else:
+        close_in_range_20d = 0.5
+
     return {
         "return_20d":          round(ret_20d, 4),
         "return_5d":           round(ret_5d, 4),
+        "return_60d_pre":      round(ret_60d_pre, 4),
         "volume_ratio_20d":    round(vol_ratio, 3),
         "rsi_14":              round(rsi, 1),
         "drawdown_20d":        round(dd_20d, 4),
         "pct_from_52w_high":   round(pct_from_52w_high, 4),
+        "atr_pct":             round(atr_pct, 4),
+        "close_in_range_20d":  round(close_in_range_20d, 4),
+        "vwap_from_low_ratio": round(vwap_low_ratio, 4),
+        "volume_poc_ratio":    round(poc_ratio, 4),
         "price":               round(float(close.iloc[-1]), 4),
     }
 
@@ -222,6 +257,124 @@ def score_momentum(signals: dict, fund: dict, sector_ret_20d: float = 0.0) -> tu
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ML multi-horizonte (L1/L2/L3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MOMENTUM_BUNDLE: dict | None = None
+_BUNDLE_MTIME: float = 0.0
+
+
+def _load_bundle() -> dict | None:
+    """Carrega bundle multi-horizonte (com cache em memória)."""
+    global _MOMENTUM_BUNDLE, _BUNDLE_MTIME
+    from pathlib import Path
+    bundle_path = Path("/data/momentum_model.pkl") if Path("/data").exists() else Path("/tmp/momentum_model.pkl")
+    if not bundle_path.exists():
+        return None
+    mtime = bundle_path.stat().st_mtime
+    if _MOMENTUM_BUNDLE is None or mtime != _BUNDLE_MTIME:
+        try:
+            import joblib
+            _MOMENTUM_BUNDLE = joblib.load(bundle_path)
+            _BUNDLE_MTIME = mtime
+            log.info("[momentum] Bundle ML carregado")
+        except Exception as e:
+            log.warning(f"[momentum] Erro ao carregar bundle: {e}")
+            return None
+    return _MOMENTUM_BUNDLE
+
+
+def _ml_score_momentum(signals: dict) -> dict:
+    """Aplica modelos L1/L2/L3 e devolve scores e durability tag.
+
+    Retorna dict:
+      ml_score_l1, ml_score_l2, ml_score_l3, ml_score_ensemble,
+      ml_durability ("DURÁVEL" | "TÁCTICO" | "MODERADO"),
+      ml_ready (bool)
+    """
+    bundle = _load_bundle()
+    if bundle is None:
+        return {"ml_ready": False}
+
+    feat_cols = bundle.get("feature_cols", [])
+    if not feat_cols:
+        return {"ml_ready": False}
+
+    # Construir vector de features
+    feat_vec = np.array(
+        [float(signals.get(c, 0.0) or 0.0) for c in feat_cols],
+        dtype=np.float32
+    ).reshape(1, -1)
+
+    # Modelos multi-horizonte (bundle novo)
+    models: dict = bundle.get("models", {})
+    scores: dict[str, float] = {}
+
+    if models:
+        for label, info in models.items():
+            m   = info.get("model")
+            means = info.get("means", {})
+            w   = info.get("weight", 1.0)
+            if m is None:
+                continue
+            # Aplicar means individuais do horizonte
+            fv = np.array(
+                [float(signals.get(c, means.get(c, 0.0)) or means.get(c, 0.0)) for c in feat_cols],
+                dtype=np.float32
+            ).reshape(1, -1)
+            try:
+                pred = float(m.predict(fv)[0])
+                scores[label] = round(pred, 4)
+            except Exception:
+                pass
+    else:
+        # Backward compat: bundle antigo (single model)
+        m = bundle.get("model")
+        if m is None:
+            return {"ml_ready": False}
+        try:
+            pred = float(m.predict(feat_vec)[0])
+            scores["L1"] = pred
+        except Exception:
+            return {"ml_ready": False}
+
+    if not scores:
+        return {"ml_ready": False}
+
+    # Ensemble ponderado com os pesos do bundle (já normalizados)
+    total_w = 0.0
+    ensemble = 0.0
+    for label, info in models.items():
+        if label in scores:
+            w = float(info.get("weight", 1.0))
+            ensemble += scores[label] * w
+            total_w  += w
+    if total_w > 0:
+        ensemble = ensemble / total_w
+    else:
+        ensemble = float(np.mean(list(scores.values())))
+
+    # Durability tag: compara L3 vs L1
+    l1 = scores.get("L1", ensemble)
+    l3 = scores.get("L3", ensemble)
+    if l3 > l1 * 1.2:
+        durability = "DURÁVEL"   # momentum esperado > 6 meses (ex: RKLB)
+    elif l1 > l3 * 1.3:
+        durability = "TÁCTICO"   # pump de curto prazo
+    else:
+        durability = "MODERADO"
+
+    return {
+        "ml_ready":          True,
+        "ml_score_l1":       round(scores.get("L1", 0.0), 4),
+        "ml_score_l2":       round(scores.get("L2", 0.0), 4),
+        "ml_score_l3":       round(scores.get("L3", 0.0), 4),
+        "ml_score_ensemble": round(ensemble, 4),
+        "ml_durability":     durability,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Scanner principal
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -295,18 +448,21 @@ def scan_momentum_universe(
             if score < min_score:
                 continue
 
+            ml = _ml_score_momentum(signals)
+
             candidates.append({
-                "ticker":           ticker,
-                "score":            score,
-                "price":            signals["price"],
-                "return_20d":       signals["return_20d"],
-                "return_5d":        signals["return_5d"],
-                "volume_ratio_20d": signals["volume_ratio_20d"],
-                "rsi_14":           signals["rsi_14"],
-                "pct_from_52w_high":signals["pct_from_52w_high"],
-                "sector":           sector,
-                "reasons":          reasons,
-                "fund":             fund,
+                "ticker":              ticker,
+                "score":               score,
+                "price":               signals["price"],
+                "return_20d":          signals["return_20d"],
+                "return_5d":           signals["return_5d"],
+                "volume_ratio_20d":    signals["volume_ratio_20d"],
+                "rsi_14":              signals["rsi_14"],
+                "pct_from_52w_high":   signals["pct_from_52w_high"],
+                "sector":              sector,
+                "reasons":             reasons,
+                "fund":                fund,
+                **ml,
             })
             scanned += 1
 
@@ -350,6 +506,21 @@ def format_momentum_alert(candidate: dict) -> str:
         f"📊 Volume: {vol:.1f}× médio  |  RSI: {rsi:.0f}",
     ]
 
+    # ML multi-horizonte
+    if candidate.get("ml_ready"):
+        l1  = candidate.get("ml_score_l1",       0.0)
+        l2  = candidate.get("ml_score_l2",       0.0)
+        l3  = candidate.get("ml_score_l3",       0.0)
+        ens = candidate.get("ml_score_ensemble", 0.0)
+        dur = candidate.get("ml_durability",     "—")
+        dur_emoji = {"DURÁVEL": "🏃", "TÁCTICO": "⚡", "MODERADO": "📈"}.get(dur, "")
+        lines.append("")
+        lines.append(
+            f"🤖 *ML Multi-Horizonte* {dur_emoji} _{dur}_\n"
+            f"  L1 30d: {l1:+.1%}  |  L2 90d: {l2:+.1%}  |  L3 180d: {l3:+.1%}\n"
+            f"  Ensemble: {ens:+.1%}"
+        )
+
     if reasons:
         lines.append("")
         lines.append("*Sinais:*")
@@ -361,9 +532,18 @@ def format_momentum_alert(candidate: dict) -> str:
         lines.append("")
         lines.append(f"_{name}_")
 
+    # Estratégia adaptada à durabilidade
+    dur = candidate.get("ml_durability", "MODERADO")
+    if dur == "DURÁVEL":
+        strategy = "Momentum duradouro (padrão RKLB/SanDisk). Hold 3-6 meses, trailing stop -15%."
+    elif dur == "TÁCTICO":
+        strategy = "Pump de curto prazo. Entrada rápida, stop apertado -8%, sair em 30d."
+    else:
+        strategy = "Momentum moderado. Trailing stop -12% do máximo."
+
     lines += [
         "",
-        "💡 *Estratégia:* Entrada em momentum. Trailing stop -12% do máximo.",
+        f"💡 *Estratégia:* {strategy}",
         f"_Diferente de um dip — o stock está a subir. Exit: trailing stop, não target fixo._",
     ]
     return "\n".join(lines)

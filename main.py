@@ -711,8 +711,22 @@ def send_saturday_report() -> None:
     logging.info("A gerar Saturday Weekly Report...")
     entries    = load_weekly_log()
     now        = datetime.now(LISBON_TZ)
-    week_start = (now - timedelta(days=now.weekday() + 1)).strftime("%d/%m")
+    week_start_dt = (now - timedelta(days=now.weekday() + 1)).date()
+    week_start_iso = week_start_dt.isoformat()
+    week_start = week_start_dt.strftime("%d/%m")
     week_end   = (now - timedelta(days=1)).strftime("%d/%m")
+
+    # Filtra entradas da semana actual (exclui acumulações de semanas anteriores)
+    def _entry_date_iso(e: dict) -> str:
+        if "date_iso" in e:
+            return e["date_iso"]
+        try:
+            day, month = e["date"].split("/")
+            return now.date().replace(month=int(month), day=int(day)).isoformat()
+        except Exception:
+            return "9999-99-99"
+
+    entries = [e for e in entries if _entry_date_iso(e) >= week_start_iso]
     lines      = [f"*📊 Weekly Report — {week_start} a {week_end}*", ""]
 
     if not entries:
@@ -784,6 +798,7 @@ def send_saturday_report() -> None:
                 sym          = s["symbol"]
                 mc_b         = (s.get("market_cap") or 0) / 1e9
                 in_portfolio = " 📦" if sym in DIRECT_TICKERS else ""
+                both_badge   = " 📅" if s.get("also_monthly") else ""
                 if i < 5:
                     try:
                         fund = get_fundamentals(sym, min_market_cap=MIN_MARKET_CAP)
@@ -793,23 +808,23 @@ def send_saturday_report() -> None:
                             score, _  = calculate_dip_score(fund, sym, ed, sector_change=sec_chg)
                             badge     = score_badge(score)
                             lines.append(
-                                f"  {badge} *{sym}*{in_portfolio}: *{s['change_pct']:.1f}%* ({label}) "
+                                f"  {badge} *{sym}*{in_portfolio}{both_badge}: *{s['change_pct']:.1f}%* ({label}) "
                                 f"| Score {score:.0f}/100 | ${s['price']} | ${mc_b:.1f}B"
                             )
                         else:
-                            lines.append(f"  📉 *{sym}*{in_portfolio}: *{s['change_pct']:.1f}%* ({label}) | ${s['price']} | ${mc_b:.1f}B")
+                            lines.append(f"  📉 *{sym}*{in_portfolio}{both_badge}: *{s['change_pct']:.1f}%* ({label}) | ${s['price']} | ${mc_b:.1f}B")
                         time.sleep(4)
                     except Exception as ex:
                         logging.warning(f"Period score {sym}: {ex}")
-                        lines.append(f"  📉 *{sym}*{in_portfolio}: *{s['change_pct']:.1f}%* ({label}) | ${s['price']} | ${mc_b:.1f}B")
+                        lines.append(f"  📉 *{sym}*{in_portfolio}{both_badge}: *{s['change_pct']:.1f}%* ({label}) | ${s['price']} | ${mc_b:.1f}B")
                 else:
-                    lines.append(f"  • *{sym}*{in_portfolio}: {s['change_pct']:.1f}% | ${s['price']} | ${mc_b:.1f}B")
+                    lines.append(f"  • *{sym}*{in_portfolio}{both_badge}: {s['change_pct']:.1f}% | ${s['price']} | ${mc_b:.1f}B")
 
         if weekly:  _score_list(weekly, "7d")
         else:       lines.append("  _Nenhum stock com queda ≥10% na semana._")
 
         lines += ["", "*📉 Monthly Dips — quedas ≥15% no último mês:*",
-                  "_Excluídos stocks já no weekly_", ""]
+                  "_📅 em weekly = queda ≥10% na semana E ≥15% no mês; excluídos do monthly_", ""]
         if monthly: _score_list(monthly, "30d")
         else:       lines.append("  _Nenhum stock com queda ≥15% no mês._")
 

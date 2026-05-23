@@ -54,7 +54,7 @@ FEATURE_COLS: list[str] = [
     "return_3m_pre",
     "return_6m_pre",
     "sector_relative",
-    "beta_60d",
+    "beta_90d",
     "vol_of_vol",
     "quality_dislocation",
     "month_of_year",
@@ -84,6 +84,10 @@ FEATURE_COLS: list[str] = [
     "rsi_sector_adjusted",
     "vix_sector_signal",
     "drawdown_sector_normalized",
+    # Market Structure (v4.3): Anchored VWAP + Volume Profile + Liquidity Sweep.
+    "vwap_from_high_ratio",
+    "volume_poc_ratio",
+    "liquidity_sweep_score",
 ]
 # Features removidas vs PR #25 (Spearman IC profiling sobre o parquet completo
 # 36929 rows confirmou 14 features inúteis):

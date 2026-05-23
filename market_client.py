@@ -294,7 +294,11 @@ def screen_period_dips(
     weekly_dips.sort(key=lambda x: x["change_pct"])
     monthly_dips.sort(key=lambda x: x["change_pct"])
 
-    weekly_syms  = {s["symbol"] for s in weekly_dips}
+    weekly_syms   = {s["symbol"] for s in weekly_dips}
+    monthly_syms  = {s["symbol"] for s in monthly_dips}
+    # Marca stocks que caem em ambas as janelas (7d E 30d)
+    for d in weekly_dips:
+        d["also_monthly"] = d["symbol"] in monthly_syms
     monthly_dips = [s for s in monthly_dips if s["symbol"] not in weekly_syms]
 
     logging.info(

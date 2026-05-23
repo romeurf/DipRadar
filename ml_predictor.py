@@ -25,7 +25,7 @@ Features esperadas (37 — FEATURE_COLUMNS de ml_features.py):
   Stage 2(5): drop_pct_today, drawdown_52w, rsi_14, atr_ratio, volume_spike
   Stage 3(5): rsi_oversold_strength, vix_regime, pe_attractive,
               drop_x_drawdown, vol_x_drop
-  Stage 3b(4): return_1m, return_3m_pre, sector_relative, beta_60d
+  Stage 3b(4): return_1m, return_3m_pre, sector_relative, beta_90d
   Stage 3c(4): quality_dislocation, peg_implicit, relative_drop, month_of_year
   Stage 3d(2): sector_alert_count_7d, days_since_52w_high
   Stage 3e(2): short_interest_ratio, earnings_surprise_avg

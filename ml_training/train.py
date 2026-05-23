@@ -1029,7 +1029,7 @@ def run_training(
         momentum_feats=[
             f for f in (
                 "return_1m", "return_3m_pre", "return_6m_pre",
-                "beta_60d",
+                "beta_90d",
             ) if f in feats_used
         ],
         rho_mean=rho_alpha_final,

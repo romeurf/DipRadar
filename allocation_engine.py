@@ -103,9 +103,13 @@ _SLOWDOWN_MULT           = 0.5
 # Pre-profit cap (FCF negativo)
 _PREPROFIT_MULT = 0.5
 
-# Score multiplier tiers (segue plano da Fase 4)
+# ETF commitment mensal fixo — deduzido do orçamento activo.
+# €300 = €100 Semicondutores + €100 S&P500 + €100 Mercados Emergentes (DCA passivo).
+_ETF_MONTHLY_EUR: float = float(os.environ.get("ETF_MONTHLY_EUR", "300"))
+
+# Score multiplier tiers (fallback quando ML não está disponível)
 def _score_multiplier(fund_score: float, ml_label: str) -> float:
-    """Multiplicador de sizing baseado no fund_score (V2 puro).
+    """Multiplicador de sizing tier-based (fallback sem Kelly).
 
     Fase 4: tier agressivo no topo (1.50x para 85+ com WIN_STRONG),
     nada abaixo de 55 (cai em PASS).
@@ -119,6 +123,49 @@ def _score_multiplier(fund_score: float, ml_label: str) -> float:
     if fund_score >= 55.0:
         return 0.30
     return 0.0
+
+
+def _kelly_fraction(win_prob: float, gain: float, loss: float) -> float:
+    """Kelly Criterion (quarter-Kelly para segurança).
+
+    f* = (b·p − a·q) / (a·b)   onde b=gain, a=loss, p=win_prob, q=1-p.
+    Usa quarter-Kelly (f*/4) para evitar over-betting em estimativas ruidosas.
+    Resultado clampado a [0, 0.30] — máx 30% do orçamento livre numa posição.
+    """
+    if gain <= 0 or loss <= 0 or win_prob <= 0 or win_prob >= 1.0:
+        return 0.0
+    q = 1.0 - win_prob
+    f_star = (gain * win_prob - loss * q) / (gain * loss)
+    return float(max(0.0, min(f_star / 4.0, 0.30)))
+
+
+def _kelly_size(ctx: "AllocationContext") -> tuple[float, str]:
+    """Calcula sizing via Kelly Criterion quando ML está disponível.
+
+    Retorna (kelly_fraction, nota_legível). Fraction é relativa ao orçamento
+    activo (mensal - ETFs fixos). Retorna (0.0, "") se Kelly não aplicável.
+    """
+    if not ctx.model_ready or ctx.win_prob is None:
+        return 0.0, ""
+
+    # Gain esperado: pred_up como fracção de ganho; mínimo 5%
+    gain = float(ctx.pred_up or 0.05)
+    if gain <= 0:
+        gain = 0.05
+
+    # Loss esperada: pred_down como fracção de perda (magnitude)
+    # pred_down vem como negativo (drawdown) → usar abs
+    loss = abs(float(ctx.pred_down or -0.12))
+    if loss <= 0:
+        loss = 0.12
+
+    fraction = _kelly_fraction(ctx.win_prob, gain, loss)
+    note = (
+        f"Kelly: p_win={ctx.win_prob:.0%} "
+        f"gain={gain:+.0%} loss={loss:.0%} "
+        f"→ f*={fraction:.1%}"
+    )
+    return fraction, note
 
 
 # ── Dataclasses ───────────────────────────────────────────────────────────────
@@ -416,27 +463,32 @@ def _size(ctx: AllocationContext, category: str) -> tuple[float, float, list[str
     """Devolve (amount_eur, raw_amount, notes). Aplica todos os caps.
 
     Sizing por categoria:
-      • CORE          : DCA passivo (base, sem score_multiplier)
-      • HIGH_CONVICTION / GROWTH : tiered score_multiplier (gate em fund<55)
-      • FLIP          : base × ml_mult × drawdown_boost (categoria já encoda
-                        a tese; score_multiplier não se aplica aqui)
+      • CORE          : DCA passivo fixo (€ETF_MONTHLY_EUR / n_etfs)
+      • HIGH_CONVICTION / GROWTH : Kelly Criterion quando ML disponível;
+                        tier-based como fallback
+      • FLIP          : base × ml_mult × drawdown_boost
     """
     notes: list[str] = []
 
     if category == CAT_PASS:
         return 0.0, 0.0, notes
 
-    base_pct = _TARGET_PCT.get(category, 0.0)
-    raw_amount = ctx.monthly_budget_eur * base_pct
-    label = _ml_label_or_derive(ctx)
+    # Orçamento activo = total menos o compromisso mensal com ETFs
+    active_budget = max(0.0, ctx.monthly_budget_eur - _ETF_MONTHLY_EUR)
+
+    base_pct   = _TARGET_PCT.get(category, 0.0)
+    raw_amount = active_budget * base_pct
+    label      = _ml_label_or_derive(ctx)
 
     # 1) Sizing inicial — depende da categoria
     if category == CAT_CORE:
-        # CORE: DCA passivo, sem gate de fund_score (ETFs são tese estrutural)
+        # CORE: DCA passivo fixo — o montante por ETF é o compromisso / nº ETFs
+        # Usamos raw_amount como sugestão (o caller passa o valor certo via budget)
         amount = raw_amount
+        notes.append(f"DCA passivo — fora do budget activo de €{active_budget:.0f}")
 
     elif category == CAT_FLIP:
-        # FLIP: ML modulation + drawdown boost (categoria já encoda fund<55)
+        # FLIP: ML modulation + drawdown boost
         ml_mult = _flip_ml_multiplier(label)
         if ml_mult == 0.0:
             notes.append(f"ML {label} sem suporte → 0")
@@ -450,13 +502,23 @@ def _size(ctx: AllocationContext, category: str) -> tuple[float, float, list[str
             notes.append(f"Drawdown severo ×{dd_mult:.2f}")
 
     else:
-        # GROWTH / HIGH_CONVICTION: score_multiplier tiered (Fase 4)
-        score_mult = _score_multiplier(ctx.fund_score, label)
-        if score_mult == 0.0:
-            notes.append(f"Score {ctx.fund_score:.0f} < 55 → 0")
-            return 0.0, raw_amount, notes
-        notes.append(f"Score {ctx.fund_score:.0f} ×{score_mult:.2f}")
-        amount = raw_amount * score_mult
+        # GROWTH / HIGH_CONVICTION: Kelly quando disponível, tier-based como fallback
+        kelly_frac, kelly_note = _kelly_size(ctx)
+        if kelly_frac > 0:
+            # Kelly sizing sobre o orçamento activo
+            amount = active_budget * kelly_frac
+            notes.append(kelly_note)
+            if ctx.pred_down is not None:
+                dd_est = abs(float(ctx.pred_down))
+                notes.append(f"Drawdown estimado até -{ dd_est:.0%} antes de recuperar")
+        else:
+            # Fallback tier-based
+            score_mult = _score_multiplier(ctx.fund_score, label)
+            if score_mult == 0.0:
+                notes.append(f"Score {ctx.fund_score:.0f} < 55 → 0")
+                return 0.0, raw_amount, notes
+            notes.append(f"Score {ctx.fund_score:.0f} ×{score_mult:.2f} (sem Kelly)")
+            amount = raw_amount * score_mult
 
     # 2) Regime macro (RED zera growth/flip, YELLOW halves)
     regime_mult = _regime_multiplier(category, ctx.macro_regime_color)
@@ -728,11 +790,15 @@ def format_allocation_telegram(
         "",
     ]
 
+    active_budget = max(0.0, ctx.monthly_budget_eur - _ETF_MONTHLY_EUR)
     if decision.amount_eur > 0:
-        pct_of_budget = decision.amount_eur / ctx.monthly_budget_eur * 100
+        pct_of_active = decision.amount_eur / active_budget * 100 if active_budget > 0 else 0
         lines.append(
             f"💶 *Sugestão*: €{decision.amount_eur:.0f} "
-            f"_({pct_of_budget:.0f}% do mensal de €{ctx.monthly_budget_eur:.0f})_"
+            f"_({pct_of_active:.0f}% do budget activo de €{active_budget:.0f})_"
+        )
+        lines.append(
+            f"   _Budget total €{ctx.monthly_budget_eur:.0f} = €{_ETF_MONTHLY_EUR:.0f} ETFs fixos + €{active_budget:.0f} activo_"
         )
         if current_price is not None and current_price > 0:
             shares = decision.amount_eur / current_price
@@ -751,13 +817,17 @@ def format_allocation_telegram(
     lines.append(f"🎯 *Saída*: {exit_human}")
 
     if ctx.model_ready and ctx.pred_up is not None:
-        ml_line = f"🤖 *ML*: pred_up {ctx.pred_up:+.1%}"
+        ml_line = f"🤖 *ML*: alpha previsto {ctx.pred_up:+.1%}"
         if ctx.win_prob is not None:
-            ml_line += f" | win_prob {ctx.win_prob:.0%}"
-        if ctx.pred_down is not None:
-            ml_line += f" | pred_down {ctx.pred_down:+.1%}"
-        ml_line += f" ({ctx.ml_label})"
+            ml_line += f" | P(win) {ctx.win_prob:.0%}"
         lines.append(ml_line)
+        if ctx.pred_down is not None:
+            dd_est = abs(float(ctx.pred_down))
+            lines.append(
+                f"   ⚠️ *Risco*: drawdown estimado até -{dd_est:.0%} antes de recuperar "
+                f"({'tolerável' if dd_est < 0.15 else 'elevado' if dd_est < 0.25 else 'severo'})"
+            )
+        lines.append(f"   _Modelo: {ctx.ml_label}_")
 
     regime_emoji = {"GREEN": "🟢", "YELLOW": "🟡", "RED": "🔴"}.get(ctx.macro_regime_color, "⚪")
     lines.append(f"⚖️ *Confiança*: {decision.confidence} | Regime: {regime_emoji} {ctx.macro_regime_color}")

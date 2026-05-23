@@ -293,7 +293,7 @@ class TestBundle(unittest.TestCase):
             train_date="2025-01-01T00:00:00Z",
             champion_name="XGB-test",
             rho_alpha=0.30, rho_down=0.20, topk_pnl=0.15,
-            momentum_feats=["return_1m", "beta_60d"],
+            momentum_feats=["return_1m", "beta_90d"],
         )
         summary = pd.DataFrame([
             {"model": "XGB-test", "rho_alpha_mean": 0.30, "topk_pnl_mean": 0.15},

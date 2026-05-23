@@ -129,6 +129,12 @@ def save_weekly_log(entries: list) -> None:
 
 def append_weekly_log(entry: dict) -> None:
     entries = load_weekly_log()
+    # Adiciona data ISO para filtrar por semana (o campo "date" só tem dd/mm)
+    if "date_iso" not in entry:
+        entry = {**entry, "date_iso": datetime.now().date().isoformat()}
+    # Remove entradas com mais de 8 dias para não acumular semanas antigas
+    cutoff = (datetime.now().date() - timedelta(days=8)).isoformat()
+    entries = [e for e in entries if e.get("date_iso", "9999-99-99") >= cutoff]
     entries.append(entry)
     save_weekly_log(entries)
 

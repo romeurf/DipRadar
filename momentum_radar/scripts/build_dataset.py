@@ -197,42 +197,60 @@ def build_dataset(
         close = hist["Close"]
         n = len(hist)
 
-        # Amostrar cada N dias para evitar autocorrelação temporal extrema
-        sample_indices = range(25, n - 35, sample_every_n_days)
+        # Amostrar cada N dias para evitar autocorrelação temporal extrema.
+        # Precisamos de 185 dias à frente para os alvos de 180d.
+        sample_indices = range(25, n - 185, sample_every_n_days)
 
         for idx in sample_indices:
             feats = _build_momentum_features(hist, idx)
             if feats is None:
                 continue
 
-            # Forward return 30d
-            future_close = close.iloc[idx + 30] if idx + 30 < n else None
-            if future_close is None:
+            # Forward returns multi-horizon (L1=30d, L2=90d, L3=180d)
+            future_30  = close.iloc[idx + 30]  if idx + 30  < n else None
+            future_90  = close.iloc[idx + 90]  if idx + 90  < n else None
+            future_180 = close.iloc[idx + 180] if idx + 180 < n else None
+
+            if future_30 is None:
                 continue
-            fwd_ret = float(future_close / close.iloc[idx] - 1)
-            if not np.isfinite(fwd_ret) or abs(fwd_ret) > 2.0:
+            fwd_30 = float(future_30 / close.iloc[idx] - 1)
+            if not np.isfinite(fwd_30) or abs(fwd_30) > 2.0:
                 continue
 
-            # Alpha 30d vs SPY
+            fwd_90  = float(future_90  / close.iloc[idx] - 1) if future_90  is not None else None
+            fwd_180 = float(future_180 / close.iloc[idx] - 1) if future_180 is not None else None
+            if fwd_90  is not None and (not np.isfinite(fwd_90)  or abs(fwd_90)  > 3.0): fwd_90  = None
+            if fwd_180 is not None and (not np.isfinite(fwd_180) or abs(fwd_180) > 5.0): fwd_180 = None
+
+            # Alpha vs SPY por horizonte
             alert_date = hist.index[idx]
-            spy_alpha  = None
-            try:
-                spy_at  = spy_hist[spy_hist.index <= alert_date]["Close"]
-                spy_fwd = spy_hist[(spy_hist.index > alert_date) &
-                                   (spy_hist.index <= alert_date + pd.Timedelta(days=35))]["Close"]
-                if not spy_at.empty and not spy_fwd.empty:
-                    spy_ret = float(spy_fwd.iloc[-1] / spy_at.iloc[-1] - 1)
-                    spy_alpha = round(fwd_ret - spy_ret, 4)
-            except Exception:
-                pass
+
+            def _spy_alpha(horizon_days: int, stock_ret: Optional[float]) -> Optional[float]:
+                if stock_ret is None:
+                    return None
+                try:
+                    spy_at  = spy_hist[spy_hist.index <= alert_date]["Close"]
+                    spy_fwd = spy_hist[
+                        (spy_hist.index > alert_date) &
+                        (spy_hist.index <= alert_date + pd.Timedelta(days=horizon_days + 5))
+                    ]["Close"]
+                    if not spy_at.empty and not spy_fwd.empty:
+                        return round(stock_ret - float(spy_fwd.iloc[-1] / spy_at.iloc[-1] - 1), 4)
+                except Exception:
+                    pass
+                return None
 
             rows.append({
-                "ticker":            ticker,
-                "date":              alert_date.date().isoformat(),
-                "sector":            sector,
+                "ticker":              ticker,
+                "date":                alert_date.date().isoformat(),
+                "sector":              sector,
                 **feats,
-                "forward_return_30d": round(fwd_ret, 4),
-                "alpha_30d":          spy_alpha,
+                "forward_return_30d":  round(fwd_30, 4),
+                "forward_return_90d":  round(fwd_90, 4)  if fwd_90  is not None else None,
+                "forward_return_180d": round(fwd_180, 4) if fwd_180 is not None else None,
+                "alpha_30d":           _spy_alpha(30,  fwd_30),
+                "alpha_90d":           _spy_alpha(90,  fwd_90),
+                "alpha_180d":          _spy_alpha(180, fwd_180),
             })
 
         if (i + 1) % 50 == 0 or (i + 1) == n_tickers:
@@ -335,17 +353,19 @@ def main() -> int:
     combined.to_parquet(out_path, index=False)
 
     log.info(f"Dataset: {len(combined)} amostras | {combined['ticker'].nunique()} tickers | {combined['sector'].nunique()} sectores")
-    log.info(f"Forward return 30d: mean={combined['forward_return_30d'].mean():.2%} std={combined['forward_return_30d'].std():.2%}")
-    if "alpha_30d" in combined.columns:
-        valid_alpha = combined["alpha_30d"].dropna()
-        log.info(f"Alpha 30d vs SPY: mean={valid_alpha.mean():.2%} | positivos: {(valid_alpha>0).mean():.0%}")
+    for col, label in [("forward_return_30d", "30d"), ("forward_return_90d", "90d"), ("forward_return_180d", "180d")]:
+        if col in combined.columns:
+            v = combined[col].dropna()
+            log.info(f"Forward return {label}: mean={v.mean():.2%} std={v.std():.2%} ({len(v)} amostras)")
     size_mb = out_path.stat().st_size / 1e6
     log.info(f"Guardado em: {out_path} ({size_mb:.1f}MB)")
     _notify(
         f"✅ *Bootstrap Momentum concluído!*\n"
         f"  {len(combined):,} amostras | {combined['ticker'].nunique()} tickers\n"
         f"  {combined['date'].min()} → {combined['date'].max()}\n"
-        f"  fwd\\_return\\_30d: mean {combined['forward_return_30d'].mean():.1%}\n"
+        f"  L1 30d: {combined['forward_return_30d'].mean():.1%} | "
+        f"L2 90d: {combined['forward_return_90d'].dropna().mean():.1%} | "
+        f"L3 180d: {combined['forward_return_180d'].dropna().mean():.1%}\n"
         f"  {size_mb:.1f}MB\n\n"
         f"_A iniciar treino do modelo de momentum..._"
     )
