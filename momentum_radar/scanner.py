@@ -328,15 +328,23 @@ def _ml_score_momentum(signals: dict) -> dict:
             except Exception:
                 pass
     else:
-        # Backward compat: bundle antigo (single model)
+        # Bundle antigo (single model): sem informação de horizonte.
+        # Retornamos o score único como ensemble; durabilidade não é determinável.
         m = bundle.get("model")
         if m is None:
             return {"ml_ready": False}
         try:
             pred = float(m.predict(feat_vec)[0])
-            scores["L1"] = pred
         except Exception:
             return {"ml_ready": False}
+        return {
+            "ml_ready":          True,
+            "ml_score_l1":       round(pred, 4),
+            "ml_score_l2":       round(pred, 4),
+            "ml_score_l3":       round(pred, 4),
+            "ml_score_ensemble": round(pred, 4),
+            "ml_durability":     "MODERADO",  # indeterminável sem multi-horizonte
+        }
 
     if not scores:
         return {"ml_ready": False}
@@ -354,12 +362,13 @@ def _ml_score_momentum(signals: dict) -> dict:
     else:
         ensemble = float(np.mean(list(scores.values())))
 
-    # Durability tag: compara L3 vs L1
+    # Durability: L3 (180d) vs L1 (30d) — só significativo com multi-horizonte
     l1 = scores.get("L1", ensemble)
     l3 = scores.get("L3", ensemble)
-    if l3 > l1 * 1.2:
+    has_multi = "L1" in scores and "L3" in scores
+    if has_multi and l3 > l1 * 1.2:
         durability = "DURÁVEL"   # momentum esperado > 6 meses (ex: RKLB)
-    elif l1 > l3 * 1.3:
+    elif has_multi and l1 > l3 * 1.3:
         durability = "TÁCTICO"   # pump de curto prazo
     else:
         durability = "MODERADO"

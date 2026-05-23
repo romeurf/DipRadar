@@ -711,7 +711,7 @@ def send_saturday_report() -> None:
     logging.info("A gerar Saturday Weekly Report...")
     entries    = load_weekly_log()
     now        = datetime.now(LISBON_TZ)
-    week_start_dt = (now - timedelta(days=now.weekday() + 1)).date()
+    week_start_dt = (now - timedelta(days=now.weekday())).date()   # Segunda-feira desta semana ISO
     week_start_iso = week_start_dt.isoformat()
     week_start = week_start_dt.strftime("%d/%m")
     week_end   = (now - timedelta(days=1)).strftime("%d/%m")

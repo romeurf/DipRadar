@@ -106,6 +106,7 @@ _PREPROFIT_MULT = 0.5
 # ETF commitment mensal fixo — deduzido do orçamento activo.
 # €300 = €100 Semicondutores + €100 S&P500 + €100 Mercados Emergentes (DCA passivo).
 _ETF_MONTHLY_EUR: float = float(os.environ.get("ETF_MONTHLY_EUR", "300"))
+_ETF_COUNT: int         = int(os.environ.get("ETF_COUNT", "3"))   # nº de ETFs no DCA
 
 # Score multiplier tiers (fallback quando ML não está disponível)
 def _score_multiplier(fund_score: float, ml_label: str) -> float:
@@ -482,10 +483,14 @@ def _size(ctx: AllocationContext, category: str) -> tuple[float, float, list[str
 
     # 1) Sizing inicial — depende da categoria
     if category == CAT_CORE:
-        # CORE: DCA passivo fixo — o montante por ETF é o compromisso / nº ETFs
-        # Usamos raw_amount como sugestão (o caller passa o valor certo via budget)
-        amount = raw_amount
-        notes.append(f"DCA passivo — fora do budget activo de €{active_budget:.0f}")
+        # CORE: DCA passivo fixo. Cada ETF recebe exatamente ETF_MONTHLY_EUR / ETF_COUNT.
+        # Não usa active_budget — a carteira ETF está fora do orçamento activo.
+        amount = _ETF_MONTHLY_EUR / max(_ETF_COUNT, 1)
+        raw_amount = amount  # override — raw também é o valor fixo, sem base no active_budget
+        notes.append(
+            f"DCA passivo €{amount:.0f}/mês "
+            f"(1 de {_ETF_COUNT} ETFs · total €{_ETF_MONTHLY_EUR:.0f}/mês)"
+        )
 
     elif category == CAT_FLIP:
         # FLIP: ML modulation + drawdown boost

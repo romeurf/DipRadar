@@ -525,7 +525,7 @@ def _get_current_momentum_signals(ticker: str) -> dict:
     try:
         from data_feed import get_eod_prices
         import pandas as pd
-        df = get_eod_prices(ticker, lookback_days=90)
+        df = get_eod_prices(ticker, lookback_days=280)  # 280d para 52-week high e VWAP
         if df is None or df.empty or "Close" not in df.columns:
             return {}
         if "date" in df.columns:
