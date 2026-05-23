@@ -2217,6 +2217,23 @@ def run_universe_snapshot() -> None:
     logging.info(f"[snapshot] {tickers_ok} tickers, +{rows_added} linhas, {elapsed:.0f}s")
 
 
+# ── News Sentiment Collection (22:15 Lisboa, seg-sex) ────────────────────────
+
+def run_news_sentiment_job() -> None:
+    """Recolha diária de headlines + classificação LLM para acumulação de feature."""
+    try:
+        from scripts.collect_news_sentiment import collect_sentiment
+        result = collect_sentiment()
+        logging.info(
+            f"[sentiment] Concluído: {result.get('n_new',0)} novas | "
+            f"{result.get('n_scored',0)} classificadas | "
+            f"{result.get('n_skipped',0)} duplicadas | "
+            f"{result.get('elapsed_s',0)}s"
+        )
+    except Exception as e:
+        logging.warning(f"[sentiment] Falhou (não crítico): {e}")
+
+
 # ── Daily Backup Job (23:30 Lisboa, seg-sex) ──────────────────────────────────
 
 def run_daily_backup() -> None:
@@ -2382,6 +2399,13 @@ def main() -> None:
         lambda: run_daily_check(send_telegram),
         CronTrigger(day_of_week="mon-fri", hour=22, minute=0, timezone=LISBON_TZ),
         id="position_monitor", name="Position Monitor 22h00",
+    )
+
+    # ── News Sentiment: 22:15 Lisboa, seg-sex ─────────────────────────────────
+    scheduler.add_job(
+        run_news_sentiment_job,
+        CronTrigger(day_of_week="mon-fri", hour=22, minute=15, timezone=LISBON_TZ),
+        id="news_sentiment", name="News Sentiment 22h15",
     )
 
     # ── Saturday Weekly Report: sábado 10:00 Lisboa ───────────────────────────

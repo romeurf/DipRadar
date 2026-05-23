@@ -60,14 +60,18 @@ _EPISODE_EXIT_RETURN = 0.05  # return_20d < 5% → episódio terminou
 # Helpers de preços
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fetch_history(ticker: str, start: str = "2019-01-01") -> Optional[pd.DataFrame]:
+def _fetch_history(ticker: str, start: str = "1993-01-01") -> Optional[pd.DataFrame]:
     cache = _CACHE_DIR / f"{ticker.replace('^','_idx_').replace('/','_').replace('.','_')}.parquet"
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
     if cache.exists() and (time.time() - cache.stat().st_mtime) < 86400 * 7:
         try:
             df = pd.read_parquet(cache)
             df.index = pd.to_datetime(df.index)
-            return df
+            # Validar que o cache cobre a data pedida (com 30d de tolerância).
+            # Se não cobre (e.g. cache antigo de 2019, pedido é 1993), invalidar.
+            if not df.empty and df.index[0] <= pd.Timestamp(start) + pd.Timedelta(days=30):
+                return df
+            cache.unlink(missing_ok=True)  # cache desactualizado — re-fetch
         except Exception:
             pass
     try:
@@ -196,7 +200,7 @@ def _build_momentum_features(hist: pd.DataFrame, idx: int) -> Optional[dict]:
 def build_dataset(
     tickers: list[str],
     spy_hist: pd.DataFrame,
-    start: str = "2019-01-01",
+    start: str = "1993-01-01",
 ) -> pd.DataFrame:
     """Para cada ticker, encontra dias com momentum e calcula forward_return_30d.
 
