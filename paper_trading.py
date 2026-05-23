@@ -219,6 +219,8 @@ def update_open_positions() -> dict:
     for t in trades:
         if t.get("status") != "OPEN":
             continue
+        if t.get("trade_type") == "MOMENTUM":
+            continue  # MOMENTUM trades têm sell_target=0 — geridas por update_momentum_positions
 
         open_date = date.fromisoformat(t["open_date"])
         days_held = (today - open_date).days

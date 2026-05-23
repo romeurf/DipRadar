@@ -2420,7 +2420,7 @@ def main() -> None:
             # Treinar modelo
             result = run_momentum_training()
             dec = result.get("decision", "?")
-            ic  = result.get("ic_new", 0)
+            ic  = result.get("ic_ensemble", 0)
             logging.info(f"[momentum_retrain] {dec} | IC={ic:.4f}")
             send_telegram(
                 f"🌙 *MomentumRadar Retrain — {dec}*\n"
