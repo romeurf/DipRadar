@@ -2409,24 +2409,73 @@ def main() -> None:
     # Corre 2h após o DipRadar retrain para não competir por recursos.
     # Dataset incremental: nunca apaga dados históricos.
     def _run_momentum_monthly():
+        import subprocess as _sp, sys as _sys
+        from pathlib import Path as _Path
+        t0_mom = time.time()
+        now_str_mom = datetime.now(LISBON_TZ).strftime("%d/%m/%Y %H:%M")
+
+        send_telegram(
+            f"Retreino Momentum iniciado ({now_str_mom}).\n"
+            f"Fase 1: dataset incremental (eventos do ultimo mes).\n"
+            f"Fase 2: treino + gating. Notificacao quando terminar."
+        )
+
         try:
             from momentum_radar.trainer import run_momentum_training
-            import subprocess, sys
-            from pathlib import Path
-            logging.info("[momentum_retrain] A actualizar dataset + treinar...")
-            # Actualizar dataset (incremental — só últimas semanas)
-            script = Path(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py"
-            subprocess.run([sys.executable, str(script)], timeout=7200)
-            # Treinar modelo
-            result = run_momentum_training()
-            dec = result.get("decision", "?")
-            ic  = result.get("ic_ensemble", 0)
-            logging.info(f"[momentum_retrain] {dec} | IC={ic:.4f}")
-            send_telegram(
-                f"🌙 *MomentumRadar Retrain — {dec}*\n"
-                f"IC: {ic:.4f} | {result.get('n_train',0):,} amostras | "
-                f"{result.get('n_sectors',0)} sector models"
+
+            # Fase 1: dataset incremental — build_dataset.py auto-detecta a
+            # ultima data do parquet e so processa dados novos (220d lookback)
+            script = _Path(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py"
+            proc = _sp.run(
+                [_sys.executable, str(script)],
+                capture_output=True, text=True, timeout=7200
             )
+            if proc.returncode != 0:
+                stderr_tail = (proc.stderr or "")[-300:]
+                logging.warning(f"[momentum_retrain] build_dataset exit {proc.returncode}")
+                send_telegram(
+                    f"⚠️ Dataset incremental falhou (exit {proc.returncode}) — "
+                    f"a treinar no dataset anterior.\n`{stderr_tail}`"
+                )
+            else:
+                logging.info("[momentum_retrain] Dataset actualizado com sucesso")
+
+            # Fase 2: treinar
+            result   = run_momentum_training()
+            elapsed  = time.time() - t0_mom
+            dec      = result.get("decision", "?")
+            ic_new   = result.get("ic_ensemble")
+            ic_prod  = result.get("ic_prod")
+            n_train  = result.get("n_train", 0)
+            n_sec    = result.get("n_sectors", 0)
+            reason   = result.get("reason", "")
+
+            def _f(v):
+                return f"{float(v):.4f}" if isinstance(v, (int, float)) else "N/A"
+
+            icon = {"PROMOTED": "🚀", "KEPT": "⚠️", "FAILED": "❌"}.get(dec, "⚙️")
+            lines = [
+                f"{icon} *MomentumRadar Retrain — {dec}*",
+                f"_{now_str_mom} ({elapsed:.0f}s)_",
+                "",
+            ]
+            if reason:
+                lines += [f"_{reason}_", ""]
+
+            lines += [
+                "*IC ensemble (Spearman):*",
+                f"  candidate : *{_f(ic_new)}*",
+                f"  producao  : *{_f(ic_prod)}*",
+            ]
+            if isinstance(ic_new, float) and isinstance(ic_prod, float) and ic_prod != 0:
+                delta = (ic_new - ic_prod) / abs(ic_prod) * 100
+                sign  = "+" if delta >= 0 else ""
+                lines.append(f"  delta     : *{sign}{delta:.1f}%*")
+            lines += ["", f"  {n_train:,} amostras | {n_sec} sector models"]
+
+            logging.info(f"[momentum_retrain] {dec} | IC={_f(ic_new)} vs prod={_f(ic_prod)}")
+            send_telegram("\n".join(lines))
+
         except Exception as e:
             logging.error(f"[momentum_retrain] {e}", exc_info=True)
             send_telegram(f"❌ MomentumRadar retrain falhou: {e}")
