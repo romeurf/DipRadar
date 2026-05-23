@@ -42,10 +42,9 @@ bot_commands.py — Todos os comandos Telegram do DipRadar.
   /mldata update           → Forçar update de outcomes
   /ml_accuracy             → Precisão real do modelo vs outcomes reais
   /admin_retrain [dry-run] → Disparar retreino ad-hoc
-  /retrigger               → Alias de /admin_retrain (sem flags)
+  /admin_full_pipeline     → Pipeline completo (parquets + retrain, com cache)
   /admin_regen_parquet [--targets-only] → Regenerar parquet (EDGAR PIT + alpha_90d)
   /admin_set_floor <valor> → Ajustar floor de IC mínimo para promoção (ex: 0.08)
-  /admin_backfill_ml       → Semear histórico de dips (5 anos) no training set
   /admin_load_models <url> → Carregar bundle ML de URL externo
 
 ━━━ SISTEMA E DIAGNÓSTICO ━━━
@@ -87,8 +86,6 @@ _last_update_id: int = 0
 _bot_start_time: datetime = datetime.now()
 
 # Flags de segurança para operações longas
-_backfill_running: bool = False
-_train_running:    bool = False
 _retrain_running:  bool = False
 
 # Callbacks injectados pelo main.py via register_callbacks() ou poll()
@@ -437,10 +434,10 @@ def _handle_mldata(force_update: bool = False) -> None:
             lines.append(f"*✅ Update:* {update_stats.get('updated', 0)} novas classificações\n")
 
         if labeled >= 100:
-            lines.append("🟢 *Pronto para treinar!* Usa `/admin_train_ml`")
+            lines.append("🟢 *Pronto para treinar!* Usa `/admin_full_pipeline --dip-only`")
         elif labeled >= 50:
             lines.append(f"🟡 *{labeled} amostras* — quase prontos (mín. recomendado: 100)")
-            lines.append("_Já podes tentar `/admin_train_ml` com resultados parciais._")
+            lines.append("_Já podes tentar `/admin_retrain` com resultados parciais._")
         else:
             lines.append(f"🕐 *{labeled} amostras* — precisa de mais dados (mín: 30 para treinar).")
 
@@ -449,320 +446,6 @@ def _handle_mldata(force_update: bool = False) -> None:
         _reply("\n".join(lines))
 
     threading.Thread(target=_run, daemon=True).start()
-
-
-# ── /admin_backfill_ml ──────────────────────────────────────────────────────────
-
-# Timeout máximo por ticker (segundos). Se o yfinance pendurar mais do que isto,
-# o ticker é marcado como erro e o backfill continua para o próximo.
-_BACKFILL_TICKER_TIMEOUT = int(os.environ.get("BACKFILL_TICKER_TIMEOUT", 90))
-
-
-def _handle_admin_backfill_ml() -> None:
-    global _backfill_running
-
-    if _backfill_running:
-        _reply("⚠️ *Backfill já está a correr.*\n_Aguarda a conclusão antes de lançar novamente._")
-        return
-
-    dynamic = load_dynamic_watchlist()
-    static  = []
-    try:
-        from watchlist import WATCHLIST as _STATIC_WL
-        static = [e["symbol"] for e in _STATIC_WL]
-    except Exception:
-        pass
-    tickers = list(dict.fromkeys(dynamic + static))
-
-    if not tickers:
-        _reply("⚠️ *Watchlist vazia.*\n_Adiciona tickers com `/watchlist add TICK` antes de fazer backfill._")
-        return
-
-    n = len(tickers)
-    est_min = n * 4 // 60 + 1
-    est_max = n * 6 // 60 + 2
-    _reply(
-        f"⏳ *A iniciar a Máquina do Tempo* — {n} ticker(s) | lookback 5 anos\n"
-        f"_Estimativa: {est_min}–{est_max} minutos..._\n"
-        f"_Vais receber update após cada ticker. Timeout por ticker: {_BACKFILL_TICKER_TIMEOUT}s._"
-    )
-
-    def _run():
-        global _backfill_running
-        _backfill_running = True
-        start_ts = time.time()
-
-        # Importações necessárias dentro da thread
-        from backtest import (
-            run_historical_backtest,
-            _load_existing_keys,
-            _write_hist_csv,
-            _HIST_DB_PATH,
-        )
-        from pathlib import Path
-
-        csv_path      = _HIST_DB_PATH
-        existing_keys = _load_existing_keys(csv_path)
-
-        total_dips     = 0
-        total_written  = 0
-        total_skipped  = 0
-        total_censored = 0
-        total_dupes    = 0
-        total_errors   = 0
-        all_dip_rows: list[dict] = []
-
-        try:
-            for i, sym in enumerate(tickers, 1):
-                ticker_start = time.time()
-                _reply(
-                    f"🔄 *[{i}/{n}]* `{sym}` — a descarregar 5 anos de dados..."
-                )
-
-                # Corre run_historical_backtest para UM ticker com timeout via thread
-                result_holder: list[dict] = []
-                error_holder:  list[str]  = []
-
-                def _fetch(s=sym, rh=result_holder, eh=error_holder):
-                    try:
-                        stats = run_historical_backtest(
-                            tickers=[s],
-                            min_score=0.0,
-                            dry_run=False,
-                        )
-                        rh.append(stats)
-                    except Exception as exc:
-                        eh.append(str(exc))
-
-                t = threading.Thread(target=_fetch, daemon=True)
-                t.start()
-                t.join(timeout=_BACKFILL_TICKER_TIMEOUT)
-
-                elapsed_ticker = int(time.time() - ticker_start)
-
-                if t.is_alive():
-                    # Timeout — o yfinance ficou pendurado
-                    total_errors += 1
-                    _reply(
-                        f"⏱️ *[{i}/{n}]* `{sym}` — *timeout* ({_BACKFILL_TICKER_TIMEOUT}s)\n"
-                        f"_A avançar para o próximo ticker._"
-                    )
-                    logging.warning(f"[admin_backfill] {sym}: timeout após {_BACKFILL_TICKER_TIMEOUT}s")
-                    continue
-
-                if error_holder:
-                    total_errors += 1
-                    _reply(
-                        f"⚠️ *[{i}/{n}]* `{sym}` — erro: `{error_holder[0][:80]}`"
-                    )
-                    logging.warning(f"[admin_backfill] {sym}: {error_holder[0]}")
-                    continue
-
-                if not result_holder:
-                    total_errors += 1
-                    _reply(f"⚠️ *[{i}/{n}]* `{sym}` — sem resultado (dados insuficientes?)")
-                    continue
-
-                stats      = result_holder[0]
-                dip_rows   = stats.get("dip_rows", [])
-                n_dips     = stats.get("total_dips", 0)
-                n_censored = stats.get("censored", 0)
-                n_skipped  = stats.get("ignored_score", 0)
-                n_err      = stats.get("errors", 0)
-
-                # Escrita incremental para este ticker
-                dupes_ticker   = sum(1 for r in dip_rows if (r["symbol"], r["date_iso"]) in existing_keys)
-                written_ticker = _write_hist_csv(dip_rows, csv_path, existing_keys)
-                # Actualiza existing_keys para evitar duplicados nos tickers seguintes
-                for r in dip_rows:
-                    existing_keys.add((r["symbol"], r["date_iso"]))
-
-                total_dips     += n_dips
-                total_written  += written_ticker
-                total_skipped  += n_skipped
-                total_censored += n_censored
-                total_dupes    += dupes_ticker
-                total_errors   += n_err
-                all_dip_rows   += dip_rows
-
-                # Distribuição de outcomes para este ticker
-                label_counts: dict = {}
-                for row in dip_rows:
-                    lbl = row.get("outcome_label") or "pending"
-                    label_counts[lbl] = label_counts.get(lbl, 0) + 1
-
-                em_map   = {"WIN_STRONG": "🟢", "WIN": "✅", "NEUTRAL": "🟡", "LOSS": "🔴", "pending": "⏳"}
-                lbl_str  = " | ".join(
-                    f"{em_map.get(k,'📊')}{k}:{v}"
-                    for k, v in sorted(label_counts.items(), key=lambda x: x[1], reverse=True)
-                ) if label_counts else "_sem dips_"
-
-                status_em = "✅" if n_dips > 0 else "➖"
-                _reply(
-                    f"{status_em} *[{i}/{n}]* `{sym}` — "
-                    f"*{n_dips}* dips | +{written_ticker} linhas | {elapsed_ticker}s\n"
-                    f"  {lbl_str}"
-                )
-
-        except Exception as e:
-            logging.error(f"[admin_backfill] Erro fatal no loop: {e}")
-            _reply(f"❌ *Backfill interrompido por erro fatal:*\n`{e}`")
-        finally:
-            _backfill_running = False
-
-        # ── Relatório final ──────────────────────────────────────────────────
-        elapsed  = int(time.time() - start_ts)
-        mins, secs = divmod(elapsed, 60)
-
-        label_counts_total: dict = {}
-        for row in all_dip_rows:
-            lbl = row.get("outcome_label") or "pending"
-            label_counts_total[lbl] = label_counts_total.get(lbl, 0) + 1
-
-        em_map = {"WIN_STRONG": "🟢", "WIN": "✅", "NEUTRAL": "🟡", "LOSS": "🔴", "pending": "⏳"}
-        lines = [
-            "✅ *Backfill ML concluído!*",
-            f"_{datetime.now().strftime('%d/%m/%Y %H:%M')} — {mins}m{secs:02d}s_", "",
-            f"*🗂️ Ficheiro:* `{str(csv_path)}`", "",
-            "*📊 Pipeline stats:*",
-            f"  📡 Dips detectados:  *{total_dips}*",
-            f"  ✍️  Escritos no CSV: *{total_written}*",
-            f"  🚫 Ignorados (score): *{total_skipped}*",
-            f"  ⏳ Censurados (edge): *{total_censored}*",
-            f"  🔁 Duplicados (skip): *{total_dupes}*",
-        ]
-        if total_errors:
-            lines.append(f"  ⚠️ Erros/timeouts: *{total_errors}*")
-        lines.append("")
-        if label_counts_total:
-            lines.append("*🎯 Distribuição de outcomes:*")
-            for lbl, cnt in sorted(label_counts_total.items(), key=lambda x: x[1], reverse=True):
-                pct = cnt / len(all_dip_rows) * 100 if all_dip_rows else 0
-                lines.append(f"  {em_map.get(lbl,'📊')} {lbl}: *{cnt}* ({pct:.0f}%)")
-            lines.append("")
-
-        total_labeled = sum(cnt for lbl, cnt in label_counts_total.items() if lbl != "pending")
-        if total_labeled >= 100:
-            lines.append("🟢 *Pronto para treinar!* Usa `/admin_train_ml`")
-        elif total_labeled >= 30:
-            lines.append(f"🟡 *{total_labeled} amostras* — podes já tentar `/admin_train_ml`")
-        else:
-            lines.append(f"🕐 *{total_labeled} amostras* — adiciona mais tickers à watchlist.")
-
-        _reply("\n".join(lines))
-
-    threading.Thread(target=_run, daemon=True, name="admin-backfill").start()
-
-
-# ── /admin_train_ml ─────────────────────────────────────────────────────────────
-
-def _handle_admin_train_ml() -> None:
-    global _train_running
-
-    if _train_running:
-        _reply("⚠️ *Treino já está a correr.*\n_Aguarda a conclusão._")
-        return
-
-    _reply(
-        "🧪 *A iniciar o Laboratório de ML...*\n"
-        "_A competição AutoSelect vai correr RF vs XGBoost vs LightGBM._\n"
-        "_Estimativa: 2–5 minutos dependendo do volume de dados._\n"
-        "_O bot continua a responder durante o treino._"
-    )
-    logging.info("[admin_train] Iniciando treino ML")
-
-    def _run():
-        global _train_running
-        _train_running = True
-        start_ts = time.time()
-        try:
-            from train_model import train_all
-            result = train_all(live_only=False, dry_run=False, min_precision=0.70)
-
-            elapsed    = int(time.time() - start_ts)
-            mins, secs = divmod(elapsed, 60)
-            s1         = result.get("stage1", {})
-            s2         = result.get("stage2")
-
-            lines = [
-                "🎓 *Treino ML concluído!*",
-                f"_{datetime.now().strftime('%d/%m/%Y %H:%M')} — {mins}m{secs:02d}s_",
-                "",
-                "*🥊 Competição AutoSelect:*",
-                f"  🏆 Vencedor Andar 1: *{s1.get('algorithm', 'N/D')}*",
-                f"  📊 AUC-PR:           *{s1.get('auc_pr', 0):.4f}*",
-                f"  🎯 Threshold:        *{s1.get('threshold', 0):.4f}*",
-                f"  📦 Amostras:         *{s1.get('n_samples', 0)}* "
-                    f"(WIN={s1.get('n_win', 0)} | NOT-WIN={s1.get('n_not_win', 0)})",
-                f"  🧬 SMOTE activado:   {'Sim' if s1.get('smote_used') else 'Não'}",
-                "",
-            ]
-
-            if s2:
-                n_win40 = s2.get('n_win40', 0)
-                n_win20 = s2.get('n_win20', 0)
-                lines += [
-                    "*🍷 Andar 2 (Sommelier WIN40 vs WIN20):*",
-                    f"  🏆 Algoritmo: *{s2.get('algorithm', 'N/D')}*",
-                    f"  📊 AUC-PR:    *{s2.get('auc_pr', 0):.4f}*",
-                    f"  📦 Amostras:  *{s2.get('n_samples', 0)}* "
-                        f"(WIN40={n_win40} | WIN20={n_win20})",
-                    "",
-                ]
-            else:
-                lines.append("_Andar 2: dados insuficientes (precisa ≥15 amostras WIN)._\n")
-
-            feat_imp = s1.get("feature_importance", [])
-            if feat_imp:
-                lines.append("*🔬 Top-5 features (Andar 1):*")
-                max_imp = feat_imp[0]["importance"] if feat_imp else 1
-                for fi in feat_imp[:5]:
-                    ratio    = fi["importance"] / max_imp if max_imp > 0 else 0
-                    bar_len  = int(ratio * 10)
-                    bar      = "█" * bar_len
-                    lines.append(f"  `{fi['feature']:<20}` {bar} *{fi['importance']:.4f}*")
-                lines.append("")
-
-            auc = s1.get("auc_pr", 0)
-            if auc >= 0.80:
-                lines.append("🟢 *Modelo excelente!* AUC-PR ≥ 0.80 — pronto para produção.")
-                lines.append("_Chunk I vai integrar este cérebro no scanner ao vivo._")
-            elif auc >= 0.65:
-                lines.append("🟡 *Modelo bom.* AUC-PR ≥ 0.65 — funcional, vai melhorar com mais dados.")
-            else:
-                lines.append("🔴 *Modelo fraco.* AUC-PR < 0.65 — precisa de mais amostras.")
-                lines.append("_Corre `/admin_backfill_ml` com mais tickers na watchlist._")
-
-            _reply("\n".join(lines))
-            logging.info(
-                f"[admin_train] Concluído em {mins}m{secs:02d}s — "
-                f"alg={s1.get('algorithm')} auc={s1.get('auc_pr')} threshold={s1.get('threshold')}"
-            )
-
-        except ValueError as e:
-            _reply(
-                f"⚠️ *Dados insuficientes para treinar:*\n`{e}`\n\n"
-                "*Solução:*\n"
-                "1. Corre `/admin_backfill_ml` para gerar mais dados históricos.\n"
-                "2. Aguarda alertas live durante algumas semanas.\n"
-                "3. Volta a tentar `/admin_train_ml`."
-            )
-        except FileNotFoundError as e:
-            _reply(
-                f"⚠️ *Ficheiro de dados não encontrado:*\n`{e}`\n\n"
-                "_Corre `/admin_backfill_ml` primeiro para gerar o hist_backtest.csv._"
-            )
-        except Exception as e:
-            logging.error(f"[admin_train] Erro fatal: {e}")
-            _reply(
-                f"❌ *Treino falhou com erro inesperado:*\n`{e}`\n"
-                "_Verifica os logs no Railway para mais detalhes._"
-            )
-        finally:
-            _train_running = False
-
-    threading.Thread(target=_run, daemon=True, name="admin-train").start()
-
 
 # ── /admin_load_models ──────────────────────────────────────────────────────────
 
@@ -1751,7 +1434,7 @@ def _handle_admin_full_pipeline(parts: list[str]) -> None:
 
     Pipeline completo com cache inteligente — tudo automatizado:
       Fase 1 (paralelo): DipRadar parquet regen + Momentum dataset build
-      Fase 2 (paralelo): DipRadar retrain + Momentum retrain
+      Fase 2 (sequencial): DipRadar retrain → Momentum retrain
 
     Cache: salta regen se parquet tiver menos de PIPELINE_MAX_AGE_DAYS dias (default: 7).
     Retrain é sempre executado quando o parquet foi (re)gerado com sucesso.
@@ -1778,7 +1461,7 @@ def _handle_admin_full_pipeline(parts: list[str]) -> None:
     _reply(
         f"*Pipeline Completo — {scope}*\n"
         + (f"--force: ignora cache\n" if force else f"Cache: reconstrói se > {max_age_days} dias\n") +
-        f"Fase 1: parquets em paralelo → Fase 2: modelos em paralelo\n"
+        f"Fase 1: parquets em paralelo → Fase 2: modelos sequencial\n"
         f"_O bot continua activo durante todo o pipeline._"
     )
 
@@ -1897,15 +1580,14 @@ def _handle_admin_full_pipeline(parts: list[str]) -> None:
                 mom_train_err2 = str(e)
                 logging.error(f"[pipeline] Momentum train: {e}", exc_info=True)
 
-        phase2_threads = []
-        if train_dip: phase2_threads.append(threading.Thread(target=_train_dip, daemon=True, name="pipeline-dip-train"))
-        if train_mom: phase2_threads.append(threading.Thread(target=_train_mom, daemon=True, name="pipeline-mom-train"))
-
-        _reply(f"*Fase 2 — {len(phase2_threads)} modelo(s) a treinar em paralelo...*")
-        for t in phase2_threads:
-            t.start()
-        for t in phase2_threads:
-            t.join()
+        n_models = (1 if train_dip else 0) + (1 if train_mom else 0)
+        _reply(f"*Fase 2 — {n_models} modelo(s) a treinar sequencialmente...*")
+        if train_dip:
+            _reply("  ⏳ DipRadar a treinar...")
+            _train_dip()
+        if train_mom:
+            _reply("  ⏳ MomentumRadar a treinar...")
+            _train_mom()
 
         # ── Relatório final ───────────────────────────────────────────────────
         final_lines = ["*Pipeline concluído!*", ""]
@@ -2172,18 +1854,6 @@ def _handle_admin_retrain(parts: list[str]) -> None:
         logging.info(f"[admin_retrain] decision={decision} cand_rho={cand_rho}")
 
     threading.Thread(target=_run, daemon=True, name="admin-retrain").start()
-
-# ── /retrigger ──────────────────────────────────────────────────────────────────
-
-def _handle_retrigger() -> None:
-    """
-    /retrigger  → alias rápido de /admin_retrain (modo REAL, sem flags extra).
-
-    Útil para disparar o pipeline mensal ad-hoc sem ter de escrever o comando
-    completo. Delega inteiramente para _handle_admin_retrain com parts=[""].
-    """
-    _handle_admin_retrain(["admin_retrain"])
-
 
 # ── /admin_set_floor ────────────────────────────────────────────────────────────
 
@@ -3028,7 +2698,7 @@ def _handle_command(text: str) -> None:
             "`/admin_regen_parquet [--targets-only]` → [ADMIN] Regenerar parquet com PIT fundamentais + alpha90d\n"
             "`/admin_load_models <url>` → [ADMIN] Carregar pickles novos para /data/\n"
             "`/admin_retrain [dry-run]` → [ADMIN] Disparar retrain ad-hoc\n"
-            "`/retrigger`               → [ADMIN] Alias rápido de /admin_retrain (full)\\n"
+            "`/admin_full_pipeline`     → [ADMIN] Pipeline completo (parquets + retrain)\n"
             "`/health`                  → Dashboard observabilidade\n"
             "`/health errors`           → Log de erros críticos\n"
             "`/help`                    → Esta mensagem"
@@ -3256,12 +2926,6 @@ def _handle_command(text: str) -> None:
         if not _check_rate(cmd_key): return
         force = len(parts) > 1 and parts[1].lower() in ("update", "atualizar", "force")
         _handle_mldata(force_update=force)
-
-    elif cmd == "/admin_backfill_ml":
-        _handle_admin_backfill_ml()
-
-    elif cmd == "/admin_train_ml":
-        _handle_admin_train_ml()
 
     elif cmd == "/admin_load_models":
         _handle_admin_load_models(parts)
@@ -3521,9 +3185,6 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_set_floor":
         _handle_admin_set_floor(parts)
-
-    elif cmd == "/retrigger":
-        _handle_admin_retrain(["admin_retrain"])
 
     elif cmd in ("/performance", "/returns", "/portfolio_performance"):
         if not _check_rate(cmd_key): return
