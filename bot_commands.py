@@ -1712,25 +1712,27 @@ def _handle_admin_momentum_retrain(parts: list[str]) -> None:
             # Passo 2 + 3: treinar e fazer gating
             from momentum_radar.trainer import run_momentum_training
             result_train = run_momentum_training()
-            decision = result_train.get("decision", "?")
-            ic_new  = result_train.get("ic_new")
-            ic_prod = result_train.get("ic_prod")
-            n_train = result_train.get("n_train", 0)
-            n_sec   = result_train.get("n_sectors", 0)
-            elapsed = result_train.get("elapsed_s", 0)
+            decision   = result_train.get("decision", "?")
+            ic_ensemble = result_train.get("ic_ensemble")
+            ic_prod    = result_train.get("ic_prod")
+            n_train    = result_train.get("n_train", 0)
+            n_sec      = result_train.get("n_sectors", 0)
+            elapsed    = result_train.get("elapsed_s", 0)
+            ic_str     = f"{ic_ensemble:.4f}" if isinstance(ic_ensemble, float) else "N/A"
+            ic_prod_str = f"{ic_prod:.4f}" if isinstance(ic_prod, float) else "N/A"
 
             if decision == "PROMOTED":
                 _reply(
                     f"🚀 *MomentumRadar Retrain — PROMOVIDO*\n"
-                    f"IC novo: *{ic_new:.4f}*"
-                    + (f" (anterior: {ic_prod:.4f})" if ic_prod else "") +
+                    f"IC novo: *{ic_str}*"
+                    + (f" (anterior: {ic_prod_str})" if ic_prod else "") +
                     f"\n{n_train:,} amostras | {n_sec} sector models | {elapsed:.0f}s"
                 )
             elif decision == "KEPT":
                 _reply(
                     f"⚠️ *MomentumRadar Retrain — MANTIDO*\n"
                     f"_{result_train.get('reason', '')}_\n"
-                    f"IC novo: {ic_new:.4f} | Produção: {ic_prod:.4f}"
+                    f"IC novo: {ic_str} | Produção: {ic_prod_str}"
                 )
             else:
                 _reply(f"❌ *MomentumRadar Retrain — FALHOU*\n_{result_train.get('reason', '')}_")
@@ -1740,6 +1742,205 @@ def _handle_admin_momentum_retrain(parts: list[str]) -> None:
             _reply(f"❌ Erro: `{e}`")
 
     threading.Thread(target=_run, daemon=True, name="momentum-retrain").start()
+
+
+# ── /admin_full_pipeline ────────────────────────────────────────────────────────
+
+def _handle_admin_full_pipeline(parts: list[str]) -> None:
+    """/admin_full_pipeline [--force] [--dip-only] [--momentum-only]
+
+    Pipeline completo com cache inteligente — tudo automatizado:
+      Fase 1 (paralelo): DipRadar parquet regen + Momentum dataset build
+      Fase 2 (paralelo): DipRadar retrain + Momentum retrain
+
+    Cache: salta regen se parquet tiver menos de PIPELINE_MAX_AGE_DAYS dias (default: 7).
+    Retrain é sempre executado quando o parquet foi (re)gerado com sucesso.
+
+    Flags:
+      --force          → ignora cache, reconstrói tudo
+      --dip-only       → só pipeline DipRadar
+      --momentum-only  → só pipeline MomentumRadar
+    """
+    global _retrain_running
+    if _retrain_running:
+        _reply("⚠️ *Retrain já em curso.* Aguarda que termine antes de lançar o pipeline.")
+        return
+
+    force         = "--force" in parts
+    dip_only      = "--dip-only" in parts
+    momentum_only = "--momentum-only" in parts
+    max_age_days  = int(os.environ.get("PIPELINE_MAX_AGE_DAYS", "7"))
+
+    scope = "DipRadar + MomentumRadar"
+    if dip_only:      scope = "DipRadar"
+    elif momentum_only: scope = "MomentumRadar"
+
+    _reply(
+        f"*Pipeline Completo — {scope}*\n"
+        + (f"--force: ignora cache\n" if force else f"Cache: reconstrói se > {max_age_days} dias\n") +
+        f"Fase 1: parquets em paralelo → Fase 2: modelos em paralelo\n"
+        f"_O bot continua activo durante todo o pipeline._"
+    )
+
+    def _run():
+        import subprocess, sys, time as _t
+        from pathlib import Path
+
+        data_dir    = Path("/data") if Path("/data").exists() else Path("/tmp")
+        dip_parquet = data_dir / "ml_training_base.parquet"
+        mom_parquet = data_dir / "momentum_training.parquet"
+
+        def _is_fresh(path: Path) -> tuple[bool, float]:
+            if force or not path.exists():
+                return False, 999.0
+            age = (_t.time() - path.stat().st_mtime) / 86400
+            return age < max_age_days, round(age, 1)
+
+        dip_fresh, dip_age = _is_fresh(dip_parquet)
+        mom_fresh, mom_age = _is_fresh(mom_parquet)
+
+        run_dip = (not dip_fresh) and (not momentum_only)
+        run_mom = (not mom_fresh) and (not dip_only)
+
+        # Cache report
+        cache_lines = ["*Cache check:*"]
+        if not momentum_only:
+            cache_lines.append(f"  DipRadar parquet: {'fresco ({:.0f}d) — skip'.format(dip_age) if not run_dip else 'a regenerar...'}")
+        if not dip_only:
+            cache_lines.append(f"  Momentum parquet: {'fresco ({:.0f}d) — skip'.format(mom_age) if not run_mom else 'a regenerar...'}")
+        _reply("\n".join(cache_lines))
+
+        # ── Fase 1: parquets em paralelo ──────────────────────────────────────
+        dip_regen_ok = not run_dip
+        mom_regen_ok = not run_mom
+        dip_regen_err: str = ""
+        mom_regen_err: str = ""
+
+        def _regen_dip():
+            nonlocal dip_regen_ok, dip_regen_err
+            try:
+                script = Path(__file__).parent / "scripts" / "regenerate_training_base.py"
+                r = subprocess.run(
+                    [sys.executable, str(script)],
+                    capture_output=True, text=True, timeout=6 * 3600,
+                )
+                if r.returncode == 0:
+                    dip_regen_ok = True
+                else:
+                    dip_regen_err = (r.stderr or r.stdout or "")[-300:]
+            except Exception as e:
+                dip_regen_err = str(e)
+
+        def _regen_mom():
+            nonlocal mom_regen_ok, mom_regen_err
+            try:
+                script = Path(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py"
+                r = subprocess.run(
+                    [sys.executable, str(script)],
+                    capture_output=True, text=True, timeout=8 * 3600,
+                )
+                if r.returncode == 0:
+                    mom_regen_ok = True
+                else:
+                    mom_regen_err = (r.stderr or r.stdout or "")[-300:]
+            except Exception as e:
+                mom_regen_err = str(e)
+
+        phase1_threads = []
+        if run_dip: phase1_threads.append(threading.Thread(target=_regen_dip, daemon=True, name="pipeline-dip-regen"))
+        if run_mom: phase1_threads.append(threading.Thread(target=_regen_mom, daemon=True, name="pipeline-mom-regen"))
+
+        if phase1_threads:
+            _reply(f"*Fase 1 — {len(phase1_threads)} parquet(s) a regenerar em paralelo...*")
+            for t in phase1_threads:
+                t.start()
+            for t in phase1_threads:
+                t.join()
+
+            ph1_lines = ["*Fase 1 concluída:*"]
+            if run_dip:
+                ph1_lines.append(f"  {'✅' if dip_regen_ok else '❌'} DipRadar parquet" + (f": {dip_regen_err}" if dip_regen_err else ""))
+            if run_mom:
+                ph1_lines.append(f"  {'✅' if mom_regen_ok else '❌'} Momentum parquet" + (f": {mom_regen_err}" if mom_regen_err else ""))
+            _reply("\n".join(ph1_lines))
+
+        # ── Fase 2: treinar modelos em paralelo ───────────────────────────────
+        # Só treinar se o parquet respectivo foi regenerado com sucesso (ou era fresh e estamos em force).
+        # force + fresh → parquet não foi regenerado mas o utilizador quer retreinar → train anyway.
+        train_dip = dip_regen_ok and not momentum_only
+        train_mom = mom_regen_ok and not dip_only
+
+        if not train_dip and not train_mom:
+            _reply("*Pipeline terminado.* Nada a treinar.")
+            return
+
+        dip_train_res: dict  = {}
+        mom_train_res: dict  = {}
+        dip_train_err2: str  = ""
+        mom_train_err2: str  = ""
+
+        def _train_dip():
+            nonlocal dip_train_res, dip_train_err2
+            try:
+                from monthly_retrain import run_monthly_retrain_v3
+                dip_train_res = run_monthly_retrain_v3() or {}
+            except Exception as e:
+                dip_train_err2 = str(e)
+                logging.error(f"[pipeline] DipRadar train: {e}", exc_info=True)
+
+        def _train_mom():
+            nonlocal mom_train_res, mom_train_err2
+            try:
+                from momentum_radar.trainer import run_momentum_training
+                mom_train_res = run_momentum_training() or {}
+            except Exception as e:
+                mom_train_err2 = str(e)
+                logging.error(f"[pipeline] Momentum train: {e}", exc_info=True)
+
+        phase2_threads = []
+        if train_dip: phase2_threads.append(threading.Thread(target=_train_dip, daemon=True, name="pipeline-dip-train"))
+        if train_mom: phase2_threads.append(threading.Thread(target=_train_mom, daemon=True, name="pipeline-mom-train"))
+
+        _reply(f"*Fase 2 — {len(phase2_threads)} modelo(s) a treinar em paralelo...*")
+        for t in phase2_threads:
+            t.start()
+        for t in phase2_threads:
+            t.join()
+
+        # ── Relatório final ───────────────────────────────────────────────────
+        final_lines = ["*Pipeline concluído!*", ""]
+
+        if train_dip:
+            if dip_train_err2:
+                final_lines.append(f"  ❌ DipRadar: {dip_train_err2[:150]}")
+            else:
+                dec     = dip_train_res.get("decision", "?")
+                rho     = dip_train_res.get("candidate_rho_alpha")
+                p_rho   = dip_train_res.get("production_rho_alpha")
+                icon    = {"PROMOTED": "🚀", "PENDING": "⚠️", "KEPT_FLOOR": "🛑"}.get(dec, "❌")
+                rho_s   = f"{rho:.4f}" if isinstance(rho, float) else "N/A"
+                prod_s  = f" (prod: {p_rho:.4f})" if isinstance(p_rho, float) else ""
+                final_lines.append(f"  {icon} DipRadar: *{dec}* | ρ={rho_s}{prod_s}")
+        else:
+            final_lines.append("  ⏩ DipRadar retrain: saltado")
+
+        if train_mom:
+            if mom_train_err2:
+                final_lines.append(f"  ❌ MomentumRadar: {mom_train_err2[:150]}")
+            else:
+                dec_m  = mom_train_res.get("decision", "?")
+                ic_m   = mom_train_res.get("ic_ensemble")
+                n_m    = mom_train_res.get("n_train", 0)
+                ns_m   = mom_train_res.get("n_sectors", 0)
+                icon_m = {"PROMOTED": "🚀", "KEPT": "⚠️", "FAILED": "❌"}.get(dec_m, "❌")
+                ic_s   = f"{ic_m:.4f}" if isinstance(ic_m, float) else "N/A"
+                final_lines.append(f"  {icon_m} MomentumRadar: *{dec_m}* | IC={ic_s} | {n_m:,} amostras | {ns_m} sectors")
+        else:
+            final_lines.append("  ⏩ Momentum retrain: saltado")
+
+        _reply("\n".join(final_lines))
+
+    threading.Thread(target=_run, daemon=True, name="admin-full-pipeline").start()
 
 
 # ── /admin_retrain ──────────────────────────────────────────────────────────────
@@ -3314,6 +3515,9 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_momentum_retrain":
         _handle_admin_momentum_retrain(parts)
+
+    elif cmd == "/admin_full_pipeline":
+        _handle_admin_full_pipeline(parts)
 
     elif cmd == "/admin_set_floor":
         _handle_admin_set_floor(parts)
