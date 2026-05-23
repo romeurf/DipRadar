@@ -76,9 +76,33 @@ def _spearman(x: np.ndarray, y: np.ndarray) -> float:
         return 0.0
 
 
+def _make_momentum_model():
+    """LightGBM-ES (mesmo config que DipRadar) com ScaledRidge como fallback.
+
+    Usa a factory partilhada de ml_training/models.py para que ambos os
+    modelos evoluam juntos quando os hiperparâmetros forem ajustados.
+    """
+    try:
+        from ml_training.models import lgbm_es_factory
+        return lgbm_es_factory()
+    except Exception:
+        from ml_training.models import ScaledRidge
+        return ScaledRidge(alpha=10.0)
+
+
+def _is_tree(m) -> bool:
+    name = type(m).__name__.lower()
+    return any(x in name for x in ("lgbm", "lightgbm", "xgb", "forest", "tree"))
+
+
 def _walk_forward_ic(df: pd.DataFrame, feats: list[str], target: str) -> tuple[float, float]:
     """Walk-forward CV purged — devolve (mean_IC, IC_SR)."""
-    from ml_training.models import ScaledRidge
+    try:
+        from ml_training.train import _fit_model, _split_val, _prepare_X, _compute_col_means
+        _has_infra = True
+    except ImportError:
+        _has_infra = False
+
     df = df.dropna(subset=[target]).sort_values("date").reset_index(drop=True)
     df["date"] = pd.to_datetime(df["date"])
     n = len(df)
@@ -99,24 +123,32 @@ def _walk_forward_ic(df: pd.DataFrame, feats: list[str], target: str) -> tuple[f
         if len(tr) < 50 or len(te) < 20:
             continue
 
-        _col_means = {
-            col: float(tr[col].dropna().mean()) if col in tr.columns and tr[col].notna().any() else 0.0
-            for col in feats
-        }
-        def _prep(df_):
-            r = df_[feats].copy()
-            for c in feats:
-                if c in r.columns and r[c].isna().any():
-                    r[c] = r[c].fillna(_col_means.get(c, 0.0))
-            return r.values.astype(np.float32)
+        m = _make_momentum_model()
 
-        X_tr = _prep(tr)
-        y_tr = tr[target].values.astype(float)
-        X_te = _prep(te)
-        y_te = te[target].values
+        if _has_infra:
+            col_means = _compute_col_means(tr, feats)
+            X_tr = _prepare_X(tr, feats, col_means, m)
+            X_te = _prepare_X(te, feats, col_means, m)
+            y_tr = tr[target].values.astype(float)
+            y_te = te[target].values
+            sw_tr = np.ones(len(X_tr), dtype=np.float32)
+            X_t, y_t, sw_t, X_v, y_v = _split_val(X_tr, y_tr, sw_tr)
+            m = _fit_model(m, X_t, y_t, sw_t, X_v, y_v)
+        else:
+            col_means = {
+                col: float(tr[col].dropna().mean()) if col in tr.columns and tr[col].notna().any() else 0.0
+                for col in feats
+            }
+            def _prep(df_):
+                r = df_[feats].copy()
+                for c in feats:
+                    if c in r.columns and r[c].isna().any():
+                        r[c] = r[c].fillna(col_means.get(c, 0.0))
+                return r.values.astype(np.float32)
+            X_tr = _prep(tr); y_tr = tr[target].values.astype(float)
+            X_te = _prep(te); y_te = te[target].values
+            m.fit(X_tr, y_tr)
 
-        m = ScaledRidge(alpha=10.0)
-        m.fit(X_tr, y_tr)
         preds = m.predict(X_te)
         ic = _spearman(preds, y_te)
         if math.isfinite(ic):
@@ -130,22 +162,43 @@ def _walk_forward_ic(df: pd.DataFrame, feats: list[str], target: str) -> tuple[f
 
 
 def _train_final_model(df: pd.DataFrame, feats: list[str], target: str):
-    """Treina modelo final no dataset completo, com mean imputation."""
-    from ml_training.models import ScaledRidge
+    """Treina modelo final no dataset completo.
+
+    LightGBM trata NaN nativamente — means devolvido como {} para
+    compatibilidade com o scanner (que tenta imputation mas LGBM ignora).
+    """
+    try:
+        from ml_training.train import _fit_model, _split_val, _prepare_X, _compute_col_means
+        _has_infra = True
+    except ImportError:
+        _has_infra = False
+
     df = df.dropna(subset=[target]).reset_index(drop=True)
-    _means = {
-        col: float(df[col].dropna().mean()) if col in df.columns and df[col].notna().any() else 0.0
-        for col in feats
-    }
-    r = df[feats].copy()
-    for c in feats:
-        if c in r.columns and r[c].isna().any():
-            r[c] = r[c].fillna(_means.get(c, 0.0))
-    X = r.values.astype(np.float32)
-    y = df[target].values.astype(float)
-    m = ScaledRidge(alpha=10.0)
-    m.fit(X, y)
-    return m, _means, len(df)
+    m = _make_momentum_model()
+
+    if _has_infra:
+        col_means = _compute_col_means(df, feats)
+        X = _prepare_X(df, feats, col_means, m)
+        y = df[target].values.astype(float)
+        sw = np.ones(len(X), dtype=np.float32)
+        X_t, y_t, sw_t, X_v, y_v = _split_val(X, y, sw)
+        m = _fit_model(m, X_t, y_t, sw_t, X_v, y_v)
+        means = {} if _is_tree(m) else col_means
+    else:
+        col_means = {
+            col: float(df[col].dropna().mean()) if col in df.columns and df[col].notna().any() else 0.0
+            for col in feats
+        }
+        r = df[feats].copy()
+        for c in feats:
+            if c in r.columns and r[c].isna().any():
+                r[c] = r[c].fillna(col_means.get(c, 0.0))
+        X = r.values.astype(np.float32)
+        y = df[target].values.astype(float)
+        m.fit(X, y)
+        means = col_means
+
+    return m, means, len(df)
 
 
 def run_momentum_training(dataset_path: Path = _DATASET) -> dict:
