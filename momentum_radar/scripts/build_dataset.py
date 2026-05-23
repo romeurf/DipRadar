@@ -296,9 +296,12 @@ def build_dataset(
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Constrói dataset de treino para Breakout ML")
-    p.add_argument("--tickers", help="Lista de tickers separados por vírgula (teste rápido)")
-    p.add_argument("--start",   default="1993-01-01", help="Data de início (YYYY-MM-DD). Default: 1993 (mesmo que DipRadar)")
-    p.add_argument("--out",     default=str(_OUTPUT),  help="Caminho de output do parquet")
+    p.add_argument("--tickers",       help="Lista de tickers separados por vírgula (teste rápido)")
+    p.add_argument("--start",         default="1993-01-01", help="Data de início (YYYY-MM-DD). Default: 1993")
+    p.add_argument("--out",           default=str(_OUTPUT),  help="Caminho de output do parquet")
+    p.add_argument("--cooldown-days", type=int, default=20,
+                   help="Dias de cooldown por ticker entre amostras (default 20). "
+                        "Stocks voláteis podem usar 10; large-caps estáveis 30.")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
@@ -360,8 +363,8 @@ def main() -> int:
             existing_df = None
 
     _notify(f"🚀 *Bootstrap Momentum {args.start[:4]}–hoje* iniciado — {len(tickers)} tickers")
-    log.info(f"A construir dataset de momentum desde {incremental_start}...")
-    new_df = build_dataset(tickers, spy_hist, start=incremental_start)
+    log.info(f"A construir dataset de momentum desde {incremental_start} (cooldown={args.cooldown_days}d)...")
+    new_df = build_dataset(tickers, spy_hist, start=incremental_start, cooldown_days=args.cooldown_days)
 
     if new_df.empty:
         if existing_df is not None and not existing_df.empty:
