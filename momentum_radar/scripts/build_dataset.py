@@ -152,16 +152,19 @@ def _build_momentum_features(hist: pd.DataFrame, idx: int) -> Optional[dict]:
     else:
         close_in_range = 0.5
 
-    # Market Structure: VWAP ancorado no mínimo (confirma preço > custo médio desde fundo)
-    # e Volume Profile POC (confirma preço > zona de maior volume 60d)
+    # Market Structure: VWAP ancorado no mínimo e Volume Profile POC
     hist_slice = hist.iloc[:idx + 1]
     try:
-        from ml_features import _anchored_vwap_ratio, _volume_poc_ratio
+        from ml_features import _anchored_vwap_ratio, _volume_poc_ratio, _compute_mfi, _compute_volume_up_pct
         vwap_low_ratio = _anchored_vwap_ratio(hist_slice, use_high=False)
         poc_ratio      = _volume_poc_ratio(hist_slice, lookback=60)
+        mfi_val        = _compute_mfi(hist_slice, period=14)
+        vol_up_pct     = _compute_volume_up_pct(hist_slice, lookback=20)
     except Exception:
         vwap_low_ratio = 0.0
         poc_ratio      = 0.0
+        mfi_val        = 50.0
+        vol_up_pct     = 0.50
 
     return {
         "return_20d":          round(ret_20d, 4),
@@ -174,6 +177,8 @@ def _build_momentum_features(hist: pd.DataFrame, idx: int) -> Optional[dict]:
         "close_in_range_20d":  round(close_in_range, 4),
         "vwap_from_low_ratio": round(vwap_low_ratio, 4),
         "volume_poc_ratio":    round(poc_ratio, 4),
+        "mfi_14":              round(mfi_val, 2),
+        "volume_up_pct_20d":   round(vol_up_pct, 4),
         "price":               round(float(close.iloc[idx]), 4),
     }
 
@@ -359,6 +364,7 @@ def main() -> int:
         "forward_return_90d", "forward_return_180d",
         "alpha_90d", "alpha_180d",
         "vwap_from_low_ratio", "volume_poc_ratio",
+        "mfi_14", "volume_up_pct_20d",
     ]
     if existing_df is not None and not existing_df.empty:
         for col in _BACKFILL_COLS:

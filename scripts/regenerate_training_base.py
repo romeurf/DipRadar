@@ -106,6 +106,9 @@ NEW_FEATURE_COLS: list[str] = [
     "vwap_from_high_ratio",
     "volume_poc_ratio",
     "liquidity_sweep_score",
+    # Volume Flow (Vertus-inspired)
+    "mfi_14",
+    "volume_up_pct_20d",
 ]
 
 # Colunas fundamentais corrigidas (PIT) — substituem valores constantes do bootstrap
@@ -319,6 +322,16 @@ def _compute_row_features(
         except Exception as e:
             log.debug(f"  market_structure failed {ticker}@{alert_date.date()}: {e}")
     for k in ("vwap_from_high_ratio", "volume_poc_ratio", "liquidity_sweep_score"):
+        fv.setdefault(k, _FALLBACK.get(k, 0.0))
+
+    # Volume Flow — MFI 14d + buying pressure ratio 20d
+    if hist is not None:
+        try:
+            from ml_features import add_volume_flow_features
+            add_volume_flow_features(fv, hist)
+        except Exception as e:
+            log.debug(f"  volume_flow failed {ticker}@{alert_date.date()}: {e}")
+    for k in ("mfi_14", "volume_up_pct_20d"):
         fv.setdefault(k, _FALLBACK.get(k, 0.0))
 
     # Devolver só as colunas de interesse

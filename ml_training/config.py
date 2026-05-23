@@ -88,6 +88,9 @@ FEATURE_COLS: list[str] = [
     "vwap_from_high_ratio",
     "volume_poc_ratio",
     "liquidity_sweep_score",
+    # Volume Flow (Vertus-inspired): MFI + buying pressure proxy.
+    "mfi_14",
+    "volume_up_pct_20d",
 ]
 # Features removidas vs PR #25 (Spearman IC profiling sobre o parquet completo
 # 36929 rows confirmou 14 features inúteis):

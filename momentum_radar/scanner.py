@@ -96,14 +96,18 @@ def _calc_momentum_signals(hist: pd.DataFrame) -> dict:
     high_52w = close.rolling(252, min_periods=20).max().iloc[-1] if len(close) >= 20 else close.max()
     pct_from_52w_high = float(close.iloc[-1] / high_52w - 1)
 
-    # Market Structure: VWAP ancorado no mínimo 52w e Volume Profile POC
+    # Market Structure + Volume Flow
     try:
-        from ml_features import _anchored_vwap_ratio, _volume_poc_ratio
+        from ml_features import _anchored_vwap_ratio, _volume_poc_ratio, _compute_mfi, _compute_volume_up_pct
         vwap_low_ratio = _anchored_vwap_ratio(hist, use_high=False)
         poc_ratio      = _volume_poc_ratio(hist, lookback=60)
+        mfi_val        = _compute_mfi(hist, period=14)
+        vol_up_pct     = _compute_volume_up_pct(hist, lookback=20)
     except Exception:
         vwap_low_ratio = 0.0
         poc_ratio      = 0.0
+        mfi_val        = 50.0
+        vol_up_pct     = 0.50
 
     # return_60d_pre (retorno dos 60d antes dos últimos 20d — impulso prévio)
     ret_60d_pre = float(close.iloc[-21] / close.iloc[-81] - 1) if len(close) >= 81 else 0.0
@@ -138,6 +142,8 @@ def _calc_momentum_signals(hist: pd.DataFrame) -> dict:
         "close_in_range_20d":  round(close_in_range_20d, 4),
         "vwap_from_low_ratio": round(vwap_low_ratio, 4),
         "volume_poc_ratio":    round(poc_ratio, 4),
+        "mfi_14":              round(mfi_val, 2),
+        "volume_up_pct_20d":   round(vol_up_pct, 4),
         "price":               round(float(close.iloc[-1]), 4),
     }
 

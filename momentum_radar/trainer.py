@@ -49,6 +49,9 @@ FEATURE_COLS = [
     # Market Structure (v4.3)
     "vwap_from_low_ratio",   # positivo = preço acima do custo médio desde fundo
     "volume_poc_ratio",      # positivo = preço acima do nível de maior volume (60d)
+    # Volume Flow
+    "mfi_14",                # Money Flow Index 14d — acumulação institucional
+    "volume_up_pct_20d",     # % volume em dias de subida — pressão compradora
 ]
 
 # Alvos multi-horizonte e pesos no ensemble

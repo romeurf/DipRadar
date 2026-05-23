@@ -94,6 +94,9 @@ FEATURE_COLUMNS: list[str] = [
     "vwap_from_high_ratio",      # (price - VWAP_desde_52w_high) / VWAP — negativo = abaixo custo institucional
     "volume_poc_ratio",          # (price - POC_90d) / POC — negativo = abaixo do nível de maior volume
     "liquidity_sweep_score",     # recência do último stop-hunt: 1=hoje, decai 0 em 10 dias
+    # Volume Flow (Vertus-inspired): MFI + pressão compradora
+    "mfi_14",                    # Money Flow Index 14d — <30 oversold/acumulação, >70 sobrecomprado
+    "volume_up_pct_20d",         # % do volume total em dias de subida (20d) — proxy de pressão institucional
 ]
 # PR #28 (Phase A): drop 14 dead features after IC profiling on full parquet:
 #   • 9 CONSTANTES (std=0, IC indefinida — _FALLBACK em todas as linhas):
@@ -198,6 +201,9 @@ _FALLBACK: dict[str, float] = {
     "vwap_from_high_ratio": -0.12,   # ~12% abaixo do VWAP desde pico — dip típico
     "volume_poc_ratio": 0.0,         # neutro — sem info de volume profile
     "liquidity_sweep_score": 0.0,    # sem sweep recente — caso mais comum
+    # Volume Flow
+    "mfi_14": 50.0,                  # neutro — sem pressão direcional
+    "volume_up_pct_20d": 0.50,       # 50% — distribuição aleatória base rate
 }
 
 def _tz_normalize(ts: Any) -> pd.Timestamp:
@@ -420,6 +426,7 @@ def build_features(
     if price_history is not None:
         add_raw_ohlcv_features(features, price_history)
         add_market_structure_features(features, price_history)
+        add_volume_flow_features(features, price_history)
 
     # Stage 5 — Sinais de qualidade e sentimento (Fase 5).
     # NaN onde não disponível — o modelo trata NaN como "informação em falta",
@@ -800,6 +807,69 @@ def add_market_structure_features(features: dict, hist: pd.DataFrame) -> dict:
     features["vwap_from_high_ratio"] = _anchored_vwap_ratio(hist, use_high=True)
     features["volume_poc_ratio"]     = _volume_poc_ratio(hist, lookback=90)
     features["liquidity_sweep_score"]= _liquidity_sweep_score(hist, lookback=20)
+    return features
+
+
+def _compute_mfi(hist: pd.DataFrame, period: int = 14) -> float:
+    """Money Flow Index — pressão compradora/vendedora ponderada por volume.
+
+    MFI < 30: possível acumulação (útil em dips para confirmar fundo).
+    MFI > 70: possível distribuição (útil em momentum para confirmar força).
+    """
+    if hist is None or len(hist) < period + 2:
+        return 50.0
+    if not all(c in hist.columns for c in ("High", "Low", "Close", "Volume")):
+        return 50.0
+    try:
+        import numpy as _np
+        typical = (hist["High"] + hist["Low"] + hist["Close"]) / 3.0
+        flow    = typical * hist["Volume"]
+        delta   = typical.diff()
+        pos_flow = flow.where(delta > 0, 0.0)
+        neg_flow = flow.where(delta <= 0, 0.0)
+        pos_sum  = pos_flow.rolling(period).sum()
+        neg_sum  = neg_flow.rolling(period).sum()
+        mfr      = pos_sum / neg_sum.replace(0, float("nan"))
+        mfi      = 100.0 - (100.0 / (1.0 + mfr))
+        val      = float(mfi.iloc[-1])
+        return round(val if _np.isfinite(val) else 50.0, 2)
+    except Exception:
+        return 50.0
+
+
+def _compute_volume_up_pct(hist: pd.DataFrame, lookback: int = 20) -> float:
+    """Fracção do volume total (últimos N dias) que ocorreu em dias de subida.
+
+    >0.65: acumulação institucional (mais volume em dias de alta).
+    <0.35: distribuição (mais volume em dias de queda).
+    """
+    if hist is None or len(hist) < 5 or "Volume" not in hist.columns:
+        return 0.50
+    try:
+        recent    = hist.iloc[-lookback:]
+        close_chg = recent["Close"].diff()
+        up_vol    = float(recent["Volume"].where(close_chg > 0, 0.0).sum())
+        total_vol = float(recent["Volume"].sum())
+        return round(up_vol / total_vol if total_vol > 0 else 0.50, 4)
+    except Exception:
+        return 0.50
+
+
+def add_volume_flow_features(features: dict, hist: pd.DataFrame) -> dict:
+    """MFI 14d + buying pressure ratio 20d.
+
+    PIT-safe: hist deve estar sliced até alert_date.
+    Ambas as features capturam o mesmo fenómeno (acumulação institucional)
+    por duas métricas ortogonais — MFI usa preço ponderado; volume_up_pct
+    usa dias de subida vs descida brutos.
+    """
+    _keys = ("mfi_14", "volume_up_pct_20d")
+    if hist is None or hist.empty or len(hist) < 5:
+        for k in _keys:
+            features.setdefault(k, _FALLBACK[k])
+        return features
+    features["mfi_14"]            = _compute_mfi(hist, period=14)
+    features["volume_up_pct_20d"] = _compute_volume_up_pct(hist, lookback=20)
     return features
 
 
