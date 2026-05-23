@@ -503,20 +503,57 @@ def format_performance_report(perf: dict) -> str:
 # Exit por trailing stop (não target fixo).
 
 _MOMENTUM_TRAILING_STOP = float(os.environ.get("MOMENTUM_TRAILING_STOP_PCT", "0.12"))
-_MOMENTUM_HOLD_DAYS     = 60   # momentum fades faster than dips
+_MOMENTUM_HOLD_DAYS     = 60   # default; sobreposto pela durability tag
+
+
+def _trailing_stop_for_durability(durability: str) -> float:
+    """Stop adaptado à durabilidade prevista: DURÁVEL tolera mais pullback."""
+    return {"DURÁVEL": 0.15, "MODERADO": 0.12, "TÁCTICO": 0.08}.get(durability, _MOMENTUM_TRAILING_STOP)
+
+
+def _hold_days_for_durability(durability: str) -> int:
+    """Hold máximo adaptado: DURÁVEL pode durar 6 meses, TÁCTICO sai em 30d."""
+    return {"DURÁVEL": 180, "MODERADO": 60, "TÁCTICO": 30}.get(durability, _MOMENTUM_HOLD_DAYS)
+
+
+def _get_current_momentum_signals(ticker: str) -> dict:
+    """Obtém sinais de momentum actuais para re-scoring diário.
+
+    Usa data_feed para preços EOD e o cálculo do scanner.
+    Retorna {} em caso de falha para que o caller salte sem erros.
+    """
+    try:
+        from data_feed import get_eod_prices
+        import pandas as pd
+        df = get_eod_prices(ticker, lookback_days=90)
+        if df is None or df.empty or "Close" not in df.columns:
+            return {}
+        if "date" in df.columns:
+            df = df.set_index(pd.to_datetime(df["date"])).sort_index()
+        df.columns = [c.capitalize() if c.lower() in ("open","high","low","close","volume") else c for c in df.columns]
+        from momentum_radar.scanner import _calc_momentum_signals
+        return _calc_momentum_signals(df)
+    except Exception as e:
+        log.debug(f"[paper_m] _get_current_signals {ticker}: {e}")
+        return {}
 
 
 def record_momentum_paper_buy(
-    ticker:       str,
-    open_price:   float,
-    amount_eur:   float,
-    momentum_score: float = 0.0,
-    usd_eur:      float   = _USD_EUR_DEFAULT,
+    ticker:            str,
+    open_price:        float,
+    amount_eur:        float,
+    momentum_score:    float = 0.0,
+    ml_score_l1:       float = 0.0,
+    ml_score_l2:       float = 0.0,
+    ml_score_l3:       float = 0.0,
+    ml_score_ensemble: float = 0.0,
+    ml_durability:     str   = "MODERADO",
+    usd_eur:           float = _USD_EUR_DEFAULT,
 ) -> str:
     """Regista posição simulada de momentum quando o scanner gera alerta.
 
-    A saída é por trailing stop (-12% do máximo), não por target fixo.
-    O capital é partilhado com os dip trades — usa o mesmo orçamento mensal.
+    A saída é por trailing stop adaptado à durabilidade (DURÁVEL=-15%,
+    MODERADO=-12%, TÁCTICO=-8%), não por target fixo.
     """
     if open_price <= 0 or amount_eur <= 0:
         return ""
@@ -529,46 +566,78 @@ def record_momentum_paper_buy(
         log.info(f"[paper_m] SKIP {ticker} — orçamento esgotado (usado €{capital_used:.0f}/{monthly_budget:.0f})")
         return ""
 
-    amount_eur = min(amount_eur, remaining)
-    trade_id   = str(uuid.uuid4())[:8]
-    shares     = amount_eur / max(open_price * usd_eur, 0.01)
+    amount_eur      = min(amount_eur, remaining)
+    trade_id        = str(uuid.uuid4())[:8]
+    shares          = amount_eur / max(open_price * usd_eur, 0.01)
+    trailing_stop   = _trailing_stop_for_durability(ml_durability)
+    hold_days       = _hold_days_for_durability(ml_durability)
+    today_iso       = date.today().isoformat()
 
     trade = {
-        "id":             trade_id,
-        "trade_type":     "MOMENTUM",
-        "ticker":         ticker.upper(),
-        "open_date":      date.today().isoformat(),
-        "open_price":     round(open_price, 4),
-        "amount_eur":     round(amount_eur, 2),
-        "shares":         round(shares, 6),
-        "sell_target":    0.0,            # momentum: sem target fixo
-        "trailing_high":  round(open_price, 4),  # inicializa no preço de entrada
-        "hold_days":      _MOMENTUM_HOLD_DAYS,
-        "status":         "OPEN",
-        "close_date":     None,
-        "close_price":    None,
-        "return_pct":     None,
-        "spy_return_pct": None,
-        "alpha_pct":      None,
-        "momentum_score": round(momentum_score, 1),
+        "id":                  trade_id,
+        "trade_type":          "MOMENTUM",
+        "ticker":              ticker.upper(),
+        "open_date":           today_iso,
+        "open_price":          round(open_price, 4),
+        "amount_eur":          round(amount_eur, 2),
+        "shares":              round(shares, 6),
+        "sell_target":         0.0,
+        "trailing_high":       round(open_price, 4),
+        "trailing_stop_pct":   trailing_stop,
+        "hold_days":           hold_days,
+        "status":              "OPEN",
+        "close_date":          None,
+        "close_price":         None,
+        "return_pct":          None,
+        "spy_return_pct":      None,
+        "alpha_pct":           None,
+        "momentum_score":      round(momentum_score, 1),
+        # ML multi-horizonte (snapshot na abertura)
+        "ml_score_l1":         round(ml_score_l1, 4),
+        "ml_score_l2":         round(ml_score_l2, 4),
+        "ml_score_l3":         round(ml_score_l3, 4),
+        "ml_score_ensemble":   round(ml_score_ensemble, 4),
+        "ml_durability_open":  ml_durability,
+        "ml_durability_cur":   ml_durability,
+        # Histórico de deriva de durabilidade: [{date, durability, l1, l2, l3}]
+        "durability_history":  [{
+            "date":       today_iso,
+            "durability": ml_durability,
+            "l1":         round(ml_score_l1, 4),
+            "l2":         round(ml_score_l2, 4),
+            "l3":         round(ml_score_l3, 4),
+        }],
         "budget_used_at_open": round(capital_used + amount_eur, 2),
         "budget_total":        round(monthly_budget, 2),
     }
     trades = _load()
     trades.append(trade)
     _save(trades)
-    log.info(f"[paper_m] OPEN {ticker} MOMENTUM €{amount_eur:.0f} @ {open_price:.2f} score={momentum_score:.0f}")
+    log.info(
+        f"[paper_m] OPEN {ticker} MOMENTUM €{amount_eur:.0f} @ {open_price:.2f} "
+        f"score={momentum_score:.0f} dur={ml_durability} stop={trailing_stop:.0%} hold={hold_days}d"
+    )
     return trade_id
 
 
-def update_momentum_positions() -> dict:
-    """Actualiza posições MOMENTUM abertas: trailing stop + timeout.
+def update_momentum_positions(send_fn=None) -> dict:
+    """Actualiza posições MOMENTUM abertas: drift de durabilidade + trailing stop + timeout.
 
-    Chamado pelo mesmo scheduler que update_open_positions().
+    Algoritmo diário:
+      1. Re-score ML multi-horizonte com sinais actuais
+      2. Detectar drift: TÁCTICO→DURÁVEL (alargar stop) ou DURÁVEL→TÁCTICO (apertar)
+      3. Enviar alerta se mudança significativa
+      4. Actualizar trailing stop e hold_days adaptados
+      5. Fechar se trailing stop atingido ou timeout
+
+    Returns dict com chaves: updated, drifted, closed.
     """
     trades  = _load()
     today   = date.today()
+    today_iso = today.isoformat()
     updated = 0
+    drifted = 0
+    closed  = 0
 
     for t in trades:
         if t.get("status") != "OPEN" or t.get("trade_type") != "MOMENTUM":
@@ -580,41 +649,115 @@ def update_momentum_positions() -> dict:
         if days_held < 3:
             continue
 
-        current_price = _fetch_close(t["ticker"], today)
+        ticker = t["ticker"]
+        current_price = _fetch_close(ticker, today)
         if current_price is None:
             continue
 
-        # Actualizar trailing high
+        # ── 1. Re-score ML com sinais actuais ────────────────────────────────
+        prev_durability = t.get("ml_durability_cur", t.get("ml_durability_open", "MODERADO"))
+        new_durability  = prev_durability  # fallback se ML falhar
+        new_l1 = new_l2 = new_l3 = 0.0
+
+        signals = _get_current_momentum_signals(ticker)
+        if signals:
+            try:
+                from momentum_radar.scanner import _ml_score_momentum
+                ml = _ml_score_momentum(signals)
+                if ml.get("ml_ready"):
+                    new_l1         = ml.get("ml_score_l1", 0.0)
+                    new_l2         = ml.get("ml_score_l2", 0.0)
+                    new_l3         = ml.get("ml_score_l3", 0.0)
+                    new_durability = ml.get("ml_durability", prev_durability)
+
+                    # Guardar no histórico (1 entrada por dia, não duplicar)
+                    hist = t.setdefault("durability_history", [])
+                    if not hist or hist[-1].get("date") != today_iso:
+                        hist.append({
+                            "date": today_iso, "durability": new_durability,
+                            "l1": round(new_l1, 4), "l2": round(new_l2, 4), "l3": round(new_l3, 4),
+                        })
+            except Exception as e:
+                log.debug(f"[paper_m] Re-score {ticker}: {e}")
+
+        # ── 2. Detectar drift de durabilidade ────────────────────────────────
+        drift_alert = ""
+        if new_durability != prev_durability:
+            t["ml_durability_cur"] = new_durability
+
+            # Adaptar trailing stop e hold_days
+            new_stop = _trailing_stop_for_durability(new_durability)
+            new_hold = _hold_days_for_durability(new_durability)
+            old_stop = float(t.get("trailing_stop_pct") or _MOMENTUM_TRAILING_STOP)
+            t["trailing_stop_pct"] = new_stop
+            t["hold_days"]         = new_hold
+
+            cur_ret = (current_price / float(t["open_price"]) - 1)
+            if prev_durability == "TÁCTICO" and new_durability == "DURÁVEL":
+                drift_alert = (
+                    f"📈 *Drift positivo — {ticker}*\n"
+                    f"TÁCTICO → DURÁVEL ✅\n"
+                    f"Momentum a ganhar força: L3 {new_l3:+.1%} > L1 {new_l1:+.1%}\n"
+                    f"Stop alargado: {old_stop:.0%} → {new_stop:.0%} | Hold: {new_hold}d\n"
+                    f"Retorno actual: {cur_ret:+.1%}"
+                )
+            elif prev_durability == "DURÁVEL" and new_durability in ("TÁCTICO", "MODERADO"):
+                drift_alert = (
+                    f"⚠️ *Drift negativo — {ticker}*\n"
+                    f"DURÁVEL → {new_durability}\n"
+                    f"Momentum a perder força: L3 {new_l3:+.1%} vs L1 {new_l1:+.1%}\n"
+                    f"Stop apertado: {old_stop:.0%} → {new_stop:.0%} | Hold: {new_hold}d\n"
+                    f"Retorno actual: {cur_ret:+.1%}\n"
+                    f"_Considera saída se stop for atingido antes da tese se confirmar._"
+                )
+            else:
+                drift_alert = (
+                    f"🔄 *Drift — {ticker}*: {prev_durability} → {new_durability} "
+                    f"(L1={new_l1:+.1%} L3={new_l3:+.1%})"
+                )
+
+            drifted += 1
+            log.info(f"[paper_m] DRIFT {ticker}: {prev_durability} → {new_durability}")
+
+            if send_fn and drift_alert:
+                try:
+                    send_fn(drift_alert)
+                except Exception:
+                    pass
+
+        # ── 3. Trailing stop adaptativo ───────────────────────────────────────
         trailing_high = max(float(t.get("trailing_high") or t["open_price"]), current_price)
         t["trailing_high"] = round(trailing_high, 4)
 
-        # Trailing stop: fechar se cair >12% do máximo
-        trailing_stop_price = trailing_high * (1 - _MOMENTUM_TRAILING_STOP)
+        stop_pct = float(t.get("trailing_stop_pct") or _MOMENTUM_TRAILING_STOP)
+        trailing_stop_price = trailing_high * (1 - stop_pct)
         hit_trailing = current_price < trailing_stop_price
-        time_up      = days_held >= t["hold_days"]
+        time_up      = days_held >= int(t.get("hold_days") or _MOMENTUM_HOLD_DAYS)
+
+        updated += 1
 
         if not hit_trailing and not time_up:
-            # Actualizar trailing_high no ficheiro mesmo sem fechar
             continue
 
-        ret_pct = round((current_price / t["open_price"] - 1) * 100, 3)
+        # ── 4. Fechar posição ─────────────────────────────────────────────────
+        ret_pct = round((current_price / float(t["open_price"]) - 1) * 100, 3)
         spy_ret = _fetch_spy_return(open_date, today)
         alpha   = round(ret_pct - (spy_ret or 0), 3) if spy_ret is not None else None
 
-        t["status"]        = "CLOSED_TRAILING_STOP" if hit_trailing else "CLOSED_TIME"
-        t["close_date"]    = today.isoformat()
-        t["close_price"]   = round(current_price, 4)
-        t["return_pct"]    = ret_pct
-        t["spy_return_pct"]= spy_ret
-        t["alpha_pct"]     = alpha
-        updated += 1
+        t["status"]         = "CLOSED_TRAILING_STOP" if hit_trailing else "CLOSED_TIME"
+        t["close_date"]     = today_iso
+        t["close_price"]    = round(current_price, 4)
+        t["return_pct"]     = ret_pct
+        t["spy_return_pct"] = spy_ret
+        t["alpha_pct"]      = alpha
+        closed += 1
         log.info(
-            f"[paper_m] CLOSED {t['ticker']} {t['status']} "
+            f"[paper_m] CLOSED {ticker} {t['status']} dur={t.get('ml_durability_cur','?')} "
             f"ret={ret_pct:.1f}% high={trailing_high:.2f} stop={trailing_stop_price:.2f}"
         )
 
     _save(trades)
-    return {"updated": updated}
+    return {"updated": updated, "drifted": drifted, "closed": closed}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -2125,14 +2125,23 @@ def run_momentum_scan() -> None:
         available = _get_monthly_budget() - _capital_used_this_month()
         opps = []
         for c in candidates:
-            # Estimar expected_ret a partir do score (score 80 → ~20% em 30d)
-            _exp_ret = min(c["score"] / 100 * 0.30, 0.50)
-            _win_prob = min(0.40 + c["score"] / 100 * 0.35, 0.80)  # score 60→61%, 90→71%
+            dur = c.get("ml_durability", "MODERADO")
+            # Usar scores ML se disponíveis; fallback heurístico baseado no score rule-based
+            if c.get("ml_ready") and c.get("ml_score_ensemble", 0.0) != 0.0:
+                _exp_ret  = max(float(c.get("ml_score_ensemble", 0.0)), 0.03)
+                # P(win) via ML: ensemble positivo → win_prob ~55-75%
+                ens = float(c.get("ml_score_ensemble", 0.0))
+                _win_prob = min(0.50 + ens * 2.0, 0.78) if ens > 0 else 0.40
+            else:
+                _exp_ret  = min(c["score"] / 100 * 0.30, 0.50)
+                _win_prob = min(0.40 + c["score"] / 100 * 0.35, 0.80)
+            # Horizonte adaptado à durabilidade: DURÁVEL usa L2 (90d), TÁCTICO usa L1 (30d)
+            _horizon = {"DURÁVEL": 90, "MODERADO": 60, "TÁCTICO": 30}.get(dur, 60)
             opps.append({
                 "trade_type":   "MOMENTUM",
                 "ticker":       c["ticker"],
                 "expected_ret": _exp_ret,
-                "horizon_days": 30,
+                "horizon_days": _horizon,
                 "win_prob":     _win_prob,
                 "amount_eur":   available / max(len(candidates), 1),
                 "_candidate":   c,
@@ -2151,17 +2160,22 @@ def run_momentum_scan() -> None:
             except Exception as e:
                 logging.warning(f"[momentum] Erro ao enviar alerta {c.get('ticker')}: {e}")
 
-        # Paper trading para aprovados
+        # Paper trading para aprovados — inclui scores ML multi-horizonte
         usd_eur = get_usdeur() if "get_usdeur" in dir() else 0.92
         for a in approved:
             c = a["_candidate"]
             try:
                 record_momentum_paper_buy(
-                    ticker        = c["ticker"],
-                    open_price    = c["price"],
-                    amount_eur    = a["amount_eur"],
-                    momentum_score= c["score"],
-                    usd_eur       = usd_eur,
+                    ticker             = c["ticker"],
+                    open_price         = c["price"],
+                    amount_eur         = a["amount_eur"],
+                    momentum_score     = c["score"],
+                    ml_score_l1        = c.get("ml_score_l1", 0.0),
+                    ml_score_l2        = c.get("ml_score_l2", 0.0),
+                    ml_score_l3        = c.get("ml_score_l3", 0.0),
+                    ml_score_ensemble  = c.get("ml_score_ensemble", 0.0),
+                    ml_durability      = c.get("ml_durability", "MODERADO"),
+                    usd_eur            = usd_eur,
                 )
             except Exception as e:
                 logging.warning(f"[momentum] Paper trade {c['ticker']}: {e}")
@@ -2429,9 +2443,17 @@ def main() -> None:
         try:
             from paper_trading import update_open_positions, update_momentum_positions
             stats  = update_open_positions()
-            stats2 = update_momentum_positions()
-            if stats.get("updated", 0) + stats2.get("updated", 0) > 0:
-                logging.info(f"[paper] Update dip={stats} momentum={stats2}")
+            # Passa send_telegram para que o monitor de drift possa enviar alertas
+            stats2 = update_momentum_positions(send_fn=send_telegram)
+            total  = stats.get("updated", 0) + stats2.get("updated", 0)
+            drift  = stats2.get("drifted", 0)
+            closed = stats2.get("closed", 0)
+            if total > 0 or drift > 0:
+                logging.info(
+                    f"[paper] Update dip={stats} "
+                    f"momentum=updated:{stats2.get('updated',0)} "
+                    f"drift:{drift} closed:{closed}"
+                )
         except Exception as e:
             logging.warning(f"[paper] Update falhou: {e}")
 

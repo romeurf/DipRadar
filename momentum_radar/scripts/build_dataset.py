@@ -152,16 +152,29 @@ def _build_momentum_features(hist: pd.DataFrame, idx: int) -> Optional[dict]:
     else:
         close_in_range = 0.5
 
+    # Market Structure: VWAP ancorado no mínimo (confirma preço > custo médio desde fundo)
+    # e Volume Profile POC (confirma preço > zona de maior volume 60d)
+    hist_slice = hist.iloc[:idx + 1]
+    try:
+        from ml_features import _anchored_vwap_ratio, _volume_poc_ratio
+        vwap_low_ratio = _anchored_vwap_ratio(hist_slice, use_high=False)
+        poc_ratio      = _volume_poc_ratio(hist_slice, lookback=60)
+    except Exception:
+        vwap_low_ratio = 0.0
+        poc_ratio      = 0.0
+
     return {
-        "return_20d":        round(ret_20d, 4),
-        "return_5d":         round(ret_5d or 0, 4),
-        "return_60d_pre":    round(ret_60d or 0, 4),
-        "volume_ratio_20d":  round(vol_ratio, 3),
-        "rsi_14":            round(rsi, 2),
-        "pct_from_52w_high": round(pct_from_high, 4),
-        "atr_pct":           round(atr_pct, 4),
-        "close_in_range_20d":round(close_in_range, 4),
-        "price":             round(float(close.iloc[idx]), 4),
+        "return_20d":          round(ret_20d, 4),
+        "return_5d":           round(ret_5d or 0, 4),
+        "return_60d_pre":      round(ret_60d or 0, 4),
+        "volume_ratio_20d":    round(vol_ratio, 3),
+        "rsi_14":              round(rsi, 2),
+        "pct_from_52w_high":   round(pct_from_high, 4),
+        "atr_pct":             round(atr_pct, 4),
+        "close_in_range_20d":  round(close_in_range, 4),
+        "vwap_from_low_ratio": round(vwap_low_ratio, 4),
+        "volume_poc_ratio":    round(poc_ratio, 4),
+        "price":               round(float(close.iloc[idx]), 4),
     }
 
 
@@ -318,11 +331,13 @@ def main() -> int:
             existing_df = pd.read_parquet(out_path)
             if "date" in existing_df.columns and not existing_df.empty:
                 last_date = existing_df["date"].max()
-                # Recuar 35 dias para garantir forward_return_30d dos últimos registos
-                cutoff = (pd.Timestamp(last_date) - pd.Timedelta(days=35)).strftime("%Y-%m-%d")
+                # Recuar 220 dias (180d janela de targets + 40d buffer de sobreposição).
+                # Com a janela de n-185 barras, precisamos de pelo menos 185 dias à frente
+                # de cada ponto amostrado — este lookback garante capturar novas entradas.
+                cutoff = (pd.Timestamp(last_date) - pd.Timedelta(days=220)).strftime("%Y-%m-%d")
                 incremental_start = cutoff
                 log.info(f"Dataset existente: {len(existing_df)} amostras até {last_date}")
-                log.info(f"Modo incremental: a computar desde {incremental_start}")
+                log.info(f"Modo incremental: a computar desde {incremental_start} (220d lookback para janela 180d)")
         except Exception as e:
             log.warning(f"Parquet existente ilegível ({e}) — a reconstruir de raiz")
             existing_df = None
@@ -339,7 +354,19 @@ def main() -> int:
         return 1
 
     # Merge: dados existentes + novos, dedup por (ticker, date)
+    # Colunas que podem estar ausentes em parquets de versões anteriores
+    _BACKFILL_COLS = [
+        "forward_return_90d", "forward_return_180d",
+        "alpha_90d", "alpha_180d",
+        "vwap_from_low_ratio", "volume_poc_ratio",
+    ]
     if existing_df is not None and not existing_df.empty:
+        for col in _BACKFILL_COLS:
+            if col not in existing_df.columns:
+                existing_df[col] = np.nan
+        for col in _BACKFILL_COLS:
+            if col not in new_df.columns:
+                new_df[col] = np.nan
         combined = pd.concat([existing_df, new_df], ignore_index=True)
         combined = combined.drop_duplicates(subset=["ticker", "date"], keep="last")
         combined = combined.sort_values(["date", "ticker"]).reset_index(drop=True)
