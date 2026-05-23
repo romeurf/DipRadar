@@ -42,6 +42,7 @@ bot_commands.py — Todos os comandos Telegram do DipRadar.
   /mldata update           → Forçar update de outcomes
   /ml_accuracy             → Precisão real do modelo vs outcomes reais
   /admin_retrain [dry-run] → Disparar retreino ad-hoc
+  /admin_dip_dataset       → Construir dataset histórico DipRadar (desde 1993)
   /admin_full_pipeline     → Pipeline completo (parquets + retrain, com cache)
   /admin_regen_parquet [--targets-only] → Regenerar parquet (EDGAR PIT + alpha_90d)
   /admin_set_floor <valor> → Ajustar floor de IC mínimo para promoção (ex: 0.08)
@@ -1439,6 +1440,98 @@ def _handle_admin_momentum_retrain(parts: list[str]) -> None:
     threading.Thread(target=_run, daemon=True, name="momentum-retrain").start()
 
 
+# ── /admin_dip_dataset ──────────────────────────────────────────────────────────
+
+def _handle_admin_dip_dataset(parts: list[str]) -> None:
+    """/admin_dip_dataset [--start YYYY-MM-DD] [--tickers TICK1,TICK2] [--no-fundamentals]
+
+    Constrói o dataset histórico para treinar o DipRadar com episódios simulados
+    desde 1993 (equivalente a /admin_momentum_dataset mas para dips).
+
+    Varre os ~780 tickers desde 1993, detecta episódios de queda
+    (return_20d < -5%, exit quando > -2%) e calcula alpha_90d vs SPY.
+    Reutiliza exactamente as mesmas funções de feature do pipeline de produção.
+
+    Output: /data/ml_training_base.parquet (merge com alertas reais existentes)
+
+    Flags:
+      --start 2010-01-01    → data de início (default: 1993-01-01)
+      --tickers AAPL,MSFT   → testar com subset (rápido, ~2 min)
+      --no-fundamentals     → saltar EDGAR/Tiingo (mais rápido)
+
+    Duração: ~3-5h (780 tickers × histórico 30 anos) | ~2 min (teste com 5 tickers)
+    """
+    start_val = "1993-01-01"
+    ticker_val = None
+    no_fund = "--no-fundamentals" in parts
+
+    for i, p in enumerate(parts[1:]):
+        if p == "--start" and i + 2 < len(parts):
+            start_val = parts[i + 2]
+        if p == "--tickers" and i + 2 < len(parts):
+            ticker_val = parts[i + 2]
+
+    is_test = ticker_val is not None
+    dur_str = "~2 min (modo teste)" if is_test else "~3-5h (universo completo)"
+
+    _reply(
+        f"*DipRadar — Dataset Builder (simulação histórica)*\n"
+        f"Desde: {start_val}\n"
+        + (f"Tickers: {ticker_val}\n" if is_test else "") +
+        f"Output: /data/ml\\_training\\_base.parquet\n"
+        + ("Fundamentais: não\n" if no_fund else "") +
+        f"Duração: {dur_str}\n"
+        f"Podes continuar a usar o bot."
+    )
+
+    def _run():
+        import subprocess, sys
+        from pathlib import Path
+        try:
+            script = Path(__file__).parent / "scripts" / "build_dip_dataset.py"
+            cmd    = [sys.executable, str(script), "--start", start_val]
+            if ticker_val:
+                cmd += ["--tickers", ticker_val]
+            if no_fund:
+                cmd += ["--no-fundamentals"]
+
+            _TIMEOUT = 6 * 3600
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=_TIMEOUT)
+
+            if result.returncode == 0:
+                try:
+                    import pandas as pd
+                    from pathlib import Path as _P
+                    data_dir = _P("/data") if _P("/data").exists() else _P("/tmp")
+                    df = pd.read_parquet(data_dir / "ml_training_base.parquet")
+                    n_rows    = len(df)
+                    n_tickers = df["ticker"].nunique() if "ticker" in df.columns else "?"
+                    n_sectors = df["sector"].nunique() if "sector" in df.columns else "?"
+                    avg_alpha = df["alpha_90d"].mean() * 100 if "alpha_90d" in df.columns else 0
+                    pct_pos   = (df["alpha_90d"] > 0).mean() * 100 if "alpha_90d" in df.columns else 0
+                    _reply(
+                        f"*DipRadar Dataset — Concluído!*\n"
+                        f"  Amostras: {n_rows:,}\n"
+                        f"  Tickers: {n_tickers} | Sectores: {n_sectors}\n"
+                        f"  Alpha médio 90d: {avg_alpha:+.1f}%\n"
+                        f"  % positivos: {pct_pos:.0f}%\n\n"
+                        f"Próximo passo: retreinar o DipRadar com `/admin\\_full\\_pipeline --dip-only`."
+                    )
+                except Exception as e:
+                    _reply(f"Dataset gerado. (verificação: {e})")
+            else:
+                stderr = (result.stderr or "")[-500:]
+                _reply(f"❌ Dataset falhou (exit {result.returncode})\n`{stderr}`")
+
+        except subprocess.TimeoutExpired:
+            _reply("⏰ Dataset excedeu 6h. O processo foi terminado.")
+        except Exception as e:
+            logging.error(f"[dip_dataset] {e}", exc_info=True)
+            _reply(f"❌ Erro: `{e}`")
+
+    threading.Thread(target=_run, daemon=True, name="dip-dataset").start()
+
+
 # ── /admin_full_pipeline ────────────────────────────────────────────────────────
 
 def _handle_admin_full_pipeline(parts: list[str]) -> None:
@@ -2752,6 +2845,7 @@ def _handle_command(text: str) -> None:
             "`/admin_regen_parquet [--targets-only]` → [ADMIN] Regenerar parquet com PIT fundamentais + alpha90d\n"
             "`/admin_load_models <url>` → [ADMIN] Carregar pickles novos para /data/\n"
             "`/admin_retrain [dry-run]` → [ADMIN] Disparar retrain ad-hoc\n"
+            "`/admin_dip_dataset`       → [ADMIN] Construir dataset histórico DipRadar (desde 1993)\n"
             "`/admin_full_pipeline`     → [ADMIN] Pipeline completo (parquets + retrain)\n"
             "`/health`                  → Dashboard observabilidade\n"
             "`/health errors`           → Log de erros críticos\n"
@@ -3109,6 +3203,9 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_momentum_dataset":
         _handle_admin_momentum_dataset(parts)
+
+    elif cmd == "/admin_dip_dataset":
+        _handle_admin_dip_dataset(parts)
 
     elif cmd in ("/admin_pipeline_status", "/pipeline_status"):
         if _pipeline_log:
