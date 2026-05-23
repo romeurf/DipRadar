@@ -174,6 +174,12 @@ def run_momentum_training(dataset_path: Path = _DATASET) -> dict:
     if len(df) < 200:
         return {"decision": "FAILED", "reason": f"Dados insuficientes: {len(df)} amostras (mínimo 200)"}
 
+    # Winsorize targets (p1–p99) para reduzir influência de outliers extremos
+    for _tcol in ["forward_return_30d", "forward_return_90d", "forward_return_180d"]:
+        if _tcol in df.columns and df[_tcol].notna().sum() > 10:
+            _p1, _p99 = df[_tcol].quantile([0.01, 0.99])
+            df[_tcol] = df[_tcol].clip(_p1, _p99)
+
     log.info(f"[momentum_train] Dataset: {len(df)} amostras | {df['ticker'].nunique()} tickers")
 
     # Walk-forward IC por horizonte

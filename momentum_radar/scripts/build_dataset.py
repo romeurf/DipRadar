@@ -43,10 +43,12 @@ _CACHE_DIR  = _DATA_DIR / "price_cache"
 _OUTPUT     = _DATA_DIR / "momentum_training.parquet"
 
 # Critérios de entrada — dias que qualificam como "momentum"
-_MIN_RETURN_20D   = 0.10    # +10% em 20 dias
-_MIN_VOLUME_RATIO = 1.30    # 30% acima da média
-_RSI_MIN          = 50.0
-_RSI_MAX          = 78.0
+# Filtros propositadamente largos: o modelo aprende os thresholds óptimos sozinho.
+# O return_20d é o critério principal; RSI e volume são confirmações secundárias.
+_MIN_RETURN_20D   = 0.10    # +10% em 20 dias — critério core do breakout
+_MIN_VOLUME_RATIO = 1.20    # 20% acima da média (era 30%) — confirmação de volume
+_RSI_MIN          = 40.0    # mínimo liberal (era 50) — captura momentum em fase inicial
+_RSI_MAX          = 85.0    # máximo alargado (era 78) — modelo aprende risco de overbought
 _MIN_MARKET_CAP_B = 2.0     # liquidez mínima
 
 
@@ -191,9 +193,14 @@ def build_dataset(
     tickers: list[str],
     spy_hist: pd.DataFrame,
     start: str = "2019-01-01",
-    sample_every_n_days: int = 5,   # não amostrar cada dia — apenas 1 em 5 dias
+    cooldown_days: int = 20,  # por ticker: após amostrar, esperar N dias antes de nova amostra
 ) -> pd.DataFrame:
-    """Para cada ticker, encontra dias com momentum e calcula forward_return_30d."""
+    """Para cada ticker, encontra dias com momentum e calcula forward_return_30d.
+
+    Sliding window com cooldown por ticker: percorre cada dia de trading, mas depois
+    de amostrar um episódio de momentum aguarda `cooldown_days` antes de amostrar o
+    mesmo ticker novamente — evita duplicar o mesmo episódio sem perder entradas novas.
+    """
     rows = []
     n_tickers = len(tickers)
 
@@ -215,11 +222,15 @@ def build_dataset(
         close = hist["Close"]
         n = len(hist)
 
-        # Amostrar cada N dias para evitar autocorrelação temporal extrema.
-        # Precisamos de 185 dias à frente para os alvos de 180d.
-        sample_indices = range(25, n - 185, sample_every_n_days)
+        # Percorrer cada dia (não subsampling fixo).
+        # Cooldown por ticker: quando se encontra um episódio de momentum, o próximo
+        # só pode ser amostrado após `cooldown_days` índices — mesmo episódio continuado
+        # não é duplicado, mas novo breakout passado o cooldown é capturado.
+        last_sampled_idx = -cooldown_days - 1
 
-        for idx in sample_indices:
+        for idx in range(25, n - 185):
+            if idx - last_sampled_idx < cooldown_days:
+                continue
             feats = _build_momentum_features(hist, idx)
             if feats is None:
                 continue
@@ -270,6 +281,7 @@ def build_dataset(
                 "alpha_90d":           _spy_alpha(90,  fwd_90),
                 "alpha_180d":          _spy_alpha(180, fwd_180),
             })
+            last_sampled_idx = idx
 
         if (i + 1) % 50 == 0 or (i + 1) == n_tickers:
             log.info(f"  [{i+1}/{n_tickers}] {ticker} | {len(rows)} amostras momentum até agora")
