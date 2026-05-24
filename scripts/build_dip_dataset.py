@@ -251,6 +251,7 @@ def main() -> int:
     p.add_argument("--cache-dir",        default=str(_CACHE_DIR), help="Dir cache de preços")
     p.add_argument("--no-fundamentals",  action="store_true", help="Saltar EDGAR/Tiingo (mais rápido)")
     p.add_argument("--no-fase5",         action="store_true", help="Saltar features Fase5 EDGAR")
+    p.add_argument("--force-rebuild",    action="store_true", help="Ignorar parquet existente e reconstruir desde --start")
     p.add_argument("-v", "--verbose",    action="store_true")
     args = p.parse_args()
 
@@ -274,7 +275,9 @@ def main() -> int:
     # ── Modo incremental ──────────────────────────────────────────────────────
     existing_df: Optional[pd.DataFrame] = None
     start = args.start
-    if out_path.exists() and not args.tickers:
+    if args.force_rebuild and out_path.exists():
+        log.info(f"--force-rebuild: a ignorar parquet existente em {out_path}")
+    if out_path.exists() and not args.tickers and not args.force_rebuild:
         try:
             existing_df = pd.read_parquet(out_path)
             if "alert_date" in existing_df.columns and not existing_df.empty:

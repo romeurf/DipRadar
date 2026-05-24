@@ -311,9 +311,10 @@ def build_dataset(
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Constrói dataset de treino para Breakout ML")
-    p.add_argument("--tickers", help="Lista de tickers separados por vírgula (teste rápido)")
-    p.add_argument("--start",   default="1993-01-01", help="Data de início (YYYY-MM-DD). Default: 1993")
-    p.add_argument("--out",     default=str(_OUTPUT),  help="Caminho de output do parquet")
+    p.add_argument("--tickers",       help="Lista de tickers separados por vírgula (teste rápido)")
+    p.add_argument("--start",         default="1993-01-01", help="Data de início (YYYY-MM-DD). Default: 1993")
+    p.add_argument("--out",           default=str(_OUTPUT),  help="Caminho de output do parquet")
+    p.add_argument("--force-rebuild", action="store_true", help="Ignorar parquet existente e reconstruir desde --start")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
@@ -358,7 +359,9 @@ def main() -> int:
     # Se o parquet já existe, só computar datas novas (após o último registo).
     existing_df = None
     incremental_start = args.start
-    if out_path.exists() and not args.tickers:  # modo teste não é incremental
+    if args.force_rebuild and out_path.exists():
+        log.info(f"--force-rebuild: a ignorar parquet existente em {out_path}")
+    if out_path.exists() and not args.tickers and not args.force_rebuild:  # modo teste não é incremental
         try:
             existing_df = pd.read_parquet(out_path)
             if "date" in existing_df.columns and not existing_df.empty:

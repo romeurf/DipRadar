@@ -1286,25 +1286,25 @@ def _handle_admin_disk(parts: list[str]) -> None:
 # ── /admin_momentum_dataset ─────────────────────────────────────────────────────
 
 def _handle_admin_momentum_dataset(parts: list[str]) -> None:
-    """/admin_momentum_dataset [--start YYYY-MM-DD] [--tickers TICK1,TICK2]
+    """/admin_momentum_dataset [--start YYYY-MM-DD] [--tickers TICK1,TICK2] [--force-rebuild]
 
     Constrói o dataset histórico para treinar o Breakout ML (MomentumRadar).
 
-    Varre os ~780 tickers desde 2019, encontra dias com momentum forte
-    (return_20d ≥ 10%, volume 1.3×, RSI 50-78) e calcula o retorno futuro
-    a 30 dias (forward_return_30d + alpha_30d vs SPY).
+    Varre os ~780 tickers desde 1993, encontra dias com momentum forte
+    (return_20d ≥ 10%, volume 1.2×, RSI 40-85) e calcula o retorno futuro.
 
     Output: /data/momentum_training.parquet
 
     Flags:
-      --start 2021-01-01  → data de início (default: 2019-01-01)
+      --start 2021-01-01  → data de início (default: 1993-01-01)
       --tickers AAPL,MSFT → testar com subset (rápido, ~2 min)
+      --force-rebuild     → ignorar parquet existente, reconstruir desde --start
 
-    Duração: ~2-3h (780 tickers × histórico 5 anos) | ~2 min (teste com 5 tickers)
+    Duração: ~3-5h (780 tickers × histórico 30 anos) | ~2 min (teste com 5 tickers)
     """
-    flags     = [p for p in parts[1:] if p.startswith("--")]
-    start_val = "2019-01-01"
-    ticker_val = None
+    start_val     = "1993-01-01"
+    ticker_val    = None
+    force_rebuild = "--force-rebuild" in parts
 
     for i, p in enumerate(parts[1:]):
         if p == "--start" and i + 2 < len(parts):
@@ -1313,11 +1313,13 @@ def _handle_admin_momentum_dataset(parts: list[str]) -> None:
             ticker_val = parts[i + 2]
 
     is_test = ticker_val is not None
-    dur_str = "~2 min (modo teste)" if is_test else "~2-3h (universo completo)"
+    dur_str = "~2 min (modo teste)" if is_test else "~3-5h (universo completo)"
 
     _reply(
         f"*MomentumRadar — Dataset Builder*\n"
-        f"Desde: {start_val}\n"
+        f"Desde: {start_val}"
+        + (" *(force rebuild)*" if force_rebuild else "") +
+        f"\n"
         + (f"Tickers: {ticker_val}\n" if is_test else "") +
         f"Output: /data/momentum\\_training.parquet\n"
         f"Duração: {dur_str}\n"
@@ -1332,6 +1334,8 @@ def _handle_admin_momentum_dataset(parts: list[str]) -> None:
             cmd    = [sys.executable, str(script), "--start", start_val]
             if ticker_val:
                 cmd += ["--tickers", ticker_val]
+            if force_rebuild:
+                cmd += ["--force-rebuild"]
 
             _TIMEOUT = 8 * 3600  # 4h
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=_TIMEOUT)
@@ -1443,7 +1447,7 @@ def _handle_admin_momentum_retrain(parts: list[str]) -> None:
 # ── /admin_dip_dataset ──────────────────────────────────────────────────────────
 
 def _handle_admin_dip_dataset(parts: list[str]) -> None:
-    """/admin_dip_dataset [--start YYYY-MM-DD] [--tickers TICK1,TICK2] [--no-fundamentals]
+    """/admin_dip_dataset [--start YYYY-MM-DD] [--tickers TICK1,TICK2] [--no-fundamentals] [--force-rebuild]
 
     Constrói o dataset histórico para treinar o DipRadar com episódios simulados
     desde 1993 (equivalente a /admin_momentum_dataset mas para dips).
@@ -1458,12 +1462,14 @@ def _handle_admin_dip_dataset(parts: list[str]) -> None:
       --start 2010-01-01    → data de início (default: 1993-01-01)
       --tickers AAPL,MSFT   → testar com subset (rápido, ~2 min)
       --no-fundamentals     → saltar EDGAR/Tiingo (mais rápido)
+      --force-rebuild       → ignorar parquet existente, reconstruir desde --start
 
     Duração: ~3-5h (780 tickers × histórico 30 anos) | ~2 min (teste com 5 tickers)
     """
-    start_val = "1993-01-01"
-    ticker_val = None
-    no_fund = "--no-fundamentals" in parts
+    start_val   = "1993-01-01"
+    ticker_val  = None
+    no_fund     = "--no-fundamentals" in parts
+    force_rebuild = "--force-rebuild" in parts
 
     for i, p in enumerate(parts[1:]):
         if p == "--start" and i + 2 < len(parts):
@@ -1476,7 +1482,9 @@ def _handle_admin_dip_dataset(parts: list[str]) -> None:
 
     _reply(
         f"*DipRadar — Dataset Builder (simulação histórica)*\n"
-        f"Desde: {start_val}\n"
+        f"Desde: {start_val}"
+        + (" *(force rebuild)*" if force_rebuild else "") +
+        f"\n"
         + (f"Tickers: {ticker_val}\n" if is_test else "") +
         f"Output: /data/ml\\_training\\_base.parquet\n"
         + ("Fundamentais: não\n" if no_fund else "") +
@@ -1494,6 +1502,8 @@ def _handle_admin_dip_dataset(parts: list[str]) -> None:
                 cmd += ["--tickers", ticker_val]
             if no_fund:
                 cmd += ["--no-fundamentals"]
+            if force_rebuild:
+                cmd += ["--force-rebuild"]
 
             _TIMEOUT = 6 * 3600
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=_TIMEOUT)
