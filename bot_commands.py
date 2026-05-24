@@ -1598,6 +1598,148 @@ def _handle_admin_dip_dataset(parts: list[str]) -> None:
     threading.Thread(target=_run, daemon=True, name="dip-dataset").start()
 
 
+# ── GitHub parquet commit helper ─────────────────────────────────────────────────
+
+def _commit_file_to_github(local_path, repo_file_path: str, message: str) -> tuple[bool, str]:
+    """Commit/update a file in the GitHub repo via Contents API.
+
+    Requires env vars GITHUB_TOKEN and GITHUB_REPO (e.g. 'romeurf/DipRadar').
+    """
+    import base64
+    import json as _json
+    import urllib.request
+    import urllib.error
+
+    token = os.environ.get("GITHUB_TOKEN", "")
+    repo  = os.environ.get("GITHUB_REPO", "")
+    if not token or not repo:
+        return False, "GITHUB_TOKEN ou GITHUB_REPO não configurados nas env vars do Railway"
+
+    from pathlib import Path as _P
+    content_b64 = base64.b64encode(_P(local_path).read_bytes()).decode()
+    api_url = f"https://api.github.com/repos/{repo}/contents/{repo_file_path}"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "Content-Type": "application/json",
+    }
+
+    # Get existing file SHA (needed to update instead of create)
+    sha = None
+    try:
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            sha = _json.loads(resp.read()).get("sha")
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            return False, f"GET SHA HTTP {e.code}: {e.read().decode()[:200]}"
+    except Exception as e:
+        return False, f"GET SHA excepção: {e}"
+
+    payload: dict = {"message": message, "content": content_b64}
+    if sha:
+        payload["sha"] = sha
+    req = urllib.request.Request(
+        api_url,
+        data=_json.dumps(payload).encode(),
+        headers=headers,
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = _json.loads(resp.read())
+            url = result.get("content", {}).get("html_url", "")
+            return True, url
+    except urllib.error.HTTPError as e:
+        return False, f"PUT HTTP {e.code}: {e.read().decode()[:300]}"
+    except Exception as e:
+        return False, f"PUT excepção: {e}"
+
+
+# ── /admin_build_core_dataset ─────────────────────────────────────────────────────
+
+def _handle_admin_build_core_dataset(parts: list[str]) -> None:
+    """/admin_build_core_dataset [--force] [--no-fundamentals]
+
+    Constrói o dataset de treino para o CoreML:
+      - 57 quality compounders × histórico desde 1993
+      - Detecta episódios MA200w (preço ≤5% acima da linha)
+      - Features: price/MA/RSI/volume + sector ETF context
+      - Targets: alpha_1y e alpha_2y vs SPY
+      - Guarda em Railway Volume (/data) + commit ao GitHub
+    """
+    global _retrain_running
+    if _retrain_running:
+        _reply("⚠️ *Pipeline já em curso.* Aguarda que termine.")
+        return
+
+    force           = "--force" in parts
+    no_fundamentals = "--no-fundamentals" in parts
+
+    _reply(
+        "*CoreML Dataset Build*\n"
+        "57 quality compounders × histórico desde 1993\n"
+        "Episódios MA200w + features price/MA/RSI/volume/sector ETF\n"
+        "Targets: alpha\\_1y e alpha\\_2y vs SPY\n"
+        "Output: Railway Volume `/data` + commit ao GitHub\n"
+        "_Duração estimada: 20-40 min_"
+    )
+
+    def _run():
+        import subprocess, sys, re as _re
+        from pathlib import Path as _P
+
+        data_dir = _P("/data") if _P("/data").exists() else _P("/tmp")
+        out_path = data_dir / "core_training_base.parquet"
+        script   = _P(__file__).parent / "scripts" / "build_core_dataset.py"
+
+        cmd = [sys.executable, str(script), "--out", str(out_path), "--start", "1993-01-01"]
+        if force:           cmd.append("--force-rebuild")
+        if no_fundamentals: cmd.append("--no-fundamentals")
+
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=4 * 3600)
+        except subprocess.TimeoutExpired:
+            _reply("❌ *Build timeout* (>4h) — verifica os logs.")
+            return
+        except Exception as e:
+            _reply(f"❌ *Build excepção:* `{e}`")
+            return
+
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "")[-400:]
+            _reply(f"❌ *Build falhou (exit {r.returncode})*\n`{err}`")
+            return
+
+        # Extrair stats do stdout
+        stats_lines = []
+        for line in (r.stdout or "").splitlines():
+            if any(k in line for k in ("rows", "tickers", "alpha_1y", "alpha_2y", "Guardado", "episódios")):
+                clean = _re.sub(r"^\d{2}:\d{2}:\d{2} \| ", "", line).strip()
+                if clean:
+                    stats_lines.append(f"  {clean}")
+
+        # Commit ao GitHub
+        github_line = ""
+        if out_path.exists():
+            ok, msg = _commit_file_to_github(
+                out_path,
+                "core_training_base.parquet",
+                "data: update CoreML training dataset [bot]",
+            )
+            github_line = f"\n✅ Commitado ao GitHub" if ok else f"\n⚠️ GitHub commit falhou: {msg}"
+
+        stats_text = "\n".join(stats_lines) if stats_lines else "  (sem stats)"
+        _reply(
+            f"✅ *CoreML Dataset Concluído!*\n"
+            f"{stats_text}"
+            f"{github_line}\n\n"
+            f"Próximo passo: `/admin_full_pipeline --dip-only`"
+        )
+
+    threading.Thread(target=_run, daemon=True, name="core-dataset-build").start()
+
+
 # ── /admin_full_pipeline ────────────────────────────────────────────────────────
 
 def _handle_admin_full_pipeline(parts: list[str]) -> None:
@@ -3133,6 +3275,7 @@ def _handle_command(text: str) -> None:
             "`/admin_load_models <url>` → [ADMIN] Carregar pickles novos para /data/\n"
             "`/admin_retrain [dry-run]` → [ADMIN] Disparar retrain ad-hoc\n"
             "`/admin_dip_dataset`       → [ADMIN] Construir dataset histórico DipRadar (desde 1993)\n"
+            "`/admin_build_core_dataset` → [ADMIN] Constrói dataset CoreML (57 compounders, desde 1993) + commit GitHub\n"
             "`/admin_full_pipeline`     → [ADMIN] Pipeline completo (parquets + retrain)\n"
             "`/health`                  → Dashboard observabilidade\n"
             "`/health errors`           → Log de erros críticos\n"
@@ -3634,6 +3777,9 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_momentum_retrain":
         _handle_admin_momentum_retrain(parts)
+
+    elif cmd in ("/admin_build_core_dataset", "/admin_core_dataset"):
+        _handle_admin_build_core_dataset(parts)
 
     elif cmd == "/admin_full_pipeline":
         _handle_admin_full_pipeline(parts)

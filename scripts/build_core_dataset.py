@@ -496,7 +496,7 @@ def build_core_dataset(
 def main() -> int:
     p = argparse.ArgumentParser(description="Backfill histórico para treino do CoreML")
     p.add_argument("--tickers",         help="Tickers separados por vírgula (teste rápido)")
-    p.add_argument("--start",           default="2000-01-01", help="Data de início (default: 2000 — inclui dot-com, 2008, COVID)")
+    p.add_argument("--start",           default="1993-01-01", help="Data de início (default: 1993 — igual ao DipRadar/MomentumRadar)")
     p.add_argument("--out",             default=str(_OUTPUT),  help="Output parquet")
     p.add_argument("--cache-dir",       default=str(_CACHE_DIR), help="Dir cache de preços")
     p.add_argument("--no-fundamentals", action="store_true", help="Saltar fetch de fundamentais recentes")
