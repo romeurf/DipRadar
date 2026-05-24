@@ -15,6 +15,7 @@ Universo: core_universe.json  {tickers: [{ticker, annual_yield_pct, note}]}
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import math
@@ -478,7 +479,7 @@ def scan_core_universe(min_score: float = 60.0) -> list[dict]:
         # Alocação sugerida: 1.5× a base da allocation engine para DIP tático
         suggested_eur = _suggest_core_allocation()
 
-        results.append({
+        opp = {
             "ticker":           ticker,
             "score":            score,
             "current_price":    round(current_price, 4),
@@ -487,7 +488,9 @@ def scan_core_universe(min_score: float = 60.0) -> list[dict]:
             "suggested_eur":    round(suggested_eur, 0),
             "scan_date":        today.isoformat(),
             **signals,
-        })
+        }
+        results.append(opp)
+        _append_core_alert_db(opp)
         log.info(
             f"[core_radar] CORE DIP {ticker} score={score:.0f} "
             f"price={current_price:.2f} yield={ann_yield:.1f}% "
@@ -496,6 +499,35 @@ def scan_core_universe(min_score: float = 60.0) -> list[dict]:
 
     results.sort(key=lambda x: -x["score"])
     return results
+
+
+_CORE_ALERT_DB = _DATA_DIR / "core_alert_db.csv"
+
+_CORE_ALERT_COLS = [
+    "alert_date", "ticker", "price", "core_score",
+    "price_vs_ma200w", "ma200d_trend_60d", "return_20d", "dd_from_52w_high",
+    "rsi_14", "obv_trend_20d", "up_down_vol_ratio_20d", "high_vol_up_days_20d",
+    "vol_spike_5d_vs_60d", "revenue_growth", "gross_margin", "roe",
+    "fcf_yield_fund", "analyst_upside", "earnings_growth", "annual_yield_pct",
+    "alpha_1y", "alpha_2y",  # filled later by outcome filler
+]
+
+
+def _append_core_alert_db(opp: dict) -> None:
+    """Appends one CoreRadar alert to the persistent feature store for CoreML training."""
+    row = {col: opp.get(col, "") for col in _CORE_ALERT_COLS}
+    row["alert_date"] = opp.get("scan_date", date.today().isoformat())
+    row["price"]      = opp.get("current_price", "")
+    row["core_score"] = opp.get("score", "")
+    write_header = not _CORE_ALERT_DB.exists()
+    try:
+        with _CORE_ALERT_DB.open("a", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=_CORE_ALERT_COLS, extrasaction="ignore")
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+    except Exception as exc:
+        log.warning(f"[core_radar] core_alert_db write failed: {exc}")
 
 
 def _suggest_core_allocation() -> float:

@@ -1582,7 +1582,7 @@ def run_scan() -> None:
                 if ml_result.model_ready:
                     logging.info(
                         f"[ml] {sym}: label={ml_result.label} "
-                        f"prob={ml_result.win_prob:.2f} conf={ml_result.confidence}"
+                        f"prob={ml_result.win_prob:.2f} conf={ml_result.confidence_label}"
                     )
 
                 # ── Score V2 Engine (Chunk 9) ──────────────────────────────

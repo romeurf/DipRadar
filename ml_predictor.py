@@ -210,7 +210,7 @@ class MLResult:
     prob_fund:          float | None = None    # alias compatibilidade (= win_prob)
     win40_prob:         float | None = None    # n/a em v3 — mantido para compatibilidade
     label:              str          = "NO_MODEL"
-    confidence:         str          = "–"
+    confidence_label:   str          = "–"
     model_ready:        bool         = False
     threshold:          float        = _SCORE_FLOOR
     features_used:      list[str]    = field(default_factory=list)
@@ -524,17 +524,17 @@ def ml_score(
 
     # Labels baseados em win_prob (mais estáveis e independentes do threshold bruto)
     if win_prob > 0.70:
-        label      = "WIN_STRONG"
-        confidence = "Alta"
+        label           = "WIN_STRONG"
+        confidence_label = "Alta"
     elif win_prob > 0.55:
-        label      = "WIN"
-        confidence = "Alta" if win_prob > 0.65 else "Média"
+        label           = "WIN"
+        confidence_label = "Alta" if win_prob > 0.65 else "Média"
     elif win_prob > 0.40:
-        label      = "WEAK"
-        confidence = "Baixa"
+        label           = "WEAK"
+        confidence_label = "Baixa"
     else:
-        label      = "NO_WIN"
-        confidence = "–"
+        label           = "NO_WIN"
+        confidence_label = "–"
 
     # Classificação de stock e sizing — requerem market_cap e quality_score
     # das features (se disponíveis; fallback neutro se não estiverem).
@@ -554,7 +554,7 @@ def ml_score(
         prob_fund         = None,
         win40_prob        = None,
         label             = label,
-        confidence        = confidence,
+        confidence_label  = confidence_label,
         model_ready       = True,
         threshold         = _SCORE_FLOOR,
         features_used     = cols,
