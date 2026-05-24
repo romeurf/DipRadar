@@ -394,7 +394,8 @@ def build_core_dataset(
         except Exception:
             pass
         etf_key = SECTOR_ETF.get(sector, "SPY")
-        sector_etf_hist = sector_etf_cache.get(etf_key) or sector_etf_cache.get("SPY")
+        _se = sector_etf_cache.get(etf_key)
+        sector_etf_hist = _se if _se is not None else sector_etf_cache.get("SPY")
         if sector_etf_hist is not None and sector_etf_hist.index.tz is not None:
             sector_etf_hist = sector_etf_hist.copy()
             sector_etf_hist.index = sector_etf_hist.index.tz_localize(None)
