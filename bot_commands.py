@@ -16,6 +16,14 @@ bot_commands.py — Todos os comandos Telegram do DipRadar.
   /add_theme k l T1,T2 [c] → Adicionar tema (key label TICKERS [confiança])
   /remove_theme <key>      → Remover tema
 
+━━━ CORE (compounders de qualidade) ━━━
+  /core                    → Posições CORE abertas (hold forever + P&L + yield)
+  /core_add T P EUR        → Registar compra CORE (ticker, preço, montante EUR)
+  /core_close T P          → Fechar posição CORE manualmente
+  /core_universe           → Ver universo CoreRadar (tickers monitorizados)
+  /core_universe_add T     → Adicionar ticker ao universo CORE
+  /core_universe_remove T  → Remover ticker do universo CORE
+
 ━━━ CARTEIRA E POSIÇÕES ━━━
   /carteira                → Snapshot da carteira em tempo real
   /portfolio               → Posições activas com P&L
@@ -2781,6 +2789,186 @@ def _fetch_eur_usd() -> float:
     return 1.0
 
 
+# ── /core handlers ────────────────────────────────────────────────────────────────
+
+
+def _handle_core(parts: list[str]) -> None:
+    """/core — mostra todas as posições CORE com P&L e yield acumulado."""
+    try:
+        from paper_trading import format_core_holdings_report
+        _reply(format_core_holdings_report())
+    except Exception as e:
+        _reply(f"❌ Erro ao ler posições CORE: `{e}`")
+
+
+def _handle_core_add(parts: list[str]) -> None:
+    """/core_add TICKER PRICE AMOUNT_EUR [--yield YLD] [--note "texto"]
+
+    Exemplos:
+      /core_add MSFT 359 2000
+      /core_add NVO 38 1500 --yield 5.0 --note "alta yield, comprado no dip"
+    """
+    if len(parts) < 4:
+        _reply(
+            "*Uso:* `/core_add TICKER PRICE AMOUNT_EUR [--yield YLD%] [--note texto]`\n\n"
+            "Exemplo: `/core_add MSFT 359 2000`\n"
+            "Exemplo: `/core_add NVO 38 1500 --yield 5.0 --note \"comprado no dip\"`"
+        )
+        return
+
+    try:
+        ticker     = parts[1].upper().strip()
+        open_price = float(parts[2])
+        amount_eur = float(parts[3])
+    except (ValueError, IndexError):
+        _reply("❌ Preço e montante têm de ser números. Ex: `/core_add MSFT 359 2000`")
+        return
+
+    # Flags opcionais
+    annual_yield = 0.0
+    note = ""
+    i = 4
+    while i < len(parts):
+        if parts[i] == "--yield" and i + 1 < len(parts):
+            try:
+                annual_yield = float(parts[i + 1])
+                i += 2
+            except ValueError:
+                i += 1
+        elif parts[i] == "--note" and i + 1 < len(parts):
+            note = " ".join(parts[i + 1:])
+            break
+        else:
+            i += 1
+
+    try:
+        from paper_trading import record_core_holding
+        trade_id = record_core_holding(
+            ticker=ticker, open_price=open_price, amount_eur=amount_eur,
+            annual_yield_pct=annual_yield, note=note,
+        )
+        if trade_id:
+            yield_str = f" | Yield: {annual_yield:.1f}%/ano" if annual_yield > 0 else ""
+            note_str  = f"\n_{note}_" if note else ""
+            _reply(
+                f"✅ *CORE {ticker}* registado `[{trade_id}]`\n"
+                f"  €{amount_eur:.0f} @ ${open_price:.2f}{yield_str}{note_str}\n"
+                f"_Posição de longo prazo — sem gestão automática._"
+            )
+        else:
+            _reply("❌ Não foi possível registar a posição CORE.")
+    except Exception as e:
+        _reply(f"❌ Erro: `{e}`")
+
+
+def _handle_core_close(parts: list[str]) -> None:
+    """/core_close TICKER PRICE — fecha manualmente uma posição CORE."""
+    if len(parts) < 3:
+        _reply("*Uso:* `/core_close TICKER PRICE`\nEx: `/core_close MSFT 420`")
+        return
+    try:
+        ticker      = parts[1].upper().strip()
+        close_price = float(parts[2])
+    except (ValueError, IndexError):
+        _reply("❌ Preço inválido.")
+        return
+    try:
+        from paper_trading import close_core_holding
+        ok = close_core_holding(ticker, close_price)
+        if ok:
+            _reply(f"✅ *CORE {ticker}* fechado manualmente @ ${close_price:.2f}")
+        else:
+            _reply(f"⚠️ Nenhuma posição CORE aberta em {ticker}.")
+    except Exception as e:
+        _reply(f"❌ Erro: `{e}`")
+
+
+# ── /core_universe handlers ───────────────────────────────────────────────────────
+
+
+def _handle_core_universe(parts: list[str]) -> None:
+    """/core_universe — lista o universo CoreRadar."""
+    try:
+        from core_radar import get_universe
+        entries = get_universe()
+        if not entries:
+            _reply(
+                "_Universo CORE vazio._\n\n"
+                "Adiciona tickers com:\n"
+                "`/core_universe_add TICKER [yield%] [nota]`\n\n"
+                "Exemplo: `/core_universe_add MSFT 0.7 compounder secular`"
+            )
+            return
+        lines = [f"💎 *Universo CoreRadar — {len(entries)} tickers*", ""]
+        for e in entries:
+            ticker   = e["ticker"]
+            yld      = e.get("annual_yield_pct", 0)
+            note     = e.get("note", "")
+            yld_str  = f" | *{yld:.1f}%/ano*" if yld > 0 else ""
+            note_str = f" — _{note}_" if note else ""
+            lines.append(f"  • *{ticker}*{yld_str}{note_str}")
+        lines += [
+            "",
+            "_/core_universe_add TICK [yield] [nota] — adicionar_",
+            "_/core_universe_remove TICK — remover_",
+        ]
+        _reply("\n".join(lines))
+    except Exception as e:
+        _reply(f"❌ Erro: `{e}`")
+
+
+def _handle_core_universe_add(parts: list[str]) -> None:
+    """/core_universe_add TICKER [yield_pct] [nota]"""
+    if len(parts) < 2:
+        _reply(
+            "*Uso:* `/core_universe_add TICKER [yield%] [nota]`\n\n"
+            "Exemplos:\n"
+            "`/core_universe_add MSFT 0.7 compounder secular cloud+AI`\n"
+            "`/core_universe_add ABBV 3.8 pharma high-yield Humira+Skyrizi`"
+        )
+        return
+    ticker       = parts[1].upper().strip()
+    annual_yield = 0.0
+    note         = ""
+    if len(parts) >= 3:
+        try:
+            annual_yield = float(parts[2])
+            note = " ".join(parts[3:]) if len(parts) > 3 else ""
+        except ValueError:
+            note = " ".join(parts[2:])
+    try:
+        from core_radar import add_to_universe
+        added = add_to_universe(ticker, annual_yield_pct=annual_yield, note=note)
+        if added:
+            yld_str  = f" | Yield: {annual_yield:.1f}%/ano" if annual_yield > 0 else ""
+            note_str = f"\n_{note}_" if note else ""
+            _reply(
+                f"✅ *{ticker}* adicionado ao universo CoreRadar{yld_str}{note_str}\n"
+                f"_Será escaneado no próximo CoreRadar scan (22h Lisboa)._"
+            )
+        else:
+            _reply(f"⚠️ *{ticker}* já está no universo CoreRadar.")
+    except Exception as e:
+        _reply(f"❌ Erro: `{e}`")
+
+
+def _handle_core_universe_remove(parts: list[str]) -> None:
+    """/core_universe_remove TICKER"""
+    if len(parts) < 2:
+        _reply("*Uso:* `/core_universe_remove TICKER`\nEx: `/core_universe_remove NVO`")
+        return
+    ticker = parts[1].upper().strip()
+    try:
+        from core_radar import remove_from_universe
+        removed = remove_from_universe(ticker)
+        if removed:
+            _reply(f"✅ *{ticker}* removido do universo CoreRadar.")
+        else:
+            _reply(f"⚠️ *{ticker}* não estava no universo CoreRadar.")
+    except Exception as e:
+        _reply(f"❌ Erro: `{e}`")
+
+
 # ── /portfolio handler ────────────────────────────────────────────────────────────
 
 def _handle_portfolio(parts: list[str]) -> None:
@@ -2935,6 +3123,12 @@ def _handle_command(text: str) -> None:
             "`/themes`                  → Ver temas/trends activos (fotónica, GLP-1, IA...)\n"
             "`/add_theme <k> <l> <T>` → Adicionar tema (key label TICK1,TICK2 [conf])\n"
             "`/remove_theme <key>`      → Remover tema\n"
+            "`/core`                    → Posições CORE abertas (hold forever)\n"
+            "`/core_add TICK P EUR`     → Registar compra CORE manual\n"
+            "`/core_close TICK P`       → Fechar posição CORE manualmente\n"
+            "`/core_universe`           → Ver universo CoreRadar\n"
+            "`/core_universe_add TICK`  → Adicionar ticker ao universo CORE\n"
+            "`/core_universe_remove T`  → Remover ticker do universo CORE\n"
             "`/admin_regen_parquet [--targets-only]` → [ADMIN] Regenerar parquet com PIT fundamentais + alpha90d\n"
             "`/admin_load_models <url>` → [ADMIN] Carregar pickles novos para /data/\n"
             "`/admin_retrain [dry-run]` → [ADMIN] Disparar retrain ad-hoc\n"
@@ -3468,6 +3662,26 @@ def _handle_command(text: str) -> None:
     elif cmd == "/health":
         if not _check_rate(cmd_key): return
         _handle_health(parts)
+
+    elif cmd in ("/core", "/core_holdings"):
+        if not _check_rate(cmd_key): return
+        _handle_core(parts)
+
+    elif cmd in ("/core_add", "/add_core"):
+        _handle_core_add(parts)
+
+    elif cmd in ("/core_close", "/close_core"):
+        _handle_core_close(parts)
+
+    elif cmd in ("/core_universe",):
+        if not _check_rate(cmd_key): return
+        _handle_core_universe(parts)
+
+    elif cmd in ("/core_universe_add", "/add_core_universe"):
+        _handle_core_universe_add(parts)
+
+    elif cmd in ("/core_universe_remove", "/remove_core_universe"):
+        _handle_core_universe_remove(parts)
 
     else:
         if text.startswith("/"):

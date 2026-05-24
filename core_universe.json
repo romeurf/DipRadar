@@ -1,0 +1,14 @@
+{
+  "tickers": [
+    {"ticker": "MSFT",  "annual_yield_pct": 0.7, "note": "compounder secular, cloud + AI"},
+    {"ticker": "GOOGL", "annual_yield_pct": 0.0, "note": "search + cloud + AI, sem dividendo"},
+    {"ticker": "AAPL",  "annual_yield_pct": 0.5, "note": "ecosystem lock-in, buybacks"},
+    {"ticker": "NVO",   "annual_yield_pct": 1.5, "note": "GLP-1 dominance, pipeline sólido"},
+    {"ticker": "ABBV",  "annual_yield_pct": 3.8, "note": "pharma high-yield, Humira + Skyrizi"},
+    {"ticker": "V",     "annual_yield_pct": 0.7, "note": "payment network, moat duradouro"},
+    {"ticker": "MA",    "annual_yield_pct": 0.5, "note": "payment network, global crescimento"},
+    {"ticker": "COST",  "annual_yield_pct": 0.5, "note": "membership model, pricing power"},
+    {"ticker": "BRK-B", "annual_yield_pct": 0.0, "note": "holding Buffett, sem dividendo"},
+    {"ticker": "JPM",   "annual_yield_pct": 2.0, "note": "best-in-class banking, dividend crescente"}
+  ]
+}

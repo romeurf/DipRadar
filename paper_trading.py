@@ -326,7 +326,9 @@ def update_open_positions() -> dict:
         if t.get("status") != "OPEN":
             continue
         if t.get("trade_type") == "MOMENTUM":
-            continue  # MOMENTUM trades têm sell_target=0 — geridas por update_momentum_positions
+            continue  # geridas por update_momentum_positions
+        if t.get("trade_type") == "CORE":
+            continue  # nunca fechadas automaticamente
 
         open_date = date.fromisoformat(t["open_date"])
         # Para posições revertidas de MOMENTUM→DIP, o prazo DIP conta da data de revert.
@@ -1002,6 +1004,419 @@ def update_momentum_positions(send_fn=None) -> dict:
 
     _save(trades)
     return {"updated": updated, "drifted": drifted, "closed": closed}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Posições CORE — Hold de longo prazo (compounder / alto yield)
+# ─────────────────────────────────────────────────────────────────────────────
+# Filosofia: CORE nunca fecha automaticamente. O sistema rastreia o P&L
+# unrealizado e o dividend income acumulado, mas a decisão de saída é sempre
+# manual. Adequado para: compounders de qualidade (MSFT, GOOGL…), high-yield
+# defensivos (NVO, ABBV…), posições de very-long-term conviction.
+
+
+def record_core_holding(
+    ticker:           str,
+    open_price:       float,
+    amount_eur:       float,
+    annual_yield_pct: float = 0.0,
+    note:             str   = "",
+    usd_eur:          float = _USD_EUR_DEFAULT,
+) -> str:
+    """Regista uma posição CORE (hold de longo prazo sem gestão automática).
+
+    Nunca é fechada pelo scheduler. Aparece separada dos trades táticos.
+    annual_yield_pct: yield anual esperado (dividendos), ex: 5.0 para NVO.
+    """
+    if open_price <= 0 or amount_eur <= 0:
+        return ""
+
+    trade_id  = str(uuid.uuid4())[:8]
+    shares    = amount_eur / max(open_price * usd_eur, 0.01)
+    today_iso = date.today().isoformat()
+
+    trade = {
+        "id":               trade_id,
+        "trade_type":       "CORE",
+        "ticker":           ticker.upper(),
+        "open_date":        today_iso,
+        "open_price":       round(open_price, 4),
+        "amount_eur":       round(amount_eur, 2),
+        "shares":           round(shares, 6),
+        "annual_yield_pct": round(annual_yield_pct, 2),
+        "note":             note,
+        "status":           "OPEN",
+        "close_date":       None,
+        "close_price":      None,
+        "return_pct":       None,
+        "spy_return_pct":   None,
+        "alpha_pct":        None,
+        # Não há trailing stop nem hold_days — gestão manual
+        "sell_target":      0.0,
+        "hold_days":        0,
+    }
+    trades = _load()
+    # Permitir várias compras CORE do mesmo ticker (dollar-cost averaging)
+    trades.append(trade)
+    _save(trades)
+    log.info(
+        f"[core] OPEN {ticker.upper()} €{amount_eur:.0f} @ {open_price:.2f} "
+        f"yield={annual_yield_pct:.1f}% note={note!r}"
+    )
+    return trade_id
+
+
+def close_core_holding(ticker: str, close_price: float) -> bool:
+    """Fecha manualmente uma posição CORE (única decisão manual do sistema)."""
+    ticker = ticker.upper()
+    today  = date.today()
+    trades = _load()
+    changed = False
+    for t in trades:
+        if t.get("ticker") != ticker or t.get("status") != "OPEN":
+            continue
+        if t.get("trade_type") != "CORE":
+            continue
+        open_date = date.fromisoformat(t["open_date"])
+        ret_pct   = round((close_price / float(t["open_price"]) - 1) * 100, 3)
+        spy_ret   = _fetch_spy_return(open_date, today)
+        alpha     = round(ret_pct - (spy_ret or 0), 3) if spy_ret is not None else None
+        t["status"]         = "CLOSED_MANUAL"
+        t["close_date"]     = today.isoformat()
+        t["close_price"]    = round(close_price, 4)
+        t["return_pct"]     = ret_pct
+        t["spy_return_pct"] = spy_ret
+        t["alpha_pct"]      = alpha
+        changed = True
+        log.info(f"[core] CLOSE {ticker} MANUAL @ {close_price:.2f} ret={ret_pct:.1f}%")
+        break  # fechar apenas a posição mais antiga
+    if changed:
+        _save(trades)
+    return changed
+
+
+def get_core_holdings_summary() -> list[dict]:
+    """Devolve todas as posições CORE abertas com P&L e yield acumulado."""
+    trades = _load()
+    today  = date.today()
+    result = []
+
+    for t in trades:
+        if t.get("status") != "OPEN" or t.get("trade_type") != "CORE":
+            continue
+
+        ticker     = t["ticker"]
+        open_date  = date.fromisoformat(t["open_date"])
+        days_held  = (today - open_date).days
+        open_price = float(t["open_price"])
+        amount_eur = float(t["amount_eur"])
+
+        current_price = _fetch_close(ticker, today)
+        if current_price is None:
+            current_price = open_price  # fallback para não crashar
+
+        # P&L unrealizado
+        ret_pct    = round((current_price / open_price - 1) * 100, 3)
+        unrealized = round(amount_eur * ret_pct / 100, 2)
+
+        # Yield income acumulado (pro-rata pelos dias detidos)
+        annual_yield = float(t.get("annual_yield_pct") or 0.0)
+        yield_income = round(amount_eur * (annual_yield / 100) * (days_held / 365), 2)
+
+        # Total return incluindo yield
+        total_return_pct = round(ret_pct + annual_yield * (days_held / 365), 3)
+
+        # SPY no mesmo período
+        spy_ret = _fetch_spy_return(open_date, today)
+
+        result.append({
+            "id":               t["id"],
+            "ticker":           ticker,
+            "open_date":        t["open_date"],
+            "open_price":       open_price,
+            "current_price":    round(current_price, 4),
+            "amount_eur":       amount_eur,
+            "days_held":        days_held,
+            "ret_pct":          ret_pct,
+            "unrealized_eur":   unrealized,
+            "annual_yield_pct": annual_yield,
+            "yield_income_eur": yield_income,
+            "total_return_pct": total_return_pct,
+            "spy_ret_pct":      spy_ret,
+            "alpha_pct":        round(total_return_pct - (spy_ret or 0), 3) if spy_ret is not None else None,
+            "note":             t.get("note", ""),
+        })
+
+    result.sort(key=lambda x: x["open_date"])
+    return result
+
+
+def update_core_positions(send_fn=None) -> dict:
+    """Monitoramento diário de posições CORE: deteção de deterioração estrutural.
+
+    NÃO fecha posições automaticamente. Usa lógica multi-fator para distinguir
+    "compounder de qualidade em dip temporário" (NVO, MSFT) de "colapso real"
+    (CISCO 2001, GE 2018).
+
+    Níveis de alerta:
+      🚨 RED   — ≥3 sinais negativos OU (≥2 negativos + fundamentais a deteriorar)
+      ⚠️ ORANGE — ≥2 sinais de preço mas fundamentais ainda intactos
+      💡 YELLOW — drawdown profundo com negócio sólido (potencial acumulação)
+      📉 INFO   — MA200 trend break isolado ou declínio secular (sem acção imediata)
+
+    Retorna dict com chaves: checked, alerts_sent.
+    """
+    trades    = _load()
+    today     = date.today()
+    today_iso = today.isoformat()
+    checked   = 0
+    alerts_sent = 0
+
+    for t in trades:
+        if t.get("status") != "OPEN" or t.get("trade_type") != "CORE":
+            continue
+
+        ticker = t["ticker"]
+        checked += 1
+
+        # Fetch histórico longo para MA200 e 52w high
+        try:
+            from data_feed import get_eod_prices
+            import pandas as _pd
+            df = get_eod_prices(ticker, lookback_days=280)
+            if df is None or df.empty or len(df) < 50:
+                continue
+            if "date" in df.columns:
+                df = df.set_index(_pd.to_datetime(df["date"])).sort_index()
+            df.columns = [
+                c.capitalize() if c.lower() in ("open","high","low","close","volume") else c
+                for c in df.columns
+            ]
+            close = df["Close"]
+        except Exception as e:
+            log.debug(f"[core] fetch {ticker}: {e}")
+            continue
+
+        current_price = float(close.iloc[-1])
+        open_price    = float(t["open_price"])
+
+        # ── Indicadores de preço ──────────────────────────────────────────────
+        ma_period = min(200, len(close) - 1)
+        ma200     = float(close.rolling(ma_period).mean().iloc[-1]) if ma_period >= 20 else None
+
+        high_52w         = float(close.rolling(min(252, len(close))).max().iloc[-1])
+        dd_from_52w_high = (current_price / high_52w - 1) if high_52w > 0 else 0.0
+
+        days_below_ma200 = 0
+        if ma200 is not None:
+            ma_series = close.rolling(ma_period).mean()
+            for j in range(len(close) - 1, max(len(close) - 60, -1), -1):
+                if close.iloc[j] < ma_series.iloc[j]:
+                    days_below_ma200 += 1
+                else:
+                    break
+
+        ma200_trend = 0.0
+        if ma200 is not None and len(close) >= ma_period + 60:
+            ma200_60d_ago = float(close.rolling(ma_period).mean().iloc[-61])
+            ma200_trend   = (ma200 / ma200_60d_ago - 1) if ma200_60d_ago > 0 else 0.0
+
+        ret_vs_cost = (current_price / open_price - 1) if open_price > 0 else 0.0
+
+        already_alerted_today = (t.get("last_structural_alert_date", "") == today_iso)
+
+        # ── Avaliação multi-fator ─────────────────────────────────────────────
+        decline_signals: list[str] = []
+        quality_signals: list[str] = []
+
+        # Sinais de preço negativos
+        if dd_from_52w_high < -0.35:
+            decline_signals.append(f"queda {dd_from_52w_high:+.1%} do pico 52s")
+        if ma200_trend < -0.05:
+            decline_signals.append(f"MA200 em declínio {ma200_trend:+.1%} (60d)")
+        if days_below_ma200 >= 30:
+            decline_signals.append(f"{days_below_ma200}d consecutivos abaixo da MA200")
+
+        # Fundamentais — lazy fetch só quando há pelo menos 1 sinal de preço negativo
+        # (evita chamadas de API desnecessárias em dias normais)
+        if len(decline_signals) >= 1:
+            try:
+                import yfinance as _yf
+                _info        = _yf.Ticker(ticker).info
+                _rev         = _info.get("revenueGrowth")       # decimal y/y
+                _fcf         = float(_info.get("freeCashflow") or 0)
+                _mktcap      = float(_info.get("marketCap") or 1)
+                _margin      = _info.get("grossMargins")
+                _earn        = _info.get("earningsGrowth")
+                _fcf_yield   = (_fcf / _mktcap) if _mktcap > 0 else None
+                _roe         = _info.get("returnOnEquity")
+
+                # Sinais fundamentais negativos
+                if _rev is not None and _rev < -0.05:
+                    decline_signals.append(f"revenue em queda {_rev:+.1%} y/y")
+                if _fcf_yield is not None and _fcf_yield < 0:
+                    decline_signals.append("FCF negativo (burning cash)")
+                if _earn is not None and _earn < -0.15:
+                    decline_signals.append(f"earnings -{ abs(_earn):.0%} y/y")
+
+                # Sinais fundamentais positivos (qualidade intacta)
+                if _rev is not None and _rev > 0.05:
+                    quality_signals.append(f"revenue +{_rev:.0%}")
+                if _fcf_yield is not None and _fcf_yield > 0.02:
+                    quality_signals.append(f"FCF yield {_fcf_yield:.1%}")
+                if _margin is not None and _margin > 0.35:
+                    quality_signals.append(f"margem bruta {_margin:.0%}")
+                if _roe is not None and _roe > 0.15:
+                    quality_signals.append(f"ROE {_roe:.0%}")
+                if _earn is not None and _earn > 0.05:
+                    quality_signals.append(f"earnings +{_earn:.0%}")
+
+            except Exception as _e:
+                log.debug(f"[core] fundamentals {ticker}: {_e}")
+
+        n_decline = len(decline_signals)
+        n_quality = len(quality_signals)
+
+        # ── Construir alertas por nível ───────────────────────────────────────
+        alerts: list[str] = []
+
+        # 🚨 RED: ≥3 sinais negativos OU (≥2 negativos E nenhum sinal de qualidade)
+        # → CISCO 2001: drawdown + MA200 falling + revenue declining → 3-4 sinais negativos
+        # → NVO 2025: só drawdown, MA200 still rising, revenue +30% → 1 sinal → NOT RED
+        if n_decline >= 3 or (n_decline >= 2 and n_quality == 0):
+            if not already_alerted_today:
+                qual_str = f"\nFundamentais intactos: {', '.join(quality_signals)}" if quality_signals else ""
+                alerts.append(
+                    f"🚨 *COLAPSO ESTRUTURAL — {ticker}*\n"
+                    f"*{n_decline} sinais negativos simultâneos:*\n"
+                    + "\n".join(f"  • {s}" for s in decline_signals)
+                    + qual_str + "\n\n"
+                    f"*Rever a tese de investimento IMEDIATAMENTE.*\n"
+                    f"_Usa `/core_close {ticker} {current_price:.2f}` se decidires sair._"
+                )
+
+        # ⚠️ ORANGE: ≥2 sinais de preço mas fundamentais ainda OK
+        # → Ex: queda 40% + MA200 declining, mas revenue ainda cresce
+        elif n_decline >= 2 and n_quality >= 1:
+            if not already_alerted_today and not t.get("orange_alert_date"):
+                t["orange_alert_date"] = today_iso
+                alerts.append(
+                    f"⚠️ *Deterioração CORE — {ticker}*\n"
+                    f"Sinais preocupantes: {' | '.join(decline_signals)}\n"
+                    f"Fundamentos ainda intactos: {', '.join(quality_signals)}\n"
+                    f"P&L vs custo: {ret_vs_cost:+.1%} | Preço: ${current_price:.2f}\n"
+                    f"_Monitorizar. Sem acção imediata necessária._"
+                )
+            elif n_decline < 2 and t.get("orange_alert_date"):
+                t.pop("orange_alert_date", None)
+
+        # 💡 YELLOW: drawdown profundo mas negócio intacto
+        # → Ex: NVO a -36% 52w com GLP-1 a crescer 30% → potencial acumulação
+        elif dd_from_52w_high < -0.30 and n_quality >= 2 and not t.get("deep_dip_alerted"):
+            t["deep_dip_alerted"] = True
+            qual_str = f" ({', '.join(quality_signals)})" if quality_signals else ""
+            alerts.append(
+                f"💡 *Dip Profundo em Compounder de Qualidade — {ticker}*\n"
+                f"Queda {dd_from_52w_high:+.1%} do pico de 52 semanas\n"
+                f"Fundamentais sólidos{qual_str}\n"
+                f"Preço: ${current_price:.2f} | Custo de entrada: ${open_price:.2f} ({ret_vs_cost:+.1%})\n"
+                f"_Potencial oportunidade de acumulação. Verifica a MA200 semanal._"
+            )
+        elif dd_from_52w_high > -0.15 and t.get("deep_dip_alerted"):
+            t.pop("deep_dip_alerted", None)
+
+        # 📉 INFO: Trend break isolado (sem outros sinais negativos)
+        if days_below_ma200 >= 10 and not t.get("trend_break_alerted") and n_decline < 2:
+            t["trend_break_alerted"] = True
+            if not already_alerted_today:
+                alerts.append(
+                    f"📉 *Trend Break — {ticker}*\n"
+                    f"{days_below_ma200} dias consecutivos abaixo da MA200"
+                    + (f" (${ma200:.2f})" if ma200 else "") + "\n"
+                    f"Preço: ${current_price:.2f} ({dd_from_52w_high:+.1%} do pico 52s)\n"
+                    + (f"Fundamentais intactos: {', '.join(quality_signals)}\n" if quality_signals else "")
+                    + f"_Sinal de atenção. Não é trigger de saída por si só._"
+                )
+        elif days_below_ma200 < 5 and t.get("trend_break_alerted"):
+            t["trend_break_alerted"] = False
+
+        # 📉 INFO: MA200 em queda secular (independente)
+        if ma200_trend < -0.05 and not t.get("secular_decline_alerted") and n_decline < 2:
+            t["secular_decline_alerted"] = True
+            if not already_alerted_today:
+                alerts.append(
+                    f"📉 *Declínio Secular — {ticker}*\n"
+                    f"MA200 caiu {ma200_trend:+.1%} em 60 dias\n"
+                    + (f"Fundamentais intactos: {', '.join(quality_signals)}\n" if quality_signals else "")
+                    + f"_Verificar se o negócio fundamental está intacto._"
+                )
+        elif ma200_trend > 0 and t.get("secular_decline_alerted"):
+            t["secular_decline_alerted"] = False
+
+        # 💡 Acumulação: preço >8% abaixo do custo de entrada
+        if ret_vs_cost < -0.08 and not t.get("accumulation_alerted"):
+            t["accumulation_alerted"] = True
+            if not already_alerted_today:
+                qual_str = f" (fundamentos: {', '.join(quality_signals)})" if quality_signals else ""
+                alerts.append(
+                    f"💡 *Oportunidade de Acumulação — {ticker}*\n"
+                    f"Preço {ret_vs_cost:+.1%} abaixo do teu custo de entrada (${open_price:.2f})\n"
+                    f"Actual: ${current_price:.2f}{qual_str}\n"
+                    f"_Se a tese se mantém, considera reforçar a posição CORE._"
+                )
+        elif ret_vs_cost > -0.03 and t.get("accumulation_alerted"):
+            t["accumulation_alerted"] = False
+
+        # ── Enviar alertas ────────────────────────────────────────────────────
+        if alerts:
+            t["last_structural_alert_date"] = today_iso
+            for alert_msg in alerts:
+                if send_fn:
+                    try:
+                        send_fn(alert_msg)
+                        alerts_sent += 1
+                    except Exception:
+                        pass
+                log.info(f"[core] ALERT {ticker}: {alert_msg[:80]}")
+
+    _save(trades)
+    return {"checked": checked, "alerts_sent": alerts_sent}
+
+
+def format_core_holdings_report() -> str:
+    """Formata o relatório de posições CORE para Telegram."""
+    holdings = get_core_holdings_summary()
+    if not holdings:
+        return "Sem posições CORE registadas."
+
+    lines = ["*Posições CORE — Hold de Longo Prazo*\n"]
+    total_invested = 0.0
+    total_unrealized = 0.0
+    total_yield = 0.0
+
+    for h in holdings:
+        ret_icon  = "" if h["ret_pct"] >= 0 else ""
+        spy_line  = f" vs SPY {h['spy_ret_pct']:+.1f}%" if h["spy_ret_pct"] is not None else ""
+        note_line = f" _{h['note']}_" if h["note"] else ""
+        yld_line  = f" | Yield: €{h['yield_income_eur']:.0f} ({h['annual_yield_pct']:.1f}%/ano)" if h["annual_yield_pct"] > 0 else ""
+
+        lines.append(
+            f"{ret_icon} *{h['ticker']}* — {h['days_held']}d\n"
+            f"  €{h['amount_eur']:.0f} @ ${h['open_price']:.2f} → ${h['current_price']:.2f}\n"
+            f"  P&L: {h['ret_pct']:+.1f}% (€{h['unrealized_eur']:+.0f}){yld_line}\n"
+            f"  Total return: {h['total_return_pct']:+.1f}%{spy_line}{note_line}\n"
+        )
+        total_invested   += h["amount_eur"]
+        total_unrealized += h["unrealized_eur"]
+        total_yield      += h["yield_income_eur"]
+
+    avg_ret = total_unrealized / total_invested * 100 if total_invested > 0 else 0
+    lines.append(
+        f"*Total CORE* | Investido: €{total_invested:.0f} | "
+        f"P&L: €{total_unrealized:+.0f} ({avg_ret:+.1f}%) | "
+        f"Yield acumulado: €{total_yield:.0f}"
+    )
+    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

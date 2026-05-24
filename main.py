@@ -2189,6 +2189,86 @@ def run_momentum_scan() -> None:
         logging.error(f"[momentum] Scan falhou: {e}", exc_info=True)
 
 
+# ── CoreRadar Scan (compounders de qualidade em dip) ─────────────────────────
+
+def run_core_scan() -> None:
+    """Varre o universo CORE e envia alertas de dip em compounders de qualidade.
+
+    Foco no toque/cruzamento da MA200 semanal — o sinal histórico de entrada
+    primário para compounders de alta convicção (MSFT, NVO, GOOGL, etc.).
+
+    Schedule: 22:00 Lisboa (dados EOD US limpos, uma vez por dia)
+    """
+    try:
+        from core_radar import scan_core_universe, format_core_alert
+        from paper_trading import record_core_holding, get_core_holdings_summary
+
+        logging.info("[core_radar] A iniciar scan do universo CORE...")
+        candidates = scan_core_universe(min_score=60.0)
+
+        if not candidates:
+            logging.info("[core_radar] Nenhuma oportunidade CORE hoje.")
+            return
+
+        send_telegram(
+            f"💎 *CoreRadar — {len(candidates)} oportunidade{'s' if len(candidates) > 1 else ''} de dip*\n"
+        )
+
+        # Tickers CORE já com posição aberta (evitar duplicados)
+        try:
+            existing_core = {
+                h["ticker"] for h in get_core_holdings_summary()
+                if h.get("status") == "open"
+            }
+        except Exception:
+            existing_core = set()
+
+        usd_eur    = get_usdeur()
+        registered = 0
+
+        for c in candidates:
+            try:
+                msg = format_core_alert(c)
+                if c["ticker"] in existing_core:
+                    msg += "\n\n_⚠️ Já tens posição CORE aberta neste ticker._"
+                send_telegram(msg)
+            except Exception as e:
+                logging.warning(f"[core_radar] Alerta {c.get('ticker')}: {e}")
+
+        # Auto-registo: score >= 70 = alta convicção → paper trade CORE
+        for c in candidates:
+            ticker = c["ticker"]
+            if ticker in existing_core or c["score"] < 70:
+                continue
+            try:
+                trade_id = record_core_holding(
+                    ticker          = ticker,
+                    open_price      = c["current_price"],
+                    amount_eur      = c.get("suggested_eur", 500.0),
+                    annual_yield_pct= c.get("annual_yield_pct", 0.0),
+                    note            = c.get("note", "CoreRadar auto-scan"),
+                    usd_eur         = usd_eur,
+                )
+                if trade_id:
+                    registered += 1
+                    logging.info(
+                        f"[core_radar] Paper CORE {ticker} [{trade_id}] "
+                        f"@ ${c['current_price']:.2f} €{c.get('suggested_eur', 500):.0f}"
+                    )
+            except Exception as e:
+                logging.warning(f"[core_radar] Paper trade {ticker}: {e}")
+
+        if registered > 0:
+            send_telegram(
+                f"_✅ {registered} paper trade{'s' if registered > 1 else ''} CORE "
+                f"registado{'s' if registered > 1 else ''} automaticamente._"
+            )
+
+        logging.info(f"[core_radar] {len(candidates)} alertas, {registered} registados.")
+    except Exception as e:
+        logging.error(f"[core_radar] Scan falhou: {e}", exc_info=True)
+
+
 # ── Daily Universe Snapshot (após fecho US) ────────────────────────────────────
 
 def run_universe_snapshot() -> None:
@@ -2364,6 +2444,13 @@ def main() -> None:
         run_momentum_scan,
         CronTrigger(day_of_week="mon-fri", hour=21, minute=30, timezone=LISBON_TZ),
         id="momentum_scan_us", name="Momentum Scan US 21h30",
+    )
+
+    # ── CoreRadar scan: 22h00 Lisboa (dados EOD US limpos) ────────────────────
+    scheduler.add_job(
+        run_core_scan,
+        CronTrigger(day_of_week="mon-fri", hour=22, minute=0, timezone=LISBON_TZ),
+        id="core_scan", name="CoreRadar Scan 22h00",
     )
 
     # ── Stress check: cada 30 min, 14h30-22h30 Lisboa, seg-sex ────────────────
@@ -2581,18 +2668,23 @@ def main() -> None:
     # Fecha posições que atingiram o target ou esgotaram o hold_days.
     def _run_paper_update():
         try:
-            from paper_trading import update_open_positions, update_momentum_positions
+            from paper_trading import (
+                update_open_positions,
+                update_momentum_positions,
+                update_core_positions,
+            )
             stats  = update_open_positions()
-            # Passa send_telegram para que o monitor de drift possa enviar alertas
             stats2 = update_momentum_positions(send_fn=send_telegram)
+            stats3 = update_core_positions(send_fn=send_telegram)
             total  = stats.get("updated", 0) + stats2.get("updated", 0)
             drift  = stats2.get("drifted", 0)
             closed = stats2.get("closed", 0)
-            if total > 0 or drift > 0:
+            if total > 0 or drift > 0 or stats3.get("alerts_sent", 0) > 0:
                 logging.info(
                     f"[paper] Update dip={stats} "
                     f"momentum=updated:{stats2.get('updated',0)} "
-                    f"drift:{drift} closed:{closed}"
+                    f"drift:{drift} closed:{closed} "
+                    f"core=checked:{stats3.get('checked',0)} alerts:{stats3.get('alerts_sent',0)}"
                 )
         except Exception as e:
             logging.warning(f"[paper] Update falhou: {e}")
