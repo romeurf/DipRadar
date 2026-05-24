@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import asdict
 from datetime import datetime, date
 from typing import Optional
 
@@ -180,7 +179,8 @@ TRIGGER_DETERIORATION      = "DETERIORATION"
 TRIGGER_TIME_DECAY         = "TIME_DECAY"
 TRIGGER_IMPROVEMENT        = "IMPROVEMENT"
 TRIGGER_ROUTINE            = "ROUTINE"
-TRIGGER_EDGE_GONE          = "EDGE_GONE"   # modelo diz: alpha < threshold → edge evaporou
+TRIGGER_EDGE_GONE          = "EDGE_GONE"            # modelo diz: alpha < threshold → edge evaporou
+TRIGGER_DIP_TO_MOMENTUM    = "DIP_TO_MOMENTUM"      # dip recuperou com momentum → modo trailing stop
 
 # Stop-loss: se o preço cair STOP_LOSS_PCT% abaixo do preço de entrada, sair.
 # Configurável via env var POSITION_STOP_LOSS_PCT (default 12%).
@@ -430,6 +430,26 @@ def _build_edge_gone_alert(record: PositionRecord, current_price: float, pred_up
     ])
 
 
+def _build_dip_to_momentum_alert(
+    record: PositionRecord,
+    current_price: float,
+    momentum_score: float,
+) -> str:
+    pnl_pct = (current_price / record.alert_price - 1) * 100
+    new_hold = record.current_hold_days
+    return "\n".join([
+        f"🔄 *DIP → MOMENTUM — {record.ticker}*  [Dia {record.days_held}]",
+        f"_O dip recuperou com momentum forte. Target fixo desactivado — trailing stop ATR activado._",
+        "",
+        f"Score de momentum: *{momentum_score:.0f}/100*",
+        f"P&L desde entrada: *{_pct(pnl_pct)}*  |  Entry: ${record.alert_price:.2f}  →  ${current_price:.2f}",
+        f"Hold estendido: +60 dias (total {new_hold}d)",
+        "",
+        "💡 *Ação:* Manter posição. Saída por trailing stop ATR ou deterioração de momentum.",
+        "_Trailing stop recalculado diariamente com base na volatilidade real (ATR 14d)._",
+    ])
+
+
 def _build_early_alpha_alert(
     record: PositionRecord,
     current_price: float,
@@ -455,6 +475,7 @@ def _resolve_thesis_health(trigger: str, delta: float) -> str:
         TRIGGER_TAKE_PROFIT:        "STRONG",
         TRIGGER_STOP_LOSS:          "STRUCTURAL_DECLINE",
         TRIGGER_EARLY_ALPHA:        "STRONG",
+        TRIGGER_DIP_TO_MOMENTUM:    "STRONG",
         TRIGGER_IMPROVEMENT:        "IMPROVING",
         TRIGGER_ROUTINE:            "STRONG" if delta < 0.05 else "WEAKENING",
         TRIGGER_DETERIORATION:      "DETERIORATING",
@@ -757,6 +778,7 @@ def _monitor_one(
     # converter para MOMENTUM e activar trailing stop.
     # Racional: o dip recuperou rápido porque havia momentum real por baixo.
     # Fechar aqui seria perder upside vertical (caso NOW, Micron, etc).
+    _dip_to_mom_score = 0.0
     _is_early = (trigger == TRIGGER_EARLY_ALPHA)
     _is_dip   = getattr(record, "position_type", "DIP") == "DIP"
     if _is_early and _is_dip:
@@ -780,14 +802,15 @@ def _monitor_one(
 
         if _momentum_score >= 60.0:
             # Converter DIP → MOMENTUM: activar trailing stop, cancelar target fixo
-            record.position_type    = "MOMENTUM"
-            record.trailing_high    = current_price
+            record.position_type     = "MOMENTUM"
+            record.trailing_high     = current_price
             record.current_hold_days = record.days_held + 60   # 60 dias adicionais de momentum
             logger.info(
                 f"[monitor] {record.ticker}: DIP → MOMENTUM (early alpha + momentum score {_momentum_score:.0f}). "
                 f"Trailing stop activado, target fixo desactivado."
             )
-            trigger = TRIGGER_ROUTINE  # não enviar alerta de early alpha, enviar mensagem de transição
+            trigger              = TRIGGER_DIP_TO_MOMENTUM
+            _dip_to_mom_score    = _momentum_score
 
     # ── 7. Persist ────────────────────────────────────────────────────────────
     position_db.update_record(record)
@@ -836,6 +859,9 @@ def _monitor_one(
         record.close_reason = "EDGE_GONE"
         record.closed_at    = datetime.utcnow().isoformat()
         record.close_price  = current_price
+
+    elif trigger == TRIGGER_DIP_TO_MOMENTUM:
+        msg = _build_dip_to_momentum_alert(record, current_price, _dip_to_mom_score)
 
     elif trigger == TRIGGER_EARLY_ALPHA:
         msg = _build_early_alpha_alert(record, current_price)
