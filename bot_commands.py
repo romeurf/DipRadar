@@ -1327,25 +1327,37 @@ def _handle_admin_momentum_dataset(parts: list[str]) -> None:
     )
 
     def _run():
-        import subprocess, sys
+        import subprocess, sys, shutil
         from pathlib import Path
         try:
-            script = Path(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py"
-            cmd    = [sys.executable, str(script), "--start", start_val]
+            script   = Path(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py"
+            data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
+            out_path = data_dir / "momentum_training.parquet"
+            # Se /data/ não tem o parquet (deploy novo), semear a partir do repo
+            if not out_path.exists() and not force_rebuild:
+                repo_seed = Path(__file__).parent / "momentum_radar" / "momentum_training.parquet"
+                if repo_seed.exists():
+                    shutil.copy2(str(repo_seed), str(out_path))
+                    logging.info(f"[momentum_dataset] Seed de {repo_seed} → {out_path}")
+            cmd      = [sys.executable, str(script), "--start", start_val, "--out", str(out_path)]
             if ticker_val:
                 cmd += ["--tickers", ticker_val]
             if force_rebuild:
                 cmd += ["--force-rebuild"]
 
-            _TIMEOUT = 8 * 3600  # 4h
+            _TIMEOUT = 8 * 3600  # 8h
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=_TIMEOUT)
 
             if result.returncode == 0:
                 try:
                     import pandas as pd
-                    from pathlib import Path as _P
-                    data_dir = _P("/data") if _P("/data").exists() else _P("/tmp")
-                    df = pd.read_parquet(data_dir / "momentum_training.parquet")
+                    df = pd.read_parquet(out_path)
+                    # Copiar para repo para rastreio em git
+                    repo_pq = Path(__file__).parent / "momentum_radar" / "momentum_training.parquet"
+                    try:
+                        shutil.copy2(str(out_path), str(repo_pq))
+                    except Exception as _cp:
+                        logging.warning(f"[momentum_dataset] cópia repo: {_cp}")
                     n_rows    = len(df)
                     n_tickers = df["ticker"].nunique() if "ticker" in df.columns else "?"
                     n_sectors = df["sector"].nunique() if "sector" in df.columns else "?"
@@ -1397,13 +1409,18 @@ def _handle_admin_momentum_retrain(parts: list[str]) -> None:
     )
 
     def _run():
-        import subprocess, sys
+        import subprocess, sys, shutil
         from pathlib import Path
         try:
+            data_dir    = Path("/data") if Path("/data").exists() else Path("/tmp")
+            ds_path     = data_dir / "momentum_training.parquet"
+            bundle_path = data_dir / "momentum_model.pkl"
+            report_path = data_dir / "momentum_report.json"
+
             # Passo 1: actualizar dataset (só últimos 35 dias — incremental)
             script = Path(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py"
             result = subprocess.run(
-                [sys.executable, str(script)],
+                [sys.executable, str(script), "--out", str(ds_path)],
                 capture_output=True, text=True, timeout=7200
             )
             if result.returncode != 0:
@@ -1411,17 +1428,36 @@ def _handle_admin_momentum_retrain(parts: list[str]) -> None:
 
             # Passo 2 + 3: treinar e fazer gating
             from momentum_radar.trainer import run_momentum_training
-            result_train = run_momentum_training()
-            decision   = result_train.get("decision", "?")
+            result_train = run_momentum_training(
+                dataset_path=ds_path,
+                bundle_path=bundle_path,
+                report_path=report_path,
+            )
+            decision    = result_train.get("decision", "?")
             ic_ensemble = result_train.get("ic_ensemble")
-            ic_prod    = result_train.get("ic_prod")
-            n_train    = result_train.get("n_train", 0)
-            n_sec      = result_train.get("n_sectors", 0)
-            elapsed    = result_train.get("elapsed_s", 0)
-            ic_str     = f"{ic_ensemble:.4f}" if isinstance(ic_ensemble, float) else "N/A"
+            ic_prod     = result_train.get("ic_prod")
+            n_train     = result_train.get("n_train", 0)
+            n_sec       = result_train.get("n_sectors", 0)
+            elapsed     = result_train.get("elapsed_s", 0)
+            ic_str      = f"{ic_ensemble:.4f}" if isinstance(ic_ensemble, float) else "N/A"
             ic_prod_str = f"{ic_prod:.4f}" if isinstance(ic_prod, float) else "N/A"
 
             if decision == "PROMOTED":
+                # Copiar artefactos para repo (fallback local + github_sync via API)
+                repo_dir = Path(__file__).parent / "momentum_radar"
+                for src, name in [(ds_path, "momentum_training.parquet"),
+                                  (bundle_path, "momentum_model.pkl"),
+                                  (report_path, "momentum_report.json")]:
+                    try:
+                        if src.exists():
+                            shutil.copy2(str(src), str(repo_dir / name))
+                    except Exception as _cp:
+                        logging.warning(f"[momentum_retrain] cópia repo {name}: {_cp}")
+                try:
+                    from github_sync import sync_momentum_artifacts
+                    sync_momentum_artifacts(data_dir)
+                except Exception as _gs:
+                    logging.warning(f"[momentum_retrain] github_sync: {_gs}")
                 _reply(
                     f"🚀 *MomentumRadar Retrain — PROMOVIDO*\n"
                     f"IC novo: *{ic_str}*"
@@ -1493,11 +1529,19 @@ def _handle_admin_dip_dataset(parts: list[str]) -> None:
     )
 
     def _run():
-        import subprocess, sys
+        import subprocess, sys, shutil
         from pathlib import Path
         try:
-            script = Path(__file__).parent / "scripts" / "build_dip_dataset.py"
-            cmd    = [sys.executable, str(script), "--start", start_val]
+            script   = Path(__file__).parent / "scripts" / "build_dip_dataset.py"
+            data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
+            out_path = data_dir / "ml_training_base.parquet"
+            # Se /data/ não tem o parquet (deploy novo), semear a partir do repo
+            if not out_path.exists() and not force_rebuild:
+                repo_seed = Path(__file__).parent / "ml_training_base.parquet"
+                if repo_seed.exists():
+                    shutil.copy2(str(repo_seed), str(out_path))
+                    logging.info(f"[dip_dataset] Seed de {repo_seed} → {out_path}")
+            cmd      = [sys.executable, str(script), "--start", start_val, "--out", str(out_path)]
             if ticker_val:
                 cmd += ["--tickers", ticker_val]
             if no_fund:
@@ -1511,9 +1555,13 @@ def _handle_admin_dip_dataset(parts: list[str]) -> None:
             if result.returncode == 0:
                 try:
                     import pandas as pd
-                    from pathlib import Path as _P
-                    data_dir = _P("/data") if _P("/data").exists() else _P("/tmp")
-                    df = pd.read_parquet(data_dir / "ml_training_base.parquet")
+                    df = pd.read_parquet(out_path)
+                    # Copiar para repo para rastreio em git
+                    repo_pq = Path(__file__).parent / "ml_training_base.parquet"
+                    try:
+                        shutil.copy2(str(out_path), str(repo_pq))
+                    except Exception as _cp:
+                        logging.warning(f"[dip_dataset] cópia repo: {_cp}")
                     n_rows    = len(df)
                     n_tickers = df["ticker"].nunique() if "ticker" in df.columns else "?"
                     n_sectors = df["sector"].nunique() if "sector" in df.columns else "?"
@@ -1705,8 +1753,14 @@ def _handle_admin_full_pipeline(parts: list[str]) -> None:
             nonlocal mom_train_res, mom_train_err2
             _plog("Fase 2 Momentum: treino iniciado")
             try:
+                from pathlib import Path as _P
+                _dd = _P("/data") if _P("/data").exists() else _P("/tmp")
                 from momentum_radar.trainer import run_momentum_training
-                mom_train_res = run_momentum_training() or {}
+                mom_train_res = run_momentum_training(
+                    dataset_path=_dd / "momentum_training.parquet",
+                    bundle_path =_dd / "momentum_model.pkl",
+                    report_path =_dd / "momentum_report.json",
+                ) or {}
                 dec = mom_train_res.get("decision", "?")
                 ic  = mom_train_res.get("ic_ensemble")
                 _plog(f"Fase 2 Momentum: {dec} | IC={ic:.4f}" if isinstance(ic, float) else f"Fase 2 Momentum: {dec}")
@@ -1850,6 +1904,23 @@ def _handle_admin_retrain(parts: list[str]) -> None:
 
         elapsed = time.time() - start_ts
         decision = result.get("decision", "?")
+
+        # Quando promovido, copiar artefactos para repo (git-trackable)
+        if decision == "PROMOTED":
+            import shutil as _shutil
+            from pathlib import Path as _P
+            data_dir  = _P("/data") if _P("/data").exists() else _P("/tmp")
+            repo_ml   = _P(__file__).parent / "ml_training"
+            for src, dst in [
+                (data_dir / "dip_models.pkl",  repo_ml / "dip_models.pkl"),
+                (data_dir / "ml_report.json",  repo_ml / "ml_report.json"),
+            ]:
+                try:
+                    if src.exists():
+                        _shutil.copy2(str(src), str(dst))
+                except Exception as _cp:
+                    logging.warning(f"[admin_retrain] cópia repo {src.name}: {_cp}")
+
         icon = {
             "PROMOTED":   "🚀",
             "PENDING":    "⚠️",
@@ -3189,8 +3260,13 @@ def _handle_command(text: str) -> None:
                     )
                 if result.returncode == 0:
                     # Pipeline automático: dataset → retrain
+                    _dd2 = _P("/data") if _P("/data").exists() else _P("/tmp")
                     from momentum_radar.trainer import run_momentum_training
-                    res = run_momentum_training()
+                    res = run_momentum_training(
+                        dataset_path=_dd2 / "momentum_training.parquet",
+                        bundle_path =_dd2 / "momentum_model.pkl",
+                        report_path =_dd2 / "momentum_report.json",
+                    )
                     dec = res.get("decision", "?")
                     ic  = res.get("ic_ensemble", 0)
                     n   = res.get("n_train", 0)

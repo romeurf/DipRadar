@@ -41,3 +41,10 @@ Thumbs.db
 # ── Logs / temp ─────────────────────────────────────────────────────────
 *.log
 *.tmp
+
+# ── Installed packages (pip install --target / Railway layer) ────────────
+pyarrow/
+pyarrow.libs/
+pyarrow-*.dist-info/
+*.dist-info/
+*.libs/

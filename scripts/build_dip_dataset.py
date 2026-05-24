@@ -61,7 +61,7 @@ log = logging.getLogger("build_dip_dataset")
 
 _DATA_DIR   = Path("/data") if Path("/data").exists() else Path("/tmp")
 _CACHE_DIR  = _DATA_DIR / "price_cache"
-_OUTPUT     = _DATA_DIR / "ml_training_base.parquet"
+_OUTPUT     = Path(__file__).parent.parent / "ml_training_base.parquet"
 
 # ── Detecção de episódio ──────────────────────────────────────────────────────
 # Propositadamente largos: o modelo aprende os thresholds óptimos.

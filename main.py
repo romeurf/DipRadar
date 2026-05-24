@@ -2453,6 +2453,33 @@ def main() -> None:
                         lines.append(f"    `{reason[:35]}`: {avg:+.1f}%")
                 lines.append("")
             send_telegram("\n".join(lines))
+
+            # ── Filter quality alert ───────────────────────────────────────
+            _ALPHA_THRESHOLD = 2.0   # pp above SPY to flag a filter
+            _MIN_SAMPLES     = 15    # minimum rejected entries to trust the stat
+            flagged = []
+            for h_label, h_key in [("30d", "h30d"), ("60d", "h60d"), ("90d", "h90d")]:
+                h = rej_stats.get(h_key, {})
+                for reason, detail in h.get("by_reason_detail", {}).items():
+                    if (
+                        detail["n"] >= _MIN_SAMPLES
+                        and detail.get("avg_alpha") is not None
+                        and detail["avg_alpha"] > _ALPHA_THRESHOLD
+                    ):
+                        flagged.append((h_label, reason, detail["n"], detail["avg_return"], detail["avg_alpha"]))
+            if flagged:
+                flagged.sort(key=lambda x: -x[4])
+                warn_lines = [
+                    "⚠️ *Filtros possivelmente demasiado agressivos*",
+                    "_Rejeições com alpha médio acima de SPY — considera rever os thresholds:_",
+                    "",
+                ]
+                for h_label, reason, n, avg_ret, avg_alpha in flagged:
+                    warn_lines.append(f"• `{reason[:45]}` ({h_label})")
+                    warn_lines.append(f"  {n} amostras | retorno médio *{avg_ret:+.1f}%* | alpha *{avg_alpha:+.1f}pp*")
+                    warn_lines.append("")
+                send_telegram("\n".join(warn_lines))
+
         except Exception as e:
             logging.warning(f"[rejected_outcomes] {e}")
 

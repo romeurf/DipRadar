@@ -5,10 +5,15 @@ Elimina a dependência do Colab: o bot trata de tudo autonomamente.
 Após retrain bem-sucedido, os artefactos são guardados no repo GitHub
 para persistirem entre deploys do Railway e servirem de auditoria.
 
-Artefactos sincronizados:
-  ml_training_base.parquet  — dataset de treino completo
-  dip_models.pkl             — bundle do modelo em produção
-  ml_report.json             — métricas e IC do modelo
+Artefactos DipRadar:
+  ml_training_base.parquet        — dataset de treino
+  ml_training/dip_models.pkl      — bundle do modelo em produção
+  ml_training/ml_report.json      — métricas e IC do modelo
+
+Artefactos MomentumRadar:
+  momentum_radar/momentum_training.parquet
+  momentum_radar/momentum_model.pkl
+  momentum_radar/momentum_report.json
 
 Env vars necessárias no Railway:
   GITHUB_TOKEN   — Personal Access Token com permissão repo:write
@@ -113,26 +118,44 @@ def sync_training_artifacts(data_dir: Path) -> dict:
     ts   = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     results = {}
 
-    # 1. Parquet de treino
-    pq = data_dir / "ml_training_base.parquet"
-    if pq.exists():
-        ok = push_file(pq, "ml_training_base.parquet",
-                       f"data: update ml_training_base.parquet [{ts}]")
-        results["parquet"] = "ok" if ok else "failed"
+    _ARTIFACTS: list[tuple[Path, str, str]] = [
+        # (local_source, repo_path, label)
+        # ── DipRadar ───────────────────────────────────────────────────────
+        (data_dir / "ml_training_base.parquet",  "ml_training_base.parquet",         "dip_parquet"),
+        (data_dir / "dip_models.pkl",            "ml_training/dip_models.pkl",       "dip_bundle"),
+        (data_dir / "ml_report.json",            "ml_training/ml_report.json",       "dip_report"),
+        # ── MomentumRadar ──────────────────────────────────────────────────
+        (data_dir / "momentum_training.parquet", "momentum_radar/momentum_training.parquet", "mom_parquet"),
+        (data_dir / "momentum_model.pkl",        "momentum_radar/momentum_model.pkl",        "mom_bundle"),
+        (data_dir / "momentum_report.json",      "momentum_radar/momentum_report.json",      "mom_report"),
+    ]
 
-    # 2. Bundle do modelo
-    pkl = data_dir / "dip_models.pkl"
-    if pkl.exists():
-        ok = push_file(pkl, "dip_models.pkl",
-                       f"model: update dip_models.pkl [{ts}]")
-        results["bundle"] = "ok" if ok else "failed"
-
-    # 3. Report de métricas
-    report = data_dir / "ml_report.json"
-    if report.exists():
-        ok = push_file(report, "ml_report.json",
-                       f"model: update ml_report.json [{ts}]")
-        results["report"] = "ok" if ok else "failed"
+    for local, repo_path, label in _ARTIFACTS:
+        if local.exists():
+            ok = push_file(local, repo_path, f"artifacts: update {repo_path.split('/')[-1]} [{ts}]")
+            results[label] = "ok" if ok else "failed"
 
     log.info(f"[github_sync] sync_training_artifacts: {results}")
+    return results
+
+
+def sync_momentum_artifacts(data_dir: Path) -> dict:
+    """Sincroniza só os artefactos MomentumRadar. Chamado após momentum retrain."""
+    if not _is_configured():
+        return {"skipped": True, "reason": "GITHUB_TOKEN/GITHUB_REPO não configurados"}
+
+    from datetime import datetime
+    ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    results = {}
+
+    for local, repo_path, label in [
+        (data_dir / "momentum_training.parquet", "momentum_radar/momentum_training.parquet", "mom_parquet"),
+        (data_dir / "momentum_model.pkl",        "momentum_radar/momentum_model.pkl",        "mom_bundle"),
+        (data_dir / "momentum_report.json",      "momentum_radar/momentum_report.json",      "mom_report"),
+    ]:
+        if local.exists():
+            ok = push_file(local, repo_path, f"artifacts: update {repo_path.split('/')[-1]} [{ts}]")
+            results[label] = "ok" if ok else "failed"
+
+    log.info(f"[github_sync] sync_momentum_artifacts: {results}")
     return results

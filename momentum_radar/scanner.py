@@ -274,8 +274,22 @@ def _load_bundle() -> dict | None:
     """Carrega bundle multi-horizonte (com cache em memória)."""
     global _MOMENTUM_BUNDLE, _BUNDLE_MTIME
     from pathlib import Path
-    bundle_path = Path("/data/momentum_model.pkl") if Path("/data").exists() else Path("/tmp/momentum_model.pkl")
-    if not bundle_path.exists():
+    _repo_bundle = Path(__file__).parent / "momentum_model.pkl"
+    _data_bundle = Path("/data/momentum_model.pkl") if Path("/data").exists() else None
+    # Semear /data/ a partir do repo se ainda não existir
+    if _data_bundle and not _data_bundle.exists() and _repo_bundle.exists():
+        try:
+            import shutil as _shutil
+            _shutil.copy2(str(_repo_bundle), str(_data_bundle))
+        except Exception:
+            pass
+    # Preferir /data/ (Railway volume, mais recente); fallback para repo
+    bundle_path = (
+        _data_bundle if (_data_bundle and _data_bundle.exists())
+        else _repo_bundle if _repo_bundle.exists()
+        else None
+    )
+    if bundle_path is None:
         return None
     mtime = bundle_path.stat().st_mtime
     if _MOMENTUM_BUNDLE is None or mtime != _BUNDLE_MTIME:
@@ -448,12 +462,32 @@ def scan_momentum_universe(
             try:
                 fund = get_fundamentals(ticker, min_market_cap=int(_MIN_MARKET_CAP_B * 1e9))
                 if fund.get("skip"):
+                    try:
+                        from state import append_rejected_log
+                        append_rejected_log({
+                            "symbol": ticker, "radar": "MOMENTUM",
+                            "reason": fund.get("skip_reason", "skip"),
+                            "score": None, "verdict": None,
+                            "price": signals.get("price"),
+                        })
+                    except Exception:
+                        pass
                     continue
             except Exception:
                 fund = {}
 
             quality = float(fund.get("quality_score") or 0.0)
             if quality < _MIN_QUALITY:
+                try:
+                    from state import append_rejected_log
+                    append_rejected_log({
+                        "symbol": ticker, "radar": "MOMENTUM",
+                        "reason": f"qualidade baixa ({quality:.0f} < {_MIN_QUALITY:.0f})",
+                        "score": quality, "verdict": None,
+                        "price": signals.get("price"),
+                    })
+                except Exception:
+                    pass
                 continue
 
             sector = fund.get("sector", "Unknown") or "Unknown"
@@ -461,6 +495,16 @@ def scan_momentum_universe(
 
             score, reasons = score_momentum(signals, fund, sector_ret)
             if score < min_score:
+                try:
+                    from state import append_rejected_log
+                    append_rejected_log({
+                        "symbol": ticker, "radar": "MOMENTUM",
+                        "reason": f"score baixo ({score:.0f} < {min_score:.0f})",
+                        "score": score, "verdict": None,
+                        "price": signals.get("price"),
+                    })
+                except Exception:
+                    pass
                 continue
 
             ml = _ml_score_momentum(signals)

@@ -302,16 +302,30 @@ def get_rejected_stats(lookback_days: int = 90) -> dict:
         returns = [e[key] for e in scored]
         alphas  = [e[key] - e[key_spy] for e in scored if e.get(key_spy) is not None]
         by_reason: dict = {}
+        by_reason_alpha: dict = {}
         for e in scored:
             r = e.get("reason", "unknown")
             by_reason.setdefault(r, []).append(e[key])
+            if e.get(key_spy) is not None:
+                by_reason_alpha.setdefault(r, []).append(e[key] - e[key_spy])
+
+        by_reason_detail = {
+            k: {
+                "n":          len(v),
+                "avg_return": round(sum(v) / len(v), 2),
+                "avg_alpha":  round(sum(by_reason_alpha[k]) / len(by_reason_alpha[k]), 2)
+                              if k in by_reason_alpha else None,
+            }
+            for k, v in by_reason.items()
+        }
 
         result[f"h{h_days}d"] = {
-            "n":          len(scored),
-            "win_rate":   round(sum(1 for r in returns if r > 0) / len(returns), 3),
-            "avg_return": round(sum(returns) / len(returns), 2),
-            "avg_alpha":  round(sum(alphas) / len(alphas), 2) if alphas else None,
-            "by_reason":  {k: round(sum(v) / len(v), 2) for k, v in sorted(by_reason.items(), key=lambda x: -abs(sum(x[1])/len(x[1])))},
+            "n":              len(scored),
+            "win_rate":       round(sum(1 for r in returns if r > 0) / len(returns), 3),
+            "avg_return":     round(sum(returns) / len(returns), 2),
+            "avg_alpha":      round(sum(alphas) / len(alphas), 2) if alphas else None,
+            "by_reason":      {k: round(sum(v) / len(v), 2) for k, v in sorted(by_reason.items(), key=lambda x: -abs(sum(x[1])/len(x[1])))},
+            "by_reason_detail": by_reason_detail,
         }
 
     return result

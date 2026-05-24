@@ -33,9 +33,10 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 _DATA_DIR    = Path("/data") if Path("/data").exists() else Path("/tmp")
-_DATASET     = _DATA_DIR / "momentum_training.parquet"
-_BUNDLE_PATH = _DATA_DIR / "momentum_model.pkl"
-_REPORT_PATH = _DATA_DIR / "momentum_report.json"
+_REPO_DIR    = Path(__file__).parent
+_DATASET     = _REPO_DIR / "momentum_training.parquet"
+_BUNDLE_PATH = _REPO_DIR / "momentum_model.pkl"
+_REPORT_PATH = _REPO_DIR / "momentum_report.json"
 
 FEATURE_COLS = [
     "return_20d",
@@ -201,7 +202,11 @@ def _train_final_model(df: pd.DataFrame, feats: list[str], target: str):
     return m, means, len(df)
 
 
-def run_momentum_training(dataset_path: Path = _DATASET) -> dict:
+def run_momentum_training(
+    dataset_path: Path = _DATASET,
+    bundle_path:  Path = _BUNDLE_PATH,
+    report_path:  Path = _REPORT_PATH,
+) -> dict:
     """Treina o Breakout ML multi-horizonte e promove se melhor.
 
     Retorna dict com: decision, ic_ensemble, ic_prod, n_train, elapsed_s
@@ -260,8 +265,8 @@ def run_momentum_training(dataset_path: Path = _DATASET) -> dict:
     # Gating: promover só se IC ≥ IC actual × 0.90
     ic_prod = None
     try:
-        if _REPORT_PATH.exists():
-            report = json.loads(_REPORT_PATH.read_text())
+        if report_path.exists():
+            report = json.loads(report_path.read_text())
             ic_prod = report.get("ic_ensemble") or report.get("ic_mean")
     except Exception:
         pass
@@ -328,9 +333,9 @@ def run_momentum_training(dataset_path: Path = _DATASET) -> dict:
         "target":        "ensemble",
     }
 
-    _BUNDLE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
     import joblib as _jl
-    _jl.dump(bundle, _BUNDLE_PATH)
+    _jl.dump(bundle, bundle_path)
 
     report = {
         "trained_at":    bundle["train_date"],
@@ -343,7 +348,7 @@ def run_momentum_training(dataset_path: Path = _DATASET) -> dict:
         "feature_cols":  FEATURE_COLS,
         "sector_models": {s: {"n_train": v["n_train"], "ic_train": v.get("ic_train")} for s, v in sector_models.items()},
     }
-    _REPORT_PATH.write_text(json.dumps(report, indent=2))
+    report_path.write_text(json.dumps(report, indent=2))
 
     elapsed = round(time.time() - t0, 1)
     log.info(f"[momentum_train] PROMOVIDO em {elapsed}s | IC_ensemble={ic_ensemble:.4f} | {len(models)} horizontes | {len(sector_models)} sector models")

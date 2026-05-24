@@ -40,7 +40,7 @@ log = logging.getLogger("momentum_dataset")
 
 _DATA_DIR   = Path("/data") if Path("/data").exists() else Path("/tmp")
 _CACHE_DIR  = _DATA_DIR / "price_cache"
-_OUTPUT     = _DATA_DIR / "momentum_training.parquet"
+_OUTPUT     = Path(__file__).parent.parent / "momentum_training.parquet"
 
 # Critérios de entrada — dias que qualificam como "momentum"
 # Filtros propositadamente largos: o modelo aprende os thresholds óptimos sozinho.
