@@ -1689,6 +1689,10 @@ def _handle_admin_build_core_dataset(parts: list[str]) -> None:
         import subprocess, sys, re as _re
         from pathlib import Path as _P
 
+        global _pipeline_log
+        _pipeline_log.clear()
+        _plog("CoreML dataset build iniciado")
+
         data_dir = _P("/data") if _P("/data").exists() else _P("/tmp")
         out_path = data_dir / "core_training_base.parquet"
         script   = _P(__file__).parent / "scripts" / "build_core_dataset.py"
@@ -1697,23 +1701,43 @@ def _handle_admin_build_core_dataset(parts: list[str]) -> None:
         if force:           cmd.append("--force-rebuild")
         if no_fundamentals: cmd.append("--no-fundamentals")
 
+        # Streaming line-by-line → visível via /admin_pipeline_status
+        # stderr=STDOUT: logging do Python vai para stderr por defeito; mergir tudo
+        all_lines: list[str] = []
+        returncode = 1
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=4 * 3600)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+
+            for raw in proc.stdout:
+                line = raw.rstrip()
+                all_lines.append(line)
+                clean = _re.sub(r"^\d{2}:\d{2}:\d{2} \| ", "", line).strip()
+                if clean:
+                    _plog(clean)
+
+            proc.wait(timeout=4 * 3600)
+            returncode = proc.returncode
         except subprocess.TimeoutExpired:
+            proc.kill()
             _reply("❌ *Build timeout* (>4h) — verifica os logs.")
             return
         except Exception as e:
             _reply(f"❌ *Build excepção:* `{e}`")
             return
 
-        if r.returncode != 0:
-            err = (r.stderr or r.stdout or "")[-400:]
-            _reply(f"❌ *Build falhou (exit {r.returncode})*\n`{err}`")
+        if returncode != 0:
+            err = "\n".join(all_lines[-15:])
+            _plog(f"Build FALHOU (exit {returncode})")
+            _reply(f"❌ *Build falhou (exit {returncode})*\n`{err[-400:]}`")
             return
 
-        # Extrair stats do stdout
+        # Resumo de stats
         stats_lines = []
-        for line in (r.stdout or "").splitlines():
+        for line in all_lines:
             if any(k in line for k in ("rows", "tickers", "alpha_1y", "alpha_2y", "Guardado", "episódios")):
                 clean = _re.sub(r"^\d{2}:\d{2}:\d{2} \| ", "", line).strip()
                 if clean:
@@ -1722,13 +1746,20 @@ def _handle_admin_build_core_dataset(parts: list[str]) -> None:
         # Commit ao GitHub
         github_line = ""
         if out_path.exists():
+            _plog("A committar ao GitHub...")
             ok, msg = _commit_file_to_github(
                 out_path,
                 "core_training_base.parquet",
                 "data: update CoreML training dataset [bot]",
             )
-            github_line = f"\n✅ Commitado ao GitHub" if ok else f"\n⚠️ GitHub commit falhou: {msg}"
+            if ok:
+                _plog("GitHub commit OK")
+                github_line = "\n✅ Commitado ao GitHub"
+            else:
+                _plog(f"GitHub commit falhou: {msg[:80]}")
+                github_line = f"\n⚠️ GitHub commit falhou: {msg}"
 
+        _plog("Build concluído")
         stats_text = "\n".join(stats_lines) if stats_lines else "  (sem stats)"
         _reply(
             f"✅ *CoreML Dataset Concluído!*\n"
