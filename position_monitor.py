@@ -436,17 +436,17 @@ def _build_dip_to_momentum_alert(
     momentum_score: float,
 ) -> str:
     pnl_pct = (current_price / record.alert_price - 1) * 100
-    new_hold = record.current_hold_days
     return "\n".join([
-        f"🔄 *DIP → MOMENTUM — {record.ticker}*  [Dia {record.days_held}]",
-        f"_O dip recuperou com momentum forte. Target fixo desactivado — trailing stop ATR activado._",
+        f"🔄 *DIP + MOMENTUM — {record.ticker}*  [Dia {record.days_held}]",
+        f"_O dip recuperou e está agora em momentum forte._",
         "",
         f"Score de momentum: *{momentum_score:.0f}/100*",
-        f"P&L desde entrada: *{_pct(pnl_pct)}*  |  Entry: ${record.alert_price:.2f}  →  ${current_price:.2f}",
-        f"Hold estendido: +60 dias (total {new_hold}d)",
+        f"P&L DIP desde entrada: *{_pct(pnl_pct)}*  |  Entry: ${record.alert_price:.2f}  →  ${current_price:.2f}",
+        f"Target DIP: ${record.current_sell_target:.2f}  |  Hold restante: {record.current_hold_days - record.days_held}d",
         "",
-        "💡 *Ação:* Manter posição. Saída por trailing stop ATR ou deterioração de momentum.",
-        "_Trailing stop recalculado diariamente com base na volatilidade real (ATR 14d)._",
+        "💡 *Posição DIP mantém targets originais.*",
+        "_Se o scanner de momentum disparar para este ticker, será aberta uma posição de momentum separada._",
+        "_Saída: qualquer dos dois sistemas que disparar primeiro._",
     ])
 
 
@@ -801,24 +801,17 @@ def _monitor_one(
             logger.debug(f"[monitor] Momentum check {record.ticker}: {_me}")
 
         if _momentum_score >= 60.0:
-            # Converter DIP → MOMENTUM: activar trailing stop, cancelar target fixo
-            record.position_type     = "MOMENTUM"
-            record.trailing_high     = current_price
-            record.current_hold_days = record.days_held + 60   # 60 dias adicionais de momentum
+            # DIP continua com os targets originais (sell_target, hold_days, stop-loss).
+            # Não convertemos: se o momentum scanner disparar independentemente para
+            # este ticker, será aberta uma posição MOMENTUM separada.
+            # As duas saem de forma independente — quem disparar primeiro, sai.
             logger.info(
-                f"[monitor] {record.ticker}: DIP → MOMENTUM (early alpha + momentum score {_momentum_score:.0f}). "
-                f"Trailing stop activado, target fixo desactivado."
+                f"[monitor] {record.ticker}: DIP+MOMENTUM detetado "
+                f"(early alpha + momentum score {_momentum_score:.0f}). "
+                f"DIP mantém targets originais."
             )
-            # Sincronizar paper trade: converter DIP → MOMENTUM para que
-            # update_open_positions não feche por early_exit e
-            # update_momentum_positions passe a geri-lo com trailing stop.
-            try:
-                from paper_trading import upgrade_paper_dip_to_momentum as _upgrade
-                _upgrade(record.ticker, current_price, trailing_stop_pct=0.12, hold_days_extra=60)
-            except Exception as _upe:
-                logger.debug(f"[monitor] upgrade paper {record.ticker}: {_upe}")
-            trigger              = TRIGGER_DIP_TO_MOMENTUM
-            _dip_to_mom_score    = _momentum_score
+            trigger           = TRIGGER_DIP_TO_MOMENTUM
+            _dip_to_mom_score = _momentum_score
 
     # ── 7. Persist ────────────────────────────────────────────────────────────
     position_db.update_record(record)

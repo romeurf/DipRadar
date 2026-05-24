@@ -144,6 +144,17 @@ def get_open_trade(ticker: str) -> Optional[dict]:
     return None
 
 
+def has_open_momentum(ticker: str) -> bool:
+    """True se já existe um trade MOMENTUM aberto para ticker."""
+    ticker = ticker.upper()
+    return any(
+        t.get("ticker") == ticker
+        and t.get("status") == "OPEN"
+        and t.get("trade_type") == "MOMENTUM"
+        for t in _load()
+    )
+
+
 def upgrade_paper_dip_to_momentum(
     ticker: str,
     current_price: float,
@@ -618,9 +629,10 @@ def record_momentum_paper_buy(
     if open_price <= 0 or amount_eur <= 0:
         return ""
 
-    # Dedup: não abrir segundo trade para o mesmo ticker
-    if get_open_trade(ticker):
-        log.info(f"[paper_m] SKIP {ticker} — posição já aberta")
+    # Dedup: não abrir MOMENTUM em cima de MOMENTUM já aberto.
+    # Permitido: MOMENTUM em cima de DIP (posições independentes, saem separadamente).
+    if has_open_momentum(ticker):
+        log.info(f"[paper_m] SKIP {ticker} — MOMENTUM já aberto")
         return ""
 
     monthly_budget = _get_monthly_budget()
