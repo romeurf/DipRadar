@@ -1532,6 +1532,7 @@ def run_scan() -> None:
                         "symbol": sym, "change": stock["change_pct"],
                         "reason": fund.get("skip_reason", "skip"),
                         "score": None, "verdict": None,
+                        "radar": "DIP", "price": stock.get("price"),
                     })
                     continue
 
@@ -1557,6 +1558,7 @@ def run_scan() -> None:
                         "symbol": sym, "change": stock["change_pct"],
                         "reason": f"score baixo ({score:.0f} < {effective_min_score:.0f})",
                         "score": score, "verdict": "EVITAR",
+                        "radar": "DIP", "price": fund.get("price"),
                     })
                     continue
 
@@ -1592,6 +1594,7 @@ def run_scan() -> None:
                         "symbol": sym, "change": stock["change_pct"],
                         "reason": f"v2_skip: conf={score_data['confidence']:.2f}",
                         "score": score_data["final_score"], "verdict": "SKIP",
+                        "radar": "DIP", "price": fund.get("price"),
                     })
                     logging.info(f"[v2] {sym} rejeitado — confidence insuficiente")
                     continue
@@ -1643,6 +1646,7 @@ def run_scan() -> None:
                         "symbol": sym, "change": stock["change_pct"],
                         "reason": f"v2_score baixo ({score:.0f})",
                         "score": score, "verdict": "EVITAR",
+                        "radar": "DIP", "price": fund.get("price"),
                     })
                     logging.info(f"[v2] {sym} rejeitado — score V2 {score:.0f} < MIN ({MIN_DIP_SCORE})")
                     continue
@@ -2420,6 +2424,42 @@ def main() -> None:
         run_ml_outcomes_job,
         CronTrigger(day_of_week="sun", hour=8, minute=0, timezone=LISBON_TZ),
         id="ml_outcomes", name="ML Outcomes domingo",
+    )
+
+    # ── Shadow Portfolio (rejeições): domingo 07:30 Lisboa ────────────────────
+    def _run_rejected_outcomes():
+        try:
+            from state import fill_rejected_outcomes, get_rejected_stats
+            stats = fill_rejected_outcomes()
+            if stats["filled"] == 0 and stats["total"] == 0:
+                return
+            rej_stats = get_rejected_stats(lookback_days=90)
+            lines = [
+                "🔍 *Shadow Portfolio — Rejeições*",
+                f"_{datetime.now(LISBON_TZ).strftime('%d/%m/%Y %H:%M')}_",
+                "",
+                f"Rejeições com outcome: actualizadas +{stats['filled']} | pendentes {stats['pending']} | total {stats['total']}",
+                "",
+            ]
+            for h_label, h_key in [("30d", "h30d"), ("60d", "h60d"), ("90d", "h90d")]:
+                h = rej_stats.get(h_key)
+                if not h:
+                    continue
+                lines.append(f"*Horizonte {h_label}* ({h['n']} amostras)")
+                lines.append(f"  Win rate: *{h['win_rate']:.0%}* | Retorno médio: *{h['avg_return']:+.1f}%*" + (f" | Alpha: *{h['avg_alpha']:+.1f}pp*" if h.get('avg_alpha') is not None else ""))
+                if h.get("by_reason"):
+                    top = sorted(h["by_reason"].items(), key=lambda x: -abs(x[1]))[:3]
+                    for reason, avg in top:
+                        lines.append(f"    `{reason[:35]}`: {avg:+.1f}%")
+                lines.append("")
+            send_telegram("\n".join(lines))
+        except Exception as e:
+            logging.warning(f"[rejected_outcomes] {e}")
+
+    scheduler.add_job(
+        _run_rejected_outcomes,
+        CronTrigger(day_of_week="sun", hour=7, minute=30, timezone=LISBON_TZ),
+        id="rejected_outcomes", name="Shadow Portfolio Rejeições",
     )
 
     # ── Monthly ML Retrain — DipRadar: dia 1, 06:00 Lisboa ────────────────────

@@ -155,13 +155,166 @@ def append_rejected_log(entry: dict) -> None:
     data    = _read(_REJECTED_FILE)
     entries = data.get("entries", [])
     today   = datetime.now().date().isoformat()
-    entries = [e for e in entries if e.get("date_iso") == today]
+    # Guardar historicamente (máx 180 dias) — não apagar entradas anteriores
+    cutoff  = (datetime.now() - timedelta(days=180)).date().isoformat()
+    entries = [e for e in entries if e.get("date_iso", "") >= cutoff]
     entries.append({
         **entry,
-        "time":     datetime.now().strftime("%H:%M"),
-        "date_iso": today,
+        "time":        datetime.now().strftime("%H:%M"),
+        "date_iso":    today,
+        "outcome_pct": None,   # preenchido pelo shadow tracker semanal
+        "outcome_spy": None,
+        "outcome_date": None,
     })
     _write(_REJECTED_FILE, {"entries": entries})
+
+
+_REJECTED_HORIZONS = {
+    "DIP":      [30, 60, 90],   # hold estimado do DipRadar
+    "MOMENTUM": [30, 60],       # hold estimado do MomentumRadar
+    "DEFAULT":  [30, 60, 90],
+}
+
+
+def _spy_return_between(alert_date, target_date, spy_hist) -> float | None:
+    """Retorno SPY entre alert_date e target_date usando hist já descarregado."""
+    try:
+        start_row = spy_hist[spy_hist.index.date >= alert_date]  # type: ignore[attr-defined]
+        end_row   = spy_hist[spy_hist.index.date <= target_date]  # type: ignore[attr-defined]
+        if start_row.empty or end_row.empty:
+            return None
+        p0 = float(start_row["Close"].iloc[0])
+        p1 = float(end_row["Close"].iloc[-1])
+        return round((p1 / p0 - 1) * 100, 2) if p0 > 0 else None
+    except Exception:
+        return None
+
+
+def fill_rejected_outcomes() -> dict:
+    """Preenche outcomes a 30d/60d/90d para rejeições com histórico suficiente.
+
+    Horizontes por radar:
+      DIP:      30d, 60d, 90d  (hold estimado do DipRadar)
+      MOMENTUM: 30d, 60d       (hold estimado do MomentumRadar)
+
+    Chamado semanalmente (domingo, antes do ML Outcomes).
+    """
+    data    = _read(_REJECTED_FILE)
+    entries = data.get("entries", [])
+    today   = datetime.now().date()
+    filled  = 0
+
+    try:
+        import yfinance as yf
+        spy_hist = yf.Ticker("SPY").history(period="200d", auto_adjust=True)
+        if not spy_hist.empty:
+            spy_hist.index = spy_hist.index.tz_localize(None) if spy_hist.index.tz else spy_hist.index
+        else:
+            spy_hist = None
+    except Exception:
+        spy_hist = None
+
+    ticker_hist_cache: dict = {}
+
+    for e in entries:
+        date_iso = e.get("date_iso", "")
+        symbol   = e.get("symbol", "")
+        price_in = e.get("price") or e.get("close")
+        if not date_iso or not symbol or not price_in:
+            continue
+        try:
+            alert_date = datetime.strptime(date_iso, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+
+        radar    = e.get("radar", "DEFAULT")
+        horizons = _REJECTED_HORIZONS.get(radar, _REJECTED_HORIZONS["DEFAULT"])
+        days_old = (today - alert_date).days
+
+        # Só processar se pelo menos o horizonte mínimo passou
+        if days_old < min(horizons):
+            continue
+
+        # Descarregar histórico do ticker uma vez
+        if symbol not in ticker_hist_cache:
+            try:
+                h = yf.Ticker(symbol).history(
+                    start=str(alert_date), end=str(today), auto_adjust=True
+                )
+                h.index = h.index.tz_localize(None) if h.index.tz else h.index
+                ticker_hist_cache[symbol] = h if not h.empty else None
+            except Exception:
+                ticker_hist_cache[symbol] = None
+        hist = ticker_hist_cache.get(symbol)
+        if hist is None:
+            continue
+
+        entry_changed = False
+        for h_days in horizons:
+            key_ret = f"outcome_{h_days}d"
+            key_spy = f"outcome_spy_{h_days}d"
+            if e.get(key_ret) is not None:
+                continue  # já preenchido
+            if days_old < h_days:
+                continue  # ainda não chegou o tempo
+
+            target_date = alert_date + timedelta(days=h_days)
+            valid = hist[hist.index.date <= target_date]  # type: ignore[attr-defined]
+            if valid.empty:
+                continue
+            price_out = float(valid["Close"].iloc[-1])
+            ret_pct   = round((price_out / float(price_in) - 1) * 100, 2)
+            e[key_ret] = ret_pct
+            if spy_hist is not None:
+                e[key_spy] = _spy_return_between(alert_date, target_date, spy_hist)
+            entry_changed = True
+
+        if entry_changed:
+            e["outcome_updated"] = str(today)
+            filled += 1
+
+    if filled > 0:
+        _write(_REJECTED_FILE, {"entries": entries})
+
+    pending = sum(
+        1 for e in entries
+        if e.get("outcome_30d") is None
+        and (datetime.now().date() - datetime.strptime(e["date_iso"], "%Y-%m-%d").date()).days >= 30
+        if e.get("date_iso")
+    )
+    return {"filled": filled, "pending": pending, "total": len(entries)}
+
+
+def get_rejected_stats(lookback_days: int = 90) -> dict:
+    """Estatísticas do shadow portfolio de rejeições por horizonte e razão."""
+    entries = load_rejected_log()
+    cutoff  = (datetime.now() - timedelta(days=lookback_days)).date().isoformat()
+    entries = [e for e in entries if e.get("date_iso", "") >= cutoff]
+
+    result: dict = {"lookback_days": lookback_days, "total_rejected": len(entries)}
+
+    for h_days in [30, 60, 90]:
+        key = f"outcome_{h_days}d"
+        key_spy = f"outcome_spy_{h_days}d"
+        scored = [e for e in entries if e.get(key) is not None]
+        if not scored:
+            continue
+        returns = [e[key] for e in scored]
+        alphas  = [e[key] - e[key_spy] for e in scored if e.get(key_spy) is not None]
+        by_reason: dict = {}
+        for e in scored:
+            r = e.get("reason", "unknown")
+            by_reason.setdefault(r, []).append(e[key])
+
+        result[f"h{h_days}d"] = {
+            "n":          len(scored),
+            "win_rate":   round(sum(1 for r in returns if r > 0) / len(returns), 3),
+            "avg_return": round(sum(returns) / len(returns), 2),
+            "avg_alpha":  round(sum(alphas) / len(alphas), 2) if alphas else None,
+            "by_reason":  {k: round(sum(v) / len(v), 2) for k, v in sorted(by_reason.items(), key=lambda x: -abs(sum(x[1])/len(x[1])))},
+        }
+
+    return result
 
 
 # ── Backtest log ──────────────────────────────────────────────────────────
