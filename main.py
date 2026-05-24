@@ -2123,7 +2123,6 @@ def run_momentum_scan() -> None:
 
         # Capital arbiter: dimensionar cada candidato e verificar budget disponível
         available = _get_monthly_budget() - _capital_used_this_month()
-        from paper_trading import get_open_trade as _get_open_trade
         opps = []
         for c in candidates:
             dur = c.get("ml_durability", "MODERADO")
@@ -2138,13 +2137,6 @@ def run_momentum_scan() -> None:
                 _win_prob = min(0.40 + c["score"] / 100 * 0.35, 0.80)
             # Horizonte adaptado à durabilidade: DURÁVEL usa L2 (90d), TÁCTICO usa L1 (30d)
             _horizon = {"DURÁVEL": 90, "MODERADO": 60, "TÁCTICO": 30}.get(dur, 60)
-            # Penalidade de concentração: se já há DIP aberto neste ticker,
-            # reduz expected_ret em 25% — só ganha capital se for visivelmente
-            # mais forte do que oportunidades frescas sem exposição prévia.
-            _has_dip = _get_open_trade(c["ticker"]) is not None
-            if _has_dip:
-                _exp_ret *= 0.75
-                logging.debug(f"[momentum] {c['ticker']}: DIP aberto → penalidade concentração aplicada")
             opps.append({
                 "trade_type":   "MOMENTUM",
                 "ticker":       c["ticker"],
@@ -2153,7 +2145,6 @@ def run_momentum_scan() -> None:
                 "win_prob":     _win_prob,
                 "amount_eur":   available / max(len(candidates), 1),
                 "_candidate":   c,
-                "_has_dip":     _has_dip,
             })
 
         approved = allocate_capital_unified(opps, available)
