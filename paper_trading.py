@@ -135,6 +135,57 @@ def _capital_used_this_month() -> float:
     )
 
 
+def get_open_trade(ticker: str) -> Optional[dict]:
+    """Devolve o primeiro trade OPEN para ticker, ou None."""
+    ticker = ticker.upper()
+    for t in _load():
+        if t.get("ticker") == ticker and t.get("status") == "OPEN":
+            return t
+    return None
+
+
+def upgrade_paper_dip_to_momentum(
+    ticker: str,
+    current_price: float,
+    trailing_stop_pct: float = 0.12,
+    hold_days_extra: int = 60,
+) -> bool:
+    """Converte o paper trade DIP aberto de ticker para modo MOMENTUM.
+
+    Chamado pelo position_monitor quando DIP→MOMENTUM transition dispara.
+    Garante que update_open_positions não fecha o trade por early_exit
+    e que update_momentum_positions passa a geri-lo com trailing stop.
+
+    Devolve True se encontrou e converteu, False se não havia DIP aberto.
+    """
+    ticker = ticker.upper()
+    trades  = _load()
+    changed = False
+    for t in trades:
+        if t.get("ticker") != ticker or t.get("status") != "OPEN":
+            continue
+        if t.get("trade_type") == "MOMENTUM":
+            continue  # já convertido
+        # Converter DIP → MOMENTUM
+        t["trade_type"]        = "MOMENTUM"
+        t["sell_target"]       = 0.0
+        t["trailing_high"]     = round(current_price, 4)
+        t["trailing_stop_pct"] = trailing_stop_pct
+        t["hold_days"]         = t.get("hold_days", 90) + hold_days_extra
+        t.setdefault("ml_durability_open", "MODERADO")
+        t.setdefault("ml_durability_cur",  "MODERADO")
+        t.setdefault("durability_history", [])
+        changed = True
+        log.info(
+            f"[paper] UPGRADE {ticker} DIP→MOMENTUM "
+            f"stop={trailing_stop_pct:.0%} hold+{hold_days_extra}d"
+        )
+        break  # só um trade aberto por ticker
+    if changed:
+        _save(trades)
+    return changed
+
+
 def record_paper_buy(
     ticker:      str,
     open_price:  float,
@@ -154,6 +205,11 @@ def record_paper_buy(
     Retorna o ID da posição criada, ou "" se não houver budget disponível.
     """
     if open_price <= 0 or amount_eur <= 0:
+        return ""
+
+    # Dedup: não abrir segundo trade para o mesmo ticker
+    if get_open_trade(ticker):
+        log.info(f"[paper] SKIP {ticker} — posição já aberta")
         return ""
 
     # Verificar orçamento mensal disponível
@@ -560,6 +616,11 @@ def record_momentum_paper_buy(
     MODERADO=-12%, TÁCTICO=-8%), não por target fixo.
     """
     if open_price <= 0 or amount_eur <= 0:
+        return ""
+
+    # Dedup: não abrir segundo trade para o mesmo ticker
+    if get_open_trade(ticker):
+        log.info(f"[paper_m] SKIP {ticker} — posição já aberta")
         return ""
 
     monthly_budget = _get_monthly_budget()

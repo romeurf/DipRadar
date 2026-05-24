@@ -809,6 +809,14 @@ def _monitor_one(
                 f"[monitor] {record.ticker}: DIP → MOMENTUM (early alpha + momentum score {_momentum_score:.0f}). "
                 f"Trailing stop activado, target fixo desactivado."
             )
+            # Sincronizar paper trade: converter DIP → MOMENTUM para que
+            # update_open_positions não feche por early_exit e
+            # update_momentum_positions passe a geri-lo com trailing stop.
+            try:
+                from paper_trading import upgrade_paper_dip_to_momentum as _upgrade
+                _upgrade(record.ticker, current_price, trailing_stop_pct=0.12, hold_days_extra=60)
+            except Exception as _upe:
+                logger.debug(f"[monitor] upgrade paper {record.ticker}: {_upe}")
             trigger              = TRIGGER_DIP_TO_MOMENTUM
             _dip_to_mom_score    = _momentum_score
 
