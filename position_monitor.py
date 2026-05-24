@@ -783,6 +783,7 @@ def _monitor_one(
     _is_dip   = getattr(record, "position_type", "DIP") == "DIP"
     if _is_early and _is_dip:
         _momentum_score = 0.0
+        _msigs: dict = {}
         try:
             from momentum_radar.scanner import _calc_momentum_signals, score_momentum
             import yfinance as _yf
@@ -801,22 +802,55 @@ def _monitor_one(
             logger.debug(f"[monitor] Momentum check {record.ticker}: {_me}")
 
         if _momentum_score >= 60.0:
-            # Converter DIP → MOMENTUM: o momentum vai superar o sell_target de 90d,
-            # por isso o trailing stop ATR toma o controlo. O sell_target original
-            # fica irrelevante — deixamos o momentum correr até reverter.
+            # Converter DIP → MOMENTUM tratando como alerta MOMENTUM fresco.
+            # Derivar stop, hold e scores ML exactamente como o scanner faria.
+            _ml_durability   = "MODERADO"
+            _ml_stop         = 0.12
+            _ml_hold         = 60
+            _ml_l1 = _ml_l2 = _ml_l3 = _ml_ens = 0.0
+            try:
+                from momentum_radar.scanner import (
+                    _ml_score_momentum,
+                    score_momentum as _score_mom,
+                )
+                from paper_trading import (
+                    _trailing_stop_for_durability as _t_stop_fn,
+                    _hold_days_for_durability    as _hold_fn,
+                )
+                _ml_res = _ml_score_momentum(_msigs) if _msigs else {}
+                if _ml_res.get("ml_ready"):
+                    _ml_durability = _ml_res.get("ml_durability", "MODERADO")
+                    _ml_l1  = float(_ml_res.get("ml_score_l1",       0.0))
+                    _ml_l2  = float(_ml_res.get("ml_score_l2",       0.0))
+                    _ml_l3  = float(_ml_res.get("ml_score_l3",       0.0))
+                    _ml_ens = float(_ml_res.get("ml_score_ensemble",  0.0))
+                    _ml_stop = _t_stop_fn(_ml_durability)
+                    _ml_hold = _hold_fn(_ml_durability)
+            except Exception as _mle:
+                logger.debug(f"[monitor] ML durability {record.ticker}: {_mle}")
+
             record.position_type     = "MOMENTUM"
             record.trailing_high     = current_price
-            record.current_hold_days = record.days_held + 60
+            record.current_hold_days = record.days_held + _ml_hold
             logger.info(
                 f"[monitor] {record.ticker}: DIP → MOMENTUM "
-                f"(early alpha + score {_momentum_score:.0f}). Trailing stop activado."
+                f"score={_momentum_score:.0f} dur={_ml_durability} "
+                f"stop={_ml_stop:.0%} hold={_ml_hold}d (reset)"
             )
-            # Converter o paper trade DIP para MOMENTUM para que
-            # update_open_positions não feche por early_exit e
-            # update_momentum_positions gerir com trailing stop ATR.
+            # Upgrade do paper trade: trata como alerta MOMENTUM fresco.
             try:
                 from paper_trading import upgrade_paper_dip_to_momentum as _upgrade
-                _upgrade(record.ticker, current_price, trailing_stop_pct=0.12, hold_days_extra=60)
+                _upgrade(
+                    record.ticker, current_price,
+                    trailing_stop_pct = _ml_stop,
+                    hold_days         = _ml_hold,
+                    momentum_score    = _momentum_score,
+                    ml_durability     = _ml_durability,
+                    ml_score_l1       = _ml_l1,
+                    ml_score_l2       = _ml_l2,
+                    ml_score_l3       = _ml_l3,
+                    ml_score_ensemble = _ml_ens,
+                )
             except Exception as _upe:
                 logger.debug(f"[monitor] upgrade paper {record.ticker}: {_upe}")
             trigger           = TRIGGER_DIP_TO_MOMENTUM

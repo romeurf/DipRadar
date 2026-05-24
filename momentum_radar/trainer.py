@@ -271,6 +271,17 @@ def run_momentum_training(
     except Exception:
         pass
 
+    _IC_FLOOR = 0.04  # não promover modelos com IC absoluto muito baixo
+    if ic_ensemble < _IC_FLOOR:
+        log.warning(f"[momentum_train] IC ({ic_ensemble:.4f}) abaixo do floor ({_IC_FLOOR}) — a manter modelo actual")
+        return {
+            "decision":    "KEPT",
+            "reason":      f"IC novo ({ic_ensemble:.4f}) abaixo do floor mínimo ({_IC_FLOOR})",
+            "ic_ensemble": ic_ensemble,
+            "ic_prod":     ic_prod,
+            "n_train":     len(df),
+            "elapsed_s":   round(time.time() - t0, 1),
+        }
     if ic_prod is not None and ic_ensemble < ic_prod * 0.90:
         log.warning(f"[momentum_train] IC ({ic_ensemble:.4f}) < prod ({ic_prod:.4f}) × 0.90 — a manter modelo actual")
         return {

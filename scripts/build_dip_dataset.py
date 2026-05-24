@@ -74,7 +74,7 @@ _MIN_BARS_AHEAD   = 95   # dias úteis mínimos necessários para target de 90d
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Target adicional: max_drawdown_60d (modelo de risco do DipRadar)
+# Target adicional: max_drawdown_90d (modelo de risco do DipRadar)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _compute_max_drawdown_90d(

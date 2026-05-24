@@ -156,40 +156,74 @@ def has_open_momentum(ticker: str) -> bool:
 
 
 def upgrade_paper_dip_to_momentum(
-    ticker: str,
-    current_price: float,
+    ticker:            str,
+    current_price:     float,
     trailing_stop_pct: float = 0.12,
-    hold_days_extra: int = 60,
+    hold_days:         int   = 60,
+    momentum_score:    float = 0.0,
+    ml_durability:     str   = "MODERADO",
+    ml_score_l1:       float = 0.0,
+    ml_score_l2:       float = 0.0,
+    ml_score_l3:       float = 0.0,
+    ml_score_ensemble: float = 0.0,
 ) -> bool:
-    """Converte o paper trade DIP aberto de ticker para modo MOMENTUM.
+    """Converte o paper trade DIP aberto de ticker para modo MOMENTUM puro.
 
-    Chamado pelo position_monitor quando DIP→MOMENTUM transition dispara.
-    Garante que update_open_positions não fecha o trade por early_exit
-    e que update_momentum_positions passa a geri-lo com trailing stop.
+    A partir deste momento o trade é tratado como um alerta MOMENTUM fresco:
+    - hold_days reseta para a duração recomendada pela durabilidade ML (não acumula)
+    - sell_target zerado — a saída é 100% por trailing stop
+    - trailing_high resetado para current_price (pico conhecido no momento do upgrade)
+    - Campos ML do MOMENTUM populados tal como record_momentum_paper_buy faria
+
+    update_open_positions ignora o trade (trade_type=MOMENTUM).
+    update_momentum_positions passa a geri-lo com re-score diário.
 
     Devolve True se encontrou e converteu, False se não havia DIP aberto.
     """
-    ticker = ticker.upper()
-    trades  = _load()
-    changed = False
+    ticker    = ticker.upper()
+    today_iso = date.today().isoformat()
+    trades    = _load()
+    changed   = False
     for t in trades:
         if t.get("ticker") != ticker or t.get("status") != "OPEN":
             continue
         if t.get("trade_type") == "MOMENTUM":
             continue  # já convertido
-        # Converter DIP → MOMENTUM
-        t["trade_type"]        = "MOMENTUM"
-        t["sell_target"]       = 0.0
-        t["trailing_high"]     = round(current_price, 4)
-        t["trailing_stop_pct"] = trailing_stop_pct
-        t["hold_days"]         = t.get("hold_days", 90) + hold_days_extra
-        t.setdefault("ml_durability_open", "MODERADO")
-        t.setdefault("ml_durability_cur",  "MODERADO")
-        t.setdefault("durability_history", [])
+
+        t["prev_trade_type"]      = "DIP"
+        t["dip_hold_days"]        = t.get("hold_days", 90)     # preservar para auditoria
+        t["dip_sell_target"]      = float(t.get("sell_target") or 0.0)  # target DIP original
+        t["upgrade_date"]         = today_iso
+        t["momentum_start_date"]  = today_iso  # days_held para MOMENTUM conta daqui
+        t["trade_type"]           = "MOMENTUM"
+        t["sell_target"]          = 0.0
+        t["trailing_high"]        = round(current_price, 4)
+        t["trailing_stop_pct"]    = round(trailing_stop_pct, 4)
+        # hold_days reseta: conta a partir de momentum_start_date
+        t["hold_days"]            = hold_days
+        # Campos de MOMENTUM (como se fosse alerta novo)
+        t["momentum_score"]      = round(momentum_score, 1)
+        t["ml_score_l1"]         = round(ml_score_l1, 4)
+        t["ml_score_l2"]         = round(ml_score_l2, 4)
+        t["ml_score_l3"]         = round(ml_score_l3, 4)
+        t["ml_score_ensemble"]   = round(ml_score_ensemble, 4)
+        t["ml_durability_open"]  = ml_durability
+        t["ml_durability_cur"]   = ml_durability
+        t["durability_history"]  = [{
+            "date":       today_iso,
+            "durability": ml_durability,
+            "l1":         round(ml_score_l1, 4),
+            "l2":         round(ml_score_l2, 4),
+            "l3":         round(ml_score_l3, 4),
+        }]
+        # Limpar flags de DIP que já não se aplicam
+        t.pop("timeout_trailing_date", None)
+        t.pop("past_hold_tightened", None)
         changed = True
         log.info(
             f"[paper] UPGRADE {ticker} DIP→MOMENTUM "
-            f"stop={trailing_stop_pct:.0%} hold+{hold_days_extra}d"
+            f"dur={ml_durability} stop={trailing_stop_pct:.0%} "
+            f"hold={hold_days}d score={momentum_score:.0f}"
         )
         break  # só um trade aberto por ticker
     if changed:
@@ -244,6 +278,7 @@ def record_paper_buy(
     trade = {
         "id":            trade_id,
         "ticker":        ticker.upper(),
+        "trade_type":    "DIP",
         "open_date":     date.today().isoformat(),
         "open_price":    round(open_price, 4),
         "amount_eur":    round(amount_eur, 2),
@@ -258,6 +293,10 @@ def record_paper_buy(
         "alpha_pct":     None,
         "score_v2":      round(score_v2, 2),
         "ml_win_prob":   round(ml_win_prob, 3),
+        # Trailing stop largo desde a entrada — protege contra perdas catastroficas.
+        # 22% dá espaço para recuperação típica de dip sem fechar prematuramente.
+        "trailing_high":     round(open_price, 4),
+        "trailing_stop_pct": 0.22,
         # Contexto de orçamento
         "budget_used_at_open": round(capital_used + amount_eur, 2),
         "budget_total":        round(monthly_budget, 2),
@@ -290,7 +329,10 @@ def update_open_positions() -> dict:
             continue  # MOMENTUM trades têm sell_target=0 — geridas por update_momentum_positions
 
         open_date = date.fromisoformat(t["open_date"])
-        days_held = (today - open_date).days
+        # Para posições revertidas de MOMENTUM→DIP, o prazo DIP conta da data de revert.
+        _dip_ref_raw = t.get("revert_to_dip_date")
+        dip_ref_date = date.fromisoformat(_dip_ref_raw) if _dip_ref_raw else open_date
+        days_held    = (today - dip_ref_date).days
 
         # Ainda dentro do período de holding?
         if days_held < t["hold_days"] and days_held < 5:
@@ -303,26 +345,59 @@ def update_open_positions() -> dict:
             still_open += 1
             continue
 
+        # ── Trailing stop (DIP que expirou ou foi activado manualmente) ──────────
+        _t_high = t.get("trailing_high")
+        _t_stop = t.get("trailing_stop_pct")
+        if _t_high is not None:
+            t["trailing_high"] = round(max(float(_t_high), current_price), 4)
+        hit_trailing = (
+            _t_high is not None and _t_stop is not None
+            and current_price < float(_t_high) * (1.0 - float(_t_stop))
+        )
+
         # ── Saída antecipada (Early Alpha Capture) ─────────────────────────────
-        # Se a posição já valorizou 70%+ do target em menos de 50% do tempo,
-        # não faz sentido aguardar os 90 dias — o mercado pode reverter.
-        # Exemplo: target +20% em 90 dias; ao fim de 28 dias já está +15% → sair.
-        ret_actual = (current_price / t["open_price"] - 1) if t["open_price"] > 0 else 0
-        target_return = (t["sell_target"] / t["open_price"] - 1) if t["open_price"] > 0 else 0
+        ret_actual    = (current_price / t["open_price"] - 1) if t["open_price"] > 0 else 0
+        sell_tgt      = float(t.get("sell_target") or 0)
+        target_return = (sell_tgt / t["open_price"] - 1) if sell_tgt > 0 and t["open_price"] > 0 else 0
         time_fraction  = days_held / max(t["hold_days"], 1)
         alpha_fraction = ret_actual / max(target_return, 0.001) if target_return > 0 else 0
 
         early_exit = (
-            alpha_fraction >= 0.70     # capturou 70%+ do target
-            and time_fraction < 0.50   # em menos de 50% do tempo
-            and ret_actual > 0.05      # pelo menos 5% de retorno real
+            alpha_fraction >= 0.70
+            and time_fraction < 0.50
+            and ret_actual > 0.05
         )
 
         # Decidir se fechar
-        hit_target = current_price >= t["sell_target"]
+        hit_target = sell_tgt > 0 and current_price >= sell_tgt
         time_up    = days_held >= t["hold_days"]
 
-        if not hit_target and not time_up and not early_exit:
+        # Prazo expirou sem atingir target: apertar trailing stop em vez de fechar.
+        # Fechamos quando o upside se esgota, não pelo calendário.
+        if time_up and not hit_target and not hit_trailing:
+            if not t.get("timeout_trailing_date"):  # primeira vez que expira
+                old_stop = float(t.get("trailing_stop_pct") or 0.22)
+                t["trailing_stop_pct"]       = round(min(old_stop, 0.12), 4)
+                t["timeout_trailing_date"]   = today.isoformat()
+                log.info(
+                    f"[paper] TIMEOUT→TRAILING {t['ticker']} "
+                    f"stop apertado {old_stop:.0%}→{t['trailing_stop_pct']:.0%} "
+                    f"high={t['trailing_high']:.2f}"
+                )
+                # Recalcular hit_trailing com stop apertado
+                hit_trailing = (
+                    current_price < float(t["trailing_high"]) * (1.0 - float(t["trailing_stop_pct"]))
+                )
+                if hit_trailing:
+                    pass  # cai para o bloco de fecho abaixo
+                else:
+                    still_open += 1
+                    continue
+            else:
+                still_open += 1
+                continue
+
+        if not hit_target and not hit_trailing and not early_exit:
             still_open += 1
             continue
 
@@ -339,8 +414,12 @@ def update_open_positions() -> dict:
                 f"[paper] EARLY EXIT {t['ticker']} — "
                 f"{alpha_fraction*100:.0f}% do alpha em {time_fraction*100:.0f}% do tempo"
             )
-        else:
-            t["status"] = "CLOSED_TIME"
+        elif hit_trailing:
+            t["status"] = "CLOSED_TRAILING_STOP"
+            log.info(
+                f"[paper] TRAILING STOP {t['ticker']} "
+                f"high={_t_high:.2f} price={current_price:.2f}"
+            )
         t["close_date"]    = today.isoformat()
         t["close_price"]   = round(current_price, 4)
         t["return_pct"]    = ret_pct
@@ -697,15 +776,48 @@ def record_momentum_paper_buy(
     return trade_id
 
 
+# Upside mínimo ao target DIP original para reverter MOMENTUM→DIP em vez de fechar
+_DIP_REVERT_MIN_UPSIDE = 0.08   # 8% para target original ainda por capturar
+_DIP_REVERT_MAX_DAYS   = 270    # após 270d de hold total a tese DIP expirou
+
+
+def _revert_momentum_to_dip(t: dict, current_price: float, today_iso: str) -> None:
+    """Converte posição MOMENTUM (vinda de DIP upgrade) de volta a gestão DIP.
+
+    Chamado quando o momentum arrefece mas o target DIP original ainda tem
+    upside suficiente. A tese DIP retoma — update_open_positions volta a gerir.
+    """
+    dip_target = float(t.get("dip_sell_target") or 0.0)
+    t["trade_type"]          = "DIP"
+    t["sell_target"]         = round(dip_target, 4)
+    # Trailing stop largo para dar espaço à recuperação DIP
+    t["trailing_high"]       = round(current_price, 4)
+    t["trailing_stop_pct"]   = 0.22
+    # hold_days: mais 60d a partir de hoje para a tese DIP se confirmar
+    t["hold_days"]           = 60
+    t["revert_to_dip_date"]  = today_iso
+    # Limpar flags MOMENTUM que já não se aplicam
+    t.pop("momentum_start_date",  None)
+    t.pop("past_hold_tightened",  None)
+    t.pop("timeout_trailing_date", None)
+    log.info(
+        f"[paper] REVERT {t['ticker']} MOMENTUM→DIP "
+        f"dip_target={dip_target:.2f} price={current_price:.2f} "
+        f"upside_restante={dip_target/current_price-1:+.1%}"
+    )
+
+
 def update_momentum_positions(send_fn=None) -> dict:
-    """Actualiza posições MOMENTUM abertas: drift de durabilidade + trailing stop + timeout.
+    """Actualiza posições MOMENTUM abertas: drift de durabilidade + trailing stop.
 
     Algoritmo diário:
       1. Re-score ML multi-horizonte com sinais actuais
       2. Detectar drift: TÁCTICO→DURÁVEL (alargar stop) ou DURÁVEL→TÁCTICO (apertar)
       3. Enviar alerta se mudança significativa
-      4. Actualizar trailing stop e hold_days adaptados
-      5. Fechar se trailing stop atingido ou timeout
+      4. Actualizar trailing stop adaptado
+      5. Fechar APENAS se trailing stop atingido — sem janela fixa de fecho.
+         Quando o hold_days esperado é ultrapassado, o stop aperta para reduzir
+         tolerância a giveback, mas a posição continua até o stop ser tocado.
 
     Returns dict com chaves: updated, drifted, closed.
     """
@@ -721,7 +833,11 @@ def update_momentum_positions(send_fn=None) -> dict:
             continue
 
         open_date = date.fromisoformat(t["open_date"])
-        days_held = (today - open_date).days
+        # Para posições vindas de upgrade DIP→MOMENTUM, a duração de MOMENTUM
+        # conta a partir do momentum_start_date (não do open_date do DIP).
+        _mom_start_raw = t.get("momentum_start_date")
+        momentum_start = date.fromisoformat(_mom_start_raw) if _mom_start_raw else open_date
+        days_held = (today - momentum_start).days
 
         if days_held < 3:
             continue
@@ -802,26 +918,76 @@ def update_momentum_positions(send_fn=None) -> dict:
                 except Exception:
                     pass
 
-        # ── 3. Trailing stop adaptativo ───────────────────────────────────────
+        # ── 3. Trailing stop adaptativo (ATR-based) ──────────────────────────
         trailing_high = max(float(t.get("trailing_high") or t["open_price"]), current_price)
         t["trailing_high"] = round(trailing_high, 4)
 
+        # stop_pct base: vem da durabilidade e é o máximo permitido
         stop_pct = float(t.get("trailing_stop_pct") or _MOMENTUM_TRAILING_STOP)
-        trailing_stop_price = trailing_high * (1 - stop_pct)
+
+        # Quando passamos o hold_days esperado, aperta o stop_pct base (uma vez).
+        time_up = days_held >= int(t.get("hold_days") or _MOMENTUM_HOLD_DAYS)
+        if time_up and not t.get("past_hold_tightened"):
+            tightened_stop = round(stop_pct * 0.75, 4)  # sem floor — ATR é o protector
+            if tightened_stop < stop_pct:
+                log.info(
+                    f"[paper_m] PAST_HOLD {ticker} day={days_held} "
+                    f"stop_base {stop_pct:.1%}→{tightened_stop:.1%}"
+                )
+                t["trailing_stop_pct"]   = tightened_stop
+                t["past_hold_tightened"] = True
+                stop_pct                 = tightened_stop
+
+        # ATR-based refinement: em baixa volatilidade, sair mais perto do pico.
+        # Em alta volatilidade, o ATR fica largo e usa-se o stop_pct base.
+        # Multiplicadores: DURÁVEL mantém mais espaço, TÁCTICO aperta mais.
+        _cur_dur  = t.get("ml_durability_cur") or "MODERADO"
+        _atr_mult = {"DURÁVEL": 5.0, "MODERADO": 4.0, "TÁCTICO": 3.0}.get(_cur_dur, 4.0)
+        _atr_pct  = float(signals.get("atr_pct", 0.02)) if signals else 0.02
+        _atr_stop = _atr_pct * _atr_mult
+        # Nunca usar stop_effectivo < 2% (evita disparos por micro-flutuações EOD)
+        effective_stop_pct = min(stop_pct, max(_atr_stop, 0.02))
+
+        trailing_stop_price = trailing_high * (1 - effective_stop_pct)
         hit_trailing = current_price < trailing_stop_price
-        time_up      = days_held >= int(t.get("hold_days") or _MOMENTUM_HOLD_DAYS)
 
         updated += 1
 
-        if not hit_trailing and not time_up:
+        if not hit_trailing:
             continue
 
-        # ── 4. Fechar posição ─────────────────────────────────────────────────
+        # ── 4. Trailing stop atingido: verificar se tese DIP original ainda válida ──
+        # Se a posição veio de upgrade DIP→MOMENTUM e o target DIP original ainda
+        # tem upside suficiente, revertemos para gestão DIP em vez de fechar.
+        total_days = (today - open_date).days
+        if (
+            t.get("prev_trade_type") == "DIP"
+            and total_days < _DIP_REVERT_MAX_DAYS
+            and not t.get("revert_to_dip_date")   # só reverter uma vez
+        ):
+            dip_target = float(t.get("dip_sell_target") or 0.0)
+            remaining_upside = (dip_target / current_price - 1) if dip_target > current_price else 0.0
+            if remaining_upside >= _DIP_REVERT_MIN_UPSIDE:
+                _revert_momentum_to_dip(t, current_price, today_iso)
+                if send_fn:
+                    try:
+                        send_fn(
+                            f"🔄 *MOMENTUM→DIP — {ticker}*\n"
+                            f"Momentum arrefeceu mas a tese DIP ainda tem "
+                            f"{remaining_upside:+.1%} de upside para o target {dip_target:.2f}\n"
+                            f"Stop alargado de volta a 22% | Hold +60d\n"
+                            f"Retorno actual: {(current_price/float(t['open_price'])-1):+.1%}"
+                        )
+                    except Exception:
+                        pass
+                continue  # posição fica aberta, update_open_positions() retoma
+
+        # ── 5. Fechar posição (momentum e DIP esgotados) ─────────────────────
         ret_pct = round((current_price / float(t["open_price"]) - 1) * 100, 3)
         spy_ret = _fetch_spy_return(open_date, today)
         alpha   = round(ret_pct - (spy_ret or 0), 3) if spy_ret is not None else None
 
-        t["status"]         = "CLOSED_TRAILING_STOP" if hit_trailing else "CLOSED_TIME"
+        t["status"]         = "CLOSED_TRAILING_STOP"
         t["close_date"]     = today_iso
         t["close_price"]    = round(current_price, 4)
         t["return_pct"]     = ret_pct
@@ -829,8 +995,9 @@ def update_momentum_positions(send_fn=None) -> dict:
         t["alpha_pct"]      = alpha
         closed += 1
         log.info(
-            f"[paper_m] CLOSED {ticker} {t['status']} dur={t.get('ml_durability_cur','?')} "
-            f"ret={ret_pct:.1f}% high={trailing_high:.2f} stop={trailing_stop_price:.2f}"
+            f"[paper_m] CLOSED {ticker} CLOSED_TRAILING_STOP dur={t.get('ml_durability_cur','?')} "
+            f"ret={ret_pct:.1f}% high={trailing_high:.2f} stop={trailing_stop_price:.2f} "
+            f"eff_stop={effective_stop_pct:.1%} atr={_atr_pct:.1%}"
         )
 
     _save(trades)

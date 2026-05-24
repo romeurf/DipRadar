@@ -551,8 +551,25 @@ def build_health_report(*, ping_apis: bool = True) -> str:
     else:
         ml_str = "🔴 _não treinado_"
 
-    lines.append("*🤖 Modelo ML (v3):*")
-    lines.append(f"  Bundle: {ml_str}")
+    lines.append("*🤖 Modelos ML:*")
+    lines.append(f"  DipRadar: {ml_str}")
+
+    # MomentumRadar model
+    mom_pkl = next(
+        (p for p in (
+            data_dir / "momentum_model.pkl",
+            repo_dir / "momentum_radar" / "momentum_model.pkl",
+        ) if p.exists()),
+        None,
+    )
+    if mom_pkl is not None:
+        mom_mtime = datetime.fromtimestamp(mom_pkl.stat().st_mtime).strftime("%d/%m %H:%M")
+        # Alertar se modelo tem mais de 45 dias (retrain mensal esperado)
+        days_old_mom = (datetime.now() - datetime.fromtimestamp(mom_pkl.stat().st_mtime)).days
+        mom_icon = "🟢" if days_old_mom < 45 else "🟡"
+        lines.append(f"  {mom_icon} MomentumRadar: *pronto* (modificado {mom_mtime})")
+    else:
+        lines.append("  🔴 MomentumRadar: _não treinado_")
     lines.append("")
 
     # ── Feature Drift ──────────────────────────────────────────────────────

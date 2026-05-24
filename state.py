@@ -170,8 +170,8 @@ def append_rejected_log(entry: dict) -> None:
 
 
 _REJECTED_HORIZONS = {
-    "DIP":      [30, 60, 90],   # hold estimado do DipRadar
-    "MOMENTUM": [30, 60],       # hold estimado do MomentumRadar
+    "DIP":      [30, 60, 90],
+    "MOMENTUM": [30, 60, 90],
     "DEFAULT":  [30, 60, 90],
 }
 
@@ -278,9 +278,9 @@ def fill_rejected_outcomes() -> dict:
 
     pending = sum(
         1 for e in entries
-        if e.get("outcome_30d") is None
-        and (datetime.now().date() - datetime.strptime(e["date_iso"], "%Y-%m-%d").date()).days >= 30
         if e.get("date_iso")
+        and e.get("outcome_30d") is None
+        and (datetime.now().date() - datetime.strptime(e["date_iso"], "%Y-%m-%d").date()).days >= 30
     )
     return {"filled": filled, "pending": pending, "total": len(entries)}
 

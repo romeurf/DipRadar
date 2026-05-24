@@ -1830,6 +1830,18 @@ def _handle_admin_full_pipeline(parts: list[str]) -> None:
         else:
             final_lines.append("  ⏩ Momentum retrain: saltado")
 
+        # GitHub sync para modelos promovidos
+        try:
+            from pathlib import Path as _Pg
+            from github_sync import sync_training_artifacts, sync_momentum_artifacts
+            _dd_g = _Pg("/data") if _Pg("/data").exists() else _Pg("/tmp")
+            if train_dip and dip_train_res.get("decision") == "PROMOTED":
+                sync_training_artifacts(_dd_g)
+            if train_mom and mom_train_res.get("decision") == "PROMOTED":
+                sync_momentum_artifacts(_dd_g)
+        except Exception as _gs_e:
+            logging.warning(f"[pipeline] github_sync: {_gs_e}")
+
         _plog("Pipeline concluído")
         _reply("\n".join(final_lines))
 
