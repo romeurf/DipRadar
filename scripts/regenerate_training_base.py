@@ -91,12 +91,13 @@ SECTOR_ETF: dict[str, str] = {
 }
 
 NEW_FEATURE_COLS: list[str] = [
+    "return_1m",
+    "return_3m_pre",
     "return_6m_pre",
-    "return_12m_pre",
-    "sector_relative_6m",
     "vol_of_vol",
     "bb_width",
     "beta_90d",
+    "sector_relative",
     "vix_percentile_1y",
     "spy_rsi_14",
     "yield_10y_change_5d",
@@ -104,11 +105,12 @@ NEW_FEATURE_COLS: list[str] = [
     "close_in_range_20d",
     "up_days_pct_20d",
     "true_range_pct_20d",
+    "price_vs_52w_percentile",
     # Market Structure (v4.3)
     "vwap_from_high_ratio",
     "volume_poc_ratio",
     "liquidity_sweep_score",
-    # Volume Flow (Vertus-inspired)
+    # Volume Flow
     "mfi_14",
     "volume_up_pct_20d",
 ]
@@ -454,13 +456,15 @@ def _compute_fase5_row(
     row: pd.Series,
     price_cache: dict[str, pd.DataFrame],
 ) -> dict[str, float]:
-    """Computa sinais Fase 5 point-in-time para uma linha do parquet.
+    """Compute Phase 5 point-in-time signals for a parquet row.
 
-    Usa apenas EDGAR (Form 4 e 8-K) e preços — totalmente PIT.
-    yfinance-live signals (short_interest, analyst_rating) não são computados
-    aqui porque não são PIT para dados históricos.
+    Uses EDGAR (Form 4 and 8-K) and price history — fully PIT.
+    yfinance-live signals (short_interest, analyst_rating) are NOT computed
+    here because they are not PIT for historical data.
+    EDGAR calls are gated by has_sec_filings() — skipped for non-US tickers.
     """
     from ml_features import _FALLBACK
+    from sec_guard import has_sec_filings as _has_sec
 
     ticker     = str(row["ticker"])
     alert_date = pd.Timestamp(row["alert_date"])
@@ -471,11 +475,11 @@ def _compute_fase5_row(
     hist = _slice_history(price_cache.get(ticker), alert_date)
     fv: dict[str, float] = {k: _FALLBACK.get(k, 0.0) for k in FASE5_COLS}
 
-    # Price-based: PIT via slice já existente
+    # Price-based signals (PIT — always computed regardless of SEC eligibility)
     if hist is not None and len(hist) >= 2:
         try:
             closes = hist["Close"]
-            # consecutive_red_days: dias consecutivos em queda até alert_date
+            # consecutive_red_days: consecutive down days before alert_date
             rets = closes.pct_change().dropna()
             if len(rets) > 0:
                 red = 0
@@ -485,7 +489,7 @@ def _compute_fase5_row(
                     else:
                         break
                 fv["consecutive_red_days"] = float(min(red, 30))
-            # ma_200d_ratio: price / MA200 (quão abaixo da média longa)
+            # ma_200d_ratio: price / 200-day MA
             if len(closes) >= 20:
                 ma200 = closes.rolling(200, min_periods=20).mean().iloc[-1]
                 last  = float(closes.iloc[-1])
@@ -494,7 +498,12 @@ def _compute_fase5_row(
         except Exception as e:
             log.debug(f"  fase5 price {ticker}@{alert_dt}: {e}")
 
-    # EDGAR-based: PIT via filed_date <= alert_date (caching por ticker)
+    # EDGAR-based signals — only for US-domiciled tickers with SEC filings
+    _ticker_exchange = str(row.get("exchange", "") or "")
+    _ticker_country  = str(row.get("country", "") or "")
+    if not _has_sec(ticker, _ticker_country, _ticker_exchange):
+        return {k: fv.get(k, _FALLBACK.get(k, 0.0)) for k in FASE5_COLS}
+
     try:
         from fundamental_signals import (
             insider_buy_recent,
@@ -902,12 +911,31 @@ def regenerate(
     except Exception as e:
         log.warning(f"[clean] Falha ao limpar colunas ({e}) — a guardar tudo")
 
+    # ── Validate feature completeness before saving ───────────────────────────
+    try:
+        from ml_features import FEATURE_COLUMNS
+        missing_cols = [c for c in FEATURE_COLUMNS if c not in df.columns]
+        if missing_cols:
+            log.error(
+                f"[validate] FEATURE_COLUMNS missing from parquet: {missing_cols}\n"
+                f"Re-run bootstrap with build_dip_dataset.py to regenerate."
+            )
+        else:
+            nan_counts = df[FEATURE_COLUMNS].isna().sum()
+            bad = nan_counts[nan_counts > 0]
+            if not bad.empty:
+                log.warning(f"[validate] NaN in feature columns: {bad.to_dict()}")
+            else:
+                log.info(f"[validate] All {len(FEATURE_COLUMNS)} FEATURE_COLUMNS present, no NaN.")
+    except Exception as e:
+        log.warning(f"[validate] feature completeness check failed: {e}")
+
     # ── Save ──────────────────────────────────────────────────────────────────
-    log.info(f"[out] a escrever {out_path}...")
+    log.info(f"[out] writing {out_path}...")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path, index=False)
     elapsed = time.time() - t0
-    log.info(f"[out] CONCLUÍDO em {elapsed:.0f}s. shape={df.shape}  size={out_path.stat().st_size/1e6:.1f} MB")
+    log.info(f"[out] DONE in {elapsed:.0f}s. shape={df.shape}  size={out_path.stat().st_size/1e6:.1f} MB")
 
     # Sanity stats finais
     log.info("[stats] resumo das colunas novas/corrigidas:")

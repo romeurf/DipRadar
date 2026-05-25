@@ -273,7 +273,6 @@ def build_feature_lists() -> tuple[list[str], list[str]]:
     _EXCLUDE_BASELINE = {
         # Stage-3c dislocation
         "quality_dislocation",
-        "peg_implicit",
         "relative_drop",
         "month_of_year",
         # Stage-3d context (v3.2)

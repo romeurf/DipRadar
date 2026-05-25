@@ -15,23 +15,55 @@ log = logging.getLogger(__name__)
 MACRO_TICKERS: list[str] = ["^VIX", "SPY", "^TNX", "^IRX", "HYG", "LQD", "IYT", "XLI"]
 
 
+def validate_parquet(parquet_path: str, feature_columns: list[str]) -> None:
+    """Raise ValueError if parquet is missing features or contains NaN in feature columns."""
+    df = pd.read_parquet(parquet_path)
+    missing = set(feature_columns) - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"Parquet missing features: {sorted(missing)}\n"
+            f"Re-run bootstrap (build_dip_dataset.py) to regenerate."
+        )
+    nan_counts = df[feature_columns].isna().sum()
+    bad = nan_counts[nan_counts > 0]
+    if not bad.empty:
+        raise ValueError(f"Parquet contains NaN in feature columns: {bad.to_dict()}")
+
+
 def load_base_dataset(parquet_path: Path) -> pd.DataFrame:
     if not Path(parquet_path).exists():
-        raise FileNotFoundError(f"parquet base não encontrado: {parquet_path}")
+        raise FileNotFoundError(f"parquet not found: {parquet_path}")
     df = pd.read_parquet(parquet_path)
     if "alert_date" not in df.columns:
-        raise KeyError(f"parquet sem coluna alert_date: {parquet_path}")
+        raise KeyError(f"parquet missing alert_date column: {parquet_path}")
     df["alert_date"] = pd.to_datetime(df["alert_date"])
     df = df.sort_values("alert_date").reset_index(drop=True)
     if "symbol" in df.columns and "ticker" not in df.columns:
         df = df.rename(columns={"symbol": "ticker"})
     if "ticker" not in df.columns:
-        raise KeyError(f"parquet sem coluna ticker/symbol: {parquet_path}")
-    # PR #28: o bootstrap original do parquet escreveu month_of_year=5.0
-    # (constante: mês em que o bootstrap correu) para todas as linhas. Recompute
-    # daqui a partir de alert_date para que o modelo possa capturar
-    # sazonalidade real (calendar effects). Override sempre, mesmo que a coluna
-    # já exista — garante consistência cross-version.
+        raise KeyError(f"parquet missing ticker/symbol column: {parquet_path}")
+
+    # Load-time schema validation: catch missing columns early
+    from ml_features import FEATURE_COLUMNS
+    missing_cols = [c for c in FEATURE_COLUMNS if c not in df.columns]
+    if missing_cols:
+        raise ValueError(
+            f"FEATURE_COLUMNS missing in parquet: {missing_cols}\n"
+            f"Re-run bootstrap (build_dip_dataset.py) to regenerate the parquet."
+        )
+    # Drop any extra columns not in FEATURE_COLUMNS or known metadata/target cols
+    meta_cols = {"ticker", "symbol", "alert_date", "alpha_90d", "label_win", "sector",
+                 "return_3m", "return_6m", "spy_return_ref", "outcome_label", "price",
+                 "market_cap", "market_cap_b", "_source", "source",
+                 "alpha_60d", "close_60d", "close_90d", "spy_close_60d", "spy_close_90d",
+                 "max_return_60d", "max_drawdown_60d", "max_drawdown_20d", "max_drawdown_90d",
+                 "alpha_60d_rank", "alpha_90d_rank", "label_upside_10_90d",
+                 "label_downside_15_20d", "month_of_year"}
+    extra = [c for c in df.columns if c not in set(FEATURE_COLUMNS) | meta_cols]
+    if extra:
+        df = df.drop(columns=extra)
+
+    # Recompute month_of_year from alert_date (bootstrap may have written a constant)
     df["month_of_year"] = df["alert_date"].dt.month.astype(float)
     return df
 

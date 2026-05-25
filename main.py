@@ -1,6 +1,6 @@
 """
 DipRadar — Stock Alert Bot v2.0
-Scheduler: APScheduler (duas janelas EOD: 17h45 EU, 21h15 US)
+Scheduler: APScheduler (US-only market windows: 17h45 intraday, 21h15 EOD)
 Data feed: Tiingo EOD + yfinance fallback
 
 Variáveis Railway obrigatórias:
@@ -21,6 +21,7 @@ Variáveis opcionais:
 """
 
 import os
+import re
 import time
 import logging
 import requests
@@ -199,6 +200,47 @@ def get_short_interest_flag(fundamentals: dict) -> str:
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 
+def _md_to_html(text: str) -> str:
+    """Convert Telegram Markdown v1 syntax to HTML tags.
+
+    Handles: ```pre```, `code`, *bold*, _italic_.
+    Special HTML chars (&, <, >) are escaped before tag insertion so that
+    dynamic content (ticker names, error messages) never breaks the parser.
+    """
+    # 1. Extract pre-blocks and inline code before escaping
+    pre_placeholders:  list[str] = []
+    code_placeholders: list[str] = []
+
+    def _stash_pre(m: re.Match) -> str:
+        pre_placeholders.append(m.group(1))
+        return f"\x00PRE{len(pre_placeholders)-1}\x00"
+
+    def _stash_code(m: re.Match) -> str:
+        code_placeholders.append(m.group(1))
+        return f"\x00CODE{len(code_placeholders)-1}\x00"
+
+    text = re.sub(r"```(.*?)```", _stash_pre,  text, flags=re.DOTALL)
+    text = re.sub(r"`([^`\n]+)`",  _stash_code, text)
+
+    # 2. Escape HTML special chars in the remaining plain text
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    # 3. Convert Markdown to HTML tags
+    text = re.sub(r"\*([^*\n]+)\*", r"<b>\1</b>", text)
+    # Italic: only match when underscore is not inside a word (avoids alpha_90d)
+    text = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"<i>\1</i>", text)
+
+    # 4. Restore code/pre blocks (content already HTML-escaped implicitly via placeholder)
+    for i, content in enumerate(code_placeholders):
+        safe = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        text = text.replace(f"\x00CODE{i}\x00", f"<code>{safe}</code>")
+    for i, content in enumerate(pre_placeholders):
+        safe = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        text = text.replace(f"\x00PRE{i}\x00", f"<pre>{safe}</pre>")
+
+    return text
+
+
 def send_telegram(message: str, retries: int = 2) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print(message)
@@ -213,24 +255,23 @@ def send_telegram(message: str, retries: int = 2) -> bool:
     url    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     all_ok = True
     for chunk in chunks:
+        html_chunk = _md_to_html(chunk)
         sent = False
         for attempt in range(retries + 1):
             try:
                 r = requests.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID, "text": chunk,
-                    "parse_mode": "Markdown", "disable_web_page_preview": True,
+                    "chat_id": TELEGRAM_CHAT_ID, "text": html_chunk,
+                    "parse_mode": "HTML", "disable_web_page_preview": True,
                 }, timeout=10)
                 r.raise_for_status()
                 sent = True
                 break
             except requests.exceptions.HTTPError as e:
-                # 400 = Markdown inválido → retry sem parse_mode (plain text)
-                # garante que a mensagem chega mesmo com chars especiais
+                # 400 = malformed HTML — fall back to plain text so the message always arrives
                 if e.response is not None and e.response.status_code == 400:
                     logging.warning(
-                        f"Telegram Markdown 400 (tentativa {attempt+1}) — "
-                        f"a reenviar como plain text. Primeiros 120 chars: "
-                        f"{chunk[:120]!r}"
+                        f"Telegram HTML 400 (attempt {attempt+1}) — "
+                        f"retrying as plain text. First 120 chars: {chunk[:120]!r}"
                     )
                     try:
                         r2 = requests.post(url, json={
@@ -241,13 +282,13 @@ def send_telegram(message: str, retries: int = 2) -> bool:
                         sent = True
                         break
                     except Exception as e2:
-                        logging.error(f"Telegram plain-text fallback falhou: {e2}")
+                        logging.error(f"Telegram plain-text fallback failed: {e2}")
                 else:
-                    logging.error(f"Telegram (tentativa {attempt+1}/{retries+1}): {e}")
+                    logging.error(f"Telegram (attempt {attempt+1}/{retries+1}): {e}")
                 if attempt < retries:
                     time.sleep(3)
             except Exception as e:
-                logging.error(f"Telegram (tentativa {attempt+1}/{retries+1}): {e}")
+                logging.error(f"Telegram (attempt {attempt+1}/{retries+1}): {e}")
                 if attempt < retries: time.sleep(3)
         if not sent: all_ok = False
         elif len(chunks) > 1: time.sleep(1)
@@ -470,43 +511,27 @@ def check_portfolio_stress() -> None:
 
 # ── Thesis Degradation Check (EOD-aware) ──────────────────────────────────────
 
-def check_thesis_degradation(region: str = "ALL") -> None:
+def check_thesis_degradation() -> None:
     """
-    Verifica degradação de tese usando preços EOD limpos (Tiingo/yfinance).
-    Chamado em boleia pelo scan europeu (17h45) e americano (21h15).
-
-    region: "EU" | "US" | "ALL"
-      EU  — tickers com sufixo de exchange europeia (.DE, .PA, .L, etc.)
-      US  — tickers sem sufixo (mercado americano)
-      ALL — todos
+    Check thesis degradation using clean EOD prices (Tiingo/yfinance).
+    Runs alongside each US scan window (17h45 intraday, 21h15 EOD).
+    US-only universe — no EU/exchange-suffix filtering needed.
     """
     positions = get_positions()
     if not positions:
-        logging.info("[degradation] Sem posições activas.")
+        logging.info("[degradation] No active positions.")
         return
-
-    _EU_SUFFIXES = (".DE", ".PA", ".AS", ".MC", ".MI", ".L", ".SW",
-                   ".ST", ".CO", ".OL", ".HE", ".BR", ".LS", ".VI", ".WA", ".I")
-
-    def _is_eu(ticker: str) -> bool:
-        return any(ticker.upper().endswith(s) for s in _EU_SUFFIXES)
 
     to_check = {
         sym: pos for sym, pos in positions.items()
-        if (
-            pos.get("entry_score") is not None
-            and pos.get("category", "") != "ETF"
-            and (region == "ALL"
-                 or (region == "EU" and _is_eu(sym))
-                 or (region == "US" and not _is_eu(sym)))
-        )
+        if pos.get("entry_score") is not None and pos.get("category", "") != "ETF"
     }
 
     if not to_check:
-        logging.info(f"[degradation] Sem posições para região '{region}'.")
+        logging.info("[degradation] No positions to check.")
         return
 
-    logging.info(f"[degradation] A verificar {len(to_check)} posições ({region})...")
+    logging.info(f"[degradation] Checking {len(to_check)} positions...")
 
     for sym, pos in to_check.items():
         entry_score = pos["entry_score"]
@@ -581,7 +606,7 @@ def check_thesis_degradation(region: str = "ALL") -> None:
         except Exception as e:
             logging.error(f"[degradation] Erro em {sym}: {e}", exc_info=True)
 
-    logging.info(f"[degradation] Check ({region}) concluído.")
+    logging.info("[degradation] Check complete.")
 
 
 # ── Recovery Alert ────────────────────────────────────────────────────────────
@@ -2409,22 +2434,24 @@ def main() -> None:
         id="heartbeat", name="Heartbeat 09h",
     )
 
-    # ── Scan EU: 17:45 Lisboa, seg-sex ────────────────────────────────────────
+    # ── Scan US Intraday: 17:45 Lisboa, seg-sex ──────────────────────────────
+    # Phase 2: European markets — not yet implemented.
+    # See ModelID.DIP_EU, ModelID.CORE_EU, ModelID.MOMENTUM_EU in model_registry.py.
     scheduler.add_job(
         lambda: (
             run_scan(),
-            check_thesis_degradation("EU"),
+            check_thesis_degradation(),
             check_recovery_alerts(),
         ),
         CronTrigger(day_of_week="mon-fri", hour=17, minute=45, timezone=LISBON_TZ),
-        id="scan_eu", name="Scan EU 17h45",
+        id="scan_intraday", name="Scan US Intraday 17h45",
     )
 
-    # ── Scan US: 21:15 Lisboa, seg-sex ────────────────────────────────────────
+    # ── Scan US EOD: 21:15 Lisboa, seg-sex ───────────────────────────────────
     scheduler.add_job(
         lambda: (
             run_scan(),
-            check_thesis_degradation("US"),
+            check_thesis_degradation(),
             check_recovery_alerts(),
             run_watchlist_job(),
             send_weekly_dip_scan(),
@@ -2433,11 +2460,13 @@ def main() -> None:
         id="scan_us", name="Scan US 21h15",
     )
 
-    # ── Momentum scan EU: 17h50 Lisboa (após fecho europeu 17h30) ────────────
+    # ── Momentum scan US Intraday: 17h50 Lisboa ──────────────────────────────
+    # Phase 2: European markets — not yet implemented.
+    # See ModelID.DIP_EU, ModelID.CORE_EU, ModelID.MOMENTUM_EU in model_registry.py.
     scheduler.add_job(
         run_momentum_scan,
         CronTrigger(day_of_week="mon-fri", hour=17, minute=50, timezone=LISBON_TZ),
-        id="momentum_scan_eu", name="Momentum Scan EU 17h50",
+        id="momentum_scan_intraday", name="Momentum Scan US Intraday 17h50",
     )
     # ── Momentum scan US: 21h30 Lisboa (após fecho americano) ────────────────
     scheduler.add_job(
@@ -2719,7 +2748,7 @@ def main() -> None:
     send_telegram(
         f"\U0001F916 DipRadar iniciado\n"
         f"{_now}\n"
-        f"Scans: EU 17h45 | US 21h15"
+        f"Scans: Intraday 17h45 | EOD 21h15 (US only)"
     )
 
     scheduler.start()

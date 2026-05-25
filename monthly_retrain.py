@@ -1,36 +1,36 @@
 """
-monthly_retrain.py — Pipeline mensal de retreino v3.
+monthly_retrain.py — Monthly retraining pipeline v3.
 
-Corre no dia 1 de cada mês via cron (main.run_monthly_retrain → schedule).
-Refactor completo: substitui o pipeline Stage1/Stage2 (AUC-PR) pela arquitectura
-v3.1 (regressor alpha + isotonic calibrator) já em produção desde PR #11/#13.
+Runs on the 1st of each month via cron (main.run_monthly_retrain → schedule).
+Full refactor: replaces Stage1/Stage2 (AUC-PR) pipeline with v3.1 architecture
+(alpha regressor + isotonic calibrator) in production since PR #11/#13.
 
-Fluxo:
+Flow:
 
-  1. Build training input incremental:
+  1. Build incremental training input:
      a. bootstrap historical (`/data/ml_training_base.parquet`,
-        com fallback para `ml_training_base.parquet` no root do repo
-        para cold-start em volumes Railway vazios)
-     b. `alert_db.csv` (alertas reais com outcomes preenchidos)
-     c. `universe_snapshot.parquet` (rows com ≥6m maturados, label resolvido)
+        with fallback to `ml_training_base.parquet` in repo root
+        for cold-start on empty Railway volumes)
+     b. `alert_db.csv` (real alerts with resolved outcomes)
+     c. `universe_snapshot.parquet` (rows >= 6m matured, label resolved)
 
-  2. Treino candidate via `ml_training.train.run_training`:
-     - 10 folds expanding-window, purge gap 21 dias
-     - target alpha_60d_rank cross-section + sector-neutralizado
-     - Champion ensemble Ridge+XGB+LGBM ponderado por IC
-     - Isotonic calibrator em OOF predictions
+  2. Train candidate via `ml_training.train.run_training`:
+     - 10 folds expanding-window, purge gap 21 days
+     - target alpha_60d_rank cross-section + sector-neutralized
+     - Champion ensemble Ridge+XGB+LGBM weighted by IC
+     - Isotonic calibrator on OOF predictions
 
-  3. **Gating** baseado em ρ_α (rho_alpha_mean):
-     - Promove só se ρ_α candidate ≥ ρ_α produção × `gating_ratio` (default 0.90)
-     - Floor absoluto ρ_α ≥ `FLOOR_RHO_ALPHA` (default 0.08; ver
-       FLOOR_RHO_ALPHA_DEFAULT abaixo para histórico)
-     - Se candidate cai > 10% mas ainda passa o floor → guarda como
-       `dip_models_pending.pkl` para revisão manual (não promove)
+  3. **Gating** based on ρ_α (rho_alpha_mean):
+     - Promote only if ρ_α candidate >= ρ_α production × `gating_ratio` (default 0.90)
+     - Absolute floor ρ_α >= `FLOOR_RHO_ALPHA` (default 0.08; see
+       FLOOR_RHO_ALPHA_DEFAULT below for history)
+     - If candidate drops > 10% but still passes floor → save as
+       `dip_models_pending.pkl` for manual review (not promoted)
 
-  4. **Atomic deploy** via shutil.move + archive em `/data/archive/`.
+  4. **Atomic deploy** via shutil.move + archive in `/data/archive/`.
 
-  5. Devolve dict com delta de métricas (ρ_α, brier_oof, top-k PnL)
-     para o Telegram do main.py formatar.
+  5. Returns dict with metric deltas (ρ_α, brier_oof, top-k PnL)
+     for main.py to format for Telegram.
 
 CLI:
     python monthly_retrain.py --dry-run
@@ -246,7 +246,7 @@ def _load_alert_db_as_training() -> pd.DataFrame:
         → drawdown_52w (nome canónico em FEATURE_COLUMNS)
       - rename explícito symbol → ticker para alinhar com data.py/load_base_dataset
       - defaults Stage 3c: rows anteriores ao commit 2026-05-05 não têm
-        quality_dislocation, peg_implicit, relative_drop, month_of_year —
+        quality_dislocation, peg_ratio, relative_drop, month_of_year —
         sem default chegam como NaN ao train e causam KeyError ou
         degradação silenciosa do modelo.
     """
@@ -327,7 +327,7 @@ def _load_alert_db_as_training() -> pd.DataFrame:
         # Sem default chegam como NaN ao train → KeyError ou degradação
         # silenciosa. Valores escolhidos de ml_features._FALLBACK.
         "quality_dislocation": 0.08,   # empresa mediana como baseline
-        "peg_implicit":        2.0,    # PEG neutro
+        "peg_ratio":        2.0,    # PEG neutro
         "relative_drop":       0.0,    # sem queda idiossincrática
         "month_of_year":       float(datetime.now().month),  # mês actual como proxy
     }

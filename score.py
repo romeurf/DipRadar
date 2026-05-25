@@ -390,10 +390,11 @@ def fcf_trend(fcf_yield_current: float | None, fcf_yield_previous: float | None)
     return 0.0
 
 
-def peg_implicit(pe: float, revenue_growth: float) -> float:
-    if pe > 0 and revenue_growth > 0:
-        return pe / (revenue_growth * 100.0)
-    return 3.0
+def peg_ratio(pe: float, earnings_growth: float) -> float:
+    """Standard PEG ratio: PE / (EPS_growth%). Lynch: <1 undervalued, >2 expensive."""
+    if pe > 0 and earnings_growth > 0.005:
+        return min(pe / (earnings_growth * 100.0), 10.0)
+    return 2.0
 
 
 def unjustified_drawdown(

@@ -12,7 +12,7 @@ Architecture: 4-stage pipeline
   Stage 3 — Engineered: non-linear interactions (rsi_oversold_strength, etc.)
   Stage 3b — Momentum: multi-window momentum (1m, 3m, 6m, 12m),
                         sector-relative (3m and 6m), beta_90d, vol_of_vol
-  Stage 3c — Dislocation: quality_dislocation, peg_implicit, relative_drop,
+  Stage 3c — Dislocation: quality_dislocation, peg_ratio, relative_drop,
                         month_of_year
   Stage 3d — Context: sector_alert_count_7d, days_since_52w_high
   Stage 3e — Short/Earnings: short_interest_ratio, earnings_surprise_avg, earnings_distance_days
@@ -54,67 +54,76 @@ FEATURE_COLUMNS: list[str] = [
     "beta_90d",
     "vol_of_vol",
     "quality_dislocation",
+    "peg_ratio",           # trailing_PE / (EPS_growth%) — Lynch PEG: <1 undervalued, >2 expensive
     "month_of_year",
     "sector_alert_count_7d",
     "vix_percentile_1y",
     "spy_rsi_14",
-    # PR #30 (Phase B): 4 raw-OHLCV features ortogonais aos existentes
-    # (vol_of_vol, bb_width já cobrem volatilidade close-to-close).
-    # Profiling IC sobre o parquet completo eliminou 3 candidatos iniciais
-    # (realized_vol_20d ρ=0.81 com vol_of_vol → redundante; mom_5d_slope
-    # ρ=0.0; gap_pct_5d ρ=0.0). Estas 4 capturam dimensões diferentes:
-    "volume_zscore_20d",   # (today_vol − mean_20d) / std_20d  — flow institucional
-    "close_in_range_20d",  # mean((C−L)/(H−L)) last 20 — fecho perto de high/low
-    "up_days_pct_20d",     # % de dias com retorno positivo nos últimos 20
-    "true_range_pct_20d",  # mean(TR_d / Close_d) últimos 20 — intraday vol
-    # ── Novos sinais de qualidade e sentimento (Fase 5) ──────────────────────
-    # Computados via yfinance + SEC EDGAR + Alpha Vantage/FMP (free tiers).
-    # Cada um captura uma dimensão ortogonal às features técnicas existentes.
-    "consecutive_red_days",  # dias consecutivos em queda antes do alerta — capitulação
-    "ma_200d_ratio",         # price / 200-day MA — quão abaixo da média de longo prazo
-    "insider_buy_recent",    # 1 se houve compra insider nos últimos 30d (SEC Form 4)
-    "earnings_beat_rate",    # % de últimos 4 trimestres onde bateu EPS estimativas
-    "analyst_rating",        # consenso analistas: 1=Strong Buy … 5=Strong Sell
-    "short_interest_pct",    # short interest como % do float — squeeze potential
-    # Fase 5b: sinais avançados (Form 4 montante + 8-K + short trend + earnings tone)
-    "insider_buy_amount_score",  # magnitude normalizada das compras insider [0,1]
-    "recent_8k_score",           # tipo de evento 8-K: -1=restatement, +1=M&A target
-    "short_interest_trend",      # variação do short interest vs mês anterior
-    "earnings_call_tone",        # sentimento da última earnings call [-1=pessimista, +1=confiante]
-    # Sector-conditioned features (v4.2): RSI, VIX e drawdown ajustados ao tipo de sector.
-    # Um VIX=35 significa coisas diferentes para growth vs commodity vs defensive.
-    # Captura o desvio relativo ao regime normal do sector — dimensão ortogonal ao modelo global.
-    "rsi_sector_adjusted",       # max(0, threshold_sector - rsi) — quão oversold vs norma do sector
-    "vix_sector_signal",         # VIX × factor_sector / 40 — growth reage negativamente, defensive positivamente
-    "drawdown_sector_normalized",# drawdown / typical_drawdown_sector — 0=normal, -3=capitulação extrema
+    # PR #30 (Phase B): 4 raw-OHLCV features orthogonal to existing ones
+    # (vol_of_vol and bb_width already cover close-to-close volatility).
+    # IC profiling on full parquet eliminated 3 initial candidates:
+    # (realized_vol_20d ρ=0.81 with vol_of_vol → redundant; mom_5d_slope
+    # ρ=0.0; gap_pct_5d ρ=0.0). These 4 capture distinct dimensions:
+    "volume_zscore_20d",   # (today_vol − mean_20d) / std_20d  — institutional flow
+    "close_in_range_20d",  # mean((C−L)/(H−L)) last 20 — where price closes in daily range
+    "up_days_pct_20d",     # fraction of last 20 sessions with positive return
+    "true_range_pct_20d",  # mean(TR_d / Close_d) last 20 — intraday volatility
+    # ── Quality and sentiment signals (Phase 5) ──────────────────────────────
+    # Sourced from yfinance + SEC EDGAR + Alpha Vantage/FMP (free tiers).
+    # Each captures a dimension orthogonal to the existing technical features.
+    "consecutive_red_days",  # consecutive down days before alert — capitulation signal
+    "ma_200d_ratio",         # price / 200-day MA — how far below long-term average
+    "insider_buy_recent",    # 1 if insider purchase in last 30d (SEC Form 4)
+    "earnings_beat_rate",    # fraction of last 4 quarters beating EPS estimates
+    "analyst_rating",        # analyst consensus: 1=Strong Buy … 5=Strong Sell
+    "short_interest_pct",    # short interest as % of float — squeeze potential
+    # Phase 5b: advanced signals (Form 4 amount + 8-K + short trend + earnings tone)
+    "insider_buy_amount_score",  # normalised magnitude of insider purchases [0,1]
+    "recent_8k_score",           # 8-K event type: -1=restatement, +1=M&A target
+    "short_interest_trend",      # change in short interest vs prior month
+    "earnings_call_tone",        # last earnings call sentiment [-1=pessimistic, +1=confident]
+    # Sector-conditioned features (v4.2): RSI, VIX and drawdown adjusted by sector type.
+    # VIX=35 means different things for growth vs commodity vs defensive sectors.
+    # Captures deviation from sector's normal regime — orthogonal to global model.
+    "rsi_sector_adjusted",       # max(0, threshold_sector - rsi) — how oversold vs sector norm
+    "vix_sector_signal",         # VIX × factor_sector / 40 — growth reacts negatively, defensive positively
+    "drawdown_sector_normalized",# drawdown / typical_drawdown_sector — 0=normal, -3=extreme capitulation
     # ── Market Structure (v4.3): Anchored VWAP + Volume Profile + Liquidity Sweep ──
-    # Capturam onde o volume realmente negociou (POC), o custo médio institucional
-    # desde o topo (VWAP ancorado) e se houve stop-hunt recente (liquidity sweep).
-    # Ortogonais às features técnicas existentes — adicionam dimensão de microestrutura.
-    "vwap_from_high_ratio",      # (price - VWAP_desde_52w_high) / VWAP — negativo = abaixo custo institucional
-    "volume_poc_ratio",          # (price - POC_90d) / POC — negativo = abaixo do nível de maior volume
-    "liquidity_sweep_score",     # recência do último stop-hunt: 1=hoje, decai 0 em 10 dias
-    # Volume Flow (Vertus-inspired): MFI + pressão compradora
-    "mfi_14",                    # Money Flow Index 14d — <30 oversold/acumulação, >70 sobrecomprado
-    "volume_up_pct_20d",         # % do volume total em dias de subida (20d) — proxy de pressão institucional
+    # Captures where volume actually traded (POC), average institutional cost
+    # since the high (anchored VWAP), and recent stop-hunts (liquidity sweep).
+    # Orthogonal to existing technical features — adds microstructure dimension.
+    "vwap_from_high_ratio",      # (price - VWAP_since_52w_high) / VWAP — negative = below institutional cost
+    "volume_poc_ratio",          # (price - POC_90d) / POC — negative = below highest-volume level
+    "liquidity_sweep_score",     # recency of last stop-hunt: 1=today, decays to 0 over 10 days
+    # Volume Flow (Vertus-inspired): MFI + buying pressure proxy
+    "mfi_14",                    # Money Flow Index 14d — <30 oversold, >70 overbought
+    "volume_up_pct_20d",         # fraction of total volume that occurred on up-days (20d) — institutional pressure proxy
+    # ── Entry zone / regime ───────────────────────────────────────────────────
+    "price_vs_52w_percentile",   # where price sits in the 52-week range: 0.0=at 52w low, 1.0=at 52w high
+    "yield_10y_change_5d",       # 5-day change in 10-year Treasury yield (macro regime signal)
+    # ── Dip maturity features ─────────────────────────────────────────────────
+    # Distinguish "first day of decline" (premature entry) from "washed-out dip"
+    # (holders exhausted, better risk/reward). NVO Feb vs NVO Mar/Apr pattern.
+    "days_below_ma200",          # consecutive trading days below 200d MA — 0=just crossed, 90+=washed out
+    "decline_deceleration",      # return_1m / avg_monthly_3m: <1=slowing, >1=accelerating, <0=recovering
 ]
 # PR #28 (Phase A): drop 14 dead features after IC profiling on full parquet:
-#   • 9 CONSTANTES (std=0, IC indefinida — _FALLBACK em todas as linhas):
+#   • 9 CONSTANTS (std=0, IC undefined — _FALLBACK on every row):
 #       gross_margin, de_ratio, pe_vs_fair, analyst_upside, quality_score,
-#       atr_ratio, volume_spike, pe_attractive, peg_implicit
-#     Razão: bootstrap original do parquet não tinha fontes point-in-time
-#     destas features → todas as 36929 linhas carregam o mesmo _FALLBACK.
-#     A inference live (build_features no position_monitor) continua a
-#     computá-las correctamente — _FALLBACK abaixo é mantido para compat.
-#   • 5 NOISE (|IC| < 0.01 com alpha_60d no parquet completo):
+#       atr_ratio, volume_spike, pe_attractive, peg_ratio (now promoted to FEATURE_COLUMNS)
+#     Reason: original bootstrap had no point-in-time sources for these
+#     features → all 36929 rows carried the same _FALLBACK.
+#     Live inference (build_features in position_monitor) still computes
+#     them correctly — _FALLBACK below kept for backward compatibility.
+#   • 5 NOISE (|IC| < 0.01 with alpha_60d on full parquet):
 #       days_since_52w_high (+0.007), sector_drawdown_5d (-0.007),
 #       macro_score (+0.005), spy_drawdown_5d (+0.003), relative_drop (+0.000)
-#     Razão: estas features VARIAM por linha mas não correlacionam com
-#     o target → desperdiçam capacidade do modelo.
-# Net: 34 → 20 features. Smoke test mostrou IC single best 0.1744 → 0.1946 (+11%).
-# Adicionalmente: month_of_year é fixed em load_base_dataset (era constante
-# 5.0 no parquet por bug do bootstrap; agora é computada de alert_date.dt.month).
-# Veja PR #25 para a remoção anterior (7 features ruidosas adicionadas em PR #23).
+#     Reason: these features VARY per row but don't correlate with the target
+#     → waste model capacity.
+# Net: 34 → 20 features. Smoke test: IC single best 0.1744 → 0.1946 (+11%).
+# Additionally: month_of_year is fixed in load_base_dataset (was constant 5.0
+# in parquet due to bootstrap bug; now derived from alert_date.dt.month).
+# See PR #25 for earlier removal (7 noisy features added in PR #23).
 
 N_FEATURES = len(FEATURE_COLUMNS)
 
@@ -165,7 +174,7 @@ _FALLBACK: dict[str, float] = {
     "beta_90d": 1.0,
     "vol_of_vol": 0.01,
     "quality_dislocation": 0.08,
-    "peg_implicit": 2.0,
+    "peg_ratio": 2.0,
     "relative_drop": 0.0,
     "month_of_year": 6.0,
     "sector_alert_count_7d": 0.0,
@@ -183,28 +192,112 @@ _FALLBACK: dict[str, float] = {
     "true_range_pct_20d": 0.02,  # 2% intraday — typical equity
     # Fase 5: sinais de qualidade e sentimento
     "consecutive_red_days": 3.0,      # 3 dias consecutivos — neutro
-    "ma_200d_ratio": 0.90,            # 10% abaixo da MA200 — dip típico
+    "ma_200d_ratio": 0.90,            # 10% below MA200 — typical dip
     "insider_buy_recent": 0.0,        # sem compra insider — caso mais comum
     "earnings_beat_rate": 0.50,       # 50% — neutro (random)
     "analyst_rating": 2.5,            # entre Buy e Hold — neutro
-    "short_interest_pct": 0.05,       # 5% — short interest típico
-    # Fase 5b: sinais avançados
+    "short_interest_pct": 0.05,       # 5% — typical short interest
+    # Phase 5b: advanced signals
     "insider_buy_amount_score": 0.0,  # sem compras — caso mais comum
     "recent_8k_score": 0.0,           # sem 8-K recente ou neutro
-    "short_interest_trend": 0.0,      # estável
+    "short_interest_trend": 0.0,      # stable
     "earnings_call_tone": 0.0,        # neutro — sem earnings call recente
     # Sector-conditioned features (v4.2)
     "rsi_sector_adjusted": 0.0,       # 0 = RSI na norma do sector (sem sinal de oversold)
     "vix_sector_signal": 0.0,         # 0 = VIX neutro ou sector tipo desconhecido
-    "drawdown_sector_normalized": -1.0,  # -1 = drawdown leve (metade do típico)
+    "drawdown_sector_normalized": -1.0,  # -1 = mild drawdown (half of sector typical)
     # Market Structure (v4.3)
-    "vwap_from_high_ratio": -0.12,   # ~12% abaixo do VWAP desde pico — dip típico
+    "vwap_from_high_ratio": -0.12,   # ~12% below anchored VWAP since peak — typical dip
     "volume_poc_ratio": 0.0,         # neutro — sem info de volume profile
     "liquidity_sweep_score": 0.0,    # sem sweep recente — caso mais comum
     # Volume Flow
-    "mfi_14": 50.0,                  # neutro — sem pressão direcional
-    "volume_up_pct_20d": 0.50,       # 50% — distribuição aleatória base rate
+    "mfi_14": 50.0,                  # neutral — no directional pressure
+    "volume_up_pct_20d": 0.50,       # 50% — random walk base rate
+    "price_vs_52w_percentile": 0.5,  # mid-range — neutral when 52w range is unknown
+    # Dip maturity
+    "days_below_ma200": 30.0,        # neutral: been below MA200 for ~1 month
+    "decline_deceleration": 1.0,     # neutral: same monthly rate (no decel/accel)
 }
+
+def assert_feature_completeness(row: dict, context: str = "") -> None:
+    """Raise ValueError if any FEATURE_COLUMNS key is missing from row."""
+    missing = [col for col in FEATURE_COLUMNS if col not in row]
+    if missing:
+        raise ValueError(
+            f"Feature schema violation [{context}]: "
+            f"{len(missing)} columns missing: {missing}"
+        )
+
+
+FEATURE_SETS: dict[str, list[str]] = {
+    "dip_us": [
+        # Drop / timing
+        "vix", "drop_pct_today", "drawdown_52w", "rsi_14", "bb_width",
+        "rsi_oversold_strength", "vix_regime", "drop_x_drawdown", "vol_x_drop",
+        # Pre-drop trend context (distinguishes clean reversal from deteriorating trend)
+        "return_1m", "return_3m_pre", "sector_relative",
+        # Volume / structure (capitulation + stop-hunt signals)
+        "volume_zscore_20d", "close_in_range_20d", "true_range_pct_20d",
+        "vwap_from_high_ratio", "volume_poc_ratio", "liquidity_sweep_score",
+        "mfi_14",
+        # Sector-relative oversold
+        "rsi_sector_adjusted", "drawdown_sector_normalized",
+        # Entry zone / valuation
+        "consecutive_red_days", "ma_200d_ratio", "price_vs_52w_percentile",
+        "peg_ratio",
+        "insider_buy_recent", "insider_buy_amount_score", "recent_8k_score",
+        "short_interest_pct",
+        # Dip maturity — distinguishes premature from washed-out entries
+        "days_below_ma200", "decline_deceleration",
+        # Macro / regime
+        "vix_percentile_1y", "spy_rsi_14", "yield_10y_change_5d",
+        # Calendar
+        "month_of_year", "sector_alert_count_7d",
+    ],
+    "core_us": [
+        # Fundamental quality — primary signals for Core
+        "earnings_beat_rate", "analyst_rating",
+        "earnings_call_tone", "recent_8k_score",
+        "insider_buy_recent", "insider_buy_amount_score",
+        "peg_ratio",       # growth-adjusted valuation: low PEG + good fundamentals = Core entry
+        # Structural entry (historical discount zone)
+        "ma_200d_ratio", "rsi_14", "drawdown_52w", "price_vs_52w_percentile",
+        "rsi_sector_adjusted", "drawdown_sector_normalized",
+        # Dip maturity — quality compounders reward patience (NVO/ADBE pattern)
+        "days_below_ma200",
+        # Macro environment
+        "vix", "vix_regime", "vix_percentile_1y",
+        "spy_rsi_14", "yield_10y_change_5d", "vix_sector_signal",
+        # Calendar
+        "return_1m",  # minimal trend context only; return_3m/6m excluded (see model philosophy)
+        "month_of_year", "sector_alert_count_7d",
+    ],
+    "momentum_us": [
+        # Trend signals
+        "return_1m", "return_3m_pre", "return_6m_pre",
+        "sector_relative", "beta_90d", "vol_of_vol",
+        # Volume flow (directional institutional pressure)
+        "volume_zscore_20d", "up_days_pct_20d",
+        "volume_up_pct_20d", "mfi_14",
+        "vwap_from_high_ratio", "volume_poc_ratio",
+        # Short / squeeze potential + valuation check
+        "short_interest_pct",
+        "peg_ratio",  # high PEG = momentum may be priced in; signals when trend is expensive
+        # Macro / regime
+        "vix", "vix_percentile_1y", "spy_rsi_14", "yield_10y_change_5d",
+        "vix_sector_signal",
+        # Calendar
+        "month_of_year", "sector_alert_count_7d",
+    ],
+}
+
+
+def get_feature_columns(model_id: str) -> list[str]:
+    """Return the ordered feature list for a given model_id."""
+    if model_id not in FEATURE_SETS:
+        raise KeyError(f"Unknown model_id: '{model_id}'. Available: {list(FEATURE_SETS)}")
+    return list(FEATURE_SETS[model_id])
+
 
 def _tz_normalize(ts: Any) -> pd.Timestamp:
     t = pd.Timestamp(ts)
@@ -220,8 +313,8 @@ def _normalize_index(df: pd.DataFrame) -> pd.DataFrame:
         df.index = df.index.tz_localize(None)
     return df
 
-# Mapeamento sector → tipo de dinâmica para sector-conditioned features.
-# O modelo aprende que VIX=35 significa coisas diferentes consoante o sector.
+# Sector → dynamics type mapping for sector-conditioned features.
+# The model learns that VIX=35 means different things depending on the sector.
 _SECTOR_TYPE: dict[str, str] = {
     "Technology":             "growth",
     "Healthcare":             "growth",
@@ -234,14 +327,14 @@ _SECTOR_TYPE: dict[str, str] = {
     "Basic Materials":        "commodity",
     "Consumer Defensive":     "defensive",
     "Utilities":              "defensive",
-    "Consumer Cyclical":      "cyclical",   # cíclico por definição — reage negativamente ao VIX
+    "Consumer Cyclical":      "cyclical",   # cyclical by definition — reacts negatively to VIX
     "Unknown":                "cyclical",   # fallback neutro
 }
 
-# Limiar de "oversold" varia por sector:
-# Growth: RSI<35 é forte sinal (tech recupera rápido de vendas de pânico)
-# Commodity: RSI<30 é necessário (movem com ciclos mais longos)
-# Defensive: RSI<40 suficiente (baixa volatilidade naturalmente)
+# "Oversold" threshold varies by sector:
+# Growth: RSI<35 is a strong signal (tech recovers quickly from panic selling)
+# Commodity: RSI<30 required (move on longer cycles)
+# Defensive: RSI<40 sufficient (naturally lower volatility)
 _RSI_OVERSOLD_THRESHOLD: dict[str, float] = {
     "growth":    35.0,
     "cyclical":  32.0,
@@ -251,15 +344,15 @@ _RSI_OVERSOLD_THRESHOLD: dict[str, float] = {
 
 
 def add_derived_features(features: dict, alert_date: Optional[Any] = None) -> dict:
-    """Computa features derivadas (interacções) + sector-conditioned features.
+    """Compute derived features (interactions) + sector-conditioned features.
 
-    Sector-conditioned features: o mesmo sinal (VIX, RSI, drawdown) tem pesos
-    diferentes por tipo de sector. Em vez de modelos separados por sector
-    (impossível com 46 linhas/stock em média), adicionamos versões condicionadas
-    ao sector que o modelo global pode aprender a ponderar correctamente.
+    Sector-conditioned features: the same signal (VIX, RSI, drawdown) carries
+    different weights by sector type. Instead of separate sector models
+    (impossible with ~46 rows/stock on average), we add sector-conditioned
+    versions that the global model can learn to weight appropriately.
 
-    Exemplo: RSI<30 em tech → sinal forte (pânico temporário).
-             RSI<30 em energy → sinal fraco (pode reflectir queda do crude).
+    Example: RSI<30 in tech → strong signal (temporary panic).
+             RSI<30 in energy → weak signal (may reflect crude oil decline).
     """
     rsi = float(features.get("rsi_14", _FALLBACK["rsi_14"]))
     vix = float(features.get("vix", _FALLBACK["vix"]))
@@ -276,12 +369,17 @@ def add_derived_features(features: dict, alert_date: Optional[Any] = None) -> di
     features["vol_x_drop"] = round(volsp * abs(drop), 4)
     gm = float(features.get("gross_margin", _FALLBACK["gross_margin"]))
     fcf = float(features.get("fcf_yield", _FALLBACK["fcf_yield"]))
-    revenue_growth = float(features.get("revenue_growth", 0.05))
     features["quality_dislocation"] = round(gm * abs(dd52) / 100.0, 4) if fcf >= 0 else 0.0
-    if revenue_growth > 0 and pe_vf > 0:
-        features["peg_implicit"] = round(min(pe_vf / (revenue_growth * 100.0), 5.0), 4)
+    # Standard PEG: trailing_PE / EPS_growth% (Lynch: <1 undervalued, >2 expensive)
+    # earnings_growth preferred; fall back to revenue_growth if not available.
+    _tpe = features.get("trailing_pe", float("nan"))
+    _eg  = features.get("earnings_growth", features.get("revenue_growth", float("nan")))
+    _tpe = float(_tpe) if _tpe is not None else float("nan")
+    _eg  = float(_eg)  if _eg  is not None else float("nan")
+    if math.isfinite(_tpe) and _tpe > 0 and math.isfinite(_eg) and _eg > 0.005:
+        features["peg_ratio"] = round(float(min(_tpe / (_eg * 100.0), 10.0)), 4)
     else:
-        features["peg_implicit"] = 3.0
+        features["peg_ratio"] = _FALLBACK["peg_ratio"]
     sec_dd = float(features.get("sector_drawdown_5d", _FALLBACK["sector_drawdown_5d"]))
     features["relative_drop"] = round(drop - sec_dd, 4)
     try:
@@ -290,37 +388,54 @@ def add_derived_features(features: dict, alert_date: Optional[Any] = None) -> di
         features["month_of_year"] = float(datetime.now().month)
 
     # ── Sector-conditioned features ───────────────────────────────────────────
-    # O modelo global aprende pesos diferentes para os mesmos sinais consoante
-    # o tipo de sector. Não são modelos separados (impossível com ~46 linhas/stock)
-    # mas o modelo aprende que VIX=35 em growth ≠ VIX=35 em commodity.
+    # The global model learns different weights for the same signals depending
+    # on sector type. Not separate models, but the model learns that
+    # VIX=35 in growth ≠ VIX=35 in commodity.
     sector   = str(features.get("sector", "Unknown") or "Unknown")
     sec_type = _SECTOR_TYPE.get(sector, "cyclical")
     rsi_thr  = _RSI_OVERSOLD_THRESHOLD.get(sec_type, 32.0)
 
-    # RSI ajustado ao sector: quão oversold está, relativo ao limiar sectorial
-    # growth: RSI<35 é "muito oversold"; commodity: RSI<28 é "muito oversold"
+    # RSI sector-adjusted: how oversold relative to sector threshold
+    # growth: RSI<35 = "very oversold"; commodity: RSI<28 = "very oversold"
     features["rsi_sector_adjusted"] = round(max(0.0, rsi_thr - rsi), 4)
 
-    # VIX × sector_type: alta volatilidade é positiva para defensivos (flight to safety)
-    # mas negativa para growth (risk-off → sell tech).
+    # VIX × sector_type: high volatility is positive for defensives (flight to safety)
+    # but negative for growth (risk-off → sell tech).
     _vix_factor = {"growth": -1.0, "cyclical": -0.5, "commodity": 0.0, "defensive": +0.5}
     features["vix_sector_signal"] = round(vix * _vix_factor.get(sec_type, -0.5) / 40.0, 4)
 
-    # Drawdown normalizado pelo sector: em energy, drawdown de -30% é comum;
-    # em tech, -30% é extremo. Normaliza pelo drawdown típico do sector.
+    # Drawdown normalised by sector: in energy, -30% drawdown is common;
+    # in tech, -30% is extreme. Normalise by sector's typical drawdown.
     _dd_typical = {"growth": -25.0, "cyclical": -30.0, "commodity": -40.0, "defensive": -20.0}
     dd_norm = dd52 / abs(_dd_typical.get(sec_type, -30.0))
     features["drawdown_sector_normalized"] = round(float(max(-3.0, min(0.0, dd_norm))), 4)
+
+    # decline_deceleration: recent monthly loss vs average monthly loss over 3m.
+    # Formula: return_1m / (return_3m_pre / 3)
+    # <1 = slowing down (good — e.g. NVO Mar/Apr: 3m=-30%, 1m=-5% → 0.5)
+    # >1 = accelerating (bad — e.g. NVO Feb: 3m=-5%, 1m=-15% → 3.0)
+    # <0 = recovering (best — 1m positive while 3m negative)
+    # Neutral fallback=1.0 when 3m context is flat (no trend information).
+    try:
+        r1m  = float(features.get("return_1m",    _FALLBACK["return_1m"]))
+        r3m  = float(features.get("return_3m_pre", _FALLBACK["return_3m_pre"]))
+        avg_monthly_3m = r3m / 3.0
+        if abs(avg_monthly_3m) >= 0.005:  # only meaningful if 3m had at least 0.5%/mo move
+            ratio = r1m / avg_monthly_3m
+            features["decline_deceleration"] = round(float(np.clip(ratio, -5.0, 5.0)), 4)
+        # else: keep fallback 1.0 (flat 3m baseline — no decel signal)
+    except Exception:
+        pass
 
     return features
 
 
 # ────────────────────────────────────────────────────────────────────────────────
-# build_features — thin orchestrator usado pelo position_monitor para
-# re-scoring diário das posições activas. Replica o contrato antigo:
-#   build_features(ticker, fundamentals) → dict com todas as FEATURE_COLUMNS.
-# Sem price_history/sector → as features técnicas e momentum caem para
-# _FALLBACK determinístico (aceitável para vigilância diária).
+# build_features — thin orchestrator used by position_monitor for daily
+# re-scoring of active positions. Replicates the legacy contract:
+#   build_features(ticker, fundamentals) → dict with all FEATURE_COLUMNS.
+# Without price_history/sector → technical and momentum features fall back to
+# deterministic _FALLBACK values (acceptable for daily position monitoring).
 # ────────────────────────────────────────────────────────────────────────────────
 def build_features(
     ticker: str,
@@ -331,31 +446,31 @@ def build_features(
     alert_date: Optional[Any] = None,
     price_history: Optional[pd.DataFrame] = None,
 ) -> dict:
-    """Constrói um dict de features para inference (predict_dip / ml_score).
+    """Build a feature dict for inference (predict_dip / ml_score).
 
-    Designed for **position_monitor** path — re-scoring diário das posições
-    activas sem price_history nem sector ETF disponíveis. Para training
-    histórico ou snapshot do universo, usar ``ml_training.data.build_dataset``
-    ou ``universe_snapshot._build_snapshot_row`` (que constroem o dict
-    manualmente e chamam apenas ``add_derived_features``).
+    Designed for the **position_monitor** path — daily re-scoring of active
+    positions without price_history or sector ETF available. For historical
+    training or universe snapshots use ``ml_training.data.build_dataset`` or
+    ``universe_snapshot._build_snapshot_row`` (which build the dict manually
+    and call only ``add_derived_features``).
 
     Parameters
     ----------
-    ticker         : str   identificador (apenas para logs).
-    fundamentals   : dict  output de ``_fetch_fundamentals_snapshot`` ou
-                           equivalente. Chaves opcionais: ``pe``, ``debt_equity``,
+    ticker         : str   ticker identifier (used in log messages only).
+    fundamentals   : dict  output of ``_fetch_fundamentals_snapshot`` or
+                           equivalent. Optional keys: ``pe``, ``debt_equity``,
                            ``revenue_growth``, ``gross_margin``, ``fcf_yield``,
                            ``analyst_upside``, ``price``, ``market_cap``.
     sector         : str   GICS sector (defaults "Unknown" → fair PE 22.0).
-    macro_context  : dict  ``get_macro_context`` pre-calculado (evita API call
-                           extra). ``None`` = chama ``get_macro_context``.
-    alert_date     : Any   timestamp do alerta (usado para ``month_of_year``).
-                           ``None`` = hoje.
+    macro_context  : dict  pre-computed ``get_macro_context`` output (avoids
+                           an extra API call). ``None`` = calls get_macro_context.
+    alert_date     : Any   alert timestamp (used for ``month_of_year``).
+                           ``None`` = today.
 
     Returns
     -------
-    dict com todas as FEATURE_COLUMNS preenchidas (valores fundamentais
-    vindos do dict, técnicos/momentum/regime em fallback).
+    dict with all FEATURE_COLUMNS populated (fundamental values from the dict;
+    technical/momentum/regime features at fallback defaults).
     """
     fund = fundamentals or {}
 
@@ -364,7 +479,7 @@ def build_features(
         try:
             macro_context = get_macro_context(sector=sector)
         except Exception as e:
-            logger.debug(f"build_features[{ticker}]: get_macro_context falhou: {e}")
+            logger.debug(f"build_features[{ticker}]: get_macro_context failed: {e}")
             macro_context = {}
     macro_context = macro_context or {}
 
@@ -378,7 +493,7 @@ def build_features(
             except (TypeError, ValueError):
                 pass
 
-    # Stage 1 — Quality / Value (do dict de fundamentais)
+    # Stage 1 — Quality / Value (from fundamentals dict)
     def _set(col: str, val: Any) -> None:
         if val is None:
             return
@@ -389,10 +504,13 @@ def build_features(
         if math.isfinite(f):
             features[col] = f
 
-    _set("gross_margin",   fund.get("gross_margin"))
-    _set("de_ratio",       fund.get("debt_equity") or fund.get("de_ratio"))
-    _set("analyst_upside", fund.get("analyst_upside") or fund.get("upside"))
-    _set("fcf_yield",      fund.get("fcf_yield"))
+    _set("gross_margin",    fund.get("gross_margin"))
+    _set("de_ratio",        fund.get("debt_equity") or fund.get("de_ratio"))
+    _set("analyst_upside",  fund.get("analyst_upside") or fund.get("upside"))
+    _set("fcf_yield",       fund.get("fcf_yield"))
+    # Inputs for standard PEG (read by add_derived_features below)
+    _set("trailing_pe",     fund.get("trailingPE") or fund.get("pe"))
+    _set("earnings_growth", fund.get("earningsGrowth") or fund.get("epsGrowth"))
 
     # pe_vs_fair = pe / fair_pe_sector (ratio > 1 = overvalued)
     pe_raw = _safe_float(fund.get("pe"))
@@ -408,29 +526,29 @@ def build_features(
         elif isinstance(sr, (int, float)):
             features["quality_score"] = float(sr)
     except Exception as e:
-        logger.debug(f"build_features[{ticker}]: score_from_fundamentals falhou: {e}")
+        logger.debug(f"build_features[{ticker}]: score_from_fundamentals failed: {e}")
 
-    # Stage 2 — Timing (do dict; sem price_history → fallback)
+    # Stage 2 — Timing (from dict; without price_history → fallback)
     _set("drop_pct_today", fund.get("drop_pct_today") or fund.get("change_pct"))
     _set("drawdown_52w",   fund.get("drawdown_52w"))
     _set("rsi_14",         fund.get("rsi_14") or fund.get("rsi"))
     _set("atr_ratio",      fund.get("atr_ratio"))
     _set("volume_spike",   fund.get("volume_spike"))
 
-    # Stage 3 — Derived (interactions). Sobrescreve os 7 derivados a partir
-    # do dict actual; o resto fica em fallback.
+    # Stage 3 — Derived (interactions). Overwrites derived features from the
+    # current dict values; remainder stays at fallback.
     add_derived_features(features, alert_date=alert_date)
 
-    # Stage 4 — Raw OHLCV + Market Structure. Opt-in: só corre se o caller
-    # passar price_history; caso contrário cai nos fallbacks neutros.
+    # Stage 4 — Raw OHLCV + Market Structure. Opt-in: only runs when the
+    # caller passes price_history; otherwise falls back to neutral defaults.
     if price_history is not None:
         add_raw_ohlcv_features(features, price_history)
         add_market_structure_features(features, price_history)
         add_volume_flow_features(features, price_history)
 
-    # Stage 5 — Sinais de qualidade e sentimento (Fase 5).
-    # NaN onde não disponível — o modelo trata NaN como "informação em falta",
-    # não como valor neutro inventado.
+    # Stage 5 — Quality and sentiment signals.
+    # NaN where unavailable — model treats NaN as "missing information",
+    # not as a neutral invented value.
     try:
         from fundamental_signals import compute_fundamental_signals
         signals = compute_fundamental_signals(
@@ -445,12 +563,12 @@ def build_features(
                 vf = float(val)
                 if math.isfinite(vf):
                     features[key] = vf
-                # Se NaN: mantém o fallback existente em features[] em vez de substituir por NaN
-                # (o modelo foi treinado em fallbacks, não em NaN)
+                # If NaN: keep existing fallback in features[] rather than replacing with NaN
+                # (model was trained on fallback values, not NaN)
             except (TypeError, ValueError):
                 pass
     except Exception as e:
-        logger.error(f"build_features[{ticker}]: fundamental_signals falhou: {e}")
+        logger.error(f"build_features[{ticker}]: fundamental_signals failed: {e}")
 
     return features
 
@@ -533,7 +651,10 @@ def add_raw_ohlcv_features(features: dict, price_history: Optional[pd.DataFrame]
       • ``true_range_pct_20d`` — mean ATR-like intraday range as a percent
         of close. Captures intraday volatility (different from close-to-close).
     """
-    out_keys = ("volume_zscore_20d", "close_in_range_20d", "up_days_pct_20d", "true_range_pct_20d")
+    out_keys = (
+        "volume_zscore_20d", "close_in_range_20d", "up_days_pct_20d",
+        "true_range_pct_20d", "price_vs_52w_percentile", "days_below_ma200",
+    )
     for k in out_keys:
         features.setdefault(k, _FALLBACK[k])
 
@@ -604,8 +725,41 @@ def add_raw_ohlcv_features(features: dict, price_history: Optional[pd.DataFrame]
                 tr_pct = (tr[mask] / close_for_div[mask])
                 v = float(tr_pct.mean())
                 if math.isfinite(v):
-                    # Clip a 100% intraday range (extremo absoluto).
                     features["true_range_pct_20d"] = float(np.clip(v, 0.0, 1.0))
+    except Exception:
+        pass
+
+    # price_vs_52w_percentile: where is price in the 52-week High/Low range?
+    # 0.0 = at 52w low, 1.0 = at 52w high. Useful for entry zone assessment.
+    try:
+        if "High" in hist.columns and "Low" in hist.columns and len(hist) >= 10:
+            high_52w = float(hist["High"].rolling(min(252, len(hist))).max().iloc[-1])
+            low_52w  = float(hist["Low"].rolling(min(252, len(hist))).min().iloc[-1])
+            rng = high_52w - low_52w
+            if rng > 0 and math.isfinite(rng):
+                price = float(hist["Close"].iloc[-1])
+                features["price_vs_52w_percentile"] = round(
+                    float(np.clip((price - low_52w) / rng, 0.0, 1.0)), 4
+                )
+    except Exception:
+        pass
+
+    # days_below_ma200: consecutive trading days with Close < 200d MA.
+    # 0 = just crossed below (or above), 90+ = holders exhausted / washed out.
+    # Distinguishes NVO-Feb (5 days below, risky entry) from NVO-Apr (90 days, better entry).
+    # Uses min_periods=40 so partial history still yields a usable signal.
+    try:
+        if len(hist) >= 40:
+            ma200 = close.rolling(min(200, len(hist)), min_periods=40).mean()
+            # Count consecutive sessions below MA200 from the most recent bar backwards
+            below = (close < ma200).values
+            count = 0
+            for i in range(len(below) - 1, -1, -1):
+                if below[i] and math.isfinite(float(ma200.iloc[i])):
+                    count += 1
+                else:
+                    break
+            features["days_below_ma200"] = float(min(count, 365))
     except Exception:
         pass
 

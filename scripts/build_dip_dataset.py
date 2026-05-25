@@ -1,26 +1,25 @@
 """
-scripts/build_dip_dataset.py — Constrói dataset histórico de treino para DipRadar.
+scripts/build_dip_dataset.py — Build historical training dataset for DipRadar.
 
-Equivalente a momentum_radar/scripts/build_dataset.py mas para condições de dip.
-Varre dados históricos de preço desde 1993 para cada ticker no universo,
-detecta episódios de queda, e constrói rows completos com TODAS as features
-do DipRadar — reutilizando as funções de regenerate_training_base.py para
-garantir consistência absoluta com a produção.
+Scans historical price data from 1993 for each ticker in the universe,
+detects dip episodes, and builds complete rows with ALL DipRadar features —
+reusing functions from regenerate_training_base.py for absolute consistency
+with production.
 
-Detecção de episódio (sem cooldown fixo):
-  Episódio inicia quando return_20d < _EPISODE_ENTRY (default -5%).
-  Termina quando return_20d recupera acima de _EPISODE_EXIT (default -2%).
-  Só o primeiro dia qualificado de cada episódio é amostrado.
-  Critérios propositadamente largos — modelo aprende os thresholds óptimos.
+Episode detection (no fixed cooldown):
+  Episode starts when return_20d < _EPISODE_ENTRY (default -5%).
+  Ends when return_20d recovers above _EPISODE_EXIT (default -2%).
+  Only the first qualifying day of each episode is sampled.
+  Thresholds deliberately wide — model learns optimal boundaries.
 
-Modo incremental: se o parquet de output já existir, processa apenas
-  datas novas (último registo - 200 dias) e faz merge com dedup.
+Incremental mode: if output parquet already exists, processes only new dates
+  (last record - 200 days) and merges with dedup.
 
-Uso:
-  python scripts/build_dip_dataset.py                    # universo completo, desde 1993
-  python scripts/build_dip_dataset.py --tickers AAPL,MSFT  # teste rápido
-  python scripts/build_dip_dataset.py --start 1985-01-01    # ir mais longe
-  python scripts/build_dip_dataset.py --no-fundamentals     # mais rápido, sem EDGAR
+Usage:
+  python scripts/build_dip_dataset.py                    # full universe from 1993
+  python scripts/build_dip_dataset.py --tickers AAPL,MSFT  # quick test
+  python scripts/build_dip_dataset.py --start 1985-01-01    # go further back
+  python scripts/build_dip_dataset.py --no-fundamentals     # faster, skip EDGAR
 """
 
 from __future__ import annotations
@@ -40,8 +39,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-# Importar infraestrutura partilhada com regenerate_training_base.py
-# (feature computation, price fetching, sector maps, column lists)
+# Shared infrastructure from regenerate_training_base.py
 from scripts.regenerate_training_base import (
     _fetch_one_ticker,
     _fetch_batch,
@@ -56,6 +54,9 @@ from scripts.regenerate_training_base import (
     FUNDAMENTAL_COLS,
     FASE5_COLS,
 )
+from config import MIN_MARKET_CAP_USD
+from universe import is_us_universe
+from sec_guard import has_sec_filings
 
 log = logging.getLogger("build_dip_dataset")
 
@@ -63,14 +64,11 @@ _DATA_DIR   = Path("/data") if Path("/data").exists() else Path("/tmp")
 _CACHE_DIR  = _DATA_DIR / "price_cache"
 _OUTPUT     = Path(__file__).parent.parent / "ml_training_base.parquet"
 
-# ── Detecção de episódio ──────────────────────────────────────────────────────
-# Propositadamente largos: o modelo aprende os thresholds óptimos.
-# Histerese: impede re-triggers durante recuperações parciais do mesmo dip.
-_EPISODE_ENTRY = -0.05   # return_20d < -5%  → início de episódio de dip
-_EPISODE_EXIT  = -0.02   # return_20d > -2%  → episódio terminou (recuperação)
+# Episode detection thresholds (deliberately wide — model learns optimal boundaries)
+_EPISODE_ENTRY = -0.05   # return_20d < -5% → episode start
+_EPISODE_EXIT  = -0.02   # return_20d > -2% → episode ended (recovery)
 
-_MIN_MARKET_CAP_B = 1.0  # mínimo de liquidez (USD mil milhões)
-_MIN_BARS_AHEAD   = 95   # dias úteis mínimos necessários para target de 90d
+_MIN_BARS_AHEAD = 95     # minimum trading days required for 90d target
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -147,8 +145,14 @@ def build_dip_dataset(
     add_fundamentals: bool = True,
     add_fase5: bool = True,
 ) -> pd.DataFrame:
-    """Constrói dataset de treino para DipRadar varrendo histórico de preços."""
-    from ml_features import _FALLBACK
+    """Build DipRadar training dataset by scanning historical price data."""
+    from ml_features import (
+        FEATURE_COLUMNS, _FALLBACK, add_derived_features,
+        add_momentum_features, add_raw_ohlcv_features,
+        add_regime_features, add_market_structure_features,
+        add_volume_flow_features, assert_feature_completeness,
+        _SECTOR_TYPE, _RSI_OVERSOLD_THRESHOLD,
+    )
 
     spy_hist = macro_cache.get("SPY")
     rows: list[dict] = []
@@ -156,42 +160,124 @@ def build_dip_dataset(
 
     for i, ticker in enumerate(tickers):
         hist = price_cache.get(ticker)
-        if hist is None or len(hist) < 60:
+        if hist is None or len(hist) < 252:
             continue
 
-        # Sector via yfinance info (com fallback)
-        sector = "Unknown"
+        # Fetch ticker_info and apply US universe filter ($2B + US exchange)
+        sector   = "Unknown"
+        country  = ""
+        exchange = ""
         try:
             import yfinance as yf
-            info = yf.Ticker(ticker).info or {}
-            sector = info.get("sector") or "Unknown"
-            mktcap = float(info.get("marketCap") or 0) / 1e9
-            if mktcap > 0 and mktcap < _MIN_MARKET_CAP_B:
+            info     = yf.Ticker(ticker).fast_info if hasattr(yf.Ticker(ticker), "fast_info") else {}
+            info     = yf.Ticker(ticker).info or {}
+            sector   = info.get("sector") or "Unknown"
+            country  = info.get("country") or ""
+            exchange = info.get("exchange") or info.get("exchangeShortName") or ""
+            if not is_us_universe(info):
+                log.debug(f"  skip {ticker}: not US universe (exchange={exchange}, mktcap={info.get('marketCap',0):.0f})")
                 continue
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(f"  {ticker}: info fetch failed ({e}) — applying fallback country/exchange")
 
+        has_sec = has_sec_filings(ticker, country, exchange)
         episode_dates = _find_dip_episodes(hist)
 
         for alert_date in episode_dates:
-            row_base = {
+            pit_hist = hist[hist.index <= alert_date]
+            if len(pit_hist) < 60:
+                continue
+            entry_price = float(pit_hist["Close"].iloc[-1])
+
+            # Step 1: initialize ALL features from _FALLBACK
+            row_base: dict = {col: _FALLBACK[col] for col in FEATURE_COLUMNS}
+            row_base.update({
                 "ticker":     ticker,
                 "alert_date": alert_date,
-                "price":      float(hist[hist.index <= alert_date]["Close"].iloc[-1]),
+                "price":      entry_price,
                 "sector":     sector,
-            }
+            })
 
-            # ── Features técnicas (partilhadas com produção) ──────────────
+            # Step 2: basic episode features from price history (PIT)
             try:
-                feat = _compute_row_features(
-                    row_base, price_cache, macro_cache, sector_etf_cache
-                )
+                closes = pit_hist["Close"]
+                # drop_pct_today: 1-day return on the episode detection date
+                if len(closes) >= 2:
+                    row_base["drop_pct_today"] = round(
+                        float(closes.iloc[-1] / closes.iloc[-2] - 1) * 100.0, 4
+                    )
+                # drawdown_52w: distance from 52-week high
+                window_52w = closes.tail(252)
+                if len(window_52w) >= 20:
+                    high_52w = float(window_52w.max())
+                    if high_52w > 0:
+                        row_base["drawdown_52w"] = round(
+                            float(entry_price / high_52w - 1) * 100.0, 4
+                        )
+                # rsi_14
+                if len(closes) >= 16:
+                    delta = closes.diff().dropna()
+                    gain  = delta.clip(lower=0).rolling(14).mean()
+                    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+                    rs    = gain / loss.replace(0, float("nan"))
+                    rsi   = (100 - 100 / (1 + rs)).iloc[-1]
+                    if not np.isnan(rsi):
+                        row_base["rsi_14"] = float(np.clip(rsi, 0.0, 100.0))
             except Exception as e:
-                log.debug(f"  features failed {ticker}@{alert_date.date()}: {e}")
-                feat = {k: _FALLBACK.get(k, 0.0) for k in NEW_FEATURE_COLS}
-            row_base.update(feat)
+                log.debug(f"  basic_features failed {ticker}@{alert_date.date()}: {e}")
 
-            # ── Target: alpha_90d ─────────────────────────────────────────
+            # VIX at alert_date
+            try:
+                vix_hist = macro_cache.get("^VIX")
+                if vix_hist is not None and not vix_hist.empty:
+                    vix_slice = vix_hist[vix_hist.index <= alert_date]
+                    if not vix_slice.empty:
+                        row_base["vix"] = float(vix_slice["Close"].iloc[-1])
+            except Exception:
+                pass
+
+            # Step 3: momentum, regime, OHLCV, market structure, volume flow
+            try:
+                _sec_etf  = SECTOR_ETF.get(sector, "SPY")
+                spy_slice = spy_hist[spy_hist.index <= alert_date] if spy_hist is not None else None
+                sec_slice = sector_etf_cache.get(_sec_etf)
+                sec_slice = sec_slice[sec_slice.index <= alert_date] if sec_slice is not None else None
+                tnx_hist  = macro_cache.get("^TNX")
+                tnx_slice = tnx_hist[tnx_hist.index <= alert_date] if tnx_hist is not None else None
+                vix_hist_full = macro_cache.get("^VIX")
+                vix_slice_full = vix_hist_full[vix_hist_full.index <= alert_date] if vix_hist_full is not None else None
+
+                add_momentum_features(row_base, pit_hist, sec_slice, spy_slice)
+                add_raw_ohlcv_features(row_base, pit_hist)
+                add_market_structure_features(row_base, pit_hist)
+                add_volume_flow_features(row_base, pit_hist)
+                add_regime_features(row_base, spy_slice, tnx_slice, alert_date, vix_slice_full)
+            except Exception as e:
+                log.debug(f"  ml_features failed {ticker}@{alert_date.date()}: {e}")
+
+            # Step 4: derived features (rsi_oversold_strength, vix_regime, etc.)
+            try:
+                add_derived_features(row_base, alert_date=alert_date)
+            except Exception as e:
+                log.debug(f"  derived_features failed {ticker}@{alert_date.date()}: {e}")
+
+            # Step 5: sector-conditioned features
+            try:
+                sec_type = _SECTOR_TYPE.get(sector, "cyclical")
+                rsi_thr  = _RSI_OVERSOLD_THRESHOLD.get(sec_type, 32.0)
+                _VIX_F   = {"growth": -1.0, "cyclical": -0.5, "commodity": 0.0, "defensive": +0.5}
+                _DD_TYP  = {"growth": -25.0, "cyclical": -30.0, "commodity": -40.0, "defensive": -20.0}
+                _rsi     = float(row_base.get("rsi_14", _FALLBACK["rsi_14"]))
+                _vix     = float(row_base.get("vix",    _FALLBACK["vix"]))
+                _dd52    = float(row_base.get("drawdown_52w", _FALLBACK["drawdown_52w"]))
+                row_base["rsi_sector_adjusted"]        = round(max(0.0, rsi_thr - _rsi), 4)
+                row_base["vix_sector_signal"]          = round(_vix * _VIX_F.get(sec_type, -0.5) / 40.0, 4)
+                dd_norm = _dd52 / abs(_DD_TYP.get(sec_type, -30.0))
+                row_base["drawdown_sector_normalized"] = round(float(max(-3.0, min(0.0, dd_norm))), 4)
+            except Exception as e:
+                log.debug(f"  sector_features failed {ticker}@{alert_date.date()}: {e}")
+
+            # Step 6: target — alpha_90d
             try:
                 targets = _compute_alpha_targets_row(
                     pd.Series(row_base), price_cache, spy_hist
@@ -201,40 +287,46 @@ def build_dip_dataset(
             row_base.update(targets)
 
             if not math.isfinite(row_base.get("alpha_90d", float("nan"))):
-                continue  # sem target = inutilizável para treino
+                continue  # no valid target → unusable for training
 
-            # ── Target: max_drawdown_90d (modelo de risco) ────────────────
-            dd = _compute_max_drawdown_90d(hist, alert_date)
-            row_base["max_drawdown_90d"] = dd if dd is not None else 0.0
+            row_base["max_drawdown_90d"] = _compute_max_drawdown_90d(hist, alert_date) or 0.0
 
-            # ── Fundamentais PIT (opcional — requer EDGAR/Tiingo) ─────────
+            # Step 7: PIT fundamentals (optional — requires EDGAR/Tiingo)
             if add_fundamentals:
                 try:
                     fund = _compute_pit_fundamentals_row(pd.Series(row_base), cache_dir)
                     row_base.update(fund)
                 except Exception:
-                    for c in FUNDAMENTAL_COLS:
-                        row_base.setdefault(c, _FALLBACK.get(c, 0.0))
-            else:
-                for c in FUNDAMENTAL_COLS:
-                    row_base.setdefault(c, _FALLBACK.get(c, 0.0))
+                    pass   # _FALLBACK already in row_base from step 1
 
-            # ── Features Fase5 (EDGAR PIT) ────────────────────────────────
-            if add_fase5:
+            # Step 8: Phase 5 signals (EDGAR Form 4 / 8-K) — gated by sec_guard
+            if add_fase5 and has_sec:
                 try:
                     f5 = _compute_fase5_row(pd.Series(row_base), price_cache)
                     row_base.update(f5)
                 except Exception:
-                    for c in FASE5_COLS:
-                        row_base.setdefault(c, _FALLBACK.get(c, 0.0))
-            else:
-                for c in FASE5_COLS:
-                    row_base.setdefault(c, _FALLBACK.get(c, 0.0))
+                    pass   # _FALLBACK already in row_base from step 1
+            elif add_fase5 and not has_sec:
+                # Non-US ticker (ADR): price-based signals from fase5 still valid
+                try:
+                    f5_price_only = _compute_fase5_row(pd.Series(row_base), price_cache)
+                    for k in ("consecutive_red_days", "ma_200d_ratio"):
+                        if k in f5_price_only:
+                            row_base[k] = f5_price_only[k]
+                except Exception:
+                    pass
+
+            # Step 9: assert all FEATURE_COLUMNS are present
+            try:
+                assert_feature_completeness(row_base, f"bootstrap/{ticker}@{alert_date.date()}")
+            except ValueError as e:
+                log.error(str(e))
+                continue   # skip this row — schema violation
 
             rows.append(row_base)
 
         if (i + 1) % 50 == 0 or (i + 1) == n_tickers:
-            log.info(f"  [{i+1}/{n_tickers}] {ticker} | {len(rows)} episódios de dip até agora")
+            log.info(f"  [{i+1}/{n_tickers}] {ticker} | {len(rows)} dip episodes so far")
 
     return pd.DataFrame(rows)
 

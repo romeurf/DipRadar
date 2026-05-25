@@ -72,6 +72,8 @@ import threading
 import requests
 from datetime import datetime
 from rate_limiter import is_allowed, rate_status
+from i18n import t, set_language, get_language
+from config import SUPPORTED_LANGUAGES
 from state import (
     load_dynamic_watchlist,
     add_to_dynamic_watchlist,
@@ -241,6 +243,7 @@ def poll(
             text = msg.get("text", "")
             if cid == chat_id and text:
                 logging.info(f"[bot_commands] Comando: {text!r}")
+                _poll_context["_current_chat_id"] = int(cid) if cid.lstrip("-").isdigit() else 0
                 _handle_command(text)
     except Exception as e:
         logging.debug(f"[bot_commands] poll error: {e}")
@@ -3310,8 +3313,29 @@ def _handle_command(text: str) -> None:
             "`/admin_full_pipeline`     → [ADMIN] Pipeline completo (parquets + retrain)\n"
             "`/health`                  → Dashboard observabilidade\n"
             "`/health errors`           → Log de erros críticos\n"
+            "`/language <en|pt>`        → Definir idioma (default: pt)\n"
             "`/help`                    → Esta mensagem"
         )
+
+    elif cmd == "/language":
+        if not _check_rate(cmd_key): return
+        # Derive chat_id from the current update context (best-effort; fall back to 0)
+        _chat_id: int = int(_poll_context.get("_current_chat_id", 0))
+        _lang_now = get_language(_chat_id)
+        if len(parts) < 2:
+            avail = ", ".join(f"`{l}`" for l in SUPPORTED_LANGUAGES)
+            _reply(
+                f"*Idioma actual:* `{_lang_now}`\n"
+                f"Uso: `/language <{' | '.join(SUPPORTED_LANGUAGES)}>`\n"
+                f"Idiomas disponíveis: {avail}"
+            )
+        else:
+            _requested = parts[1].lower().strip()
+            if set_language(_chat_id, _requested):
+                _reply(t("language_set", lang=_requested))
+            else:
+                avail = ", ".join(SUPPORTED_LANGUAGES)
+                _reply(t("language_invalid", lang=_requested, available=avail))  # TODO(i18n): lang param needed here; use default
 
     elif cmd == "/status":
         if not _check_rate(cmd_key): return
@@ -3889,6 +3913,7 @@ def _poll_loop() -> None:
                     chat            = str(msg.get("chat", {}).get("id", ""))
                     text            = msg.get("text", "")
                     if chat == TELEGRAM_CHAT_ID and text:
+                        _poll_context["_current_chat_id"] = int(chat) if chat.lstrip("-").isdigit() else 0
                         _handle_command(text)
         except Exception as e:
             logging.warning(f"[bot_commands] poll error: {e}")

@@ -57,6 +57,7 @@ FEATURE_COLS: list[str] = [
     "beta_90d",
     "vol_of_vol",
     "quality_dislocation",
+    "peg_ratio",
     "month_of_year",
     "sector_alert_count_7d",
     "vix_percentile_1y",
@@ -91,6 +92,12 @@ FEATURE_COLS: list[str] = [
     # Volume Flow (Vertus-inspired): MFI + buying pressure proxy.
     "mfi_14",
     "volume_up_pct_20d",
+    # Entry zone / regime
+    "price_vs_52w_percentile",   # where price sits in the 52-week range (0=low, 1=high)
+    "yield_10y_change_5d",       # 5-day change in 10-year Treasury yield
+    # Dip maturity features (NVO/ADBE pattern: best entry after prolonged dip, not day 1)
+    "days_below_ma200",          # consecutive days below 200d MA — 0=just crossed, 90+=washed out
+    "decline_deceleration",      # return_1m / avg_monthly_3m: <1=slowing, >1=accelerating, <0=recovering
 ]
 # Features removidas vs PR #25 (Spearman IC profiling sobre o parquet completo
 # 36929 rows confirmou 14 features inúteis):
@@ -98,7 +105,7 @@ FEATURE_COLS: list[str] = [
 #   • 9 constantes (std=0 → IC indefinida; bootstrap não tem fonte point-in-time):
 #       gross_margin (=0.35), de_ratio (=80.0), pe_vs_fair (=1.0),
 #       analyst_upside (=0.10), quality_score (=0.50), atr_ratio (=0.02),
-#       volume_spike (=1.0), pe_attractive (=0.0), peg_implicit (=0.20)
+#       volume_spike (=1.0), pe_attractive (=0.0), peg_ratio (=0.20)
 #
 #   • 5 noise (|Spearman IC| < 0.01 com alpha_60d):
 #       days_since_52w_high (+0.0075), sector_drawdown_5d (-0.0072),

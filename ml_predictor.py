@@ -26,7 +26,7 @@ Features esperadas (37 — FEATURE_COLUMNS de ml_features.py):
   Stage 3(5): rsi_oversold_strength, vix_regime, pe_attractive,
               drop_x_drawdown, vol_x_drop
   Stage 3b(4): return_1m, return_3m_pre, sector_relative, beta_90d
-  Stage 3c(4): quality_dislocation, peg_implicit, relative_drop, month_of_year
+  Stage 3c(4): quality_dislocation, peg_ratio, relative_drop, month_of_year
   Stage 3d(2): sector_alert_count_7d, days_since_52w_high
   Stage 3e(2): short_interest_ratio, earnings_surprise_avg
   Stage 3f(3): vix_percentile_1y, spy_rsi_14, yield_10y_change_5d
