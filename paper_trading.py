@@ -490,6 +490,8 @@ def record_paper_buy(
         "trailing_stop_pct":       0.22,
         "portfolio_value_at_open": round(port_value, 2),
         "available_at_open":       round(available, 2),
+        # PIT SPY price stored at open so alpha is not recalculated from historical yfinance later
+        "spy_price_open": _fetch_close("SPY", date.today()),
     }
     trades.append(trade)
     _save(trades)
@@ -592,10 +594,16 @@ def update_open_positions() -> dict:
             still_open += 1
             continue
 
-        # Fechar posição
+        # Close position — compute alpha using PIT SPY price stored at open
         ret_pct = round((current_price / t["open_price"] - 1) * 100, 3)
-        spy_ret = _fetch_spy_return(open_date, today)
-        alpha   = round(ret_pct - (spy_ret or 0), 3) if spy_ret is not None else None
+        _spy_open_stored = t.get("spy_price_open")
+        _spy_close_live  = _fetch_close("SPY", today)
+        if _spy_open_stored and _spy_close_live and _spy_open_stored > 0:
+            spy_ret = round((_spy_close_live / _spy_open_stored - 1) * 100, 3)
+            t["spy_price_close"] = _spy_close_live
+        else:
+            spy_ret = _fetch_spy_return(open_date, today)
+        alpha = round(ret_pct - (spy_ret or 0), 3) if spy_ret is not None else None
 
         if hit_target:
             t["status"] = "CLOSED_TARGET"
@@ -1000,6 +1008,7 @@ def record_momentum_paper_buy(
         "sector":              sector,
         "portfolio_value_at_open": round(port_value, 2),
         "available_at_open":       round(available, 2),
+        "spy_price_open": _fetch_close("SPY", date.today()),
     }
     trades.append(trade)
     _save(trades)
@@ -1218,10 +1227,16 @@ def update_momentum_positions(send_fn=None) -> dict:
                         pass
                 continue  # posição fica aberta, update_open_positions() retoma
 
-        # ── 5. Fechar posição (momentum e DIP esgotados) ─────────────────────
+        # ── 5. Close position — PIT SPY comparison using stored open price ──────
         ret_pct = round((current_price / float(t["open_price"]) - 1) * 100, 3)
-        spy_ret = _fetch_spy_return(open_date, today)
-        alpha   = round(ret_pct - (spy_ret or 0), 3) if spy_ret is not None else None
+        _spy_open_stored = t.get("spy_price_open")
+        _spy_close_live  = _fetch_close("SPY", today)
+        if _spy_open_stored and _spy_close_live and _spy_open_stored > 0:
+            spy_ret = round((_spy_close_live / _spy_open_stored - 1) * 100, 3)
+            t["spy_price_close"] = _spy_close_live
+        else:
+            spy_ret = _fetch_spy_return(open_date, today)
+        alpha = round(ret_pct - (spy_ret or 0), 3) if spy_ret is not None else None
 
         t["status"]         = "CLOSED_TRAILING_STOP"
         t["close_date"]     = today_iso
@@ -1327,6 +1342,7 @@ def record_core_holding(
         "hold_days":               0,
         "portfolio_value_at_open": round(port_value, 2),
         "available_at_open":       round(available, 2),
+        "spy_price_open": _fetch_close("SPY", date.today()),
         # Dividend reinvestment tracking (DRIP — gross, pre-tax)
         "dividends_reinvested_eur": 0.0,   # cumulative gross dividends reinvested
         "last_dividend_check":      today_iso,
@@ -1356,8 +1372,14 @@ def close_core_holding(ticker: str, close_price: float) -> bool:
             continue
         open_date = date.fromisoformat(t["open_date"])
         ret_pct   = round((close_price / float(t["open_price"]) - 1) * 100, 3)
-        spy_ret   = _fetch_spy_return(open_date, today)
-        alpha     = round(ret_pct - (spy_ret or 0), 3) if spy_ret is not None else None
+        _spy_open_stored = t.get("spy_price_open")
+        _spy_close_live  = _fetch_close("SPY", today)
+        if _spy_open_stored and _spy_close_live and _spy_open_stored > 0:
+            spy_ret = round((_spy_close_live / _spy_open_stored - 1) * 100, 3)
+            t["spy_price_close"] = _spy_close_live
+        else:
+            spy_ret = _fetch_spy_return(open_date, today)
+        alpha = round(ret_pct - (spy_ret or 0), 3) if spy_ret is not None else None
         t["status"]         = "CLOSED_MANUAL"
         t["close_date"]     = today.isoformat()
         t["close_price"]    = round(close_price, 4)

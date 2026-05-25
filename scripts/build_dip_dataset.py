@@ -343,7 +343,8 @@ def main() -> int:
     p.add_argument("--cache-dir",        default=str(_CACHE_DIR), help="Dir cache de preços")
     p.add_argument("--no-fundamentals",  action="store_true", help="Saltar EDGAR/Tiingo (mais rápido)")
     p.add_argument("--no-fase5",         action="store_true", help="Saltar features Fase5 EDGAR")
-    p.add_argument("--force-rebuild",    action="store_true", help="Ignorar parquet existente e reconstruir desde --start")
+    p.add_argument("--force-rebuild",    action="store_true", help="Ignore existing parquet and rebuild from --start")
+    p.add_argument("--clear-cache",      action="store_true", help="Delete all price cache files before fetching (forces full re-download)")
     p.add_argument("-v", "--verbose",    action="store_true")
     args = p.parse_args()
 
@@ -355,7 +356,20 @@ def main() -> int:
     cache_dir = Path(args.cache_dir)
     out_path  = Path(args.out)
 
-    # ── Universo de tickers ───────────────────────────────────────────────────
+    # ── Clear price cache if requested ───────────────────────────────────────
+    if args.clear_cache and cache_dir.exists():
+        deleted = 0
+        for f in cache_dir.glob("*.parquet"):
+            if f.name.startswith("edgar_"):
+                continue  # preserve EDGAR filing cache (expensive to rebuild)
+            try:
+                f.unlink()
+                deleted += 1
+            except Exception:
+                pass
+        log.info(f"--clear-cache: deleted {deleted} price cache files — will re-download all tickers")
+
+    # ── Universe ──────────────────────────────────────────────────────────────
     if args.tickers:
         tickers = [t.strip().upper() for t in args.tickers.split(",")]
         log.info(f"Modo teste: {len(tickers)} tickers")

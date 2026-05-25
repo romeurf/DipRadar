@@ -179,12 +179,13 @@ def _fetch_one_ticker(
         try:
             df = pd.read_parquet(cache_file)
             df.index = pd.to_datetime(df.index)
-            # Validate the cache actually covers the requested start date.
-            # If it starts more than 60 days after `start`, the cache was built from
-            # a shorter window (e.g. daily bot operation) — re-download the full history.
             if not df.empty:
+                # Strip timezone before comparing so tz-aware caches (daily bot) work correctly.
+                _cs = df.index[0]
+                if getattr(_cs, "tz", None) is not None:
+                    _cs = _cs.tz_localize(None)
+                cache_start     = _cs.normalize()
                 requested_start = pd.Timestamp(start)
-                cache_start     = df.index[0].normalize()
                 if cache_start > requested_start + pd.Timedelta(days=60):
                     log.debug(
                         f"  {ticker}: cache starts {cache_start.date()} "
@@ -194,7 +195,7 @@ def _fetch_one_ticker(
                 else:
                     return df
         except Exception as e:
-            log.warning(f"  cache corrupto {ticker} ({e}) — re-download")
+            log.warning(f"  {ticker}: corrupt cache ({e}) — re-downloading")
 
     if end is None:
         end = date.today().strftime("%Y-%m-%d")

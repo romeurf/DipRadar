@@ -72,6 +72,7 @@ bot_commands.py — Todos os comandos Telegram do DipRadar.
   /admin_check_config      → Verificar config + estado dos 3 modelos
   /ps                      → Pipeline status: fase actual, log, tempo decorrido
   /admin_kill_pipeline     → Terminar processo de pipeline em curso
+  /admin_clear_price_cache → Apagar cache de preços (forçar re-download completo)
   /health                  → Dashboard: RAM, CPU, APIs, drift
   /admin_test_feed TICKER  → Testar pipeline de dados para um ticker
   /help                    → Lista completa de comandos
@@ -2273,7 +2274,7 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
       --retrain       Retrain only — skip dataset build (use existing parquets)
 
     ── Other ──
-      --force         Ignore parquet age cache; always rebuild datasets
+      --force         Force full rebuild AND clear price cache (re-downloads all tickers)
       --test T1,T2    Smoke-test: run on these tickers only (~2 min)
 
     Examples:
@@ -2355,7 +2356,7 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
             out    = data_dir / "ml_training_base.parquet"
             cmd    = [sys.executable, str(script), "--start", "1993-01-01", "--out", str(out)]
             if test_tickers: cmd += ["--tickers", test_tickers]
-            if force:        cmd += ["--force-rebuild"]
+            if force:        cmd += ["--force-rebuild", "--clear-cache"]
             rc, lines = _run_script_streaming(cmd, "Phase 1 — DIP dataset")
             if rc == 0:
                 dip_ds_ok = True
@@ -2368,7 +2369,7 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
             out    = data_dir / "momentum_training.parquet"
             cmd    = [sys.executable, str(script), "--start", "1993-01-01", "--out", str(out)]
             if test_tickers: cmd += ["--tickers", test_tickers]
-            if force:        cmd += ["--force-rebuild"]
+            if force:        cmd += ["--force-rebuild", "--clear-cache"]
             rc, lines = _run_script_streaming(cmd, "Phase 1 — Momentum dataset")
             if rc == 0:
                 mom_ds_ok = True
@@ -2381,7 +2382,7 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
             out    = data_dir / "core_training_base.parquet"
             cmd    = [sys.executable, str(script), "--start", "1993-01-01", "--out", str(out)]
             if test_tickers: cmd += ["--tickers", test_tickers]
-            if force:        cmd += ["--force-rebuild"]
+            if force:        cmd += ["--force-rebuild", "--clear-cache"]
             rc, lines = _run_script_streaming(cmd, "Phase 1 — CORE dataset")
             if rc == 0:
                 core_ds_ok = True
@@ -4365,6 +4366,30 @@ def _handle_command(text: str) -> None:
                 _self._pipeline_proc   = None
             except Exception as e:
                 _reply(f"Kill failed: {e}")
+
+    elif cmd in ("/admin_clear_price_cache", "/clear_price_cache"):
+        from pathlib import Path as _P
+        _dd = _P("/data") if _P("/data").exists() else _P("/tmp")
+        _cache = _dd / "price_cache"
+        if not _cache.exists():
+            _reply("Price cache directory does not exist — nothing to clear.")
+        else:
+            _deleted = 0
+            _skipped = 0
+            for _f in _cache.glob("*.parquet"):
+                if _f.name.startswith("edgar_"):
+                    _skipped += 1
+                    continue
+                try:
+                    _f.unlink()
+                    _deleted += 1
+                except Exception:
+                    pass
+            _reply(
+                f"Price cache cleared: {_deleted} files deleted, {_skipped} EDGAR files preserved.\n"
+                f"Next dataset build will re-download all price histories from yfinance.\n"
+                f"Run /admin_run_pipeline --dip --dataset to rebuild."
+            )
 
     elif cmd == "/admin_disk":
         _handle_admin_disk(parts)
