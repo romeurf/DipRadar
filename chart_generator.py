@@ -147,9 +147,11 @@ def generate_equity_curve(trades: list[dict]) -> Optional[Path]:
     port_dates = [start_dt] + port_dates
     port_pcts  = [0.0] + port_pcts
 
-    # Fetch SPY for the same period
-    end_str = date.today().isoformat()
-    spy_dates, spy_pcts = _fetch_spy_returns(first_open, end_str)
+    # SPY fetched for the exact same period as the portfolio (PIT comparison).
+    # Using last close date rather than today avoids inflating/deflating alpha
+    # when the report is generated weeks after the last trade closed.
+    last_close = max(t["close_date"] for t in closed)
+    spy_dates, spy_pcts = _fetch_spy_returns(first_open, last_close)
 
     fig, ax = plt.subplots(figsize=(12, 5))
 
@@ -185,7 +187,8 @@ def generate_equity_curve(trades: list[dict]) -> Optional[Path]:
     n_missed = sum(1 for t in trades if t.get("status") == "MISSED_CAPITAL")
     missed_note = f" | {n_missed} signals missed (capital deployed)" if n_missed else ""
     ax.set_title(
-        f"Portfolio Return vs SPY — {n_total} closed trades since {first_open[:7]}{missed_note}",
+        f"Portfolio Return vs SPY — {n_total} closed trades "
+        f"({first_open[:7]} → {last_close[:7]}){missed_note}",
         fontsize=13, fontweight="bold", color=_C_TEXT, pad=14,
     )
     ax.set_ylabel("Cumulative return (%)", color=_C_SUBTEXT)
