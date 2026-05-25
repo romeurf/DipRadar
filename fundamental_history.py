@@ -252,6 +252,10 @@ def _edgar_get(ticker: str, alert_date: date, cache_dir: Path) -> dict:
                               ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
                               form_filter=("10-Q", "10-K", "10-Q/A", "10-K/A"))
 
+    net_income = _edgar_pit_value(facts, alert_date,
+                                  ["NetIncomeLoss", "ProfitLoss"],
+                                  form_filter=("10-Q", "10-K", "10-Q/A", "10-K/A"))
+
     mkt_cap = _edgar_pit_value(facts, alert_date,
                                ["CommonStockSharesOutstanding"],
                                unit="shares",
@@ -260,6 +264,7 @@ def _edgar_get(ticker: str, alert_date: date, cache_dir: Path) -> dict:
     result: dict[str, Optional[float]] = {
         "gross_margin":   None,
         "de_ratio":       None,
+        "roe":            None,
         "fcf_yield":      None,
         "revenue_growth": None,
         "quality_score":  None,
@@ -274,6 +279,9 @@ def _edgar_get(ticker: str, alert_date: date, cache_dir: Path) -> dict:
     if total_debt is not None and equity and equity > 0:
         result["de_ratio"] = round(total_debt / equity, 4)
 
+    if net_income is not None and equity and equity > 0:
+        result["roe"] = round(net_income / abs(equity), 4)
+
     fcf: Optional[float] = None
     if op_cf is not None:
         fcf = op_cf - (capex or 0)
@@ -283,13 +291,15 @@ def _edgar_get(ticker: str, alert_date: date, cache_dir: Path) -> dict:
     # Guardamos o FCF raw para usar no build_dataset onde o preço é conhecido
     result["_fcf_raw"] = fcf
 
-    # Quality score simples
+    # Simple quality score
     score = 0.0
     if result["gross_margin"] is not None and result["gross_margin"] > 0.35:
         score += 0.25
     if result["de_ratio"] is not None and result["de_ratio"] < 2.0:
         score += 0.25
     if fcf is not None and fcf > 0:
+        score += 0.25
+    if result["roe"] is not None and result["roe"] > 0.10:
         score += 0.25
     result["quality_score"] = round(score, 3)
 

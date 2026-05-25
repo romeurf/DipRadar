@@ -371,7 +371,6 @@ def build_core_dataset(
     rows: list[dict] = []
     n_tickers = len(tickers)
     today = pd.Timestamp.now(tz="UTC").normalize().tz_localize(None)
-    six_months_ago = today - pd.Timedelta(days=182)
 
     for i, ticker in enumerate(tickers):
         hist = price_cache.get(ticker)
@@ -445,13 +444,38 @@ def build_core_dataset(
             # ── Targets ─────────────────────────────────────────────────────
             targets = _compute_alpha_targets(hist, alert_date, spy_hist)
 
-            # ── Fundamentais (só se recente e pedido) ───────────────────────
+            # ── PIT Fundamentals (all historical episodes via EDGAR XBRL) ─────
+            # Uses fundamental_history.get_pit_fundamentals() which fetches
+            # SEC EDGAR XBRL company facts (cached once per ticker, 30-day TTL)
+            # and extracts the values filed BEFORE alert_date (no look-ahead).
+            # Falls back to yfinance quarterly for pre-XBRL episodes (<2009).
             fund: dict = {}
-            if add_fundamentals and alert_date >= six_months_ago:
+            if add_fundamentals:
                 try:
-                    fund = _fetch_fundamentals_yf(ticker)
-                except Exception:
-                    pass
+                    from fundamental_history import get_pit_fundamentals
+                    fund_raw = get_pit_fundamentals(
+                        ticker,
+                        alert_date.date() if hasattr(alert_date, "date") else alert_date,
+                        cache_dir / "fundamental_cache",
+                    )
+                    if fund_raw:
+                        # FCF yield: use Tiingo's direct value, or compute from raw+price
+                        fcf_yield_v = fund_raw.get("fcf_yield")
+                        if fcf_yield_v is None and fund_raw.get("_fcf_raw") and price > 0:
+                            # Rough estimate: FCF / (price × shares_outstanding)
+                            # shares not available here — skip; Tiingo tier provides it directly
+                            fcf_yield_v = None
+
+                        fund = {
+                            "revenue_growth":  fund_raw.get("revenue_growth"),
+                            "gross_margin":    fund_raw.get("gross_margin"),
+                            "roe":             fund_raw.get("roe"),
+                            "fcf_yield_fund":  fcf_yield_v,
+                            "analyst_upside":  fund_raw.get("analyst_upside"),
+                            "earnings_growth": fund_raw.get("revenue_growth"),  # proxy
+                        }
+                except Exception as _fe:
+                    log.debug(f"[core_fund] {ticker}@{alert_date.date()}: {_fe}")
 
             row = {
                 "alert_date":             alert_date,

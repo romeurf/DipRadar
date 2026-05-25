@@ -26,9 +26,74 @@ from typing import Optional
 
 log = logging.getLogger("core_radar")
 
-_REPO_DIR     = Path(__file__).parent
+_REPO_DIR      = Path(__file__).parent
 _UNIVERSE_FILE = _REPO_DIR / "core_universe.json"
 _DATA_DIR      = Path("/data") if Path("/data").exists() else _REPO_DIR
+_MODEL_PATH    = _DATA_DIR / "core_us_model.pkl"
+
+# ── ML model (loaded lazily on first call to is_model_ready()) ────────────────
+_core_model_bundle = None
+_core_model_checked = False
+
+
+def _load_core_model():
+    global _core_model_bundle, _core_model_checked
+    if _core_model_checked:
+        return _core_model_bundle
+    _core_model_checked = True
+    if not _MODEL_PATH.exists():
+        log.warning(f"[core_radar] ML model not found at {_MODEL_PATH}. Run /admin_train_core_model.")
+        return None
+    try:
+        import joblib
+        _core_model_bundle = joblib.load(_MODEL_PATH)
+        log.info(
+            f"[core_radar] ML model loaded: n_train={_core_model_bundle.n_train} "
+            f"train_date={_core_model_bundle.train_date} "
+            f"CV_RMSE={_core_model_bundle.cv_rmse:.4f}"
+        )
+        return _core_model_bundle
+    except Exception as e:
+        log.error(f"[core_radar] Failed to load ML model: {e}")
+        return None
+
+
+def is_model_ready() -> bool:
+    """Return True if the core_us ML model is loaded and ready to score."""
+    return _load_core_model() is not None
+
+
+def _ml_score(signals: dict, annual_yield_pct: float) -> float | None:
+    """Score a candidate using the ML model. Returns predicted alpha_1y converted
+    to 0-100 scale, or None if the model is not ready.
+
+    Conversion: score = clamp(50 + alpha_1y * 250, 0, 100)
+      alpha_1y =  0.00 → score 50  (no edge vs SPY)
+      alpha_1y = +0.20 → score 100 (20% outperformance expected)
+      alpha_1y = -0.20 → score   0 (underperformance expected)
+    """
+    bundle = _load_core_model()
+    if bundle is None:
+        return None
+    try:
+        import numpy as np
+        medians = bundle.impute_medians
+        row = []
+        for col in bundle.feature_cols:
+            if col == "annual_yield_pct":
+                val = annual_yield_pct
+            else:
+                raw = signals.get(col)
+                val = float(raw) if raw is not None and not math.isnan(float(raw)) else medians.get(col, 0.0)
+            row.append(val)
+        X = np.array(row).reshape(1, -1)
+        X_scaled = bundle.scaler.transform(X)
+        alpha_pred = float(bundle.model.predict(X_scaled)[0])
+        score = max(0.0, min(100.0, 50.0 + alpha_pred * 250.0))
+        return round(score, 1)
+    except Exception as e:
+        log.debug(f"[core_radar] ML score failed: {e}")
+        return None
 
 # ── Thresholds de entrada (ajustados para CORE — qualidade alta, comprar no dip) ─
 _ENTRY_RETURN_20D    = -0.05   # queda ≥5% em 20d
@@ -492,10 +557,27 @@ def _score_core_dip(
     elif vol_spike > 1.5 and ud_ratio > 1.0:
         score += 2.0
 
+    # Try ML model first — if loaded, it replaces the heuristic score entirely
+    ml_score = _ml_score(signals, annual_yield_pct)
+    if ml_score is not None:
+        # ML model gates: apply the same mandatory gates even with ML scoring
+        # (the model may not have seen extreme cases during training)
+        if rev_growth is not None and rev_growth < -0.10:
+            ml_score = 0.0
+        if gross_margin is not None and gross_margin < 0.25:
+            ml_score = 0.0
+        signals["core_score"]    = ml_score
+        signals["score_source"]  = "ml"
+        signals["near_ma200w"]   = near_ma200w
+        signals["below_ma200w"]  = below_ma200w
+        return ml_score, signals
+
+    # Heuristic fallback (used until ML model is trained)
     score = max(0.0, min(score, 100.0))
-    signals["core_score"]   = round(score, 1)
-    signals["near_ma200w"]  = near_ma200w
-    signals["below_ma200w"] = below_ma200w
+    signals["core_score"]    = round(score, 1)
+    signals["score_source"]  = "heuristic"
+    signals["near_ma200w"]   = near_ma200w
+    signals["below_ma200w"]  = below_ma200w
     return round(score, 1), signals
 
 

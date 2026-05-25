@@ -1992,10 +1992,89 @@ def _handle_admin_build_core_dataset(parts: list[str]) -> None:
             f"✅ *CoreML Dataset Concluído!*\n"
             f"{stats_text}"
             f"{github_line}\n\n"
-            f"Próximo passo: `/admin_full_pipeline --dip-only`"
+            f"Próximo passo: `/admin_train_core_model` para treinar o modelo ML."
         )
 
     threading.Thread(target=_run, daemon=True, name="core-dataset-build").start()
+
+
+# ── /admin_train_core_model ────────────────────────────────────────────────────
+
+def _handle_admin_train_core_model(parts: list[str]) -> None:
+    """/admin_train_core_model [--dry-run]
+
+    Trains the core_us ML model on core_training_base.parquet.
+    Saves model bundle to /data/core_us_model.pkl.
+    Once trained, the nightly CoreRadar scan uses ML scoring instead of heuristics.
+    """
+    global _retrain_running
+    if _retrain_running:
+        _reply("⚠️ Pipeline already running. Wait for it to finish.")
+        return
+
+    dry_run = "--dry-run" in parts
+
+    _reply(
+        "<b>CoreML Model Training</b>\n"
+        f"{'Dry-run mode — model will NOT be saved.\n' if dry_run else ''}"
+        "Training GradientBoostingRegressor on core_training_base.parquet.\n"
+        "Features: price/MA/RSI/volume/sector/fundamentals (PIT EDGAR XBRL)\n"
+        "Target: alpha_1y (1-year excess return vs SPY)\n"
+        "<i>Estimated duration: 1-3 minutes</i>"
+    )
+
+    def _run():
+        import subprocess, sys, re as _re
+        from pathlib import Path as _P
+
+        data_dir   = _P("/data") if _P("/data").exists() else _P(".")
+        parquet    = data_dir / "core_training_base.parquet"
+        script     = _P(__file__).parent / "scripts" / "train_core_model.py"
+
+        if not parquet.exists():
+            # Fallback: try repo root
+            parquet = _P(__file__).parent / "core_training_base.parquet"
+        if not parquet.exists():
+            _reply("❌ core_training_base.parquet not found. Run /admin_build_core_dataset first.")
+            return
+
+        cmd = [sys.executable, str(script), "--parquet", str(parquet)]
+        if dry_run:
+            cmd.append("--dry-run")
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            _reply("❌ Training timeout (>10 min) — check logs.")
+            return
+        except Exception as e:
+            _reply(f"❌ Training exception: <code>{e}</code>")
+            return
+
+        output = (result.stdout or "") + (result.stderr or "")
+        if result.returncode != 0:
+            _reply(f"❌ Training failed (exit {result.returncode})\n<code>{output[-600:]}</code>")
+            return
+
+        # Reload model in the running process so the scan picks it up immediately
+        try:
+            import core_radar as _cr
+            _cr._core_model_checked = False
+            _cr._core_model_bundle  = None
+            _cr._load_core_model()
+            model_ready = _cr.is_model_ready()
+        except Exception:
+            model_ready = False
+
+        model_status = "✅ Model loaded in memory — CoreRadar scan is now ML-driven." if model_ready else "⚠️ Model saved but not yet loaded — will load on next scan."
+
+        _reply(
+            f"{'🔬 DRY RUN — ' if dry_run else ''}✅ <b>core_us model trained!</b>\n\n"
+            f"<pre>{output[-800:]}</pre>\n\n"
+            + (f"{model_status}" if not dry_run else "Model NOT saved (dry run).")
+        )
+
+    threading.Thread(target=_run, daemon=True, name="core-model-train").start()
 
 
 # ── /admin_full_pipeline ────────────────────────────────────────────────────────
@@ -4532,6 +4611,9 @@ def _handle_command(text: str) -> None:
 
     elif cmd in ("/admin_build_core_dataset", "/admin_core_dataset"):
         _handle_admin_build_core_dataset(parts)
+
+    elif cmd in ("/admin_train_core_model", "/admin_core_train"):
+        _handle_admin_train_core_model(parts)
 
     elif cmd == "/admin_full_pipeline":
         _handle_admin_full_pipeline(parts)

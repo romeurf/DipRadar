@@ -2270,10 +2270,21 @@ def run_core_scan() -> None:
     Schedule: 22:00 Lisboa (dados EOD US limpos, uma vez por dia)
     """
     try:
-        from core_radar import scan_core_universe, format_core_alert
+        from core_radar import scan_core_universe, format_core_alert, is_model_ready
         from paper_trading import record_core_holding, get_core_holdings_summary
 
-        logging.info("[core_radar] A iniciar scan do universo CORE...")
+        if not is_model_ready():
+            logging.warning(
+                "[core_radar] ML model not trained — nightly scan disabled. "
+                "Run /admin_train_core_model after rebuilding core_training_base.parquet."
+            )
+            send_telegram(
+                "⚠️ <b>CoreRadar</b> — ML model not ready.\n"
+                "Use <code>/admin_build_core_dataset</code> then <code>/admin_train_core_model</code> to enable production scanning."
+            )
+            return
+
+        logging.info("[core_radar] Starting CoreRadar scan (ML model active)...")
         candidates = scan_core_universe(min_score=60.0)
 
         if not candidates:
