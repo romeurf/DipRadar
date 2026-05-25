@@ -993,6 +993,20 @@ def run_monthly_retrain_v3(
     elapsed = time.time() - t0
     log.info(f"[retrain] CONCLUÍDO em {elapsed:.0f}s — decision={gate['decision']}")
 
+    # Auto-publish charts to GitHub after retrain
+    try:
+        from chart_generator import generate_all_charts
+        from github_publisher import push_all_charts
+        generate_all_charts()
+        results = push_all_charts()
+        published = [k for k, v in results.items() if v and not str(v).startswith("ERROR")]
+        if published:
+            log.info(f"[retrain] Charts published to GitHub: {published}")
+        else:
+            log.debug("[retrain] No charts published (no data or GITHUB_TOKEN not set).")
+    except Exception as _chart_err:
+        log.warning(f"[retrain] Chart publish failed (non-blocking): {_chart_err}")
+
     return {
         **gate,
         "elapsed_s":      round(elapsed, 1),

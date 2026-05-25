@@ -72,6 +72,9 @@ _FIELDS = [
     "mfe_3m",
     "mae_3m",
     "outcome_label",       # WIN_STRONG | WIN | NEUTRAL | LOSS (baseado em alpha_90d)
+    # Portfolio context at signal time — for ML to learn capital-reservation patterns
+    "capital_utilization_pct",  # % of paper portfolio already deployed when alert fired
+    "n_open_positions",         # number of open paper positions at signal time
 ]
 
 # Maturidade mínima (dias) para preencher return_90d e rotular
@@ -108,19 +111,29 @@ def migrate_schema() -> bool:
             f"A arquivar e recriar limpo."
         )
 
-        # Recuperar apenas linhas que correspondem ao schema actual.
-        # Linhas com campo count diferente (corrupção, schema antigo) são descartadas.
-        # Dados velhos ou corrompidos não têm lugar no pipeline — limpar é a política correcta.
+        # Recover rows from the old schema, padding any new columns with "".
+        # Rows with MORE columns than expected are also kept (extra fields ignored).
+        # Only rows with far fewer columns than either schema are discarded (corruption).
         recovered: list[dict] = []
         discarded  = 0
+        min_acceptable = min(n_current, n_target) - 2  # allow up to 2 missing columns
         for row in all_rows:
-            if len(row) == n_target:
-                recovered.append(dict(zip(_FIELDS, row)))
+            if len(row) >= min_acceptable:
+                # Map by old header if available, else by position
+                if current_header and len(current_header) == len(row):
+                    row_dict = dict(zip(current_header, row))
+                else:
+                    row_dict = dict(zip(_FIELDS, row))
+                # Ensure all target fields exist (pad missing with "")
+                for field in _FIELDS:
+                    if field not in row_dict:
+                        row_dict[field] = ""
+                recovered.append(row_dict)
             else:
                 discarded += 1
 
         if discarded:
-            logging.info(f"[alert_db] {discarded} linhas descartadas (schema incompatível)")
+            logging.info(f"[alert_db] {discarded} rows discarded (corrupt / unrecoverable)")
 
         # Recriar CSV limpo com schema correcto
         with _DB_PATH.open("w", newline="", encoding="utf-8") as f:
@@ -133,9 +146,8 @@ def migrate_schema() -> bool:
             writer.writerows(recovered)
 
         logging.info(
-            f"[alert_db] CSV recriado com schema correcto: "
-            f"{len(recovered)} linhas válidas preservadas, "
-            f"linhas de schema antigo eliminadas (campos em falta, irrecuperáveis)."
+            f"[alert_db] Schema updated: {len(recovered)} rows preserved "
+            f"(new fields padded with empty string), {discarded} discarded."
         )
         return True
 
@@ -206,6 +218,8 @@ def log_alert_snapshot(
     historical_pe: float | dict | None = None,
     spy_change: float | None = None,
     sector_etf_change: float | None = None,
+    capital_utilization_pct: float | None = None,
+    n_open_positions: int | None = None,
 ) -> None:
     """
     Regista um alerta na base de dados ML.
@@ -266,6 +280,12 @@ def log_alert_snapshot(
             "spy_return_90d": "",
             "alpha_90d_label": "",
             "mfe_3m": "", "mae_3m": "", "outcome_label": "",
+            # Portfolio state at alert time — for ML capital-reservation learning
+            "capital_utilization_pct": (
+                round(capital_utilization_pct, 1)
+                if capital_utilization_pct is not None else ""
+            ),
+            "n_open_positions": n_open_positions if n_open_positions is not None else "",
         }
         with _DB_PATH.open("a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(

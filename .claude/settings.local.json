@@ -64,7 +64,9 @@
       "Bash(grep -v \"^[0-9]*:$\")",
       "Bash(python -m py_compile ml_features.py ml_training/config.py ml_training/models.py)",
       "Bash(python -m py_compile ml_features.py ml_training/config.py score.py monthly_retrain.py ml_predictor.py)",
-      "Bash(python -m py_compile ml_features.py score.py)"
+      "Bash(python -m py_compile ml_features.py score.py)",
+      "Bash(python -m py_compile paper_trading.py chart_generator.py github_publisher.py alert_db.py main.py bot_commands.py monthly_retrain.py)",
+      "Bash(python -m py_compile paper_trading.py chart_generator.py github_publisher.py bot_commands.py)"
     ],
     "additionalDirectories": [
       "c:\\Users\\Romeu\\OneDrive\\Documentos\\GitHub\\DipRadar"

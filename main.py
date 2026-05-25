@@ -1699,12 +1699,30 @@ def run_scan() -> None:
                 )
                 # ──────────────────────────────────────────────────────────
 
+                # Compute portfolio context at signal time for ML training
+                _cap_util_pct = None
+                _n_open       = None
+                try:
+                    from paper_trading import (
+                        get_paper_portfolio_value, get_paper_allocated,
+                        get_paper_available, _load as _pt_load,
+                    )
+                    _pt = _pt_load()
+                    _pv = get_paper_portfolio_value(_pt)
+                    _al = get_paper_allocated(_pt)
+                    _cap_util_pct = round(_al / max(_pv, 1.0) * 100, 1)
+                    _n_open = sum(1 for t in _pt if t.get("status") == "OPEN")
+                except Exception:
+                    pass
+
                 log_alert_snapshot(
                     symbol=sym, fundamentals=fund, score=score,
                     verdict=verdict, category=category,
                     change_day_pct=stock["change_pct"], rsi_val=rsi_val,
                     historical_pe=hist_pe, spy_change=spy_change,
                     sector_etf_change=sector_chg,
+                    capital_utilization_pct=_cap_util_pct,
+                    n_open_positions=_n_open,
                 )
 
                 # Verificar liquidez disponível — o alerta dispara sempre,
@@ -1775,6 +1793,8 @@ def run_scan() -> None:
                                     score_v2=score,
                                     ml_win_prob=_wp,
                                     usd_eur=get_usdeur(),
+                                    model_id="dip_us",
+                                    sector=fund.get("sector", ""),
                                 )
                     except Exception as _pe:
                         logging.debug(f"[paper] {sym}: {_pe}")
@@ -2205,6 +2225,8 @@ def run_momentum_scan() -> None:
                     ml_score_ensemble  = c.get("ml_score_ensemble", 0.0),
                     ml_durability      = c.get("ml_durability", "MODERADO"),
                     usd_eur            = usd_eur,
+                    model_id           = "momentum_us",
+                    sector             = c.get("sector", ""),
                 )
             except Exception as e:
                 logging.warning(f"[momentum] Paper trade {c['ticker']}: {e}")
@@ -2273,6 +2295,8 @@ def run_core_scan() -> None:
                     annual_yield_pct= c.get("annual_yield_pct", 0.0),
                     note            = c.get("note", "CoreRadar auto-scan"),
                     usd_eur         = usd_eur,
+                    model_id        = "core_us",
+                    sector          = c.get("sector", ""),
                 )
                 if trade_id:
                     registered += 1
@@ -2701,10 +2725,31 @@ def main() -> None:
                 update_open_positions,
                 update_momentum_positions,
                 update_core_positions,
+                update_missed_trade_outcomes,
+                update_core_dividends,
             )
             stats  = update_open_positions()
             stats2 = update_momentum_positions(send_fn=send_telegram)
             stats3 = update_core_positions(send_fn=send_telegram)
+            # DRIP: reinvest any new dividends in CORE positions (non-blocking)
+            try:
+                _ue = get_usdeur() if "get_usdeur" in dir() else 0.92
+                drip = update_core_dividends(usd_eur=_ue)
+                if drip["events"] > 0:
+                    logging.info(
+                        f"[core_drip] Reinvested €{drip['total_reinvested_eur']:.2f} "
+                        f"across {drip['events']} dividend events. "
+                        f"TAX NOTE: {drip['tax_disclaimer'][:80]}"
+                    )
+            except Exception as _de:
+                logging.debug(f"[core_drip] update failed: {_de}")
+            # Resolve 90-day outcomes for MISSED_CAPITAL trades (non-blocking)
+            try:
+                missed_stats = update_missed_trade_outcomes()
+                if missed_stats["resolved"] > 0:
+                    logging.info(f"[paper] Missed outcomes resolved: {missed_stats}")
+            except Exception as _me:
+                logging.debug(f"[paper] missed outcome update: {_me}")
             total  = stats.get("updated", 0) + stats2.get("updated", 0)
             drift  = stats2.get("drifted", 0)
             closed = stats2.get("closed", 0)

@@ -56,6 +56,14 @@ bot_commands.py — Todos os comandos Telegram do DipRadar.
   /admin_set_floor <valor> → Ajustar floor de IC mínimo para promoção (ex: 0.08)
   /admin_load_models <url> → Carregar bundle ML de URL externo
 
+━━━ PAPER TRADING ━━━
+  /paper_portfolio         → Last 3 months performance vs SPY
+  /paper_portfolio 6       → Last 6 months
+  /paper_portfolio open    → Open positions with live weights
+  /paper_portfolio drip    → CORE DRIP audit trail (every dividend event, tax disclaimer)
+  /paper_portfolio missed  → MISSED_CAPITAL signals (lost alpha due to full pool)
+  /admin_publish_charts    → Publish charts + DRIP ledger to GitHub (public URL)
+
 ━━━ SISTEMA E DIAGNÓSTICO ━━━
   /status                  → Estado do bot + mercado + modelo
   /health                  → Dashboard: RAM, CPU, APIs, drift
@@ -2326,15 +2334,17 @@ def _handle_admin_set_floor(parts: list[str]) -> None:
 # ── /paper_portfolio ─────────────────────────────────────────────────────────────
 
 def _handle_paper_performance(parts: list[str]) -> None:
-    """/paper_portfolio [meses]
+    """/paper_portfolio [months | open | drip | missed]
 
-    Mostra a performance do paper trading automatico do bot.
-    O bot simula as suas proprias recomendacoes COMPRAR e mede se bate o SPY.
+    Paper trading portfolio report. The bot simulates its own BUY signals and
+    tracks whether it beats SPY over 90 days.
 
-    Uso:
-      /paper_portfolio        → ultimos 3 meses
-      /paper_portfolio 6      → ultimos 6 meses
-      /paper_portfolio open   → posicoes abertas actuais
+    Usage:
+      /paper_portfolio          → last 3 months
+      /paper_portfolio 6        → last 6 months
+      /paper_portfolio open     → all open positions with live weights
+      /paper_portfolio drip     → DRIP audit trail for CORE positions
+      /paper_portfolio missed   → MISSED_CAPITAL signals (lost alpha due to full pool)
     """
     def _run():
         try:
@@ -2342,43 +2352,152 @@ def _handle_paper_performance(parts: list[str]) -> None:
                 get_monthly_performance, format_performance_report, _load
             )
 
-            if len(parts) > 1 and parts[1].lower() == "open":
+            sub = parts[1].lower() if len(parts) > 1 else ""
+
+            # ── open positions ────────────────────────────────────────────────
+            if sub == "open":
+                from paper_trading import (
+                    get_paper_portfolio_value, get_paper_allocated,
+                    get_paper_available, PAPER_PORTFOLIO_EUR,
+                )
+                from datetime import date as _date
                 trades  = _load()
                 open_ps = [t for t in trades if t.get("status") == "OPEN"]
                 if not open_ps:
-                    _reply("Sem posicoes de paper trading abertas.")
+                    _reply("No open paper trading positions.")
                     return
-                lines = [f"Paper portfolio — {len(open_ps)} posicoes abertas:", ""]
+                port_val  = get_paper_portfolio_value(trades)
+                allocated = get_paper_allocated(trades)
+                available = get_paper_available(trades)
+                port_ret  = (port_val - PAPER_PORTFOLIO_EUR) / max(PAPER_PORTFOLIO_EUR, 1) * 100
+                lines = [
+                    f"Paper portfolio — {len(open_ps)} open positions",
+                    f"Value: €{port_val:.0f} ({port_ret:+.1f}%) | "
+                    f"Allocated: €{allocated:.0f} | Available: €{available:.0f}",
+                    "",
+                ]
                 for t in sorted(open_ps, key=lambda x: x["open_date"], reverse=True)[:15]:
-                    from datetime import date
-                    days = (date.today() - date.fromisoformat(t["open_date"])).days
+                    days = (_date.today() - _date.fromisoformat(t["open_date"])).days
+                    wt   = t.get("weight_pct", 0)
+                    kind = t.get("trade_type", "DIP")
                     lines.append(
-                        f"  {t['ticker']}: aberto {t['open_date']} "
-                        f"({days}d) @ {t['open_price']:.2f} "
-                        f"| target {t['sell_target']:.2f} | €{t['amount_eur']:.0f}"
+                        f"  [{kind}] {t['ticker']}: {t['open_date']} ({days}d) "
+                        f"@ {t['open_price']:.2f} | {wt:.1f}% | €{t['amount_eur']:.0f}"
                     )
                 _reply("\n".join(lines))
                 return
 
+            # ── DRIP audit trail ──────────────────────────────────────────────
+            if sub == "drip":
+                from paper_trading import get_drip_history, _TAX_DISCLAIMER
+                data = get_drip_history()
+                pos  = data["positions"]
+                tot  = data["totals"]
+
+                header = [
+                    "CORE DRIP Ledger — Dividend Reinvestment Audit Trail",
+                    "",
+                    f"Positions: {tot['total_positions']} | "
+                    f"Events: {tot['total_drip_events']} | "
+                    f"Total reinvested: €{tot['total_reinvested_eur']:,.2f} (gross)",
+                    "",
+                    f"TAX: {_TAX_DISCLAIMER}",
+                    "",
+                ]
+                _reply("\n".join(header))
+
+                if not pos:
+                    _reply(
+                        "No DRIP events recorded yet.\n"
+                        "DRIP tracking activates automatically on the next dividend ex-date "
+                        "for each open CORE position."
+                    )
+                    return
+
+                for p in pos:
+                    events = p["drip_events"]
+                    block = [
+                        f"{p['ticker']} — opened {p['open_date']} | "
+                        f"€{p['amount_eur']:,.2f} deployed",
+                        f"  Shares: {p['shares_original']:.4f} → {p['shares_current']:.4f} "
+                        f"(+{p['shares_added_via_drip']:.4f} via DRIP)",
+                        f"  Total reinvested: €{p['total_reinvested_eur']:,.4f} "
+                        f"across {len(events)} event(s)",
+                    ]
+                    if not events:
+                        block.append("  No dividend events recorded yet.")
+                    else:
+                        block.append("  Events:")
+                        for ev in events:
+                            block.append(
+                                f"    {ev['date']}: ${ev['per_share_usd']:.4f}/sh × "
+                                f"{ev['shares_held']:.4f} sh = "
+                                f"€{ev['gross_eur']:.4f} → "
+                                f"+{ev['new_shares']:.6f} sh @ ${ev['reinvest_price_usd']:.2f} "
+                                f"[{ev['tax_note']}]"
+                            )
+                    if p.get("note"):
+                        block.append(f"  Note: {p['note']}")
+                    _reply("\n".join(block))
+
+                _reply(
+                    "Full DRIP ledger published to GitHub alongside performance charts.\n"
+                    "Use /admin_publish_charts to force a refresh."
+                )
+                return
+
+            # ── missed signals ────────────────────────────────────────────────
+            if sub == "missed":
+                from paper_trading import get_missed_trades_stats, _load as _pt_load
+                trades = _pt_load()
+                missed = [t for t in trades if t.get("status") == "MISSED_CAPITAL"]
+                stats  = get_missed_trades_stats(trades)
+
+                if not missed:
+                    _reply("No MISSED_CAPITAL signals recorded yet.")
+                    return
+
+                lines = [
+                    f"MISSED_CAPITAL — {len(missed)} signals not opened (pool was full)",
+                    f"Resolved: {stats.get('resolved', 0)} | Pending: {stats.get('pending', 0)}",
+                    "",
+                ]
+                for m in sorted(missed, key=lambda x: x.get("signal_date", ""), reverse=True)[:20]:
+                    resolved = m.get("actual_return_90d")
+                    ret_str  = f"{resolved:+.1f}%" if resolved is not None else "pending"
+                    alpha_str = (
+                        f" vs SPY {m.get('actual_alpha_90d', 0):+.1f}%"
+                        if m.get("actual_alpha_90d") is not None else ""
+                    )
+                    lines.append(
+                        f"  [{m.get('trade_type','?')}] {m.get('ticker','?')} "
+                        f"{m.get('signal_date','?')}: "
+                        f"requested €{m.get('requested_eur',0):.0f}, "
+                        f"available €{m.get('available_eur',0):.0f} → {ret_str}{alpha_str}"
+                    )
+                _reply("\n".join(lines))
+                return
+
+            # ── default: monthly summary ──────────────────────────────────────
             months = 3
-            if len(parts) > 1:
+            if sub:
                 try:
-                    months = int(parts[1])
+                    months = int(sub)
                 except ValueError:
                     pass
 
             perf   = get_monthly_performance(months_back=months)
             report = format_performance_report(perf)
-            _reply(f"Paper Trading — Bot vs Mercado\n\n{report}")
+            _reply(f"Paper Trading — Bot vs Market\n\n{report}")
 
-            # Lista detalhada de trades por mês
             from paper_trading import format_monthly_trade_list
             trade_list = format_monthly_trade_list(months_back=months)
-            if trade_list and trade_list != "Sem trades fechados no periodo.":
-                _reply(f"Trades por mes:\n{trade_list}")
+            if trade_list and "Sem trades" not in trade_list:
+                _reply(f"Trades by month:\n{trade_list}")
+
         except Exception as e:
             logging.error(f"[paper_performance] {e}", exc_info=True)
-            _reply(f"Erro ao calcular paper performance: {e}")
+            _reply(f"Error calculating paper performance: {e}")
 
     threading.Thread(target=_run, daemon=True, name="paper-perf").start()
 
@@ -3022,6 +3141,7 @@ def _handle_core_add(parts: list[str]) -> None:
         trade_id = record_core_holding(
             ticker=ticker, open_price=open_price, amount_eur=amount_eur,
             annual_yield_pct=annual_yield, note=note,
+            model_id="core_us", sector="",
         )
         if trade_id:
             yield_str = f" | Yield: {annual_yield:.1f}%/ano" if annual_yield > 0 else ""
@@ -3838,6 +3958,49 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_full_pipeline":
         _handle_admin_full_pipeline(parts)
+
+    elif cmd == "/admin_publish_charts":
+        _reply("Generating performance charts + DRIP ledger and publishing to GitHub…")
+        def _run_publish():
+            try:
+                from chart_generator import generate_all_charts
+                from github_publisher import push_all_charts
+                chart_paths = generate_all_charts()
+                if not chart_paths:
+                    _reply("No files generated — no closed trades yet.")
+                    return
+                results = push_all_charts()
+                charts_ok   = []
+                reports_ok  = []
+                errors      = []
+                for name, url in results.items():
+                    if url and not url.startswith("ERROR"):
+                        if name.endswith(".md"):
+                            reports_ok.append((name, url))
+                        else:
+                            charts_ok.append((name, url))
+                    else:
+                        errors.append(f"  {name}: {url or 'skipped'}")
+
+                lines = ["Published to GitHub:", ""]
+                if charts_ok:
+                    lines.append("Charts (embed-ready):")
+                    for name, url in charts_ok:
+                        lines.append(f"  {name}: {url}")
+                if reports_ok:
+                    lines.append("")
+                    lines.append("Transparency reports (share this link with clients):")
+                    for name, url in reports_ok:
+                        lines.append(f"  {name}: {url}")
+                if errors:
+                    lines.append("")
+                    lines.append("Errors:")
+                    lines += errors
+                _reply("\n".join(lines))
+            except Exception as e:
+                _reply(f"Error publishing: {e}")
+        import threading
+        threading.Thread(target=_run_publish, daemon=True, name="publish-charts").start()
 
     elif cmd == "/admin_set_floor":
         _handle_admin_set_floor(parts)

@@ -46,6 +46,20 @@ _DATA_DIR   = Path("/data") if Path("/data").exists() else Path("/tmp")
 _TRADES_FILE = _DATA_DIR / "paper_trades.json"
 _USD_EUR_DEFAULT = 0.92
 
+# ── Rotating paper portfolio ──────────────────────────────────────────────────
+# The paper portfolio starts with PAPER_PORTFOLIO_EUR (default €10k) and
+# behaves like a real rotating fund:
+#   - Each open position draws capital from the pool.
+#   - When a position closes, the capital (+ P&L) rotates back into the pool.
+#   - New signals can only open if enough available capital remains.
+#   - No per-position cap: the allocator decides sizing; the only limit is
+#     what's actually available. If the portfolio grows to €12k, you can
+#     deploy €12k (or any fraction) on the next trade.
+#   - When a signal fires but available < MIN_POSITION_EUR, the trade is
+#     recorded as "MISSED_CAPITAL" so the ML can learn from capital constraints.
+PAPER_PORTFOLIO_EUR: float = float(os.environ.get("PAPER_PORTFOLIO_EUR", "10000"))
+MIN_POSITION_EUR:    float = 100.0   # below €100 a position isn't worth tracking
+
 
 # ── I/O ───────────────────────────────────────────────────────────────────────
 
@@ -125,7 +139,7 @@ def _get_monthly_budget() -> float:
 
 
 def _capital_used_this_month() -> float:
-    """Quanto capital foi alocado este mês nas posições de papel."""
+    """Capital allocated this month across all paper positions."""
     trades     = _load()
     this_month = date.today().strftime("%Y-%m")
     return sum(
@@ -133,6 +147,162 @@ def _capital_used_this_month() -> float:
         for t in trades
         if t.get("open_date", "")[:7] == this_month
     )
+
+
+# ── Rotating portfolio accounting ─────────────────────────────────────────────
+
+def get_paper_portfolio_value(trades: Optional[list] = None) -> float:
+    """Current portfolio value = starting capital + sum of all closed position P&L."""
+    if trades is None:
+        trades = _load()
+    closed_pnl = sum(
+        t["amount_eur"] * (t["return_pct"] / 100.0)
+        for t in trades
+        if t.get("return_pct") is not None and t.get("amount_eur") is not None
+    )
+    return PAPER_PORTFOLIO_EUR + closed_pnl
+
+
+def get_paper_allocated(trades: Optional[list] = None) -> float:
+    """Capital currently locked in ALL open positions (DIP + MOMENTUM + CORE).
+
+    The €10k paper pool is shared across all three models — a CORE position
+    consumes the same capital as a DIP position and reduces what's available
+    for the next signal, regardless of strategy.
+    """
+    if trades is None:
+        trades = _load()
+    return sum(
+        t.get("amount_eur", 0)
+        for t in trades
+        if t.get("status") == "OPEN" and t.get("trade_type") in ("DIP", "MOMENTUM", "CORE")
+    )
+
+
+def get_paper_available(trades: Optional[list] = None) -> float:
+    """Capital available to open new positions (portfolio value minus allocated)."""
+    if trades is None:
+        trades = _load()
+    return max(0.0, get_paper_portfolio_value(trades) - get_paper_allocated(trades))
+
+
+def get_missed_trades_stats(trades: Optional[list] = None) -> dict:
+    """Stats on signals missed due to capital constraints (status=MISSED_CAPITAL).
+
+    Returns counts and total requested EUR to show the cost of being fully deployed.
+    Useful for ML feedback: high missed_alpha_est = strategy should be less aggressive.
+    """
+    if trades is None:
+        trades = _load()
+    missed = [t for t in trades if t.get("status") == "MISSED_CAPITAL"]
+    if not missed:
+        return {"n_missed": 0, "total_requested_eur": 0.0, "avg_ml_prob": None}
+    total_req  = sum(t.get("requested_eur", 0) for t in missed)
+    probs      = [t["ml_win_prob"] for t in missed if t.get("ml_win_prob") is not None]
+    m_probs    = [t["ml_score_ensemble"] for t in missed if t.get("ml_score_ensemble") is not None]
+    all_probs  = probs + m_probs
+    avg_prob   = round(sum(all_probs) / len(all_probs), 3) if all_probs else None
+    resolved   = [t for t in missed if t.get("actual_return_90d") is not None]
+    avg_missed_alpha = (
+        round(sum(t.get("actual_alpha_90d", 0) for t in resolved) / len(resolved), 2)
+        if resolved else None
+    )
+    return {
+        "n_missed":            len(missed),
+        "n_resolved":          len(resolved),
+        "total_requested_eur": round(total_req, 2),
+        "avg_ml_prob":         avg_prob,
+        "avg_missed_alpha":    avg_missed_alpha,   # mean alpha we left on the table
+        "by_model": {
+            "dip_us":      sum(1 for t in missed if t.get("model_id") == "dip_us"),
+            "momentum_us": sum(1 for t in missed if t.get("model_id") == "momentum_us"),
+        },
+    }
+
+
+def update_missed_trade_outcomes(horizon_days: int = 90) -> dict:
+    """Resolve actual forward returns for MISSED_CAPITAL trades after horizon_days.
+
+    For each unresolved missed trade older than horizon_days, fetches:
+      - actual_return_90d   — what the stock did in the next 90 days
+      - spy_return_90d      — what SPY did in the same window
+      - actual_alpha_90d    — actual_return_90d - spy_return_90d
+
+    This data lets the model learn: "when I was capital-constrained and skipped
+    a high-probability signal, how much alpha did I actually leave on the table?"
+    Over many cycles, patterns emerge — e.g. high VIX + high win_prob missed trades
+    during crowded portfolios tend to have above-average alpha.
+
+    Returns {"resolved": N, "skipped": N, "errors": N}.
+    """
+    trades  = _load()
+    today   = date.today()
+    cutoff  = today - timedelta(days=horizon_days)
+
+    resolved_count = 0
+    skipped_count  = 0
+    error_count    = 0
+    changed        = False
+
+    for t in trades:
+        if t.get("status") != "MISSED_CAPITAL":
+            continue
+        if t.get("actual_return_90d") is not None:
+            skipped_count += 1
+            continue  # already resolved
+
+        signal_date_str = t.get("signal_date", "")
+        if not signal_date_str:
+            skipped_count += 1
+            continue
+
+        signal_date = date.fromisoformat(signal_date_str)
+        if signal_date > cutoff:
+            skipped_count += 1
+            continue  # too recent — 90-day window not elapsed
+
+        target_date = signal_date + timedelta(days=horizon_days)
+        signal_price = float(t.get("signal_price") or 0)
+        ticker = t.get("ticker", "")
+
+        if not ticker or signal_price <= 0:
+            skipped_count += 1
+            continue
+
+        try:
+            close_90d = _fetch_close(ticker, target_date)
+            if close_90d is None:
+                error_count += 1
+                continue
+
+            ret_pct = round((close_90d / signal_price - 1) * 100, 3)
+            spy_ret = _fetch_spy_return(signal_date, target_date)
+            alpha   = round(ret_pct - (spy_ret or 0), 3) if spy_ret is not None else None
+
+            t["actual_return_90d"] = ret_pct
+            t["spy_return_90d"]    = spy_ret
+            t["actual_alpha_90d"]  = alpha
+            t["resolved_date"]     = today.isoformat()
+            changed = True
+            resolved_count += 1
+            log.info(
+                f"[missed] Resolved {ticker} (missed {signal_date_str}): "
+                f"ret={ret_pct:+.1f}% alpha={alpha:+.1f}pp"
+                if alpha is not None else
+                f"[missed] Resolved {ticker}: ret={ret_pct:+.1f}%"
+            )
+        except Exception as exc:
+            log.debug(f"[missed] Error resolving {ticker}: {exc}")
+            error_count += 1
+
+    if changed:
+        _save(trades)
+
+    return {
+        "resolved": resolved_count,
+        "skipped":  skipped_count,
+        "errors":   error_count,
+    }
 
 
 def get_open_trade(ticker: str) -> Optional[dict]:
@@ -240,40 +410,60 @@ def record_paper_buy(
     score_v2:    float = 0.0,
     ml_win_prob: float = 0.0,
     usd_eur:     float = _USD_EUR_DEFAULT,
+    model_id:    str   = "dip_us",
+    sector:      str   = "",
 ) -> str:
-    """Regista uma nova posição simulada quando o bot gera um alerta COMPRAR.
+    """Record a simulated DIP position when the bot fires a BUY alert.
 
-    Respeita o orçamento mensal (MONTHLY_BUDGET_EUR) exactamente como o
-    utilizador real: no início de cada mês renova o capital disponível,
-    e não abre posições quando o orçamento do mês está esgotado.
+    Every signal is always recorded — no budget exhaustion guard.
+    Positions are expressed as weight_pct = amount_eur / PAPER_PORTFOLIO_EUR * 100,
+    treating the portfolio as a hypothetical €10k (configurable via PAPER_PORTFOLIO_EUR env var).
 
-    Retorna o ID da posição criada, ou "" se não houver budget disponível.
+    Returns the trade ID, or "" if the ticker already has an open DIP position.
     """
-    if open_price <= 0 or amount_eur <= 0:
+    if open_price <= 0:
         return ""
 
-    # Dedup: não abrir segundo trade para o mesmo ticker
+    # Dedup: don't open a second DIP on the same ticker
     if get_open_trade(ticker):
-        log.info(f"[paper] SKIP {ticker} — posição já aberta")
+        log.info(f"[paper] SKIP {ticker} — position already open")
         return ""
 
-    # Verificar orçamento mensal disponível
-    monthly_budget = _get_monthly_budget()
-    capital_used   = _capital_used_this_month()
-    remaining      = monthly_budget - capital_used
+    # Rotating pool: clamp to whatever is actually available (no per-position % cap)
+    trades     = _load()
+    port_value = get_paper_portfolio_value(trades)
+    available  = get_paper_available(trades)
+    requested  = float(amount_eur)
+    amount_eur = min(requested, available)
 
-    if remaining <= 20:  # mínimo de €20 para abrir posição
+    if amount_eur < MIN_POSITION_EUR:
+        # Signal fired but capital is tied up — record as MISSED so ML can learn
+        missed = {
+            "id":               str(uuid.uuid4())[:8],
+            "ticker":           ticker.upper(),
+            "trade_type":       "DIP",
+            "status":           "MISSED_CAPITAL",
+            "signal_date":      date.today().isoformat(),
+            "signal_price":     round(open_price, 4),
+            "requested_eur":    round(requested, 2),
+            "available_eur":    round(available, 2),
+            "portfolio_value":  round(port_value, 2),
+            "score_v2":         round(score_v2, 2),
+            "ml_win_prob":      round(ml_win_prob, 3),
+            "model_id":         model_id,
+            "sector":           sector,
+        }
+        trades.append(missed)
+        _save(trades)
         log.info(
-            f"[paper] SKIP {ticker} — orçamento mensal esgotado "
-            f"(usado €{capital_used:.0f}/{monthly_budget:.0f})"
+            f"[paper] MISSED {ticker} — available €{available:.0f} < €{MIN_POSITION_EUR:.0f} "
+            f"(requested €{requested:.0f}, portfolio €{port_value:.0f})"
         )
         return ""
 
-    # Ajustar amount ao capital disponível
-    amount_eur = min(amount_eur, remaining)
-
-    trade_id = str(uuid.uuid4())[:8]
-    shares   = amount_eur / max(open_price * usd_eur, 0.01)
+    trade_id   = str(uuid.uuid4())[:8]
+    shares     = amount_eur / max(open_price * usd_eur, 0.01)
+    weight_pct = round(amount_eur / max(port_value, 1.0) * 100, 2)
 
     trade = {
         "id":            trade_id,
@@ -282,6 +472,7 @@ def record_paper_buy(
         "open_date":     date.today().isoformat(),
         "open_price":    round(open_price, 4),
         "amount_eur":    round(amount_eur, 2),
+        "weight_pct":    weight_pct,
         "shares":        round(shares, 6),
         "sell_target":   round(sell_target, 4),
         "hold_days":     hold_days,
@@ -293,21 +484,19 @@ def record_paper_buy(
         "alpha_pct":     None,
         "score_v2":      round(score_v2, 2),
         "ml_win_prob":   round(ml_win_prob, 3),
-        # Trailing stop largo desde a entrada — protege contra perdas catastroficas.
-        # 22% dá espaço para recuperação típica de dip sem fechar prematuramente.
-        "trailing_high":     round(open_price, 4),
-        "trailing_stop_pct": 0.22,
-        # Contexto de orçamento
-        "budget_used_at_open": round(capital_used + amount_eur, 2),
-        "budget_total":        round(monthly_budget, 2),
+        "model_id":      model_id,
+        "sector":        sector,
+        "trailing_high":           round(open_price, 4),
+        "trailing_stop_pct":       0.22,
+        "portfolio_value_at_open": round(port_value, 2),
+        "available_at_open":       round(available, 2),
     }
-    trades = _load()
     trades.append(trade)
     _save(trades)
     log.info(
-        f"[paper] OPEN {ticker} €{amount_eur:.0f} @ {open_price:.2f} "
-        f"target={sell_target:.2f} hold={hold_days}d score={score_v2:.0f} "
-        f"(budget {capital_used+amount_eur:.0f}/{monthly_budget:.0f})"
+        f"[paper] OPEN {ticker} €{amount_eur:.0f} ({weight_pct:.1f}% of €{port_value:.0f}) "
+        f"@ {open_price:.2f} target={sell_target:.2f} hold={hold_days}d score={score_v2:.0f} "
+        f"[available €{available:.0f} → €{available - amount_eur:.0f}]"
     )
     return trade_id
 
@@ -458,23 +647,29 @@ def get_monthly_performance(months_back: int = 3) -> dict:
     ]
     early_exits = sum(1 for t in closed if t.get("status") == "CLOSED_EARLY_ALPHA")
 
-    monthly_bgt = _get_monthly_budget()
     if not closed:
-        open_count = sum(1 for t in trades if t.get("status") == "OPEN")
+        open_count  = sum(1 for t in trades if t.get("status") == "OPEN")
+        port_value  = get_paper_portfolio_value(trades)
+        allocated   = get_paper_allocated(trades)
+        available   = get_paper_available(trades)
         return {
-            "n_closed":       0,
-            "n_open":         open_count,
-            "n_early_exits":  0,
-            "total_return":   0.0,
-            "spy_return":     0.0,
-            "alpha":          0.0,
-            "win_rate":       0.0,
-            "total_capital":  0.0,
-            "monthly_budget": monthly_bgt,
-            "best":           None,
-            "worst":          None,
-            "monthly":        {},
-            "months_back":    months_back,
+            "n_closed":             0,
+            "n_open":               open_count,
+            "n_early_exits":        0,
+            "total_return":         0.0,
+            "spy_return":           0.0,
+            "alpha":                0.0,
+            "win_rate":             0.0,
+            "total_capital":        0.0,
+            "portfolio_start":      round(PAPER_PORTFOLIO_EUR, 2),
+            "portfolio_value":      round(port_value, 2),
+            "portfolio_return_pct": 0.0,
+            "allocated_eur":        round(allocated, 2),
+            "available_eur":        round(available, 2),
+            "best":                 None,
+            "worst":                None,
+            "monthly":              {},
+            "months_back":          months_back,
         }
 
     # Métricas totais
@@ -515,24 +710,32 @@ def get_monthly_performance(months_back: int = 3) -> dict:
         m["ret"]   = round(m["ret"], 2)
         m["spy"]   = round(m["spy"], 2)
 
-    open_count    = sum(1 for t in trades if t.get("status") == "OPEN")
-    total_capital = sum(t.get("amount_eur", 0) for t in closed)
-    monthly_bgt   = _get_monthly_budget()
+    open_count       = sum(1 for t in trades if t.get("status") == "OPEN")
+    total_capital    = sum(t.get("amount_eur", 0) for t in closed)
+    port_value       = get_paper_portfolio_value(trades)
+    allocated        = get_paper_allocated(trades)
+    available        = get_paper_available(trades)
+    port_return_pct  = round((port_value - PAPER_PORTFOLIO_EUR) / max(PAPER_PORTFOLIO_EUR, 1) * 100, 2)
 
     return {
-        "n_closed":       len(closed),
-        "n_open":         open_count,
-        "n_early_exits":  early_exits,
-        "total_return":   round(weighted_ret, 2),
-        "spy_return":     round(weighted_spy, 2),
-        "alpha":          round(avg_alpha, 2),
-        "win_rate":       round(win_rate, 3),
-        "total_capital":  round(total_capital, 2),
-        "monthly_budget": monthly_bgt,
-        "best":           {"ticker": best["ticker"], "ret": best["return_pct"], "date": best["close_date"]},
-        "worst":          {"ticker": worst["ticker"], "ret": worst["return_pct"], "date": worst["close_date"]},
-        "monthly":        dict(sorted(monthly.items())),
-        "months_back":    months_back,
+        "n_closed":             len(closed),
+        "n_open":               open_count,
+        "n_early_exits":        early_exits,
+        "total_return":         round(weighted_ret, 2),
+        "spy_return":           round(weighted_spy, 2),
+        "alpha":                round(avg_alpha, 2),
+        "win_rate":             round(win_rate, 3),
+        "total_capital":        round(total_capital, 2),
+        # Rotating portfolio stats
+        "portfolio_start":      round(PAPER_PORTFOLIO_EUR, 2),
+        "portfolio_value":      round(port_value, 2),
+        "portfolio_return_pct": port_return_pct,
+        "allocated_eur":        round(allocated, 2),
+        "available_eur":        round(available, 2),
+        "best":                 {"ticker": best["ticker"], "ret": best["return_pct"], "date": best["close_date"]},
+        "worst":                {"ticker": worst["ticker"], "ret": worst["return_pct"], "date": worst["close_date"]},
+        "monthly":              dict(sorted(monthly.items())),
+        "months_back":          months_back,
     }
 
 
@@ -591,13 +794,18 @@ def format_monthly_trade_list(months_back: int = 3) -> str:
 
 
 def format_performance_report(perf: dict) -> str:
-    """Formata o relatório de paper trading para Telegram."""
+    """Format the paper trading performance report for Telegram."""
+    port_val  = perf.get("portfolio_value", PAPER_PORTFOLIO_EUR)
+    port_ret  = perf.get("portfolio_return_pct", 0.0)
+    allocated = perf.get("allocated_eur", 0.0)
+    available = perf.get("available_eur", PAPER_PORTFOLIO_EUR)
+
     if perf["n_closed"] == 0:
         n_open = perf.get("n_open", 0)
         return (
-            f"Paper trading activo — {n_open} posicoes abertas.\n"
-            f"Ainda sem posicoes fechadas para calcular performance.\n"
-            f"O bot abre posicoes automaticamente a cada alerta COMPRAR."
+            f"Paper portfolio active — {n_open} open positions.\n"
+            f"Portfolio: EUR{port_val:.0f} | Available: EUR{available:.0f}\n"
+            f"No closed positions yet — performance will appear after first exit."
         )
 
     months = perf.get("months_back", 3)
@@ -605,35 +813,34 @@ def format_performance_report(perf: dict) -> str:
     spy    = perf["spy_return"]
     alpha  = perf["alpha"]
     wr     = perf["win_rate"]
-    bgt    = perf.get("monthly_budget", 1050)
     early  = perf.get("n_early_exits", 0)
     n_open = perf.get("n_open", 0)
 
-    alpha_verdict = "BATE O MERCADO" if alpha > 0 else "ABAIXO DO MERCADO"
+    alpha_verdict = "BEATS MARKET" if alpha > 0 else "BELOW MARKET"
     lines = [
-        f"Se seguisses as indicacoes do bot a risca nos ultimos {months} meses:",
-        f"(orcamento simulado: EUR{bgt:.0f}/mes | {perf['n_closed']} trades fechados)",
+        f"Paper portfolio — rotating EUR{PAPER_PORTFOLIO_EUR:.0f} fund, last {months} months:",
+        f"Portfolio value: EUR{port_val:.0f} ({port_ret:+.1f}% total) | "
+        f"Allocated: EUR{allocated:.0f} | Available: EUR{available:.0f}",
         "",
-        f"Retorno do bot: {ret:+.1f}%",
-        f"SPY no mesmo periodo: {spy:+.1f}%",
-        f"Alpha gerado: {alpha:+.1f}pp  [{alpha_verdict}]",
-        f"Win rate: {wr:.0%}  ({int(perf['n_closed']*wr)}/{perf['n_closed']} positivos)",
+        f"{perf['n_closed']} closed trades:",
+        f"  Return: {ret:+.1f}% | SPY: {spy:+.1f}% | Alpha: {alpha:+.1f}pp  [{alpha_verdict}]",
+        f"  Win rate: {wr:.0%}  ({int(perf['n_closed']*wr)}/{perf['n_closed']} positive)",
     ]
     if early > 0:
-        lines.append(f"Saidas antecipadas (Early Alpha): {early} trades")
+        lines.append(f"  Early exits: {early} trades")
     lines.append("")
 
     if perf.get("best"):
         b = perf["best"]
-        lines.append(f"Melhor: {b['ticker']} {b['ret']:+.1f}% ({b['date']})")
+        lines.append(f"Best: {b['ticker']} {b['ret']:+.1f}% ({b['date']})")
     if perf.get("worst"):
         w = perf["worst"]
-        lines.append(f"Pior: {w['ticker']} {w['ret']:+.1f}% ({w['date']})")
+        lines.append(f"Worst: {w['ticker']} {w['ret']:+.1f}% ({w['date']})")
 
     monthly = perf.get("monthly", {})
     if monthly:
         lines.append("")
-        lines.append("Por mes:")
+        lines.append("By month:")
         for month, m in sorted(monthly.items())[-6:]:
             sign = "+" if m["alpha"] >= 0 else ""
             lines.append(
@@ -641,9 +848,8 @@ def format_performance_report(perf: dict) -> str:
                 f"(alpha {sign}{m['alpha']:.1f}pp) | {m['n']} trades"
             )
 
-    n_open = perf.get("n_open", 0)
     if n_open:
-        lines.append(f"\n{n_open} posicoes ainda abertas a aguardar fecho.")
+        lines.append(f"\n{n_open} positions still open.")
 
     return "\n".join(lines)
 
@@ -701,35 +907,61 @@ def record_momentum_paper_buy(
     ml_score_ensemble: float = 0.0,
     ml_durability:     str   = "MODERADO",
     usd_eur:           float = _USD_EUR_DEFAULT,
+    model_id:          str   = "momentum_us",
+    sector:            str   = "",
 ) -> str:
     """Regista posição simulada de momentum quando o scanner gera alerta.
 
     A saída é por trailing stop adaptado à durabilidade (DURÁVEL=-15%,
     MODERADO=-12%, TÁCTICO=-8%), não por target fixo.
     """
-    if open_price <= 0 or amount_eur <= 0:
+    if open_price <= 0:
         return ""
 
-    # Dedup: não abrir MOMENTUM em cima de MOMENTUM já aberto.
-    # Permitido: MOMENTUM em cima de DIP (posições independentes, saem separadamente).
+    # Dedup: don't open MOMENTUM on top of an existing MOMENTUM position.
+    # DIP + MOMENTUM on same ticker is allowed (independent positions, exit separately).
     if has_open_momentum(ticker):
-        log.info(f"[paper_m] SKIP {ticker} — MOMENTUM já aberto")
+        log.info(f"[paper_m] SKIP {ticker} — MOMENTUM already open")
         return ""
 
-    monthly_budget = _get_monthly_budget()
-    capital_used   = _capital_used_this_month()
-    remaining      = monthly_budget - capital_used
+    # Rotating pool: clamp to available capital (no per-position % cap)
+    trades     = _load()
+    port_value = get_paper_portfolio_value(trades)
+    available  = get_paper_available(trades)
+    requested  = float(amount_eur)
+    amount_eur = min(requested, available)
 
-    if remaining <= 20:
-        log.info(f"[paper_m] SKIP {ticker} — orçamento esgotado (usado €{capital_used:.0f}/{monthly_budget:.0f})")
+    if amount_eur < MIN_POSITION_EUR:
+        missed = {
+            "id":               str(uuid.uuid4())[:8],
+            "ticker":           ticker.upper(),
+            "trade_type":       "MOMENTUM",
+            "status":           "MISSED_CAPITAL",
+            "signal_date":      date.today().isoformat(),
+            "signal_price":     round(open_price, 4),
+            "requested_eur":    round(requested, 2),
+            "available_eur":    round(available, 2),
+            "portfolio_value":  round(port_value, 2),
+            "momentum_score":   round(momentum_score, 1),
+            "ml_score_ensemble": round(ml_score_ensemble, 4),
+            "ml_durability":    ml_durability,
+            "model_id":         model_id,
+            "sector":           sector,
+        }
+        trades.append(missed)
+        _save(trades)
+        log.info(
+            f"[paper_m] MISSED {ticker} — available €{available:.0f} < €{MIN_POSITION_EUR:.0f} "
+            f"(requested €{requested:.0f}, portfolio €{port_value:.0f})"
+        )
         return ""
 
-    amount_eur      = min(amount_eur, remaining)
-    trade_id        = str(uuid.uuid4())[:8]
-    shares          = amount_eur / max(open_price * usd_eur, 0.01)
-    trailing_stop   = _trailing_stop_for_durability(ml_durability)
-    hold_days       = _hold_days_for_durability(ml_durability)
-    today_iso       = date.today().isoformat()
+    trade_id      = str(uuid.uuid4())[:8]
+    shares        = amount_eur / max(open_price * usd_eur, 0.01)
+    trailing_stop = _trailing_stop_for_durability(ml_durability)
+    hold_days     = _hold_days_for_durability(ml_durability)
+    today_iso     = date.today().isoformat()
+    weight_pct    = round(amount_eur / max(port_value, 1.0) * 100, 2)
 
     trade = {
         "id":                  trade_id,
@@ -738,6 +970,7 @@ def record_momentum_paper_buy(
         "open_date":           today_iso,
         "open_price":          round(open_price, 4),
         "amount_eur":          round(amount_eur, 2),
+        "weight_pct":          weight_pct,
         "shares":              round(shares, 6),
         "sell_target":         0.0,
         "trailing_high":       round(open_price, 4),
@@ -750,14 +983,12 @@ def record_momentum_paper_buy(
         "spy_return_pct":      None,
         "alpha_pct":           None,
         "momentum_score":      round(momentum_score, 1),
-        # ML multi-horizonte (snapshot na abertura)
         "ml_score_l1":         round(ml_score_l1, 4),
         "ml_score_l2":         round(ml_score_l2, 4),
         "ml_score_l3":         round(ml_score_l3, 4),
         "ml_score_ensemble":   round(ml_score_ensemble, 4),
         "ml_durability_open":  ml_durability,
         "ml_durability_cur":   ml_durability,
-        # Histórico de deriva de durabilidade: [{date, durability, l1, l2, l3}]
         "durability_history":  [{
             "date":       today_iso,
             "durability": ml_durability,
@@ -765,15 +996,18 @@ def record_momentum_paper_buy(
             "l2":         round(ml_score_l2, 4),
             "l3":         round(ml_score_l3, 4),
         }],
-        "budget_used_at_open": round(capital_used + amount_eur, 2),
-        "budget_total":        round(monthly_budget, 2),
+        "model_id":            model_id,
+        "sector":              sector,
+        "portfolio_value_at_open": round(port_value, 2),
+        "available_at_open":       round(available, 2),
     }
-    trades = _load()
     trades.append(trade)
     _save(trades)
     log.info(
-        f"[paper_m] OPEN {ticker} MOMENTUM €{amount_eur:.0f} @ {open_price:.2f} "
-        f"score={momentum_score:.0f} dur={ml_durability} stop={trailing_stop:.0%} hold={hold_days}d"
+        f"[paper_m] OPEN {ticker} MOMENTUM €{amount_eur:.0f} ({weight_pct:.1f}% of €{port_value:.0f}) "
+        f"@ {open_price:.2f} score={momentum_score:.0f} dur={ml_durability} "
+        f"stop={trailing_stop:.0%} hold={hold_days}d "
+        f"[available €{available:.0f} → €{available - amount_eur:.0f}]"
     )
     return trade_id
 
@@ -1022,18 +1256,53 @@ def record_core_holding(
     annual_yield_pct: float = 0.0,
     note:             str   = "",
     usd_eur:          float = _USD_EUR_DEFAULT,
+    model_id:         str   = "core_us",
+    sector:           str   = "",
 ) -> str:
-    """Regista uma posição CORE (hold de longo prazo sem gestão automática).
+    """Record a CORE long-term holding position.
 
-    Nunca é fechada pelo scheduler. Aparece separada dos trades táticos.
-    annual_yield_pct: yield anual esperado (dividendos), ex: 5.0 para NVO.
+    CORE positions share the same €10k paper pool as DIP and MOMENTUM — opening
+    a CORE position reduces the capital available for tactical signals and vice versa.
+    annual_yield_pct: expected annual dividend yield (%), e.g. 5.0 for NVO.
     """
     if open_price <= 0 or amount_eur <= 0:
         return ""
 
-    trade_id  = str(uuid.uuid4())[:8]
-    shares    = amount_eur / max(open_price * usd_eur, 0.01)
-    today_iso = date.today().isoformat()
+    # Rotating pool: shared across all models
+    trades     = _load()
+    port_value = get_paper_portfolio_value(trades)
+    available  = get_paper_available(trades)
+    requested  = float(amount_eur)
+    amount_eur = min(requested, available)
+
+    if amount_eur < MIN_POSITION_EUR:
+        missed = {
+            "id":               str(uuid.uuid4())[:8],
+            "ticker":           ticker.upper(),
+            "trade_type":       "CORE",
+            "status":           "MISSED_CAPITAL",
+            "signal_date":      date.today().isoformat(),
+            "signal_price":     round(open_price, 4),
+            "requested_eur":    round(requested, 2),
+            "available_eur":    round(available, 2),
+            "portfolio_value":  round(port_value, 2),
+            "model_id":         model_id,
+            "sector":           sector,
+            "note":             note,
+        }
+        trades.append(missed)
+        _save(trades)
+        log.info(
+            f"[core] MISSED {ticker.upper()} — available €{available:.0f} < €{MIN_POSITION_EUR:.0f} "
+            f"(requested €{requested:.0f}, portfolio €{port_value:.0f})"
+        )
+        return ""
+
+    trade_id   = str(uuid.uuid4())[:8]
+    shares     = amount_eur / max(open_price * usd_eur, 0.01)
+    today_iso  = date.today().isoformat()
+    weight_pct = round(amount_eur / max(port_value, 1.0) * 100, 2)
+    weight_pct = round(amount_eur / max(PAPER_PORTFOLIO_EUR, 1.0) * 100, 2)
 
     trade = {
         "id":               trade_id,
@@ -1042,26 +1311,34 @@ def record_core_holding(
         "open_date":        today_iso,
         "open_price":       round(open_price, 4),
         "amount_eur":       round(amount_eur, 2),
+        "weight_pct":       weight_pct,
         "shares":           round(shares, 6),
         "annual_yield_pct": round(annual_yield_pct, 2),
         "note":             note,
+        "model_id":         model_id,
+        "sector":           sector,
         "status":           "OPEN",
         "close_date":       None,
         "close_price":      None,
         "return_pct":       None,
         "spy_return_pct":   None,
         "alpha_pct":        None,
-        # Não há trailing stop nem hold_days — gestão manual
-        "sell_target":      0.0,
-        "hold_days":        0,
+        "sell_target":             0.0,
+        "hold_days":               0,
+        "portfolio_value_at_open": round(port_value, 2),
+        "available_at_open":       round(available, 2),
+        # Dividend reinvestment tracking (DRIP — gross, pre-tax)
+        "dividends_reinvested_eur": 0.0,   # cumulative gross dividends reinvested
+        "last_dividend_check":      today_iso,
+        "dividend_history":         [],    # [{date, per_share, shares_added, price, gross_eur}]
     }
-    trades = _load()
-    # Permitir várias compras CORE do mesmo ticker (dollar-cost averaging)
+    # `trades` was already loaded by the pool check above — reuse it
     trades.append(trade)
     _save(trades)
     log.info(
-        f"[core] OPEN {ticker.upper()} €{amount_eur:.0f} @ {open_price:.2f} "
-        f"yield={annual_yield_pct:.1f}% note={note!r}"
+        f"[core] OPEN {ticker.upper()} €{amount_eur:.0f} ({weight_pct:.1f}% of €{port_value:.0f}) "
+        f"@ {open_price:.2f} yield={annual_yield_pct:.1f}% "
+        f"[available €{available:.0f} → €{available - amount_eur:.0f}]"
     )
     return trade_id
 
@@ -1095,6 +1372,142 @@ def close_core_holding(ticker: str, close_price: float) -> bool:
     return changed
 
 
+_TAX_DISCLAIMER = (
+    "GROSS dividends reinvested (pre-tax). "
+    "No withholding tax deducted — actual after-tax returns will be lower. "
+    "PT residents: dividends taxed at 28% IRS + possible foreign withholding (e.g. 15% US, 15% DK). "
+    "Tax is owed but not modelled here."
+)
+
+
+def _fetch_dividends_since(ticker: str, since_date: date) -> list[dict]:
+    """Return list of {date, per_share} dividend events since since_date (exclusive)."""
+    try:
+        import yfinance as yf
+        import pandas as pd
+        hist = yf.Ticker(ticker).dividends
+        if hist is None or hist.empty:
+            return []
+        if hist.index.tz is not None:
+            hist.index = hist.index.tz_convert(None)
+        # Keep only dividends after since_date
+        since_ts = pd.Timestamp(since_date)
+        recent   = hist[hist.index > since_ts]
+        return [
+            {"date": str(idx.date()), "per_share": round(float(val), 6)}
+            for idx, val in recent.items()
+            if float(val) > 0
+        ]
+    except Exception as e:
+        log.debug(f"[core_drip] dividend fetch {ticker}: {e}")
+        return []
+
+
+def update_core_dividends(usd_eur: float = _USD_EUR_DEFAULT) -> dict:
+    """Reinvest dividends for all open CORE positions (DRIP — gross, pre-tax).
+
+    For each CORE position, fetches actual ex-dividend events since the last
+    check date and buys additional shares at the closing price of that day.
+    Shares accumulate in the position — no cash leaves the portfolio.
+
+    IMPORTANT: dividends are reinvested GROSS (before any tax).
+    See _TAX_DISCLAIMER for the tax caveat.
+
+    Returns: {"processed": N, "events": N, "total_reinvested_eur": X, "errors": N}
+    """
+    trades   = _load()
+    today    = date.today()
+    changed  = False
+    total_events       = 0
+    total_reinvested   = 0.0
+    processed_tickers  = 0
+    errors             = 0
+
+    for t in trades:
+        if t.get("trade_type") != "CORE" or t.get("status") != "OPEN":
+            continue
+
+        ticker     = t["ticker"]
+        shares     = float(t.get("shares", 0))
+        last_check = date.fromisoformat(t.get("last_dividend_check") or t.get("open_date", "2000-01-01"))
+
+        if shares <= 0:
+            continue
+
+        try:
+            events = _fetch_dividends_since(ticker, last_check)
+        except Exception as e:
+            log.warning(f"[core_drip] {ticker} fetch error: {e}")
+            errors += 1
+            continue
+
+        processed_tickers += 1
+
+        for ev in events:
+            ex_date    = date.fromisoformat(ev["date"])
+            per_share  = float(ev["per_share"])
+            gross_usd  = shares * per_share
+            gross_eur  = round(gross_usd * usd_eur, 4)
+
+            if gross_eur < 0.01:
+                continue  # negligible
+
+            # Fetch closing price on the ex-date to compute reinvestment price
+            reinvest_price_usd = _fetch_close(ticker, ex_date)
+            if reinvest_price_usd is None or reinvest_price_usd <= 0:
+                log.debug(f"[core_drip] {ticker} no price on {ex_date} — skipping dividend")
+                continue
+
+            reinvest_price_eur = reinvest_price_usd * usd_eur
+            new_shares = round(gross_eur / reinvest_price_eur, 6)
+
+            # Reinvest: add shares to position
+            t["shares"]                    = round(shares + new_shares, 6)
+            t["dividends_reinvested_eur"]  = round(
+                float(t.get("dividends_reinvested_eur", 0)) + gross_eur, 4
+            )
+            shares += new_shares  # update local var for next event in same loop
+
+            history_entry = {
+                "date":        ev["date"],
+                "per_share":   per_share,
+                "shares_before": round(shares - new_shares, 6),
+                "shares_added":  new_shares,
+                "reinvest_price_usd": round(reinvest_price_usd, 4),
+                "gross_eur":   gross_eur,
+                "tax_note":    "gross — no tax deducted",
+            }
+            if "dividend_history" not in t or not isinstance(t["dividend_history"], list):
+                t["dividend_history"] = []
+            t["dividend_history"].append(history_entry)
+
+            total_events      += 1
+            total_reinvested  += gross_eur
+            changed            = True
+            log.info(
+                f"[core_drip] {ticker} DRIP {ev['date']}: "
+                f"{per_share:.4f}/share × {shares - new_shares:.4f}sh "
+                f"= €{gross_eur:.2f} → +{new_shares:.4f} shares @ {reinvest_price_usd:.2f}. "
+                f"[{_TAX_DISCLAIMER[:60]}...]"
+            )
+
+        # Update last_dividend_check regardless (even if no events — avoids re-fetching old history)
+        if str(today) != t.get("last_dividend_check"):
+            t["last_dividend_check"] = today.isoformat()
+            changed = True
+
+    if changed:
+        _save(trades)
+
+    return {
+        "processed":            processed_tickers,
+        "events":               total_events,
+        "total_reinvested_eur": round(total_reinvested, 2),
+        "errors":               errors,
+        "tax_disclaimer":       _TAX_DISCLAIMER,
+    }
+
+
 def get_core_holdings_summary() -> list[dict]:
     """Devolve todas as posições CORE abertas com P&L e yield acumulado."""
     trades = _load()
@@ -1119,36 +1532,256 @@ def get_core_holdings_summary() -> list[dict]:
         ret_pct    = round((current_price / open_price - 1) * 100, 3)
         unrealized = round(amount_eur * ret_pct / 100, 2)
 
-        # Yield income acumulado (pro-rata pelos dias detidos)
+        # Actual reinvested dividends (from DRIP history — more accurate than estimated yield)
+        drip_eur    = float(t.get("dividends_reinvested_eur", 0.0))
+        drip_events = len(t.get("dividend_history", []))
+        shares_now  = float(t.get("shares", 0))
+
+        # Estimated yield income for display (pro-rata, for positions without DRIP data yet)
         annual_yield = float(t.get("annual_yield_pct") or 0.0)
-        yield_income = round(amount_eur * (annual_yield / 100) * (days_held / 365), 2)
+        yield_income_est = round(amount_eur * (annual_yield / 100) * (days_held / 365), 2)
+        # Prefer actual DRIP amount if available; fall back to estimate
+        yield_income = drip_eur if drip_eur > 0 else yield_income_est
 
-        # Total return incluindo yield
-        total_return_pct = round(ret_pct + annual_yield * (days_held / 365), 3)
+        # Total return: price P&L + actual dividend income
+        # Dividends already reinvested → reflected in shares_now > shares_original
+        # We express total return as (current_value - original_investment) / original_investment
+        original_shares = float(amount_eur) / max(open_price, 0.01)  # approximate (ignores usd_eur drift)
+        current_value_eur = shares_now * current_price  # in USD, approximate
+        drip_adjusted_ret_pct = round(
+            (current_value_eur / max(amount_eur / (current_price / open_price if open_price else 1), 0.01) - 1) * 100, 3
+        ) if shares_now > 0 else ret_pct
+        total_return_pct = round(ret_pct + (drip_eur / max(amount_eur, 1)) * 100, 3)
 
-        # SPY no mesmo período
+        # SPY in the same period
         spy_ret = _fetch_spy_return(open_date, today)
 
         result.append({
-            "id":               t["id"],
-            "ticker":           ticker,
-            "open_date":        t["open_date"],
-            "open_price":       open_price,
-            "current_price":    round(current_price, 4),
-            "amount_eur":       amount_eur,
-            "days_held":        days_held,
-            "ret_pct":          ret_pct,
-            "unrealized_eur":   unrealized,
-            "annual_yield_pct": annual_yield,
-            "yield_income_eur": yield_income,
-            "total_return_pct": total_return_pct,
-            "spy_ret_pct":      spy_ret,
-            "alpha_pct":        round(total_return_pct - (spy_ret or 0), 3) if spy_ret is not None else None,
-            "note":             t.get("note", ""),
+            "id":                       t["id"],
+            "ticker":                   ticker,
+            "open_date":                t["open_date"],
+            "open_price":               open_price,
+            "current_price":            round(current_price, 4),
+            "amount_eur":               amount_eur,
+            "shares":                   shares_now,
+            "days_held":                days_held,
+            "ret_pct":                  ret_pct,
+            "unrealized_eur":           unrealized,
+            "annual_yield_pct":         annual_yield,
+            "yield_income_eur":         yield_income,
+            "yield_income_is_actual":   drip_eur > 0,  # True = from real DRIP, False = estimate
+            "drip_events":              drip_events,
+            "dividends_reinvested_eur": drip_eur,
+            "total_return_pct":         total_return_pct,
+            "spy_ret_pct":              spy_ret,
+            "alpha_pct":                round(total_return_pct - (spy_ret or 0), 3) if spy_ret is not None else None,
+            "note":                     t.get("note", ""),
+            "tax_disclaimer":           _TAX_DISCLAIMER,
         })
 
     result.sort(key=lambda x: x["open_date"])
     return result
+
+
+def get_drip_history() -> dict:
+    """Return a full, auditable DRIP ledger for all CORE positions.
+
+    Structure:
+    {
+      "generated":      ISO datetime,
+      "portfolio_start_eur": float,
+      "tax_disclaimer": str,
+      "note_gross":     str,
+      "positions": [
+        {
+          "ticker":         str,
+          "open_date":      str,
+          "amount_eur":     float,
+          "shares_original": float,
+          "shares_current":  float,
+          "shares_added_via_drip": float,
+          "total_reinvested_eur":  float,
+          "drip_events": [
+            {
+              "date":            str,       # ex-dividend date
+              "per_share_usd":   float,     # gross dividend per original share (USD)
+              "shares_held":     float,     # shares held at that date
+              "gross_usd":       float,     # total gross dividend (USD)
+              "gross_eur":       float,     # converted at rate used
+              "reinvest_price_usd": float,  # closing price on that day
+              "new_shares":      float,     # shares purchased with this dividend
+              "tax_note":        str,       # always "gross — no tax deducted"
+            }
+          ],
+          "note": str,
+        }
+      ],
+      "totals": {
+        "total_reinvested_eur": float,
+        "total_drip_events":    int,
+        "total_positions":      int,
+      }
+    }
+    """
+    trades   = _load()
+    today    = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    positions = []
+
+    for t in trades:
+        if t.get("trade_type") != "CORE" or t.get("status") != "OPEN":
+            continue
+
+        raw_history = t.get("dividend_history") or []
+        shares_original = float(t.get("amount_eur", 0)) / max(float(t.get("open_price", 1)), 1e-9)
+        shares_current  = float(t.get("shares", shares_original))
+        drip_eur        = float(t.get("dividends_reinvested_eur", 0.0))
+        shares_added    = round(shares_current - shares_original, 6)
+
+        events_clean = []
+        for ev in raw_history:
+            events_clean.append({
+                "date":               ev.get("date", ""),
+                "per_share_usd":      round(float(ev.get("per_share", ev.get("per_share_usd", 0))), 6),
+                "shares_held":        round(float(ev.get("shares_held", 0)), 4),
+                "gross_usd":          round(float(ev.get("gross_usd", 0)), 4),
+                "gross_eur":          round(float(ev.get("gross_eur", 0)), 4),
+                "reinvest_price_usd": round(float(ev.get("reinvest_price_usd", 0)), 4),
+                "new_shares":         round(float(ev.get("new_shares", ev.get("shares_added", 0))), 6),
+                "tax_note":           "gross — no tax deducted",
+            })
+        events_clean.sort(key=lambda e: e["date"])
+
+        positions.append({
+            "ticker":                t["ticker"],
+            "open_date":             t["open_date"],
+            "amount_eur":            float(t.get("amount_eur", 0)),
+            "shares_original":       round(shares_original, 6),
+            "shares_current":        round(shares_current, 6),
+            "shares_added_via_drip": round(shares_added, 6),
+            "total_reinvested_eur":  round(drip_eur, 4),
+            "drip_events":           events_clean,
+            "note":                  t.get("note", ""),
+        })
+
+    positions.sort(key=lambda p: p["open_date"])
+    total_reinvested = sum(p["total_reinvested_eur"] for p in positions)
+    total_events     = sum(len(p["drip_events"]) for p in positions)
+
+    return {
+        "generated":          today,
+        "portfolio_start_eur": PAPER_PORTFOLIO_EUR,
+        "tax_disclaimer":     _TAX_DISCLAIMER,
+        "note_gross": (
+            "All dividends are recorded and reinvested GROSS (before any withholding tax). "
+            "This ledger is published for transparency — not as tax advice. "
+            "Your actual after-tax return will be lower. See 'tax_disclaimer' field for details."
+        ),
+        "positions": positions,
+        "totals": {
+            "total_reinvested_eur": round(total_reinvested, 4),
+            "total_drip_events":    total_events,
+            "total_positions":      len(positions),
+        },
+    }
+
+
+def format_drip_report_md() -> str:
+    """Generate a human-readable Markdown DRIP ledger for publishing.
+
+    This is the public-facing transparency document — every dividend event,
+    every reinvestment, explicit tax disclaimer.
+    """
+    data     = get_drip_history()
+    today    = data["generated"]
+    positions = data["positions"]
+    totals   = data["totals"]
+
+    lines = [
+        "# DipRadar — CORE DRIP Ledger (Dividend Reinvestment Audit Trail)",
+        "",
+        f"**Generated:** {today}  ",
+        f"**Portfolio base:** €{data['portfolio_start_eur']:,.0f}  ",
+        f"**Total positions:** {totals['total_positions']}  ",
+        f"**Total DRIP events:** {totals['total_drip_events']}  ",
+        f"**Total reinvested (gross):** €{totals['total_reinvested_eur']:,.2f}  ",
+        "",
+        "---",
+        "",
+        "## ⚠️ Tax Disclaimer",
+        "",
+        f"> {data['tax_disclaimer']}",
+        "",
+        f"> {data['note_gross']}",
+        "",
+        "---",
+        "",
+    ]
+
+    if not positions:
+        lines += [
+            "## No CORE positions with dividend history yet.",
+            "",
+            "_DRIP tracking activates automatically once CORE positions receive their first dividend._",
+        ]
+        return "\n".join(lines)
+
+    lines += ["## Position Summary", ""]
+    lines += ["| Ticker | Open Date | Invested (€) | Shares (original) | Shares (current) | Via DRIP | Reinvested (€) | Events |"]
+    lines += ["|--------|-----------|-------------|-------------------|-----------------|----------|----------------|--------|"]
+    for p in positions:
+        lines.append(
+            f"| {p['ticker']} | {p['open_date']} | €{p['amount_eur']:,.2f} "
+            f"| {p['shares_original']:.4f} | {p['shares_current']:.4f} "
+            f"| +{p['shares_added_via_drip']:.4f} | €{p['total_reinvested_eur']:,.4f} "
+            f"| {len(p['drip_events'])} |"
+        )
+
+    lines += ["", "---", ""]
+
+    for p in positions:
+        ticker = p["ticker"]
+        lines += [
+            f"## {ticker} — DRIP Event Log",
+            "",
+            f"- **Position opened:** {p['open_date']}",
+            f"- **Capital deployed:** €{p['amount_eur']:,.2f}",
+            f"- **Original shares:** {p['shares_original']:.4f}",
+            f"- **Current shares:** {p['shares_current']:.4f} "
+            f"(+{p['shares_added_via_drip']:.4f} via DRIP = "
+            f"+{(p['shares_added_via_drip'] / max(p['shares_original'], 1e-9) * 100):.2f}%)",
+            f"- **Total reinvested:** €{p['total_reinvested_eur']:,.4f} (gross, pre-tax)",
+            "",
+        ]
+        if p.get("note"):
+            lines += [f"*Note: {p['note']}*", ""]
+
+        if not p["drip_events"]:
+            lines += ["_No dividend events recorded yet._", "", ""]
+            continue
+
+        lines += [
+            "| Date | Per Share (USD) | Shares Held | Gross (USD) | Gross (EUR) | Reinvest Price | New Shares | Tax Note |",
+            "|------|----------------|-------------|-------------|-------------|----------------|------------|----------|",
+        ]
+        for ev in p["drip_events"]:
+            lines.append(
+                f"| {ev['date']} | ${ev['per_share_usd']:.4f} | {ev['shares_held']:.4f} "
+                f"| ${ev['gross_usd']:.4f} | €{ev['gross_eur']:.4f} "
+                f"| ${ev['reinvest_price_usd']:.2f} | +{ev['new_shares']:.6f} "
+                f"| {ev['tax_note']} |"
+            )
+        lines += [""]
+
+    lines += [
+        "---",
+        "",
+        "_This report is auto-generated by DipRadar. "
+        "All figures are simulated paper-trading — not real money. "
+        "Past performance is not indicative of future results. "
+        "No investment advice is implied._",
+    ]
+
+    return "\n".join(lines)
 
 
 def update_core_positions(send_fn=None) -> dict:
