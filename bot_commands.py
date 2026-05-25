@@ -1446,10 +1446,11 @@ def _handle_admin_disk(parts: list[str]) -> None:
         return sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) if p.exists() else 0
 
     if purge:
-        # Nuclear option: delete everything except alert_db.csv.
-        # Model pickles are also deleted — the overnight rebuild will regenerate them.
-        # This frees 100% of non-essential disk so the rebuild has room.
-        KEEP = {"alert_db.csv"}
+        # Delete all non-essential data to free disk for the overnight rebuild.
+        # NEVER deleted: alert_db.csv (open positions) + backups/ dir (daily ZIPs).
+        # Model pickles ARE deleted — the overnight rebuild retrains all 3.
+        KEEP_FILES = {"alert_db.csv"}
+        KEEP_DIRS  = {"backups"}   # /data/backups/*.zip — daily backups, always preserved
         freed = 0
         deleted_dirs: list[str] = []
         deleted_files: list[str] = []
@@ -1462,7 +1463,7 @@ def _handle_admin_disk(parts: list[str]) -> None:
             shutil.rmtree(str(price_cache_dir), ignore_errors=True)
             deleted_dirs.append(f"price_cache/ ({_human(sz)})")
 
-        # 2. Delete training parquets and snapshot — will be rebuilt
+        # 2. Delete training parquets, model pickles, reports — will be rebuilt
         for name in (
             "ml_training_base.parquet",
             "core_training_base.parquet",
@@ -1470,6 +1471,11 @@ def _handle_admin_disk(parts: list[str]) -> None:
             "ml_momentum_training.parquet",
             "universe_snapshot.parquet",
             "ml_training_input.parquet",
+            "dip_models.pkl",
+            "core_us_model.pkl",
+            "momentum_model.pkl",
+            "momentum_report.json",
+            "ml_report.json",
         ):
             p = data_dir / name
             if p.exists():
@@ -1478,18 +1484,22 @@ def _handle_admin_disk(parts: list[str]) -> None:
                 p.unlink()
                 deleted_files.append(f"{name} ({_human(sz)})")
 
-        # 3. Any other file not in KEEP
+        # 3. Any other top-level file not in KEEP_FILES (directories are skipped)
         for p in data_dir.iterdir():
-            if p.is_file() and p.name not in KEEP and p.suffix in (".parquet", ".json", ".csv", ".tmp"):
-                if p.name not in KEEP:
-                    sz = p.stat().st_size
-                    freed += sz
-                    try:
-                        p.unlink()
-                        deleted_files.append(f"{p.name} ({_human(sz)})")
-                    except Exception:
-                        pass
+            if p.is_dir():
+                continue  # never touch subdirectories (preserves backups/)
+            if p.name in KEEP_FILES:
+                continue
+            if p.suffix in (".parquet", ".json", ".csv", ".tmp", ".pkl"):
+                sz = p.stat().st_size
+                freed += sz
+                try:
+                    p.unlink()
+                    deleted_files.append(f"{p.name} ({_human(sz)})")
+                except Exception:
+                    pass
 
+        backup_count = len(list((data_dir / "backups").glob("*.zip"))) if (data_dir / "backups").exists() else 0
         lines = [
             "<b>Disk purge complete</b>",
             f"Freed: <b>{_human(freed)}</b>",
@@ -1501,7 +1511,8 @@ def _handle_admin_disk(parts: list[str]) -> None:
             lines += ["Files deleted:"] + [f"  • {f}" for f in deleted_files]
         lines += [
             "",
-            "Kept: <code>alert_db.csv</code> only (open positions safe)",
+            f"✅ Kept: <code>alert_db.csv</code> (open positions)",
+            f"✅ Kept: <code>backups/</code> — {backup_count} daily ZIP(s) untouched",
             "Model pickles deleted — overnight will retrain all 3.",
             "",
             "Ready for <code>/admin_overnight</code>",
@@ -1571,18 +1582,21 @@ def _handle_admin_disk(parts: list[str]) -> None:
         p = data_dir / name
         return p.stat().st_size if p.exists() else 0
 
+    backup_dir   = data_dir / "backups"
+    backup_count = len(list(backup_dir.glob("*.zip"))) if backup_dir.exists() else 0
     items = [
-        ("price_cache/ (total)",        _dir_size(data_dir / "price_cache")),
-        ("price_cache/fundamental_cache",_dir_size(data_dir / "price_cache" / "fundamental_cache")),
-        ("price_cache/edgar_*.json",    sum(f.stat().st_size for f in (data_dir / "price_cache").glob("edgar_*.json")) if (data_dir / "price_cache").exists() else 0),
-        ("universe_snapshot.parquet",   _sz("universe_snapshot.parquet")),
-        ("ml_training_base.parquet",    _sz("ml_training_base.parquet")),
-        ("core_training_base.parquet",  _sz("core_training_base.parquet")),
-        ("momentum_training.parquet",   _sz("momentum_training.parquet")),
-        ("dip_models.pkl",              _sz("dip_models.pkl")),
-        ("core_us_model.pkl",           _sz("core_us_model.pkl")),
-        ("momentum_model.pkl",          _sz("momentum_model.pkl")),
-        ("alert_db.csv",                _sz("alert_db.csv")),
+        ("price_cache/ (total)",         _dir_size(data_dir / "price_cache")),
+        ("price_cache/fundamental_cache", _dir_size(data_dir / "price_cache" / "fundamental_cache")),
+        ("price_cache/edgar_*.json",     sum(f.stat().st_size for f in (data_dir / "price_cache").glob("edgar_*.json")) if (data_dir / "price_cache").exists() else 0),
+        (f"backups/ ({backup_count} ZIPs)", _dir_size(backup_dir)),
+        ("universe_snapshot.parquet",    _sz("universe_snapshot.parquet")),
+        ("ml_training_base.parquet",     _sz("ml_training_base.parquet")),
+        ("core_training_base.parquet",   _sz("core_training_base.parquet")),
+        ("momentum_training.parquet",    _sz("momentum_training.parquet")),
+        ("dip_models.pkl",               _sz("dip_models.pkl")),
+        ("core_us_model.pkl",            _sz("core_us_model.pkl")),
+        ("momentum_model.pkl",           _sz("momentum_model.pkl")),
+        ("alert_db.csv",                 _sz("alert_db.csv")),
     ]
     total = _dir_size(data_dir)
 
