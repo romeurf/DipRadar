@@ -66,7 +66,8 @@
       "Bash(python -m py_compile ml_features.py ml_training/config.py score.py monthly_retrain.py ml_predictor.py)",
       "Bash(python -m py_compile ml_features.py score.py)",
       "Bash(python -m py_compile paper_trading.py chart_generator.py github_publisher.py alert_db.py main.py bot_commands.py monthly_retrain.py)",
-      "Bash(python -m py_compile paper_trading.py chart_generator.py github_publisher.py bot_commands.py)"
+      "Bash(python -m py_compile paper_trading.py chart_generator.py github_publisher.py bot_commands.py)",
+      "Bash(python -c \"import json; d=json.load\\(open\\('core_universe.json'\\)\\); print\\(len\\(d\\), type\\(d\\)\\); print\\(d[:5] if isinstance\\(d,list\\) else list\\(d.items\\(\\)\\)[:3]\\)\")"
     ],
     "additionalDirectories": [
       "c:\\Users\\Romeu\\OneDrive\\Documentos\\GitHub\\DipRadar"

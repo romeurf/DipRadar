@@ -49,9 +49,12 @@ bot_commands.py — Todos os comandos Telegram do DipRadar.
   /mldata                  → Estatísticas da base de dados ML
   /mldata update           → Forçar update de outcomes
   /ml_accuracy             → Precisão real do modelo vs outcomes reais
-  /admin_retrain [dry-run] → Disparar retreino ad-hoc
-  /admin_dip_dataset       → Construir dataset histórico DipRadar (desde 1993)
-  /admin_full_pipeline     → Pipeline completo (parquets + retrain, com cache)
+  /admin_run_pipeline      → Pipeline unificado (dataset + retrain, todos os modelos)
+  /admin_run_pipeline --dip --retrain       → retrain DIP apenas
+  /admin_run_pipeline --momentum --dataset  → só dataset momentum
+  /admin_run_pipeline --core                → só dataset CORE
+  /admin_run_pipeline --test AAPL,MSFT      → smoke test rápido (~2 min)
+  /admin_retrain [dry-run] → Retreino DIP ad-hoc (usa parquet existente)
   /admin_regen_parquet [--targets-only] → Regenerar parquet (EDGAR PIT + alpha_90d)
   /admin_set_floor <valor> → Ajustar floor de IC mínimo para promoção (ex: 0.08)
   /admin_load_models <url> → Carregar bundle ML de URL externo
@@ -65,10 +68,11 @@ bot_commands.py — Todos os comandos Telegram do DipRadar.
   /admin_publish_charts    → Publish charts + DRIP ledger to GitHub (public URL)
 
 ━━━ SISTEMA E DIAGNÓSTICO ━━━
-  /status                  → Estado do bot + mercado + modelo
+  /status                  → Estado do bot + mercado + modelos
+  /admin_check_config      → Verificar config + estado dos 3 modelos
+  /ps                      → Pipeline status: fase actual, log, tempo decorrido
+  /admin_kill_pipeline     → Terminar processo de pipeline em curso
   /health                  → Dashboard: RAM, CPU, APIs, drift
-  /health errors           → Últimos erros críticos
-  /admin_check_config      → Verificar env vars críticas em falta
   /admin_test_feed TICKER  → Testar pipeline de dados para um ticker
   /help                    → Lista completa de comandos
 """
@@ -107,17 +111,128 @@ _bot_start_time: datetime = datetime.now()
 # Flags de segurança para operações longas
 _retrain_running:  bool = False
 
-# Log de progresso do pipeline — consultável via /admin_pipeline_status
-_pipeline_log: list[str] = []
+# Pipeline live state — updated during runs, readable via /admin_pipeline_status
+_pipeline_log:   list[str] = []          # rolling log of key progress lines (last 100)
+_pipeline_phase: str       = ""          # current phase label e.g. "Phase 1 — DIP dataset"
+_pipeline_start: float     = 0.0         # wall-clock start time (time.time())
+_pipeline_proc:  object    = None        # subprocess.Popen object — killable via /admin_kill_pipeline
+_PIPELINE_LOG_MAX = 100
+
 
 def _plog(msg: str) -> None:
-    """Regista uma linha de progresso com timestamp."""
-    ts = datetime.now().strftime("%H:%M")
-    entry = f"{ts} {msg}"
+    """Record a timestamped progress line and log it."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    entry = f"[{ts}] {msg}"
     _pipeline_log.append(entry)
-    if len(_pipeline_log) > 30:
+    if len(_pipeline_log) > _PIPELINE_LOG_MAX:
         _pipeline_log.pop(0)
     logging.info(f"[pipeline] {msg}")
+
+
+def _pipeline_elapsed() -> str:
+    """Human-readable elapsed time since pipeline started."""
+    import time as _t
+    if not _pipeline_start:
+        return "0s"
+    s = int(_t.time() - _pipeline_start)
+    if s < 60:   return f"{s}s"
+    if s < 3600: return f"{s // 60}m {s % 60}s"
+    return f"{s // 3600}h {(s % 3600) // 60}m"
+
+
+def _run_script_streaming(
+    cmd: list,
+    phase_label: str,
+    timeout_s: int = 8 * 3600,
+    telegram_interval_s: int = 300,
+) -> tuple[int, list[str]]:
+    """Run a subprocess and stream its output in real time.
+
+    - Updates _pipeline_log line by line (filters noise, keeps INFO/WARNING/ERROR and progress lines)
+    - Automatically sends a Telegram status update every telegram_interval_s seconds
+    - Stores the Popen object in _pipeline_proc so it can be killed via /admin_kill_pipeline
+    - Returns (returncode, list_of_captured_lines)
+    """
+    import subprocess as _sp, time as _t, re as _re
+    global _pipeline_proc, _pipeline_phase
+
+    _pipeline_phase = phase_label
+    _plog(f"{phase_label}: starting")
+
+    # Patterns that are useful to surface; everything else is debug noise
+    _PROGRESS_RE  = _re.compile(r"\[(\d+)/(\d+)\]")          # [42/780] AAPL
+    _LEVEL_RE     = _re.compile(r"\b(INFO|WARNING|ERROR|CRITICAL)\b")
+    _SUMMARY_KEYS = ("dataset", "rows", "tickers", "samples", "promoted", "failed",
+                     "complete", "done", "skip", "merge", "alpha", "episodes",
+                     "IC=", "rho", "elapsed", "error", "exception")
+
+    def _is_interesting(line: str) -> bool:
+        ll = line.lower()
+        if _PROGRESS_RE.search(line):    return True
+        if _LEVEL_RE.search(line):       return True
+        if any(k in ll for k in _SUMMARY_KEYS): return True
+        return False
+
+    captured: list[str] = []
+    last_tg_push = _t.time()
+    last_progress = ""   # last "[X/Y]" line — shown in periodic updates
+
+    try:
+        proc = _sp.Popen(
+            cmd,
+            stdout=_sp.PIPE, stderr=_sp.STDOUT,
+            text=True, bufsize=1,
+        )
+        _pipeline_proc = proc
+
+        deadline = _t.time() + timeout_s
+        for raw in proc.stdout:
+            if _t.time() > deadline:
+                proc.terminate()
+                _plog(f"{phase_label}: TIMEOUT after {timeout_s}s — process terminated")
+                break
+
+            line = raw.rstrip()
+            captured.append(line)
+
+            if _is_interesting(line):
+                # Strip leading timestamp if the script already adds one
+                clean = _re.sub(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[,.]?\d*\s*\|\s*", "", line).strip()
+                clean = _re.sub(r"^\d{2}:\d{2}:\d{2}\s+", "", clean).strip()
+                if clean:
+                    _plog(clean)
+                    m = _PROGRESS_RE.search(line)
+                    if m:
+                        last_progress = clean
+
+            # Periodic Telegram push so the user isn't blind
+            now = _t.time()
+            if now - last_tg_push >= telegram_interval_s:
+                tail = _pipeline_log[-8:]
+                elapsed = _pipeline_elapsed()
+                status_lines = [
+                    f"Pipeline still running — {elapsed} elapsed",
+                    f"Phase: {phase_label}",
+                    *(f"  {l}" for l in tail),
+                    "",
+                    "Use /admin_pipeline_status for full log or /admin_kill_pipeline to stop.",
+                ]
+                _reply("\n".join(status_lines))
+                last_tg_push = now
+
+        proc.wait()
+        returncode = proc.returncode
+    except Exception as exc:
+        _plog(f"{phase_label}: exception — {exc}")
+        logging.error(f"[pipeline] {phase_label}: {exc}", exc_info=True)
+        returncode = -1
+    finally:
+        _pipeline_proc = None
+        _pipeline_phase = ""
+
+    status = "OK" if returncode == 0 else f"FAILED (exit {returncode})"
+    _plog(f"{phase_label}: {status}")
+    return returncode, captured
 
 # Callbacks injectados pelo main.py via register_callbacks() ou poll()
 _cb_send_telegram    = None
@@ -1104,16 +1219,68 @@ def _handle_admin_check_config() -> None:
     lines.append("")
     lines.append(f"Resultado: {ok_count} configuradas, {warn_count} obrigatorias em falta")
 
-    # Estado do modelo ML
+    # ── Model status — all 3 models ──────────────────────────────────────────
+    lines.append("")
+    lines.append("Models:")
+
+    # DIP model (dip_models.pkl)
     try:
         from ml_predictor import is_model_ready, get_model_info
         if is_model_ready():
             info = get_model_info()
-            lines.append(f"Modelo ML: pronto (IC={info.get('rho_mean', '?')})")
+            rho  = info.get("rho_mean")
+            rho_str = f"{rho:.5f}" if isinstance(rho, float) else str(rho)
+            lines.append(
+                f"  DIP (dip_us): ready | rho_alpha={rho_str} | "
+                f"champion={info.get('champion','?')} | "
+                f"features={info.get('n_features','?')}"
+            )
         else:
-            lines.append("Modelo ML: NAO treinado — faz /admin_retrain")
-    except Exception:
-        lines.append("Modelo ML: erro ao verificar")
+            lines.append("  DIP (dip_us): NOT trained — run /admin_run_pipeline --dip")
+    except Exception as e:
+        lines.append(f"  DIP (dip_us): error checking — {e}")
+
+    # Momentum model (momentum_model.pkl)
+    try:
+        from pathlib import Path as _P
+        _data = _P("/data") if _P("/data").exists() else _P("/tmp")
+        _mom_pkl = _data / "momentum_model.pkl"
+        _mom_repo = _P(__file__).parent / "momentum_radar" / "momentum_model.pkl"
+        _mom_report = _data / "momentum_report.json"
+        if not _mom_report.exists():
+            _mom_report = _P(__file__).parent / "momentum_radar" / "momentum_report.json"
+        if (_mom_pkl.exists() or _mom_repo.exists()) and _mom_report.exists():
+            import json as _json
+            rep = _json.loads(_mom_report.read_text())
+            ic  = rep.get("ic_ensemble") or rep.get("ic")
+            ic_str = f"{ic:.5f}" if isinstance(ic, float) else str(ic)
+            lines.append(
+                f"  Momentum (momentum_us): ready | IC={ic_str} | "
+                f"n_train={rep.get('n_train','?')} | sectors={rep.get('n_sectors','?')}"
+            )
+        else:
+            lines.append("  Momentum (momentum_us): NOT trained — run /admin_run_pipeline --momentum")
+    except Exception as e:
+        lines.append(f"  Momentum (momentum_us): error checking — {e}")
+
+    # CORE model — rule-based scoring, no ML pickle; check dataset exists
+    try:
+        from pathlib import Path as _Pc
+        _data_c = _Pc("/data") if _Pc("/data").exists() else _Pc("/tmp")
+        _core_ds = _data_c / "core_training_base.parquet"
+        _core_repo = _Pc(__file__).parent / "core_training_base.parquet"
+        if _core_ds.exists() or _core_repo.exists():
+            _ds_path = _core_ds if _core_ds.exists() else _core_repo
+            import pandas as _pd
+            _nrows = len(_pd.read_parquet(_ds_path, columns=["ticker"]))
+            lines.append(
+                f"  CORE (core_us): rule-based scoring (no ML pkl) | "
+                f"training dataset: {_nrows:,} rows"
+            )
+        else:
+            lines.append("  CORE (core_us): rule-based scoring | dataset missing — run /admin_run_pipeline --core")
+    except Exception as e:
+        lines.append(f"  CORE (core_us): error checking — {e}")
 
     _reply("\n".join(lines))
 
@@ -2086,6 +2253,283 @@ def _handle_admin_full_pipeline(parts: list[str]) -> None:
         _reply("\n".join(final_lines))
 
     threading.Thread(target=_run, daemon=True, name="admin-full-pipeline").start()
+
+
+# ── /admin_run_pipeline ────────────────────────────────────────────────────────
+
+def _handle_admin_run_pipeline(parts: list[str]) -> None:
+    """/admin_run_pipeline [model flags] [stage flags] [--force] [--test T1,T2]
+
+    Unified pipeline: dataset build (parallel) → retrain (sequential).
+
+    ── Model flags (default: all three) ──
+      --dip           DIP model only
+      --momentum      Momentum model only
+      --core          CORE model only
+      (combine freely: --dip --core)
+
+    ── Stage flags (default: both) ──
+      --dataset       Build datasets only — do not retrain
+      --retrain       Retrain only — skip dataset build (use existing parquets)
+
+    ── Other ──
+      --force         Ignore parquet age cache; always rebuild datasets
+      --test T1,T2    Smoke-test: run on these tickers only (~2 min)
+
+    Examples:
+      /admin_run_pipeline                       → full pipeline, all models
+      /admin_run_pipeline --dip                 → DIP dataset + retrain
+      /admin_run_pipeline --momentum --dataset  → build momentum dataset only
+      /admin_run_pipeline --retrain             → retrain DIP + momentum (skip dataset)
+      /admin_run_pipeline --dip --retrain       → retrain DIP only
+      /admin_run_pipeline --core                → build CORE dataset (no ML retrain yet)
+      /admin_run_pipeline --force               → full rebuild, ignore cache
+      /admin_run_pipeline --test AAPL,MSFT      → quick smoke test on 2 tickers
+    """
+    global _retrain_running
+    if _retrain_running:
+        _reply("A pipeline is already running. Wait for it to finish (/admin_pipeline_status).")
+        return
+
+    flags = [p.lower() for p in parts[1:]]
+
+    # ── parse model selection ─────────────────────────────────────────────────
+    want_dip  = "--dip"  in flags
+    want_mom  = "--momentum" in flags
+    want_core = "--core" in flags
+    if not want_dip and not want_mom and not want_core:
+        want_dip = want_mom = want_core = True  # default: all
+
+    # ── parse stage selection ─────────────────────────────────────────────────
+    want_dataset = "--dataset" in flags
+    want_retrain = "--retrain" in flags
+    if not want_dataset and not want_retrain:
+        want_dataset = want_retrain = True       # default: both
+
+    # ── other flags ───────────────────────────────────────────────────────────
+    force = "--force" in flags
+    test_tickers = None
+    for i, f in enumerate(flags):
+        if f == "--test" and i + 1 < len(flags):
+            test_tickers = flags[i + 1]
+            break
+
+    # ── build human-readable summary ──────────────────────────────────────────
+    models_str = " + ".join(
+        m for m, sel in [("DIP", want_dip), ("Momentum", want_mom), ("CORE", want_core)] if sel
+    )
+    stages_str = " + ".join(
+        s for s, sel in [("dataset build", want_dataset), ("retrain", want_retrain)] if sel
+    )
+    test_str = f" | TEST MODE: {test_tickers}" if test_tickers else ""
+    force_str = " | FORCE (ignore cache)" if force else ""
+
+    _reply(
+        f"Pipeline starting: {models_str}\n"
+        f"Stages: {stages_str}{force_str}{test_str}\n"
+        f"Dataset builds run in parallel. Retrains run sequentially after.\n"
+        f"Use /admin_pipeline_status to follow progress."
+    )
+
+    def _run():
+        import sys, time as _t
+        from pathlib import Path
+        global _retrain_running, _pipeline_log, _pipeline_start
+        _retrain_running = True
+        _pipeline_log.clear()
+        _pipeline_start = _t.time()
+
+        data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Phase 1 — Dataset builds (parallel threads, each streams its output)
+        # ─────────────────────────────────────────────────────────────────────
+        dip_ds_ok   = not want_dataset or not want_dip
+        mom_ds_ok   = not want_dataset or not want_mom
+        core_ds_ok  = not want_dataset or not want_core
+        dip_ds_err  = mom_ds_err = core_ds_err = ""
+
+        def _build_dip():
+            nonlocal dip_ds_ok, dip_ds_err
+            script = Path(__file__).parent / "scripts" / "build_dip_dataset.py"
+            out    = data_dir / "ml_training_base.parquet"
+            cmd    = [sys.executable, str(script), "--start", "1993-01-01", "--out", str(out)]
+            if test_tickers: cmd += ["--tickers", test_tickers]
+            if force:        cmd += ["--force-rebuild"]
+            rc, lines = _run_script_streaming(cmd, "Phase 1 — DIP dataset")
+            if rc == 0:
+                dip_ds_ok = True
+            else:
+                dip_ds_err = next((l for l in reversed(lines) if "error" in l.lower()), lines[-1] if lines else "")[:120]
+
+        def _build_momentum():
+            nonlocal mom_ds_ok, mom_ds_err
+            script = Path(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py"
+            out    = data_dir / "momentum_training.parquet"
+            cmd    = [sys.executable, str(script), "--start", "1993-01-01", "--out", str(out)]
+            if test_tickers: cmd += ["--tickers", test_tickers]
+            if force:        cmd += ["--force-rebuild"]
+            rc, lines = _run_script_streaming(cmd, "Phase 1 — Momentum dataset")
+            if rc == 0:
+                mom_ds_ok = True
+            else:
+                mom_ds_err = next((l for l in reversed(lines) if "error" in l.lower()), lines[-1] if lines else "")[:120]
+
+        def _build_core():
+            nonlocal core_ds_ok, core_ds_err
+            script = Path(__file__).parent / "scripts" / "build_core_dataset.py"
+            out    = data_dir / "core_training_base.parquet"
+            cmd    = [sys.executable, str(script), "--start", "1993-01-01", "--out", str(out)]
+            if test_tickers: cmd += ["--tickers", test_tickers]
+            if force:        cmd += ["--force-rebuild"]
+            rc, lines = _run_script_streaming(cmd, "Phase 1 — CORE dataset")
+            if rc == 0:
+                core_ds_ok = True
+            else:
+                core_ds_err = next((l for l in reversed(lines) if "error" in l.lower()), lines[-1] if lines else "")[:120]
+
+        # Datasets run SEQUENTIALLY — one at a time, zero risk of partial/corrupt data.
+        # If one fails, the pipeline stops before wasting time on the next.
+        if want_dataset:
+            ds_sequence = []
+            if want_dip:  ds_sequence.append(("DIP",      _build_dip))
+            if want_mom:  ds_sequence.append(("Momentum", _build_momentum))
+            if want_core: ds_sequence.append(("CORE",     _build_core))
+
+            for i, (model_name, build_fn) in enumerate(ds_sequence):
+                n = len(ds_sequence)
+                _reply(f"Phase 1 [{i+1}/{n}] — {model_name} dataset starting… (/ps for progress)")
+                build_fn()
+
+                ok  = dip_ds_ok  if model_name == "DIP"      else (mom_ds_ok if model_name == "Momentum" else core_ds_ok)
+                err = dip_ds_err if model_name == "DIP"      else (mom_ds_err if model_name == "Momentum" else core_ds_err)
+
+                if ok:
+                    _reply(f"Phase 1 [{i+1}/{n}] — {model_name} dataset: OK")
+                else:
+                    _reply(
+                        f"Phase 1 [{i+1}/{n}] — {model_name} dataset: FAILED\n"
+                        f"{err}\n"
+                        f"Fix the error above before continuing. Pipeline stopped."
+                    )
+                    _retrain_running = False
+                    return
+        else:
+            _plog("Phase 1 — skipped (--retrain only)")
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Phase 2 — Retrains (sequential — CPU-bound, resource intensive)
+        # ─────────────────────────────────────────────────────────────────────
+        if not want_retrain:
+            elapsed = round(_t.time() - start_wall)
+            _plog("Phase 2 — skipped (--dataset only)")
+            _reply(f"Pipeline complete (dataset only). Elapsed: {elapsed}s")
+            _retrain_running = False
+            return
+
+        train_dip = want_dip  and want_retrain and dip_ds_ok
+        train_mom = want_mom  and want_retrain and mom_ds_ok
+        # CORE has no ML retrain yet — rule-based scoring in core_radar.py
+        # When CORE ML training is added, wire it here.
+
+        if not train_dip and not train_mom:
+            elapsed = round(_t.time() - start_wall)
+            _reply(
+                "Phase 2 — nothing to retrain "
+                "(datasets failed or only CORE was selected — CORE uses rule-based scoring, no ML retrain).\n"
+                f"Elapsed: {elapsed}s"
+            )
+            _retrain_running = False
+            return
+
+        models_training = " → ".join(
+            m for m, sel in [("DIP", train_dip), ("Momentum", train_mom)] if sel
+        )
+        _plog(f"Phase 2 — retraining sequentially: {models_training}")
+        _reply(f"Phase 2 — retraining: {models_training} (use /admin_pipeline_status to follow)")
+
+        dip_result: dict = {}
+        mom_result: dict = {}
+
+        if train_dip:
+            _plog("Phase 2 — DIP retrain: starting")
+            try:
+                from monthly_retrain import run_monthly_retrain_v3
+                dip_result = run_monthly_retrain_v3() or {}
+                dec = dip_result.get("decision", "?")
+                rho = dip_result.get("rho_alpha_mean")
+                rho_str = f" | rho_alpha={rho:.4f}" if isinstance(rho, float) else ""
+                _plog(f"Phase 2 — DIP retrain: {dec}{rho_str}")
+            except Exception as e:
+                dip_result = {"decision": "ERROR", "error": str(e)}
+                _plog(f"Phase 2 — DIP retrain: exception — {e}")
+                logging.error(f"[run_pipeline] DIP retrain: {e}", exc_info=True)
+
+        if train_mom:
+            _plog("Phase 2 — Momentum retrain: starting")
+            try:
+                from momentum_radar.trainer import run_momentum_training
+                mom_result = run_momentum_training(
+                    dataset_path=data_dir / "momentum_training.parquet",
+                    bundle_path =data_dir / "momentum_model.pkl",
+                    report_path =data_dir / "momentum_report.json",
+                ) or {}
+                dec = mom_result.get("decision", "?")
+                ic  = mom_result.get("ic_ensemble")
+                ic_str = f" | IC={ic:.4f}" if isinstance(ic, float) else ""
+                _plog(f"Phase 2 — Momentum retrain: {dec}{ic_str}")
+            except Exception as e:
+                mom_result = {"decision": "ERROR", "error": str(e)}
+                _plog(f"Phase 2 — Momentum retrain: exception — {e}")
+                logging.error(f"[run_pipeline] Momentum retrain: {e}", exc_info=True)
+
+        # ── GitHub sync for promoted models ───────────────────────────────────
+        try:
+            from github_sync import sync_training_artifacts, sync_momentum_artifacts
+            if train_dip and dip_result.get("decision") == "PROMOTED":
+                sync_training_artifacts(data_dir)
+            if train_mom and mom_result.get("decision") == "PROMOTED":
+                sync_momentum_artifacts(data_dir)
+        except Exception as e:
+            logging.warning(f"[run_pipeline] github_sync: {e}")
+
+        # ── auto-publish charts after successful retrain ───────────────────────
+        try:
+            from chart_generator import generate_all_charts
+            generate_all_charts()
+            if os.environ.get("GITHUB_TOKEN") and os.environ.get("GITHUB_CHARTS_REPO"):
+                from github_publisher import push_all_charts
+                push_all_charts()
+                _plog("Charts published to GitHub")
+        except Exception as e:
+            logging.warning(f"[run_pipeline] chart publish: {e}")
+
+        # ── final summary ─────────────────────────────────────────────────────
+        elapsed = round(_t.time() - start_wall)
+        summary = [f"Pipeline complete in {elapsed}s", ""]
+
+        def _dec_line(model: str, result: dict) -> str:
+            dec = result.get("decision", "ERROR")
+            err = result.get("error", "")
+            if dec == "PROMOTED":
+                rho = result.get("rho_alpha_mean") or result.get("ic_ensemble")
+                metric = f"metric={rho:.4f}" if isinstance(rho, float) else ""
+                return f"  {model}: PROMOTED {metric}"
+            elif dec == "KEPT":
+                return f"  {model}: kept (candidate did not beat production)"
+            elif dec == "PENDING":
+                return f"  {model}: saved as pending (manual review needed)"
+            else:
+                return f"  {model}: FAILED — {err[:80]}"
+
+        if train_dip: summary.append(_dec_line("DIP",      dip_result))
+        if train_mom: summary.append(_dec_line("Momentum", mom_result))
+        if want_core: summary.append("  CORE: dataset built (rule-based scoring — no ML retrain)")
+
+        _reply("\n".join(summary))
+        _retrain_running = False
+
+    threading.Thread(target=_run, daemon=True, name="admin-run-pipeline").start()
 
 
 # ── /admin_retrain ──────────────────────────────────────────────────────────────
@@ -3875,15 +4319,52 @@ def _handle_command(text: str) -> None:
     elif cmd == "/admin_dip_dataset":
         _handle_admin_dip_dataset(parts)
 
-    elif cmd in ("/admin_pipeline_status", "/pipeline_status"):
-        if _pipeline_log:
-            lines = ["*Pipeline — Log de Progresso:*", ""]
-            lines += [f"  {e}" for e in _pipeline_log]
-            if _retrain_running:
-                lines += ["", "_A correr..._"]
+    elif cmd in ("/admin_pipeline_status", "/pipeline_status", "/ps"):
+        import time as _t
+        if _retrain_running or _pipeline_log:
+            elapsed = _pipeline_elapsed() if _pipeline_start else "?"
+            phase   = _pipeline_phase or "idle"
+            running = _retrain_running
+            tail    = _pipeline_log[-20:]  # last 20 lines
+            lines   = [
+                f"Pipeline {'RUNNING' if running else 'last run'} — {elapsed} elapsed",
+                f"Phase: {phase}",
+                "",
+            ]
+            lines += [f"  {e}" for e in tail]
+            if running:
+                lines += [
+                    "",
+                    "Commands:",
+                    "  /admin_pipeline_status  — refresh this log",
+                    "  /admin_kill_pipeline    — terminate the current process",
+                ]
             _reply("\n".join(lines))
         else:
-            _reply("_Nenhum pipeline em curso (ou ainda não iniciado)._")
+            _reply("No pipeline running. Use /admin_run_pipeline to start one.")
+
+    elif cmd in ("/admin_kill_pipeline", "/kill_pipeline"):
+        import bot_commands as _self
+        _proc = _pipeline_proc
+        if _proc is None and not _retrain_running:
+            _reply("No pipeline process running.")
+        else:
+            try:
+                _phase = _pipeline_phase or "?"
+                if _proc is not None:
+                    _proc.terminate()
+                    _reply(
+                        f"Sent SIGTERM to pipeline process (phase: {_phase}).\n"
+                        f"The process will stop within seconds.\n"
+                        f"Partial parquet data may be incomplete — use --force-rebuild next time."
+                    )
+                else:
+                    _reply("Pipeline thread running but no subprocess found. Forcing flag reset.")
+                _self._retrain_running = False
+                _self._pipeline_phase  = ""
+                _self._pipeline_proc   = None
+            except Exception as e:
+                _reply(f"Kill failed: {e}")
 
     elif cmd == "/admin_disk":
         _handle_admin_disk(parts)
@@ -4016,6 +4497,39 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_full_pipeline":
         _handle_admin_full_pipeline(parts)
+
+    elif cmd == "/admin_run_pipeline":
+        _handle_admin_run_pipeline(parts)
+
+    elif cmd in ("/admin_refresh_core_universe", "/core_refresh_universe"):
+        dry = "--dry-run" in parts
+        _reply(
+            f"CORE universe refresh starting{'(dry-run)' if dry else ''}.\n"
+            f"Screening full US universe (~3,500 tickers) for quality compounders.\n"
+            f"Criteria: gross_margin>=35%, 5y_rev_growth>=5%, market_cap>=$5B "
+            f"OR Dividend Aristocrat.\n"
+            f"Duration: ~30-60 min. Use /ps to follow progress."
+        )
+        def _run_refresh():
+            try:
+                import subprocess, sys
+                from pathlib import Path as _P
+                script = _P(__file__).parent / "scripts" / "refresh_core_universe.py"
+                cmd_args = [sys.executable, str(script)]
+                if dry: cmd_args.append("--dry-run")
+                for p in parts[1:]:
+                    if p.startswith("--min"): cmd_args.append(p)
+                rc, lines = _run_script_streaming(cmd_args, "CORE universe refresh", timeout_s=7200)
+                # Parse result summary from last lines
+                summary_lines = [l for l in lines[-30:] if any(k in l for k in ("Added:", "Removed:", "Kept:", "Skipped:", "Errors:", "DRY RUN"))]
+                _reply(
+                    f"CORE universe refresh {'dry-run ' if dry else ''}complete (exit {rc}).\n"
+                    + "\n".join(summary_lines) +
+                    f"\nUse /core_universe to see the updated list."
+                )
+            except Exception as e:
+                _reply(f"CORE refresh error: {e}")
+        threading.Thread(target=_run_refresh, daemon=True, name="core-refresh").start()
 
     elif cmd == "/admin_publish_charts":
         has_github = bool(os.environ.get("GITHUB_TOKEN") and os.environ.get("GITHUB_CHARTS_REPO"))
