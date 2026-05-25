@@ -183,7 +183,7 @@ def _fetch_one_ticker(
                 # Strip timezone before comparing so tz-aware caches (daily bot) work correctly.
                 _cs = df.index[0]
                 if getattr(_cs, "tz", None) is not None:
-                    _cs = _cs.tz_localize(None)
+                    _cs = _cs.tz_convert(None)  # strip tz from aware timestamp
                 cache_start     = _cs.normalize()
                 requested_start = pd.Timestamp(start)
                 if cache_start > requested_start + pd.Timedelta(days=60):

@@ -372,11 +372,26 @@ def main() -> int:
     # ── Universe ──────────────────────────────────────────────────────────────
     if args.tickers:
         tickers = [t.strip().upper() for t in args.tickers.split(",")]
-        log.info(f"Modo teste: {len(tickers)} tickers")
+        log.info(f"Test mode: {len(tickers)} tickers")
+        # Test mode always re-downloads from scratch: daily-bot cache files contain
+        # only ~60-90 days of recent data, which is far too short for episode detection
+        # (need 252+ bars). Delete cache for these tickers + all macro/ETFs now.
+        _to_purge = tickers + MACRO_TICKERS + SECTOR_ETFS
+        _purged = 0
+        for _t in _to_purge:
+            _safe = _t.replace("^", "_idx_").replace("/", "_")
+            _cf   = cache_dir / f"{_safe}.parquet"
+            if _cf.exists():
+                try:
+                    _cf.unlink()
+                    _purged += 1
+                except Exception:
+                    pass
+        log.info(f"Test mode: purged {_purged} cache files — will re-download full history")
     else:
         from universe import get_ml_universe
         tickers = get_ml_universe()
-        log.info(f"Universo completo: {len(tickers)} tickers")
+        log.info(f"Full universe: {len(tickers)} tickers")
 
     # ── Modo incremental ──────────────────────────────────────────────────────
     existing_df: Optional[pd.DataFrame] = None
