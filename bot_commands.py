@@ -266,6 +266,54 @@ def _reply(text: str) -> None:
         fn(text)
 
 
+def _send_document(
+    file_bytes: bytes,
+    filename: str,
+    caption: str = "",
+) -> bool:
+    """Send a file to the Telegram chat via sendDocument.
+
+    Falls back silently if TELEGRAM_TOKEN / TELEGRAM_CHAT_ID are not set.
+    Returns True on success.
+    """
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.warning("[send_document] No TELEGRAM_TOKEN/CHAT_ID — cannot send file.")
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+    try:
+        resp = requests.post(
+            url,
+            data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]},
+            files={"document": (filename, file_bytes, "text/plain")},
+            timeout=30,
+        )
+        if not resp.ok:
+            logging.warning("[send_document] Telegram error %s: %s", resp.status_code, resp.text[:200])
+            return False
+        return True
+    except Exception as exc:
+        logging.warning("[send_document] %s", exc)
+        return False
+
+
+def _send_photo(file_bytes: bytes, caption: str = "") -> bool:
+    """Send a PNG image to the Telegram chat via sendPhoto."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+    try:
+        resp = requests.post(
+            url,
+            data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]},
+            files={"photo": ("chart.png", file_bytes, "image/png")},
+            timeout=30,
+        )
+        return resp.ok
+    except Exception as exc:
+        logging.warning("[send_photo] %s", exc)
+        return False
+
+
 def _md_safe(s: object) -> str:
     """Sanitiza para uso dentro de code span (backtick): remove backticks internos.
 
@@ -2440,10 +2488,20 @@ def _handle_paper_performance(parts: list[str]) -> None:
                         block.append(f"  Note: {p['note']}")
                     _reply("\n".join(block))
 
-                _reply(
-                    "Full DRIP ledger published to GitHub alongside performance charts.\n"
-                    "Use /admin_publish_charts to force a refresh."
+                # Send the full ledger as a downloadable Markdown file
+                from paper_trading import format_drip_report_md
+                md_content = format_drip_report_md()
+                sent = _send_document(
+                    md_content.encode("utf-8"),
+                    filename="dipr_drip_ledger.md",
+                    caption=(
+                        "DipRadar CORE DRIP Ledger — full audit trail.\n"
+                        "Every dividend event, date, amount, shares added.\n"
+                        "GROSS (pre-tax). See disclaimer inside."
+                    ),
                 )
+                if not sent:
+                    _reply("Could not send file via Telegram. Use /admin_publish_charts to push to GitHub.")
                 return
 
             # ── missed signals ────────────────────────────────────────────────
@@ -3960,43 +4018,69 @@ def _handle_command(text: str) -> None:
         _handle_admin_full_pipeline(parts)
 
     elif cmd == "/admin_publish_charts":
-        _reply("Generating performance charts + DRIP ledger and publishing to GitHub…")
+        has_github = bool(os.environ.get("GITHUB_TOKEN") and os.environ.get("GITHUB_CHARTS_REPO"))
+        if has_github:
+            _reply("Generating performance charts + DRIP ledger and publishing to GitHub…")
+        else:
+            _reply(
+                "GITHUB_TOKEN or GITHUB_CHARTS_REPO not set — skipping GitHub upload.\n"
+                "Generating charts + DRIP ledger and sending here via Telegram…"
+            )
         def _run_publish():
             try:
                 from chart_generator import generate_all_charts
-                from github_publisher import push_all_charts
                 chart_paths = generate_all_charts()
                 if not chart_paths:
                     _reply("No files generated — no closed trades yet.")
                     return
-                results = push_all_charts()
-                charts_ok   = []
-                reports_ok  = []
-                errors      = []
-                for name, url in results.items():
-                    if url and not url.startswith("ERROR"):
-                        if name.endswith(".md"):
-                            reports_ok.append((name, url))
-                        else:
-                            charts_ok.append((name, url))
-                    else:
-                        errors.append(f"  {name}: {url or 'skipped'}")
 
-                lines = ["Published to GitHub:", ""]
-                if charts_ok:
-                    lines.append("Charts (embed-ready):")
+                # Step 1: always send charts as Telegram photos + DRIP as document
+                png_paths = [p for p in chart_paths if p.suffix == ".png"]
+                md_paths  = [p for p in chart_paths if p.suffix == ".md"]
+
+                for png in png_paths:
+                    try:
+                        _send_photo(png.read_bytes(), caption=png.stem.replace("_", " ").title())
+                    except Exception as e:
+                        logging.warning("[publish_charts] photo send %s: %s", png.name, e)
+
+                for md in md_paths:
+                    try:
+                        _send_document(
+                            md.read_bytes(),
+                            filename=md.name,
+                            caption="DipRadar DRIP Ledger — full dividend audit trail (gross, pre-tax)",
+                        )
+                    except Exception as e:
+                        logging.warning("[publish_charts] doc send %s: %s", md.name, e)
+
+                # Step 2: push to GitHub if configured
+                if has_github:
+                    from github_publisher import push_all_charts
+                    results = push_all_charts()
+                    charts_ok  = [(n, u) for n, u in results.items() if u and not u.startswith("ERROR") and not n.endswith(".md")]
+                    reports_ok = [(n, u) for n, u in results.items() if u and not u.startswith("ERROR") and n.endswith(".md")]
+                    errors     = [(n, u) for n, u in results.items() if not u or u.startswith("ERROR")]
+
+                    lines = ["", "GitHub URLs:"]
                     for name, url in charts_ok:
                         lines.append(f"  {name}: {url}")
-                if reports_ok:
-                    lines.append("")
-                    lines.append("Transparency reports (share this link with clients):")
-                    for name, url in reports_ok:
-                        lines.append(f"  {name}: {url}")
-                if errors:
-                    lines.append("")
-                    lines.append("Errors:")
-                    lines += errors
-                _reply("\n".join(lines))
+                    if reports_ok:
+                        lines.append("")
+                        lines.append("DRIP ledger (share with clients):")
+                        for name, url in reports_ok:
+                            lines.append(f"  {name}: {url}")
+                    if errors:
+                        lines.append("")
+                        lines.append("Errors:")
+                        for name, url in errors:
+                            lines.append(f"  {name}: {url or 'skipped'}")
+                    _reply("\n".join(lines))
+                else:
+                    _reply(
+                        "Charts and DRIP ledger sent above.\n"
+                        "To publish permanently to GitHub, set GITHUB_TOKEN and GITHUB_CHARTS_REPO in Railway env vars."
+                    )
             except Exception as e:
                 _reply(f"Error publishing: {e}")
         import threading
