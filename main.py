@@ -295,6 +295,29 @@ def send_telegram(message: str, retries: int = 2) -> bool:
     return all_ok
 
 
+def send_telegram_photo(photo_path, caption: str = "") -> bool:
+    """Send a photo file to the Telegram chat."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    try:
+        from pathlib import Path as _P
+        _path = _P(photo_path)
+        if not _path.exists():
+            return False
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+        with open(_path, "rb") as _f:
+            r = requests.post(
+                url,
+                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]},
+                files={"photo": (_path.name, _f, "image/png")},
+                timeout=30,
+            )
+        return r.ok
+    except Exception as e:
+        logging.debug(f"[send_photo] {e}")
+        return False
+
+
 # ── Heartbeat das 9h ──────────────────────────────────────────────────────────
 
 def _pnl_emoji(v: float) -> str:
@@ -2731,6 +2754,31 @@ def main() -> None:
             stats  = update_open_positions()
             stats2 = update_momentum_positions(send_fn=send_telegram)
             stats3 = update_core_positions(send_fn=send_telegram)
+
+            # Send trade card PNG for every trade that just closed
+            _just_closed = stats.get("just_closed", []) + stats2.get("just_closed", [])
+            if _just_closed:
+                try:
+                    from chart_generator import generate_trade_card
+                    for _trade in _just_closed:
+                        _card = generate_trade_card(_trade)
+                        if _card and _card.exists():
+                            _ticker   = _trade.get("ticker", "")
+                            _ret      = _trade.get("return_pct")
+                            _alpha    = _trade.get("alpha_pct")
+                            _ret_s    = f"{_ret:+.1f}%" if _ret is not None else "—"
+                            _alpha_s  = f"{_alpha:+.1f}%" if _alpha is not None else "—"
+                            _days     = ""
+                            if _trade.get("open_date") and _trade.get("close_date"):
+                                from datetime import date as _d
+                                _days = f" · {(_d.fromisoformat(_trade['close_date']) - _d.fromisoformat(_trade['open_date'])).days}d"
+                            _caption  = (
+                                f"Trade closed: {_ticker} [{_trade.get('trade_type','?')}]{_days}\n"
+                                f"Return: {_ret_s}  Alpha vs SPY: {_alpha_s}"
+                            )
+                            send_telegram_photo(_card, caption=_caption)
+                except Exception as _ce:
+                    logging.debug(f"[trade_card] failed: {_ce}")
             # DRIP: reinvest any new dividends in CORE positions (non-blocking)
             try:
                 _ue = get_usdeur() if "get_usdeur" in dir() else 0.92

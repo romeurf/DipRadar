@@ -508,10 +508,11 @@ def update_open_positions() -> dict:
 
     Chamado diariamente pelo scheduler. Retorna estatísticas do update.
     """
-    trades   = _load()
-    today    = date.today()
-    updated  = 0
+    trades     = _load()
+    today      = date.today()
+    updated    = 0
     still_open = 0
+    just_closed: list[dict] = []
 
     for t in trades:
         if t.get("status") != "OPEN":
@@ -626,6 +627,7 @@ def update_open_positions() -> dict:
         t["alpha_pct"]     = alpha
 
         updated += 1
+        just_closed.append(t)
         spy_s   = f"{spy_ret:.1f}%" if spy_ret is not None else "N/A"
         alpha_s = f"{alpha:.1f}%" if alpha is not None else "N/A"
         log.info(
@@ -634,7 +636,7 @@ def update_open_positions() -> dict:
         )
 
     _save(trades)
-    return {"updated": updated, "still_open": still_open, "total": len(trades)}
+    return {"updated": updated, "still_open": still_open, "total": len(trades), "just_closed": just_closed}
 
 
 def get_monthly_performance(months_back: int = 3) -> dict:
@@ -1066,12 +1068,13 @@ def update_momentum_positions(send_fn=None) -> dict:
 
     Returns dict com chaves: updated, drifted, closed.
     """
-    trades  = _load()
-    today   = date.today()
-    today_iso = today.isoformat()
-    updated = 0
-    drifted = 0
-    closed  = 0
+    trades      = _load()
+    today       = date.today()
+    today_iso   = today.isoformat()
+    updated     = 0
+    drifted     = 0
+    closed      = 0
+    just_closed: list[dict] = []
 
     for t in trades:
         if t.get("status") != "OPEN" or t.get("trade_type") != "MOMENTUM":
@@ -1245,6 +1248,7 @@ def update_momentum_positions(send_fn=None) -> dict:
         t["spy_return_pct"] = spy_ret
         t["alpha_pct"]      = alpha
         closed += 1
+        just_closed.append(t)
         log.info(
             f"[paper_m] CLOSED {ticker} CLOSED_TRAILING_STOP dur={t.get('ml_durability_cur','?')} "
             f"ret={ret_pct:.1f}% high={trailing_high:.2f} stop={trailing_stop_price:.2f} "
@@ -1252,7 +1256,7 @@ def update_momentum_positions(send_fn=None) -> dict:
         )
 
     _save(trades)
-    return {"updated": updated, "drifted": drifted, "closed": closed}
+    return {"updated": updated, "drifted": drifted, "closed": closed, "just_closed": just_closed}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -425,6 +425,154 @@ def generate_core_holdings_chart(trades: list[dict]) -> Optional[Path]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 5. Per-trade card — stock vs SPY for the exact holding period
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_trade_card(trade: dict) -> Optional[Path]:
+    """Mini performance card for a single closed trade.
+
+    Shows the stock vs SPY normalised to 0% at entry, with vertical markers
+    at entry and exit dates, and a stats box showing return %, SPY %, and alpha.
+    Saved to charts/trade_cards/{TICKER}_{open_date}.png.
+    """
+    if not _setup_matplotlib():
+        return None
+
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    import pandas as pd
+
+    ticker      = str(trade.get("ticker", ""))
+    open_date   = str(trade.get("open_date", ""))
+    close_date  = str(trade.get("close_date", ""))
+    open_price  = float(trade.get("open_price") or 0)
+    ret_pct     = trade.get("return_pct")
+    alpha_pct   = trade.get("alpha_pct")
+    spy_ret     = trade.get("spy_return_pct")
+    trade_type  = trade.get("trade_type", "DIP")
+    status      = str(trade.get("status", "CLOSED"))
+
+    if not ticker or not open_date or not close_date or open_price <= 0:
+        return None
+
+    try:
+        import yfinance as yf
+        _open_dt  = datetime.fromisoformat(open_date)
+        _close_dt = datetime.fromisoformat(close_date)
+        # 5-day buffer before entry and 3 days after exit for visual context
+        _start = (_open_dt  - timedelta(days=7)).strftime("%Y-%m-%d")
+        _end   = (_close_dt + timedelta(days=5)).strftime("%Y-%m-%d")
+
+        tick_h = yf.Ticker(ticker).history(start=_start, end=_end, auto_adjust=True)
+        spy_h  = yf.Ticker("SPY").history(start=_start, end=_end, auto_adjust=True)
+
+        if tick_h is None or tick_h.empty or spy_h is None or spy_h.empty:
+            return None
+
+        for _df in (tick_h, spy_h):
+            if _df.index.tz is not None:
+                _df.index = _df.index.tz_convert(None)
+
+    except Exception as e:
+        log.debug(f"[trade_card] fetch failed {ticker}: {e}")
+        return None
+
+    # Reference point: first close on or after open_date (entry day)
+    _open_ts  = pd.Timestamp(open_date)
+    _close_ts = pd.Timestamp(close_date)
+
+    tick_from_entry = tick_h[tick_h.index >= _open_ts]
+    spy_from_entry  = spy_h[spy_h.index  >= _open_ts]
+    if tick_from_entry.empty or spy_from_entry.empty:
+        return None
+
+    tick_ref = float(tick_from_entry["Close"].iloc[0])
+    spy_ref  = float(spy_from_entry["Close"].iloc[0])
+    if tick_ref <= 0 or spy_ref <= 0:
+        return None
+
+    # Normalise both series to 0% at entry
+    tick_norm = ((tick_h["Close"] / tick_ref) - 1.0) * 100.0
+    spy_norm  = ((spy_h["Close"] / spy_ref)  - 1.0) * 100.0
+
+    # ── Chart ────────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+
+    is_win     = (ret_pct or 0) > 0
+    t_color    = _C_POS if is_win else _C_NEG
+    type_color = {
+        "DIP":      _C_DIP,
+        "MOMENTUM": _C_MOMENTUM,
+        "CORE":     _C_CORE,
+    }.get(trade_type, _C_DIP)
+
+    ax.plot(tick_norm.index, tick_norm.values,
+            color=t_color, linewidth=2.2, label=ticker, zorder=4)
+    ax.plot(spy_norm.index, spy_norm.values,
+            color=_C_SPY, linewidth=1.6, linestyle="--", label="SPY", zorder=3)
+
+    # Entry / exit vertical markers
+    ax.axvline(_open_ts,  color=type_color, linewidth=1.4, linestyle=":", alpha=0.9, zorder=2)
+    ax.axvline(_close_ts, color="#374151",  linewidth=1.4, linestyle=":", alpha=0.9, zorder=2)
+
+    # Entry dot at 0%
+    ax.scatter([_open_ts], [0.0], color=type_color, s=55, zorder=5)
+
+    # Exit dot on the ticker line
+    tick_at_exit = tick_norm[tick_norm.index <= _close_ts]
+    if not tick_at_exit.empty:
+        exit_val = float(tick_at_exit.iloc[-1])
+        ax.scatter([_close_ts], [exit_val],
+                   color=t_color, s=55, marker="D", zorder=5)
+
+    ax.axhline(0, color="#D1D5DB", linewidth=0.9, linestyle="-", zorder=1)
+
+    # ── Stats box (top-left) ─────────────────────────────────────────────────
+    days_held = (_close_dt - _open_dt).days
+    ret_s   = f"{ret_pct:+.1f}%"   if ret_pct   is not None else "—"
+    spy_s   = f"{spy_ret:+.1f}%"   if spy_ret   is not None else "—"
+    alpha_s = f"{alpha_pct:+.1f}%" if alpha_pct is not None else "—"
+    status_label = status.replace("CLOSED_", "").replace("_", " ").title()
+
+    box_text = (
+        f"{ticker}  ·  {trade_type}\n"
+        f"Entry {open_date}  →  Exit {close_date}  ({days_held}d)\n"
+        f"Return: {ret_s}   SPY: {spy_s}   Alpha: {alpha_s}"
+    )
+    ax.text(
+        0.01, 0.97, box_text,
+        transform=ax.transAxes, va="top", ha="left", fontsize=9, color=_C_TEXT,
+        bbox=dict(boxstyle="round,pad=0.4", facecolor="#F9FAFB",
+                  edgecolor="#E5E7EB", alpha=0.95),
+    )
+
+    # Status badge (top-right)
+    ax.text(
+        0.99, 0.97, status_label,
+        transform=ax.transAxes, va="top", ha="right",
+        fontsize=9, color="white", fontweight="bold",
+        bbox=dict(boxstyle="round,pad=0.35",
+                  facecolor=_C_POS if is_win else _C_NEG, edgecolor="none"),
+    )
+
+    ax.set_ylabel("Return since entry (%)", color=_C_SUBTEXT)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:+.1f}%"))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b '%y"))
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=3, maxticks=8))
+    plt.xticks(rotation=25, ha="right")
+    ax.legend(frameon=False, loc="lower right", fontsize=9)
+    ax.text(0.99, 0.02, _WATERMARK, transform=ax.transAxes,
+            ha="right", va="bottom", color=_C_SUBTEXT, fontsize=7.5, style="italic")
+
+    plt.tight_layout()
+
+    out_dir  = _CHARTS_DIR / "trade_cards"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{ticker}_{open_date}.png"
+    return _save(fig, out_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
