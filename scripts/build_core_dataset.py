@@ -192,33 +192,35 @@ def _compute_volume_signals_pit(
 # Detecção de episódios MA200w
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _find_ma200w_episodes(hist: pd.DataFrame) -> list[pd.Timestamp]:
-    """Detecta datas em que o preço entrou na zona de suporte MA200w.
+_SAMPLE_EVERY_BARS = 5   # sample every 5 trading days (~weekly) inside an episode
 
-    Episódio inicia quando price/MA200w <= _MA200W_ENTRY_RATIO.
-    Episódio termina quando price/MA200w > _MA200W_EXIT_RATIO.
-    Só o primeiro dia qualificado de cada episódio é amostrado.
-    Requer pelo menos _MIN_WEEKS_FOR_MA semanas de história acumulada.
+
+def _find_ma200w_episodes(hist: pd.DataFrame) -> list[pd.Timestamp]:
+    """Detect all MA200w entry dates, sampled weekly throughout each episode.
+
+    Episode: price/MA200w <= _MA200W_ENTRY_RATIO (within 5% above MA200w).
+    Ends when: price/MA200w > _MA200W_EXIT_RATIO (clear recovery).
+
+    Sampling: every _SAMPLE_EVERY_BARS trading days while inside the episode.
+    This gives ~12 samples per average episode instead of 1, producing a much
+    richer training set while keeping each sample genuinely independent
+    (RSI, OBV, return_20d, alpha_1y all differ day-by-day).
+
+    Requires at least _MIN_WEEKS_FOR_MA weeks of accumulated history.
     """
     close = hist["Close"]
     n = len(hist)
     episode_dates: list[pd.Timestamp] = []
     in_episode = False
+    bars_since_last_sample = 0
 
-    # Pré-computar MA200w em cada ponto — computação eficiente
-    weekly_close = close.resample("W-FRI").last().dropna()
-
-    # Mapeamento de data diária → ratio_to_ma200w calculado com dados até essa data
-    # Para eficiência, percorre semanalmente e interpola para diário
     for i in range(_MIN_BARS_AHEAD_1Y, n):
-        # Slice ponto-no-tempo: só dados até barra i
         close_pit = close.iloc[:i+1]
         price = float(close_pit.iloc[-1])
 
-        # MA200w PIT (semanal resample até esta data)
         weekly_pit = close_pit.resample("W-FRI").last().dropna()
         if len(weekly_pit) < _MIN_WEEKS_FOR_MA:
-            continue  # ainda sem história suficiente para MA200w
+            continue
 
         ma200w_val = float(weekly_pit.rolling(200).mean().iloc[-1])
         if not math.isfinite(ma200w_val) or ma200w_val <= 0:
@@ -227,14 +229,22 @@ def _find_ma200w_episodes(hist: pd.DataFrame) -> list[pd.Timestamp]:
         ratio = price / ma200w_val
 
         if in_episode and ratio > _MA200W_EXIT_RATIO:
-            in_episode = False  # recuperação clara — episódio terminou
-
-        if in_episode:
-            continue  # ainda no mesmo episódio — não re-amostrar
+            in_episode = False
+            bars_since_last_sample = 0
 
         if ratio <= _MA200W_ENTRY_RATIO:
-            in_episode = True
-            episode_dates.append(hist.index[i])
+            if not in_episode:
+                in_episode = True
+                bars_since_last_sample = 0
+                episode_dates.append(hist.index[i])  # always sample episode entry
+            else:
+                bars_since_last_sample += 1
+                if bars_since_last_sample >= _SAMPLE_EVERY_BARS:
+                    bars_since_last_sample = 0
+                    episode_dates.append(hist.index[i])
+        else:
+            if in_episode:
+                bars_since_last_sample += 1
 
     return episode_dates
 
