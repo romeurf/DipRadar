@@ -338,30 +338,44 @@ def _score_core_dip(
     signals["analyst_upside"]  = round(analyst_up, 4)   if analyst_up   is not None else None
     signals["earnings_growth"] = round(earn_growth, 4)  if earn_growth  is not None else None
 
-    # ── Cálculo do score ─────────────────────────────────────────────────────
-    score = 50.0  # base
+    # ── Mandatory fundamental quality gate ──────────────────────────────────
+    # CoreRadar is for quality compounders only. A business with badly declining
+    # revenue or negligible margins is not a compounder — don't alert regardless
+    # of price action.
+    if rev_growth is not None and rev_growth < -0.10:
+        return 0.0, signals   # structural revenue decline — not a compounder
+    if gross_margin is not None and gross_margin < 0.25:
+        return 0.0, signals   # commodity-level margins — no pricing power
 
-    # ★ Eixo 1: Preço ★ ──────────────────────────────────────────────────────
+    # ── Mandatory price gate: near or below MA200 weekly ─────────────────────
+    # CoreRadar's entire thesis is "buy quality compounders at or below the
+    # 200-week MA". If the stock is not near that level, we have no entry thesis.
+    # This is the gate that was missing and caused 40 alerts per night.
+    if ma200w and not near_ma200w and not below_ma200w:
+        return 0.0, signals   # not near MA200w — no entry thesis
 
-    # Sinal primário: MA200 semanal
+    # ── Score calculation (0-based; the stock must earn every point) ─────────
+    score = 0.0
+
+    # Axis 1: Price — MA200 weekly proximity (primary signal, max 35 pts)
     if below_ma200w:
-        score += 25.0   # abaixo da MA200w = oportunidade histórica (MSFT 359$, NVO 38$)
+        score += 35.0   # at/below MA200w = historical entry zone (MSFT 2022, NVO 2024)
     elif near_ma200w:
-        score += 15.0   # perto da MA200w = zona de suporte a vigiar
+        score += 20.0   # within 5% of MA200w = zone to watch
 
-    # Profundidade do dip tático
+    # Dip depth — more pain, more opportunity (max 12 pts)
     dip_depth = abs(ret_20d)
-    score += min(dip_depth * 250, 15.0)  # até +15 pts
+    score += min(dip_depth * 150, 12.0)
 
-    # MA200 diária crescente (tese secular intacta)
+    # MA200d trend — secular thesis intact?
     if ma200d_trend > 0.01:
-        score += 8.0
+        score += 8.0    # MA200d rising: long-term trend intact
     elif ma200d_trend > 0:
-        score += 4.0
+        score += 3.0
     else:
-        score -= 8.0  # MA200d em queda = cuidado
+        score -= 10.0   # MA200d falling: compounding thesis at risk
 
-    # RSI oversold
+    # RSI oversold (max 8 pts)
     if rsi < 30:
         score += 8.0
     elif rsi < 40:
@@ -369,21 +383,61 @@ def _score_core_dip(
     elif rsi < _RSI_MAX:
         score += 2.0
 
-    # Drawdown 52w: quanto mais profundo, mais atrativo (até certo ponto)
-    score += min(abs(dd_52w) * 30, 6.0)
+    # Drawdown from 52w high (max 5 pts)
+    score += min(abs(dd_52w) * 20, 5.0)
 
-    # Momentum ainda negativo nos últimos 5d — penalizar levemente
+    # Momentum still negative in last 5d — small penalty
     if ret_5d < -0.03:
-        score -= 4.0
+        score -= 3.0
 
-    # Yield de dividendo — sinal explícito definido pelo utilizador
+    # Dividend yield — explicit user signal (max 8 pts)
     if annual_yield_pct > 0 and current_price > 0:
-        score += min(annual_yield_pct * _YIELD_BONUS_PER_PCT, 10.0)  # até +10 pts
+        score += min(annual_yield_pct * _YIELD_BONUS_PER_PCT, 8.0)
 
-    # Nota: FCF yield, revenue growth, gross margin, ROE, analyst upside são
-    # recolhidos como features (acima, em signals) mas NÃO aplicam scoring
-    # hardcoded. O CoreML aprenderá os pesos correctos a partir de dados históricos.
-    # Aplicar pesos manuais seria arbitrário — o ML fá-lo melhor.
+    # Axis 2: Fundamental quality (max 32 pts)
+    # These gates are real — a compounder must show quality fundamentals.
+    # The CoreML model will replace this with learned weights once trained.
+    if rev_growth is not None:
+        if rev_growth >= _REV_GROWTH_STRONG:
+            score += 10.0   # accelerating compounder
+        elif rev_growth >= _REV_GROWTH_OK:
+            score += 6.0
+        elif rev_growth >= 0:
+            score += 2.0
+        elif rev_growth >= _REV_DECLINE_WARN:
+            score -= 5.0    # mild revenue decline — reducing conviction
+        # < -10% is already gated above
+
+    if gross_margin is not None:
+        if gross_margin >= _GROSS_MARGIN_MOAT:
+            score += 10.0   # strong pricing power
+        elif gross_margin >= _GROSS_MARGIN_OK:
+            score += 5.0
+        # < 25% gated above
+
+    if roe is not None:
+        if roe >= _ROE_COMPOUNDER:
+            score += 8.0    # capital allocation machine
+        elif roe >= _ROE_OK:
+            score += 4.0
+        elif roe < 0.05:
+            score -= 5.0    # low ROE = not actually compounding
+
+    if fcf_yield_q is not None:
+        if fcf_yield_q >= _FCF_YIELD_STRONG:
+            score += 7.0
+        elif fcf_yield_q >= _FCF_YIELD_OK:
+            score += 3.0
+        elif fcf_yield_q < 0:
+            score -= 6.0    # burning cash in a dip = danger
+
+    if analyst_up is not None:
+        if analyst_up >= 0.20:
+            score += 5.0
+        elif analyst_up >= 0.10:
+            score += 2.0
+        elif analyst_up < 0:
+            score -= 4.0    # analysts see downside — unusual for quality compounder
 
     # ★ Eixo 3: Fluxo Institucional (Volume) ★ ──────────────────────────────
     # Quando o preço toca a MA200w, volume alto em dias verdes = fundos a acumular.

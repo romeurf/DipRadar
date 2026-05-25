@@ -2277,12 +2277,22 @@ def run_core_scan() -> None:
         candidates = scan_core_universe(min_score=60.0)
 
         if not candidates:
-            logging.info("[core_radar] Nenhuma oportunidade CORE hoje.")
+            logging.info("[core_radar] No CORE opportunities today.")
             return
 
-        send_telegram(
-            f"💎 *CoreRadar — {len(candidates)} oportunidade{'s' if len(candidates) > 1 else ''} de dip*\n"
+        # Hard cap: send at most 5 alerts (sorted by score descending)
+        _MAX_ALERTS    = 5
+        _MAX_TRADES    = 3   # max auto-trades per day regardless of score
+        _AUTO_THRESHOLD = 80  # score threshold for auto-trade (stricter than alert)
+
+        top = candidates[:_MAX_ALERTS]
+        hidden = len(candidates) - len(top)
+        header = (
+            f"💎 *CoreRadar — {len(top)} oportunidade{'s' if len(top) > 1 else ''} de dip*"
+            + (f" _(+{hidden} com score mais baixo omitidos)_" if hidden > 0 else "")
+            + "\n"
         )
+        send_telegram(header)
 
         # Tickers CORE já com posição aberta (evitar duplicados)
         try:
@@ -2296,19 +2306,22 @@ def run_core_scan() -> None:
         usd_eur    = get_usdeur()
         registered = 0
 
-        for c in candidates:
+        for c in top:
             try:
                 msg = format_core_alert(c)
                 if c["ticker"] in existing_core:
                     msg += "\n\n_⚠️ Já tens posição CORE aberta neste ticker._"
                 send_telegram(msg)
             except Exception as e:
-                logging.warning(f"[core_radar] Alerta {c.get('ticker')}: {e}")
+                logging.warning(f"[core_radar] Alert {c.get('ticker')}: {e}")
 
-        # Auto-registo: score >= 70 = alta convicção → paper trade CORE
-        for c in candidates:
+        # Auto-registration: score >= 80 AND daily trade cap not reached
+        for c in top:
+            if registered >= _MAX_TRADES:
+                logging.info(f"[core_radar] Daily auto-trade cap ({_MAX_TRADES}) reached — skipping remaining.")
+                break
             ticker = c["ticker"]
-            if ticker in existing_core or c["score"] < 70:
+            if ticker in existing_core or c["score"] < _AUTO_THRESHOLD:
                 continue
             try:
                 trade_id = record_core_holding(
