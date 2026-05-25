@@ -107,7 +107,8 @@ def _tiingo_get(ticker: str, alert_date: date) -> dict:
 
 # ── Tier 2: SEC EDGAR XBRL ───────────────────────────────────────────────────
 
-_EDGAR_BASE = "https://data.sec.gov"
+_EDGAR_BASE     = "https://data.sec.gov"   # XBRL / submissions / facts
+_EDGAR_WWW_BASE = "https://www.sec.gov"    # company_tickers.json lives here
 _EDGAR_HEADERS = {"User-Agent": "DipRadar research@dipradar.io"}
 
 # Mapeamento CIK: carregado uma vez e cached em memória
@@ -130,7 +131,7 @@ def _load_cik_map(cache_dir: Path) -> None:
     try:
         import requests
         resp = requests.get(
-            f"{_EDGAR_BASE}/files/company_tickers.json",
+            f"{_EDGAR_WWW_BASE}/files/company_tickers.json",
             headers=_EDGAR_HEADERS, timeout=30,
         )
         resp.raise_for_status()

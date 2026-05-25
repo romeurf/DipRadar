@@ -85,11 +85,12 @@ def _get(
         try:
             resp = requests.get(url, params=params, timeout=20)
 
-            if resp.status_code in (403, 401):
+            if resp.status_code in (400, 401, 403):
                 _tiingo_fund_disabled = True
                 log.warning(
-                    f"[tiingo_fund] {resp.status_code} — plano sem acesso a Fundamentals. "
-                    "A desactivar para esta sessão. Fallback: EDGAR XBRL + yfinance."
+                    f"[tiingo_fund] {resp.status_code} — plan does not include Fundamentals "
+                    "(free plan returns 400; Starter required). Disabling for this session. "
+                    "Fallback: SEC EDGAR XBRL + yfinance."
                 )
                 return None
 
