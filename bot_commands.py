@@ -1422,14 +1422,18 @@ def _handle_admin_regen_parquet(parts: list[str]) -> None:
 # ── /admin_disk ─────────────────────────────────────────────────────────────────
 
 def _handle_admin_disk(parts: list[str]) -> None:
-    """/admin_disk          → ver utilização do volume /data/
-    /admin_disk clean     → apagar EDGAR cache antigo (>30d) e libertar espaço
+    """/admin_disk          → disk usage breakdown for /data/
+    /admin_disk clean     → delete old EDGAR cache (>30d) and prune snapshot
+    /admin_disk purge     → delete ALL cache and training parquets — keep only
+                            alert_db.csv and model pickles (use before overnight rebuild)
     """
-    import os, time
+    import os, time, shutil
     from pathlib import Path
 
     data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
-    clean = len(parts) > 1 and parts[1].lower() == "clean"
+    subcmd   = parts[1].lower() if len(parts) > 1 else ""
+    clean    = subcmd == "clean"
+    purge    = subcmd == "purge"
 
     def _human(b: int) -> str:
         for unit in ("B", "KB", "MB", "GB"):
@@ -1440,6 +1444,70 @@ def _handle_admin_disk(parts: list[str]) -> None:
 
     def _dir_size(p: Path) -> int:
         return sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) if p.exists() else 0
+
+    if purge:
+        # Nuclear option: delete everything except alert_db.csv.
+        # Model pickles are also deleted — the overnight rebuild will regenerate them.
+        # This frees 100% of non-essential disk so the rebuild has room.
+        KEEP = {"alert_db.csv"}
+        freed = 0
+        deleted_dirs: list[str] = []
+        deleted_files: list[str] = []
+
+        # 1. Nuke price_cache/ (OHLCV parquets + EDGAR json + fundamental_cache subdir)
+        price_cache_dir = data_dir / "price_cache"
+        if price_cache_dir.exists():
+            sz = sum(f.stat().st_size for f in price_cache_dir.rglob("*") if f.is_file())
+            freed += sz
+            shutil.rmtree(str(price_cache_dir), ignore_errors=True)
+            deleted_dirs.append(f"price_cache/ ({_human(sz)})")
+
+        # 2. Delete training parquets and snapshot — will be rebuilt
+        for name in (
+            "ml_training_base.parquet",
+            "core_training_base.parquet",
+            "momentum_training.parquet",
+            "ml_momentum_training.parquet",
+            "universe_snapshot.parquet",
+            "ml_training_input.parquet",
+        ):
+            p = data_dir / name
+            if p.exists():
+                sz = p.stat().st_size
+                freed += sz
+                p.unlink()
+                deleted_files.append(f"{name} ({_human(sz)})")
+
+        # 3. Any other file not in KEEP
+        for p in data_dir.iterdir():
+            if p.is_file() and p.name not in KEEP and p.suffix in (".parquet", ".json", ".csv", ".tmp"):
+                if p.name not in KEEP:
+                    sz = p.stat().st_size
+                    freed += sz
+                    try:
+                        p.unlink()
+                        deleted_files.append(f"{p.name} ({_human(sz)})")
+                    except Exception:
+                        pass
+
+        lines = [
+            "<b>Disk purge complete</b>",
+            f"Freed: <b>{_human(freed)}</b>",
+            "",
+        ]
+        if deleted_dirs:
+            lines += ["Directories deleted:"] + [f"  • {d}" for d in deleted_dirs]
+        if deleted_files:
+            lines += ["Files deleted:"] + [f"  • {f}" for f in deleted_files]
+        lines += [
+            "",
+            "Kept: <code>alert_db.csv</code> only (open positions safe)",
+            "Model pickles deleted — overnight will retrain all 3.",
+            "",
+            "Ready for <code>/admin_overnight</code>",
+        ]
+        _reply("\n".join(lines))
+        return
 
     if clean:
         # Apagar EDGAR facts cache com mais de 30 dias (edgar_*.json em price_cache)
@@ -1498,23 +1566,37 @@ def _handle_admin_disk(parts: list[str]) -> None:
         )
         return
 
-    # Listagem de tamanhos
+    # Disk usage breakdown
+    def _sz(name: str) -> int:
+        p = data_dir / name
+        return p.stat().st_size if p.exists() else 0
+
     items = [
-        ("price_cache/edgar_*.json", sum(f.stat().st_size for f in (data_dir / "price_cache").glob("edgar_*.json")) if (data_dir / "price_cache").exists() else 0),
-        ("price_cache/ (total)",     _dir_size(data_dir / "price_cache")),
-        ("universe_snapshot.parquet",(data_dir / "universe_snapshot.parquet").stat().st_size if (data_dir / "universe_snapshot.parquet").exists() else 0),
-        ("ml_training_base.parquet", (data_dir / "ml_training_base.parquet").stat().st_size if (data_dir / "ml_training_base.parquet").exists() else 0),
-        ("momentum_training.parquet",(data_dir / "momentum_training.parquet").stat().st_size if (data_dir / "momentum_training.parquet").exists() else 0),
-        ("dip_models.pkl",           (data_dir / "dip_models.pkl").stat().st_size if (data_dir / "dip_models.pkl").exists() else 0),
-        ("alert_db.csv",             (data_dir / "alert_db.csv").stat().st_size if (data_dir / "alert_db.csv").exists() else 0),
+        ("price_cache/ (total)",        _dir_size(data_dir / "price_cache")),
+        ("price_cache/fundamental_cache",_dir_size(data_dir / "price_cache" / "fundamental_cache")),
+        ("price_cache/edgar_*.json",    sum(f.stat().st_size for f in (data_dir / "price_cache").glob("edgar_*.json")) if (data_dir / "price_cache").exists() else 0),
+        ("universe_snapshot.parquet",   _sz("universe_snapshot.parquet")),
+        ("ml_training_base.parquet",    _sz("ml_training_base.parquet")),
+        ("core_training_base.parquet",  _sz("core_training_base.parquet")),
+        ("momentum_training.parquet",   _sz("momentum_training.parquet")),
+        ("dip_models.pkl",              _sz("dip_models.pkl")),
+        ("core_us_model.pkl",           _sz("core_us_model.pkl")),
+        ("momentum_model.pkl",          _sz("momentum_model.pkl")),
+        ("alert_db.csv",                _sz("alert_db.csv")),
     ]
     total = _dir_size(data_dir)
 
-    lines = ["*Utilização do volume /data/:*", ""]
+    lines = ["<b>Disk usage — /data/</b>", ""]
     for name, size in sorted(items, key=lambda x: x[1], reverse=True):
         if size > 0:
-            lines.append(f"  `{name}`: {_human(size)}")
-    lines += ["", f"*Total: {_human(total)}*", "", "_/admin\\_disk clean → apagar EDGAR cache antigo e snapshot >180d_"]
+            lines.append(f"  <code>{name}</code>: {_human(size)}")
+    lines += [
+        "",
+        f"<b>Total: {_human(total)}</b>",
+        "",
+        "<code>/admin_disk clean</code> — delete old EDGAR cache (>30d) + prune snapshot",
+        "<code>/admin_disk purge</code> — nuke ALL cache/parquets, keep alert_db + pickles",
+    ]
     _reply("\n".join(lines))
 
 
@@ -2333,6 +2415,263 @@ def _handle_admin_full_pipeline(parts: list[str]) -> None:
         _reply("\n".join(final_lines))
 
     threading.Thread(target=_run, daemon=True, name="admin-full-pipeline").start()
+
+
+# ── /admin_overnight ──────────────────────────────────────────────────────────
+
+def _handle_admin_overnight(parts: list[str]) -> None:
+    """/admin_overnight [--no-purge] [--dip-only] [--core-only] [--momentum-only]
+
+    Full sequential rebuild of all 3 models — designed to run overnight.
+
+    Steps (in order):
+      1. Purge disk (price_cache + training parquets + snapshot) — keeps alert_db + pickles
+      2. DIP dataset build  (scripts/build_dip_dataset.py --force-rebuild)
+      3. DIP model retrain  (monthly_retrain.run_monthly_retrain_v3)
+      4. Core dataset build (scripts/build_core_dataset.py --force-rebuild)
+      5. Core model train   (scripts/train_core_model.py)
+      6. Momentum dataset   (momentum_radar/scripts/build_dataset.py)
+      7. Momentum retrain   (momentum_radar.trainer.run_momentum_training)
+
+    Flags:
+      --no-purge      Skip the disk purge step (if you already freed space)
+      --dip-only      Only steps 2-3
+      --core-only     Only steps 4-5
+      --momentum-only Only steps 6-7
+
+    The bot stays fully responsive throughout. Use /admin_pipeline_status to monitor.
+    Each step sends a Telegram update on start and completion.
+    """
+    global _retrain_running
+    if _retrain_running:
+        _reply("⚠️ Pipeline already running. Wait for it to finish.")
+        return
+
+    no_purge      = "--no-purge"      in parts
+    dip_only      = "--dip-only"      in parts
+    core_only     = "--core-only"     in parts
+    momentum_only = "--momentum-only" in parts
+
+    run_dip      = not core_only and not momentum_only
+    run_core     = not dip_only  and not momentum_only
+    run_momentum = not dip_only  and not core_only
+
+    scope_parts = []
+    if run_dip:      scope_parts.append("DIP")
+    if run_core:     scope_parts.append("Core")
+    if run_momentum: scope_parts.append("Momentum")
+    scope = " + ".join(scope_parts)
+
+    _reply(
+        f"<b>Overnight Pipeline — {scope}</b>\n"
+        f"{'Step 0: disk purge\n' if not no_purge else 'Skipping disk purge (--no-purge)\n'}"
+        f"Steps: dataset build → retrain for each model, sequentially.\n"
+        f"Bot stays active. Use <code>/admin_pipeline_status</code> to monitor.\n"
+        f"<i>Estimated total time: 6–12 hours</i>"
+    )
+
+    def _run():
+        global _retrain_running, _pipeline_log
+        _retrain_running = True
+        _pipeline_log.clear()
+        import subprocess, sys, shutil, time as _t
+        from pathlib import Path
+
+        data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
+        scripts  = Path(__file__).parent / "scripts"
+
+        def _sub(cmd: list[str], timeout_h: float) -> tuple[bool, str]:
+            """Run subprocess, return (ok, tail_output)."""
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=int(timeout_h * 3600))
+                tail = ((r.stdout or "") + (r.stderr or ""))[-600:]
+                return r.returncode == 0, tail
+            except subprocess.TimeoutExpired:
+                return False, f"Timeout after {timeout_h}h"
+            except Exception as e:
+                return False, str(e)
+
+        try:
+            # ── Step 0: Purge disk ────────────────────────────────────────────
+            if not no_purge:
+                _plog("Step 0: purging disk...")
+                price_cache = data_dir / "price_cache"
+                freed = 0
+                if price_cache.exists():
+                    freed += sum(f.stat().st_size for f in price_cache.rglob("*") if f.is_file())
+                    shutil.rmtree(str(price_cache), ignore_errors=True)
+                for name in ("ml_training_base.parquet", "core_training_base.parquet",
+                             "momentum_training.parquet", "ml_momentum_training.parquet",
+                             "universe_snapshot.parquet", "ml_training_input.parquet",
+                             "dip_models.pkl", "core_us_model.pkl", "momentum_model.pkl",
+                             "momentum_report.json", "ml_report.json"):
+                    p = data_dir / name
+                    if p.exists():
+                        freed += p.stat().st_size
+                        p.unlink()
+                mb = freed / 1024 / 1024
+                _plog(f"Step 0: purge done — freed {mb:.0f} MB")
+                _reply(f"✅ <b>Step 0 — Disk purged</b>: freed <b>{mb:.0f} MB</b>\nStarting dataset builds...")
+
+            # ── Step 1+2: DIP ─────────────────────────────────────────────────
+            if run_dip:
+                _plog("Step 1: DIP dataset build started (~4-6h)...")
+                _reply("⏳ <b>Step 1/6 — DIP dataset</b> building (4-6h)...")
+                t0 = _t.time()
+                out_dip = data_dir / "ml_training_base.parquet"
+                ok, tail = _sub(
+                    [sys.executable, str(scripts / "build_dip_dataset.py"),
+                     "--start", "1993-01-01", "--out", str(out_dip), "--force-rebuild"],
+                    timeout_h=8,
+                )
+                elapsed = (_t.time() - t0) / 60
+                if ok:
+                    try:
+                        import pandas as pd
+                        df = pd.read_parquet(out_dip)
+                        rows = len(df)
+                        tickers = df["ticker"].nunique() if "ticker" in df.columns else "?"
+                        _plog(f"Step 1: DIP dataset OK — {rows:,} rows, {tickers} tickers, {elapsed:.0f}m")
+                        _reply(f"✅ <b>Step 1/6 — DIP dataset done</b> ({elapsed:.0f} min)\n{rows:,} rows | {tickers} tickers")
+                    except Exception:
+                        _plog(f"Step 1: DIP dataset OK ({elapsed:.0f}m) — stats unavailable")
+                        _reply(f"✅ <b>Step 1/6 — DIP dataset done</b> ({elapsed:.0f} min)")
+                else:
+                    _plog(f"Step 1: DIP dataset FAILED — {tail[-200:]}")
+                    _reply(f"❌ <b>Step 1/6 — DIP dataset FAILED</b>\n<code>{tail[-400:]}</code>\n\n<i>Continuing with Core...</i>")
+
+                if ok:
+                    _plog("Step 2: DIP retrain started...")
+                    _reply("⏳ <b>Step 2/6 — DIP retrain</b>...")
+                    t0 = _t.time()
+                    try:
+                        from monthly_retrain import run_monthly_retrain_v3
+                        result = run_monthly_retrain_v3() or {}
+                        dec    = result.get("decision", "?")
+                        rho    = result.get("candidate_rho_alpha")
+                        elapsed = (_t.time() - t0) / 60
+                        icon   = {"PROMOTED": "🚀", "KEPT": "⚠️"}.get(dec, "❌")
+                        rho_s  = f" | ρ={rho:.4f}" if isinstance(rho, float) else ""
+                        _plog(f"Step 2: DIP retrain {dec} ({elapsed:.0f}m){rho_s}")
+                        _reply(f"{icon} <b>Step 2/6 — DIP retrain: {dec}</b> ({elapsed:.0f} min){rho_s}")
+                    except Exception as e:
+                        _plog(f"Step 2: DIP retrain exception — {e}")
+                        _reply(f"❌ <b>Step 2/6 — DIP retrain FAILED</b>\n<code>{e}</code>")
+
+            # ── Step 3+4: Core ────────────────────────────────────────────────
+            if run_core:
+                _plog("Step 3: Core dataset build started (~1-2h)...")
+                _reply("⏳ <b>Step 3/6 — Core dataset</b> building (1-2h)...")
+                t0 = _t.time()
+                out_core = data_dir / "core_training_base.parquet"
+                ok, tail = _sub(
+                    [sys.executable, str(scripts / "build_core_dataset.py"),
+                     "--out", str(out_core), "--start", "1993-01-01", "--force-rebuild"],
+                    timeout_h=4,
+                )
+                elapsed = (_t.time() - t0) / 60
+                if ok:
+                    try:
+                        import pandas as pd
+                        df = pd.read_parquet(out_core)
+                        rows = len(df)
+                        tickers = df["ticker"].nunique() if "ticker" in df.columns else "?"
+                        _plog(f"Step 3: Core dataset OK — {rows:,} rows, {tickers} tickers, {elapsed:.0f}m")
+                        _reply(f"✅ <b>Step 3/6 — Core dataset done</b> ({elapsed:.0f} min)\n{rows:,} rows | {tickers} tickers")
+                    except Exception:
+                        _plog(f"Step 3: Core dataset OK ({elapsed:.0f}m) — stats unavailable")
+                        _reply(f"✅ <b>Step 3/6 — Core dataset done</b> ({elapsed:.0f} min)")
+                else:
+                    _plog(f"Step 3: Core dataset FAILED — {tail[-200:]}")
+                    _reply(f"❌ <b>Step 3/6 — Core dataset FAILED</b>\n<code>{tail[-400:]}</code>\n\n<i>Continuing with Momentum...</i>")
+
+                if ok:
+                    _plog("Step 4: Core model train started...")
+                    _reply("⏳ <b>Step 4/6 — Core model training</b>...")
+                    t0 = _t.time()
+                    ok4, tail4 = _sub(
+                        [sys.executable, str(scripts / "train_core_model.py"),
+                         "--parquet", str(out_core)],
+                        timeout_h=1,
+                    )
+                    elapsed = (_t.time() - t0) / 60
+                    if ok4:
+                        _plog(f"Step 4: Core model trained ({elapsed:.0f}m)")
+                        # Reload model in-process
+                        try:
+                            import core_radar as _cr
+                            _cr._core_model_checked = False
+                            _cr._core_model_bundle  = None
+                            _cr._load_core_model()
+                        except Exception:
+                            pass
+                        _reply(f"✅ <b>Step 4/6 — Core model trained</b> ({elapsed:.0f} min)\nML scoring active.")
+                    else:
+                        _plog(f"Step 4: Core model FAILED — {tail4[-200:]}")
+                        _reply(f"❌ <b>Step 4/6 — Core model FAILED</b>\n<code>{tail4[-400:]}</code>")
+
+            # ── Step 5+6: Momentum ────────────────────────────────────────────
+            if run_momentum:
+                _plog("Step 5: Momentum dataset build started (~2-3h)...")
+                _reply("⏳ <b>Step 5/6 — Momentum dataset</b> building (2-3h)...")
+                t0 = _t.time()
+                out_mom = data_dir / "momentum_training.parquet"
+                mom_script = Path(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py"
+                ok, tail = _sub(
+                    [sys.executable, str(mom_script), "--out", str(out_mom)],
+                    timeout_h=8,
+                )
+                elapsed = (_t.time() - t0) / 60
+                if ok:
+                    try:
+                        import pandas as pd
+                        df = pd.read_parquet(out_mom)
+                        rows = len(df)
+                        _plog(f"Step 5: Momentum dataset OK — {rows:,} rows, {elapsed:.0f}m")
+                        _reply(f"✅ <b>Step 5/6 — Momentum dataset done</b> ({elapsed:.0f} min)\n{rows:,} rows")
+                    except Exception:
+                        _plog(f"Step 5: Momentum dataset OK ({elapsed:.0f}m)")
+                        _reply(f"✅ <b>Step 5/6 — Momentum dataset done</b> ({elapsed:.0f} min)")
+                else:
+                    _plog(f"Step 5: Momentum dataset FAILED — {tail[-200:]}")
+                    _reply(f"❌ <b>Step 5/6 — Momentum dataset FAILED</b>\n<code>{tail[-400:]}</code>")
+
+                if ok:
+                    _plog("Step 6: Momentum retrain started...")
+                    _reply("⏳ <b>Step 6/6 — Momentum retrain</b>...")
+                    t0 = _t.time()
+                    try:
+                        from momentum_radar.trainer import run_momentum_training
+                        result = run_momentum_training(
+                            dataset_path=out_mom,
+                            bundle_path =data_dir / "momentum_model.pkl",
+                            report_path =data_dir / "momentum_report.json",
+                        ) or {}
+                        dec  = result.get("decision", "?")
+                        ic   = result.get("ic_ensemble")
+                        elapsed = (_t.time() - t0) / 60
+                        icon = {"PROMOTED": "🚀", "KEPT": "⚠️"}.get(dec, "❌")
+                        ic_s = f" | IC={ic:.4f}" if isinstance(ic, float) else ""
+                        _plog(f"Step 6: Momentum retrain {dec} ({elapsed:.0f}m){ic_s}")
+                        _reply(f"{icon} <b>Step 6/6 — Momentum retrain: {dec}</b> ({elapsed:.0f} min){ic_s}")
+                    except Exception as e:
+                        _plog(f"Step 6: Momentum retrain exception — {e}")
+                        _reply(f"❌ <b>Step 6/6 — Momentum retrain FAILED</b>\n<code>{e}</code>")
+
+            _plog("Overnight pipeline complete")
+            _reply(
+                "<b>Overnight pipeline complete!</b>\n"
+                "All models rebuilt from scratch.\n"
+                "Use <code>/admin_check_config</code> to verify model status."
+            )
+
+        except Exception as e:
+            logging.error(f"[overnight] unexpected: {e}", exc_info=True)
+            _reply(f"❌ <b>Overnight pipeline crashed:</b>\n<code>{e}</code>")
+        finally:
+            _retrain_running = False
+
+    threading.Thread(target=_run, daemon=True, name="admin-overnight").start()
 
 
 # ── /admin_run_pipeline ────────────────────────────────────────────────────────
@@ -4617,6 +4956,9 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_full_pipeline":
         _handle_admin_full_pipeline(parts)
+
+    elif cmd in ("/admin_overnight", "/overnight"):
+        _handle_admin_overnight(parts)
 
     elif cmd == "/admin_run_pipeline":
         _handle_admin_run_pipeline(parts)
