@@ -206,10 +206,27 @@ def _fetch_nasdaq100() -> list[str]:
 # ─────────────────────────────────────────────────────────────────────────
 
 def is_us_universe(ticker_info: dict) -> bool:
-    """Return True if ticker_info describes a US-domiciled stock above the $2B market cap floor."""
+    """Return True if ticker_info describes a US-domiciled stock above the $2B market cap floor.
+
+    yfinance returns exchange codes that differ from the formal names in US_EXCHANGES:
+      NMS  = Nasdaq Market Select (AAPL, MSFT, NVDA, GOOGL...)
+      NYQ  = NYSE (JPM, GS, BAC...)
+      NGM  = Nasdaq Global Market
+      NCM  = Nasdaq Capital Market
+      PCX  = NYSE Arca
+    Checks both yfinance codes and the formal names, then falls back to country == US.
+    """
+    _YFINANCE_US_CODES = {
+        "NMS", "NYQ", "NGM", "NCM", "PCX",   # yfinance actual codes
+        "NYSE", "NASDAQ", "AMEX", "NYSEARCA", "NYSEAMERICAN", "BATS",  # formal names
+    }
     exchange   = str(ticker_info.get("exchange") or ticker_info.get("exchangeShortName") or "")
     market_cap = float(ticker_info.get("marketCap") or 0)
-    return exchange in US_EXCHANGES and market_cap >= MIN_MARKET_CAP_USD
+    country    = str(ticker_info.get("country") or "")
+
+    if market_cap < MIN_MARKET_CAP_USD:
+        return False
+    return exchange in _YFINANCE_US_CODES or country == "United States"
 
 
 # In-memory cache — invalidated if result is empty
