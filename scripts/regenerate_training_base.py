@@ -179,7 +179,20 @@ def _fetch_one_ticker(
         try:
             df = pd.read_parquet(cache_file)
             df.index = pd.to_datetime(df.index)
-            return df
+            # Validate the cache actually covers the requested start date.
+            # If it starts more than 60 days after `start`, the cache was built from
+            # a shorter window (e.g. daily bot operation) — re-download the full history.
+            if not df.empty:
+                requested_start = pd.Timestamp(start)
+                cache_start     = df.index[0].normalize()
+                if cache_start > requested_start + pd.Timedelta(days=60):
+                    log.debug(
+                        f"  {ticker}: cache starts {cache_start.date()} "
+                        f"but need history from {start} — re-downloading"
+                    )
+                    # Fall through to yfinance download below
+                else:
+                    return df
         except Exception as e:
             log.warning(f"  cache corrupto {ticker} ({e}) — re-download")
 
