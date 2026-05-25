@@ -539,6 +539,30 @@ def generate_trade_card(trade: dict) -> Optional[Path]:
         f"Entry {open_date}  →  Exit {close_date}  ({days_held}d)\n"
         f"Return: {ret_s}   SPY: {spy_s}   Alpha: {alpha_s}"
     )
+
+    # CORE positions: add dividend yield line (actual DRIP income if tracked,
+    # otherwise pro-rated from annual_yield_pct over the holding period)
+    if trade_type == "CORE":
+        amount_eur   = float(trade.get("amount_eur") or 0)
+        drip_eur     = float(trade.get("dividends_reinvested_eur") or 0)
+        annual_yield = float(trade.get("annual_yield_pct") or 0)
+
+        if drip_eur > 0 and amount_eur > 0:
+            yield_pct = round(drip_eur / amount_eur * 100, 2)
+            yield_src = "actual DRIP"
+        elif annual_yield > 0 and days_held > 0:
+            yield_pct = round(annual_yield * (days_held / 365.0), 2)
+            yield_src = "est. yield"
+        else:
+            yield_pct = None
+            yield_src = ""
+
+        if yield_pct is not None:
+            total_ret = round((ret_pct or 0) + yield_pct, 2)
+            box_text += (
+                f"\nYield income: +{yield_pct:.2f}% ({yield_src})"
+                f"   Total return (incl. yield): {total_ret:+.1f}%"
+            )
     ax.text(
         0.01, 0.97, box_text,
         transform=ax.transAxes, va="top", ha="left", fontsize=9, color=_C_TEXT,

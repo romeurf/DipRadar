@@ -3673,13 +3673,26 @@ def _handle_core_close(parts: list[str]) -> None:
         return
     try:
         from paper_trading import close_core_holding
-        ok = close_core_holding(ticker, close_price)
-        if ok:
-            _reply(f"✅ *CORE {ticker}* fechado manualmente @ ${close_price:.2f}")
+        closed_trade = close_core_holding(ticker, close_price)
+        if closed_trade:
+            ret_s   = f"{closed_trade.get('return_pct', 0):+.1f}%"
+            alpha_s = f"{closed_trade.get('alpha_pct', 0):+.1f}%" if closed_trade.get("alpha_pct") is not None else "N/A"
+            _reply(
+                f"✅ <b>CORE {ticker}</b> closed manually @ ${close_price:.2f}\n"
+                f"Return: {ret_s}  Alpha vs SPY: {alpha_s}"
+            )
+            # Generate and send trade card (CORE cards include yield income line)
+            try:
+                from chart_generator import generate_trade_card
+                card = generate_trade_card(closed_trade)
+                if card and card.exists():
+                    _send_photo(card.read_bytes(), caption=f"CORE {ticker} — trade card")
+            except Exception as _ce:
+                logging.debug(f"[trade_card] core close card: {_ce}")
         else:
-            _reply(f"⚠️ Nenhuma posição CORE aberta em {ticker}.")
+            _reply(f"⚠️ No open CORE position found for {ticker}.")
     except Exception as e:
-        _reply(f"❌ Erro: `{e}`")
+        _reply(f"❌ Error: <code>{e}</code>")
 
 
 # ── /core_universe handlers ───────────────────────────────────────────────────────

@@ -1363,12 +1363,12 @@ def record_core_holding(
     return trade_id
 
 
-def close_core_holding(ticker: str, close_price: float) -> bool:
-    """Fecha manualmente uma posição CORE (única decisão manual do sistema)."""
-    ticker = ticker.upper()
-    today  = date.today()
-    trades = _load()
-    changed = False
+def close_core_holding(ticker: str, close_price: float) -> Optional[dict]:
+    """Close a CORE position manually. Returns the closed trade dict, or None if not found."""
+    ticker    = ticker.upper()
+    today     = date.today()
+    trades    = _load()
+    closed_t: Optional[dict] = None
     for t in trades:
         if t.get("ticker") != ticker or t.get("status") != "OPEN":
             continue
@@ -1390,12 +1390,12 @@ def close_core_holding(ticker: str, close_price: float) -> bool:
         t["return_pct"]     = ret_pct
         t["spy_return_pct"] = spy_ret
         t["alpha_pct"]      = alpha
-        changed = True
+        closed_t = t
         log.info(f"[core] CLOSE {ticker} MANUAL @ {close_price:.2f} ret={ret_pct:.1f}%")
-        break  # fechar apenas a posição mais antiga
-    if changed:
+        break  # close only the oldest open position
+    if closed_t is not None:
         _save(trades)
-    return changed
+    return closed_t
 
 
 _TAX_DISCLAIMER = (
