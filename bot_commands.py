@@ -1447,9 +1447,32 @@ def _handle_admin_disk(parts: list[str]) -> None:
 
     if purge:
         # Delete all non-essential data to free disk for the overnight rebuild.
-        # NEVER deleted: alert_db.csv (open positions) + backups/ dir (daily ZIPs).
+        # NEVER deleted: position/state files, alert databases, backups/ dir.
         # Model pickles ARE deleted — the overnight rebuild retrains all 3.
-        KEEP_FILES = {"alert_db.csv"}
+        KEEP_FILES = {
+            # Positions / trades (irreplaceable without manual entry)
+            "alert_db.csv",
+            "core_alert_db.csv",
+            "paper_trades.json",
+            "positions.json",
+            "persistent_dips.json",
+            "portfolio_override.json",
+            # Bot state (session continuity)
+            "_dipr_alerts.json",
+            "_dipr_recovery.json",
+            "_dipr_watchlist.json",
+            "_dipr_dip_streaks.json",
+            "_dipr_weekly.json",
+            "_dipr_backtest.json",
+            "_dipr_rejected.json",
+            "alerted_today.json",
+            # Logs (historical record)
+            "backtest_log.json",
+            "hist_backtest.csv",
+            "rejected_log.json",
+            "weekly_log.json",
+            "ml_predictions.csv",
+        }
         KEEP_DIRS  = {"backups"}   # /data/backups/*.zip — daily backups, always preserved
         freed = 0
         deleted_dirs: list[str] = []

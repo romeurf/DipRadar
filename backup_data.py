@@ -33,38 +33,50 @@ KEEP_LAST_N = 30
 
 # Padrões de ficheiros a incluir no backup (relativos à raiz do projecto)
 _BACKUP_PATTERNS: list[str] = [
-    # Base de dados de alertas (SQLite)
+    # Alert databases
+    "/data/alert_db.csv",
     "/data/alert_db.sqlite",
     "/data/alert_db.db",
-    # State JSON files
+    "/data/core_alert_db.csv",
+    # Paper trades and positions (irreplaceable)
+    "/data/paper_trades.json",
+    "/data/positions.json",
+    "/data/persistent_dips.json",
+    "/data/portfolio_override.json",
+    # Bot state JSON files
     "/data/alerts.json",
     "/data/recovery_watch.json",
     "/data/weekly_log.json",
     "/data/backtest_log.json",
     "/data/rejected_log.json",
-    "/data/persistent_dips.json",
-    "/data/positions.json",
     "/data/prediction_log.json",
+    "/data/alerted_today.json",
+    "/data/_dipr_alerts.json",
+    "/data/_dipr_recovery.json",
+    "/data/_dipr_watchlist.json",
+    "/data/_dipr_dip_streaks.json",
+    "/data/_dipr_weekly.json",
+    "/data/_dipr_backtest.json",
+    "/data/_dipr_rejected.json",
+    # Historical logs (CSV)
+    "/data/hist_backtest.csv",
+    "/data/ml_predictions.csv",
     # Universe snapshots (parquet)
     "/data/universe_snapshot*.parquet",
-    # Datasets de treino ML (raiz do repo)
-    "ml_training_base.parquet",
-    "ml_training_merged.parquet",   # legacy nome
-    "ml_training_fund.parquet",     # legacy nome
-    "ml_training_price.parquet",    # legacy nome
-    # Bundle ML em produção (nome canónico após PR robustez 2026-05)
-    "dip_models.pkl",
+    # DIP model — stage1 + stage2 (actual production models)
+    "/data/dip_model_stage1.pkl",
+    "/data/dip_model_stage2.pkl",
     "/data/dip_models.pkl",
+    "dip_models.pkl",
     "ml_training/dip_models.pkl",
-    # Legacy v3 names (mantidos para snapshots antigos durante migração)
-    "dip_models_v3.pkl",
-    "/data/dip_models_v3.pkl",
-    # Relatório de métricas (nome canónico + legacy)
+    # Core + Momentum models
+    "/data/core_us_model.pkl",
+    "/data/momentum_model.pkl",
+    "/data/momentum_report.json",
+    # ML reports
     "ml_report.json",
     "/data/ml_report.json",
-    "ml_training/ml_report.json",
-    "ml_report_v3.json",
-    "/data/ml_report_v3.json",
+    "/data/ml_floor_rho_alpha.json",
 ]
 
 
