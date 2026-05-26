@@ -1989,7 +1989,7 @@ def _handle_admin_build_core_dataset(parts: list[str]) -> None:
     """/admin_build_core_dataset [--force] [--no-fundamentals]
 
     Constrói o dataset de treino para o CoreML:
-      - 57 quality compounders × histórico desde 1993
+      - core_universe.json × histórico desde 1993
       - Detecta episódios MA200w (preço ≤5% acima da linha)
       - Features: price/MA/RSI/volume + sector ETF context
       - Targets: alpha_1y e alpha_2y vs SPY
@@ -2005,7 +2005,7 @@ def _handle_admin_build_core_dataset(parts: list[str]) -> None:
 
     _reply(
         "*CoreML Dataset Build*\n"
-        "57 quality compounders × histórico desde 1993\n"
+        "core_universe.json × histórico desde 1993\n"
         "Episódios MA200w + features price/MA/RSI/volume/sector ETF\n"
         "Targets: alpha\\_1y e alpha\\_2y vs SPY\n"
         "Output: Railway Volume `/data` + commit ao GitHub\n"
@@ -2593,7 +2593,7 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                     [sys.executable, str(scripts / "build_core_dataset.py"),
                      "--out", str(out_core), "--start", "1993-01-01", "--force-rebuild"],
                     phase="Step 3/6 — Core dataset build",
-                    timeout_h=4,
+                    timeout_h=10,
                 )
                 elapsed = (_t.time() - t0) / 60
                 if ok:
@@ -4390,7 +4390,7 @@ def _handle_command(text: str) -> None:
             "`/admin_load_models <url>` → [ADMIN] Carregar pickles novos para /data/\n"
             "`/admin_retrain [dry-run]` → [ADMIN] Disparar retrain ad-hoc\n"
             "`/admin_dip_dataset`       → [ADMIN] Construir dataset histórico DipRadar (desde 1993)\n"
-            "`/admin_build_core_dataset` → [ADMIN] Constrói dataset CoreML (57 compounders, desde 1993) + commit GitHub\n"
+            "`/admin_build_core_dataset` → [ADMIN] Constrói dataset CoreML (core_universe.json, desde 1993) + commit GitHub\n"
             "`/admin_full_pipeline`     → [ADMIN] Pipeline completo (parquets + retrain)\n"
             "`/health`                  → Dashboard observabilidade\n"
             "`/health errors`           → Log de erros críticos\n"
