@@ -53,7 +53,6 @@ FEATURE_COLUMNS: list[str] = [
     "sector_relative",
     "beta_90d",
     "vol_of_vol",
-    "quality_dislocation",
     "peg_ratio",           # trailing_PE / (EPS_growth%) — Lynch PEG: <1 undervalued, >2 expensive
     "month_of_year",
     "sector_alert_count_7d",
@@ -80,8 +79,7 @@ FEATURE_COLUMNS: list[str] = [
     # Phase 5b: advanced signals (Form 4 amount + 8-K + short trend + earnings tone)
     "insider_buy_amount_score",  # normalised magnitude of insider purchases [0,1]
     "recent_8k_score",           # 8-K event type: -1=restatement, +1=M&A target
-    "short_interest_trend",      # change in short interest vs prior month
-    "earnings_call_tone",        # last earnings call sentiment [-1=pessimistic, +1=confident]
+    "earnings_call_tone",        # last earnings call sentiment [-1=pessimistic, +1=confident]; NaN when unavailable (XGBoost learns split direction natively)
     # Sector-conditioned features (v4.2): RSI, VIX and drawdown adjusted by sector type.
     # VIX=35 means different things for growth vs commodity vs defensive sectors.
     # Captures deviation from sector's normal regime — orthogonal to global model.
@@ -106,6 +104,11 @@ FEATURE_COLUMNS: list[str] = [
     # (holders exhausted, better risk/reward). NVO Feb vs NVO Mar/Apr pattern.
     "days_below_ma200",          # consecutive trading days below 200d MA — 0=just crossed, 90+=washed out
     "decline_deceleration",      # return_1m / avg_monthly_3m: <1=slowing, >1=accelerating, <0=recovering
+    # New features (tasks 3-6)
+    "days_to_next_earnings",     # calendar days to next scheduled earnings; cap 90; DIP only
+    "pe_vs_sector_median",       # forward PE / sector median forward PE; 1.0=at sector median; Core only
+    "dividend_growth_3y",        # 3-year dividend CAGR; 0.0 for non-payers; Core only
+    "sector_momentum_3m",        # sector ETF 3m return (%); Momentum only
 ]
 # PR #28 (Phase A): drop 14 dead features after IC profiling on full parquet:
 #   • 9 CONSTANTS (std=0, IC undefined — _FALLBACK on every row):
@@ -143,6 +146,22 @@ _SECTOR_FAIR_PE: dict[str, float] = {
     "Materials": 14.0,
 }
 
+_SECTOR_MEDIAN_FWD_PE: dict[str, float] = {
+    "Technology": 28.0,
+    "Healthcare": 20.0,
+    "Communication Services": 20.0,
+    "Financial Services": 13.0,
+    "Financials": 13.0,
+    "Consumer Cyclical": 18.0,
+    "Consumer Defensive": 20.0,
+    "Industrials": 18.0,
+    "Energy": 11.0,
+    "Utilities": 17.0,
+    "Real Estate": 35.0,
+    "Basic Materials": 13.0,
+    "Materials": 13.0,
+}
+
 _FALLBACK: dict[str, float] = {
     "macro_score": 2.0,
     "vix": 20.0,
@@ -173,7 +192,6 @@ _FALLBACK: dict[str, float] = {
     "sector_relative_6m": 0.0,
     "beta_90d": 1.0,
     "vol_of_vol": 0.01,
-    "quality_dislocation": 0.08,
     "peg_ratio": 2.0,
     "relative_drop": 0.0,
     "month_of_year": 6.0,
@@ -198,10 +216,9 @@ _FALLBACK: dict[str, float] = {
     "analyst_rating": 2.5,            # entre Buy e Hold — neutro
     "short_interest_pct": 0.05,       # 5% — typical short interest
     # Phase 5b: advanced signals
-    "insider_buy_amount_score": 0.0,  # sem compras — caso mais comum
-    "recent_8k_score": 0.0,           # sem 8-K recente ou neutro
-    "short_interest_trend": 0.0,      # stable
-    "earnings_call_tone": 0.0,        # neutro — sem earnings call recente
+    "insider_buy_amount_score": 0.0,  # no insider buys — most common case
+    "recent_8k_score": 0.0,           # no recent 8-K or neutral
+    "earnings_call_tone": float("nan"),  # NaN = call not available; XGBoost learns split direction for missing data
     # Sector-conditioned features (v4.2)
     "rsi_sector_adjusted": 0.0,       # 0 = RSI na norma do sector (sem sinal de oversold)
     "vix_sector_signal": 0.0,         # 0 = VIX neutro ou sector tipo desconhecido
@@ -217,6 +234,11 @@ _FALLBACK: dict[str, float] = {
     # Dip maturity
     "days_below_ma200": 30.0,        # neutral: been below MA200 for ~1 month
     "decline_deceleration": 1.0,     # neutral: same monthly rate (no decel/accel)
+    # New features (tasks 3-6)
+    "days_to_next_earnings": 45.0,   # 45d = typical mid-quarter distance
+    "pe_vs_sector_median": 1.0,      # 1.0 = at sector median (no discount/premium)
+    "dividend_growth_3y": 0.0,       # 0.0 = no dividend history (most common)
+    "sector_momentum_3m": 0.0,       # 0.0 = flat sector (neutral)
 }
 
 def assert_feature_completeness(row: dict, context: str = "") -> None:
@@ -247,6 +269,7 @@ FEATURE_SETS: dict[str, list[str]] = {
         "peg_ratio",
         "insider_buy_recent", "insider_buy_amount_score", "recent_8k_score",
         "short_interest_pct",
+        "days_to_next_earnings",  # earnings proximity risk: avoid buying 3d before report
         # Dip maturity — distinguishes premature from washed-out entries
         "days_below_ma200", "decline_deceleration",
         # Macro / regime
@@ -259,7 +282,9 @@ FEATURE_SETS: dict[str, list[str]] = {
         "earnings_beat_rate", "analyst_rating",
         "earnings_call_tone", "recent_8k_score",
         "insider_buy_recent", "insider_buy_amount_score",
-        "peg_ratio",       # growth-adjusted valuation: low PEG + good fundamentals = Core entry
+        "peg_ratio",            # growth-adjusted valuation: low PEG + good fundamentals = Core entry
+        "pe_vs_sector_median",  # stock fwd PE / sector median fwd PE: <1 = structural discount
+        "dividend_growth_3y",   # 3y CAGR: growing dividend = management conviction in earnings durability
         # Structural entry (historical discount zone)
         "ma_200d_ratio", "rsi_14", "drawdown_52w", "price_vs_52w_percentile",
         "rsi_sector_adjusted", "drawdown_sector_normalized",
@@ -275,7 +300,8 @@ FEATURE_SETS: dict[str, list[str]] = {
     "momentum_us": [
         # Trend signals
         "return_1m", "return_3m_pre", "return_6m_pre",
-        "sector_relative", "beta_90d", "vol_of_vol",
+        "sector_relative", "sector_momentum_3m",  # absolute sector trend context
+        "beta_90d", "vol_of_vol",
         # Volume flow (directional institutional pressure)
         "volume_zscore_20d", "up_days_pct_20d",
         "volume_up_pct_20d", "mfi_14",
@@ -367,9 +393,6 @@ def add_derived_features(features: dict, alert_date: Optional[Any] = None) -> di
     features["pe_attractive"] = round(max(0.0, 1.0 - pe_vf), 4)
     features["drop_x_drawdown"] = round(drop * dd52 / 100.0, 4)
     features["vol_x_drop"] = round(volsp * abs(drop), 4)
-    gm = float(features.get("gross_margin", _FALLBACK["gross_margin"]))
-    fcf = float(features.get("fcf_yield", _FALLBACK["fcf_yield"]))
-    features["quality_dislocation"] = round(gm * abs(dd52) / 100.0, 4) if fcf >= 0 else 0.0
     # Standard PEG: trailing_PE / EPS_growth% (Lynch: <1 undervalued, >2 expensive)
     # earnings_growth preferred; fall back to revenue_growth if not available.
     _tpe = features.get("trailing_pe", float("nan"))
@@ -380,6 +403,18 @@ def add_derived_features(features: dict, alert_date: Optional[Any] = None) -> di
         features["peg_ratio"] = round(float(min(_tpe / (_eg * 100.0), 10.0)), 4)
     else:
         features["peg_ratio"] = _FALLBACK["peg_ratio"]
+    # pe_vs_sector_median: stock forward PE relative to sector median forward PE.
+    # <1.0 = trading at a discount to sector peers (potential entry for Core).
+    # Uses forwardPE key stored in features by build_features / bootstrap.
+    _fwd_pe = features.get("forward_pe")
+    _fwd_pe = float(_fwd_pe) if _fwd_pe is not None else float("nan")
+    sector_for_pe = str(features.get("sector", "Unknown") or "Unknown")
+    _sec_med_pe = _SECTOR_MEDIAN_FWD_PE.get(sector_for_pe, 18.0)
+    if math.isfinite(_fwd_pe) and _fwd_pe > 0 and _sec_med_pe > 0:
+        features["pe_vs_sector_median"] = round(float(min(_fwd_pe / _sec_med_pe, 5.0)), 4)
+    else:
+        features.setdefault("pe_vs_sector_median", _FALLBACK["pe_vs_sector_median"])
+
     sec_dd = float(features.get("sector_drawdown_5d", _FALLBACK["sector_drawdown_5d"]))
     features["relative_drop"] = round(drop - sec_dd, 4)
     try:
@@ -508,9 +543,10 @@ def build_features(
     _set("de_ratio",        fund.get("debt_equity") or fund.get("de_ratio"))
     _set("analyst_upside",  fund.get("analyst_upside") or fund.get("upside"))
     _set("fcf_yield",       fund.get("fcf_yield"))
-    # Inputs for standard PEG (read by add_derived_features below)
+    # Inputs for standard PEG and pe_vs_sector_median (read by add_derived_features)
     _set("trailing_pe",     fund.get("trailingPE") or fund.get("pe"))
     _set("earnings_growth", fund.get("earningsGrowth") or fund.get("epsGrowth"))
+    _set("forward_pe",      fund.get("forwardPE") or fund.get("forward_pe"))
 
     # pe_vs_fair = pe / fair_pe_sector (ratio > 1 = overvalued)
     pe_raw = _safe_float(fund.get("pe"))
@@ -627,6 +663,31 @@ def add_short_earnings_features(features: dict, ticker_info: Optional[dict] = No
     except Exception:
         features["earnings_surprise_avg"] = _FALLBACK["earnings_surprise_avg"]
         features["earnings_distance_days"] = _FALLBACK["earnings_distance_days"]
+
+    # days_to_next_earnings: calendar days to next scheduled earnings release.
+    # Uses earningsDate list from yfinance info (list of upcoming timestamps).
+    # Capped at 90 — beyond that, proximity no longer affects entry risk.
+    features.setdefault("days_to_next_earnings", _FALLBACK["days_to_next_earnings"])
+    try:
+        now_ne = _tz_normalize(alert_date) if alert_date is not None else pd.Timestamp.now().normalize()
+        ed = info.get("earningsDate")
+        if isinstance(ed, list) and ed:
+            best_diff = None
+            for ts in ed:
+                try:
+                    dt = (pd.Timestamp.fromtimestamp(int(ts)) if isinstance(ts, (int, float))
+                          else pd.Timestamp(ts))
+                    dt_norm = _tz_normalize(dt)
+                    diff = (dt_norm - now_ne).days
+                    if 0 <= diff and (best_diff is None or diff < best_diff):
+                        best_diff = diff
+                except Exception:
+                    pass
+            if best_diff is not None:
+                features["days_to_next_earnings"] = float(min(best_diff, 90))
+    except Exception:
+        pass
+
     return features
 
 def add_raw_ohlcv_features(features: dict, price_history: Optional[pd.DataFrame]) -> dict:
@@ -1027,6 +1088,50 @@ def add_volume_flow_features(features: dict, hist: pd.DataFrame) -> dict:
     return features
 
 
+def add_dividend_features(
+    features: dict,
+    price_history: Optional[pd.DataFrame],
+    alert_date: Optional[Any] = None,
+) -> dict:
+    """3-year dividend CAGR for Core model.
+
+    Requires price_history fetched with actions=True (yfinance Dividends column).
+    0.0 for non-dividend payers — model learns "not a dividend grower" is different
+    from a growing dividend, without any invented value polluting the signal.
+    """
+    features.setdefault("dividend_growth_3y", _FALLBACK["dividend_growth_3y"])
+    if price_history is None or "Dividends" not in price_history.columns:
+        return features
+    try:
+        hist = _normalize_index(price_history)
+        divs = hist["Dividends"].dropna()
+        divs = divs[divs > 0]
+        if divs.empty:
+            features["dividend_growth_3y"] = 0.0
+            return features
+
+        ref = _tz_normalize(alert_date) if alert_date is not None else pd.Timestamp.now().normalize()
+        cutoff_3y = ref - pd.DateOffset(years=3)
+        cutoff_6y = ref - pd.DateOffset(years=6)
+
+        recent = divs[(divs.index > cutoff_3y) & (divs.index <= ref)]
+        prior  = divs[(divs.index > cutoff_6y) & (divs.index <= cutoff_3y)]
+
+        recent_sum = float(recent.sum())
+        prior_sum  = float(prior.sum())
+
+        if prior_sum > 0 and recent_sum > 0:
+            cagr = (recent_sum / prior_sum) ** (1.0 / 3.0) - 1.0
+            features["dividend_growth_3y"] = round(float(np.clip(cagr, -0.5, 1.0)), 4)
+        elif recent_sum > 0 and prior_sum == 0:
+            features["dividend_growth_3y"] = 1.0   # initiated dividends in last 3y: treat as max growth
+        else:
+            features["dividend_growth_3y"] = 0.0
+    except Exception:
+        pass
+    return features
+
+
 def add_momentum_features(features: dict, price_history: Optional[pd.DataFrame], sector_history: Optional[pd.DataFrame] = None, spy_history: Optional[pd.DataFrame] = None) -> dict:
     keys = ["return_1m", "return_3m_pre", "return_6m_pre", "return_12m_pre", "sector_relative", "sector_relative_6m", "beta_90d", "vol_of_vol", "bb_width"]
     if price_history is None or price_history.empty:
@@ -1045,9 +1150,11 @@ def add_momentum_features(features: dict, price_history: Optional[pd.DataFrame],
         sec_ret_6m = _pct_return(sec_closes, 126)
         features["sector_relative"] = round(features["return_3m_pre"] - sec_ret_3m, 4)
         features["sector_relative_6m"] = round(features["return_6m_pre"] - sec_ret_6m, 4)
+        features["sector_momentum_3m"] = round(sec_ret_3m, 4)
     else:
         features["sector_relative"] = _FALLBACK["sector_relative"]
         features["sector_relative_6m"] = _FALLBACK["sector_relative_6m"]
+        features.setdefault("sector_momentum_3m", _FALLBACK["sector_momentum_3m"])
     features["beta_90d"] = _FALLBACK["beta_90d"]
     if spy_history is not None and not spy_history.empty:
         try:

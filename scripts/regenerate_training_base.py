@@ -291,6 +291,7 @@ def _compute_row_features(
         add_raw_ohlcv_features,
         add_regime_features,
         add_market_structure_features,
+        add_dividend_features,
     )
 
     ticker = str(row["ticker"])
@@ -351,6 +352,14 @@ def _compute_row_features(
             log.debug(f"  volume_flow failed {ticker}@{alert_date.date()}: {e}")
     for k in ("mfi_14", "volume_up_pct_20d"):
         fv.setdefault(k, _FALLBACK.get(k, 0.0))
+
+    # Dividends — 3-year CAGR (Core model)
+    if hist is not None:
+        try:
+            add_dividend_features(fv, hist, alert_date)
+        except Exception as e:
+            log.debug(f"  dividend_features failed {ticker}@{alert_date.date()}: {e}")
+    fv.setdefault("dividend_growth_3y", _FALLBACK.get("dividend_growth_3y", 0.0))
 
     # Devolver só as colunas de interesse
     return {k: float(fv.get(k, _FALLBACK.get(k, 0.0))) for k in NEW_FEATURE_COLS}

@@ -56,7 +56,6 @@ FEATURE_COLS: list[str] = [
     "sector_relative",
     "beta_90d",
     "vol_of_vol",
-    "quality_dislocation",
     "peg_ratio",
     "month_of_year",
     "sector_alert_count_7d",
@@ -78,7 +77,6 @@ FEATURE_COLS: list[str] = [
     # Fase 5b: sinais avançados SEC + mercado
     "insider_buy_amount_score",
     "recent_8k_score",
-    "short_interest_trend",
     "earnings_call_tone",
     # Sector-conditioned features (v4.2): RSI/VIX/drawdown ajustados ao tipo de sector.
     # Sincronizadas com FEATURE_COLUMNS em ml_features.py.
@@ -98,6 +96,11 @@ FEATURE_COLS: list[str] = [
     # Dip maturity features (NVO/ADBE pattern: best entry after prolonged dip, not day 1)
     "days_below_ma200",          # consecutive days below 200d MA — 0=just crossed, 90+=washed out
     "decline_deceleration",      # return_1m / avg_monthly_3m: <1=slowing, >1=accelerating, <0=recovering
+    # New features (tasks 3-6)
+    "days_to_next_earnings",
+    "pe_vs_sector_median",
+    "dividend_growth_3y",
+    "sector_momentum_3m",
 ]
 # Features removidas vs PR #25 (Spearman IC profiling sobre o parquet completo
 # 36929 rows confirmou 14 features inúteis):

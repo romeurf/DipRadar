@@ -83,7 +83,10 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\('bot_commands.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('bot_commands.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('bot_commands.py', encoding='utf-8'\\).read\\(\\)\\); print\\('bot_commands OK'\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('backup_data.py', encoding='utf-8'\\).read\\(\\)\\); print\\('backup_data OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('backup_data.py', encoding='utf-8'\\).read\\(\\)\\); print\\('backup_data OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('fundamental_history.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('bot_commands.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/collect_news_sentiment.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ],
     "additionalDirectories": [
       "c:\\Users\\Romeu\\OneDrive\\Documentos\\GitHub\\DipRadar"

@@ -150,7 +150,8 @@ def build_dip_dataset(
         FEATURE_COLUMNS, _FALLBACK, add_derived_features,
         add_momentum_features, add_raw_ohlcv_features,
         add_regime_features, add_market_structure_features,
-        add_volume_flow_features, assert_feature_completeness,
+        add_volume_flow_features, add_dividend_features,
+        assert_feature_completeness,
         _SECTOR_TYPE, _RSI_OVERSOLD_THRESHOLD,
     )
 
@@ -251,6 +252,7 @@ def build_dip_dataset(
                 add_raw_ohlcv_features(row_base, pit_hist)
                 add_market_structure_features(row_base, pit_hist)
                 add_volume_flow_features(row_base, pit_hist)
+                add_dividend_features(row_base, pit_hist, alert_date)
                 add_regime_features(row_base, spy_slice, tnx_slice, alert_date, vix_slice_full)
             except Exception as e:
                 log.debug(f"  ml_features failed {ticker}@{alert_date.date()}: {e}")

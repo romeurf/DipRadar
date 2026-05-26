@@ -65,6 +65,9 @@ CORE_FEATURE_COLS: list[str] = [
     "gross_margin",           # gross margin ratio (pricing power / moat)
     "roe",                    # return on equity (capital allocation quality)
     "fcf_yield_fund",         # FCF yield (cash generation at entry price)
+    # Relative valuation + dividend quality
+    "pe_vs_sector_median",    # fwd PE / sector median: <1.0 = structural discount
+    "dividend_growth_3y",     # 3y dividend CAGR: growing dividend = durable earnings
 ]
 
 TARGET = "alpha_1y"  # 1-year excess return vs SPY

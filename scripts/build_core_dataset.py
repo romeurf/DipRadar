@@ -395,11 +395,27 @@ def build_core_dataset(
         is_core = int(ticker in core_tickers)
         ann_yield = core_yields.get(ticker, 0.0)
 
-        # Sector ETF para este ticker (fetch uma vez, reutilizar em todos os episódios)
+        # Sector ETF and per-ticker signals (fetch once, reuse across all episodes)
         sector = "Unknown"
+        fwd_pe_ticker: Optional[float] = None
+        dividends_ticker: Optional[pd.Series] = None
         try:
             info = _yf.Ticker(ticker).info or {}
             sector = info.get("sector") or "Unknown"
+            _fpe = info.get("forwardPE")
+            if _fpe is not None:
+                try:
+                    fwd_pe_ticker = float(_fpe) if math.isfinite(float(_fpe)) and float(_fpe) > 0 else None
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            _divs = _yf.Ticker(ticker).dividends
+            if _divs is not None and not _divs.empty:
+                if _divs.index.tz is not None:
+                    _divs.index = _divs.index.tz_localize(None)
+                dividends_ticker = _divs
         except Exception:
             pass
         etf_key = SECTOR_ETF.get(sector, "SPY")
@@ -454,6 +470,34 @@ def build_core_dataset(
             # ── Targets ─────────────────────────────────────────────────────
             targets = _compute_alpha_targets(hist, alert_date, spy_hist)
 
+            # ── pe_vs_sector_median: stock fwd PE / sector median fwd PE ─────
+            # Note: forwardPE is fetched from current yfinance info (not PIT).
+            # For Core model, this is used as a cross-sectional valuation rank —
+            # the relative ranking within sector is stable enough across time.
+            from ml_features import _SECTOR_MEDIAN_FWD_PE as _SMED_PE
+            _sec_med = _SMED_PE.get(sector, 18.0)
+            if fwd_pe_ticker is not None and _sec_med > 0:
+                pe_vs_sector_med = round(min(fwd_pe_ticker / _sec_med, 5.0), 4)
+            else:
+                pe_vs_sector_med = 1.0  # fallback: at sector median
+
+            # ── dividend_growth_3y: PIT 3-year dividend CAGR ────────────────
+            div_growth_3y = 0.0  # fallback: non-payer or no data
+            if dividends_ticker is not None and not dividends_ticker.empty:
+                try:
+                    ref_d = alert_date if isinstance(alert_date, pd.Timestamp) else pd.Timestamp(alert_date)
+                    cutoff_3y = ref_d - pd.DateOffset(years=3)
+                    cutoff_6y = ref_d - pd.DateOffset(years=6)
+                    recent_sum = float(dividends_ticker[(dividends_ticker.index > cutoff_3y) & (dividends_ticker.index <= ref_d)].sum())
+                    prior_sum  = float(dividends_ticker[(dividends_ticker.index > cutoff_6y) & (dividends_ticker.index <= cutoff_3y)].sum())
+                    if prior_sum > 0 and recent_sum > 0:
+                        cagr = (recent_sum / prior_sum) ** (1.0 / 3.0) - 1.0
+                        div_growth_3y = round(float(np.clip(cagr, -0.5, 1.0)), 4)
+                    elif recent_sum > 0 and prior_sum == 0:
+                        div_growth_3y = 1.0   # initiated dividends
+                except Exception:
+                    pass
+
             # ── PIT Fundamentals (all historical episodes via EDGAR XBRL) ─────
             # Uses fundamental_history.get_pit_fundamentals() which fetches
             # SEC EDGAR XBRL company facts (cached once per ticker, 30-day TTL)
@@ -507,6 +551,8 @@ def build_core_dataset(
                 "sector_etf_vs_ma200w":   se_feats["sector_etf_vs_ma200w"],
                 "stock_vs_sector_spread": se_feats["stock_vs_sector_spread"],
                 "sector_return_20d":      se_feats["sector_return_20d"],
+                "pe_vs_sector_median":    pe_vs_sector_med,
+                "dividend_growth_3y":     div_growth_3y,
                 "revenue_growth":         fund.get("revenue_growth"),
                 "gross_margin":           fund.get("gross_margin"),
                 "roe":                    fund.get("roe"),
