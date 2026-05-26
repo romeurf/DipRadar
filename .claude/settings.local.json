@@ -87,7 +87,16 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\('fundamental_history.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('bot_commands.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/collect_news_sentiment.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
-      "Bash(Remove-Item \"c:\\\\Users\\\\Romeu\\\\OneDrive\\\\Documentos\\\\GitHub\\\\DipRadar\\\\universe_snapshot.py\" -Force)"
+      "Bash(Remove-Item \"c:\\\\Users\\\\Romeu\\\\OneDrive\\\\Documentos\\\\GitHub\\\\DipRadar\\\\universe_snapshot.py\" -Force)",
+      "Bash(python -c \"import json; d=json.loads\\(open\\('core_universe.json'\\).read\\(\\)\\); print\\(len\\(d['tickers']\\), 'tickers'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/build_core_dataset.py'\\).read\\(\\)\\); print\\('OK: no syntax errors'\\)\")",
+      "Bash(python -c \"import monthly_retrain; print\\('monthly_retrain imports OK'\\); print\\('PRODUCTION_BUNDLE:', monthly_retrain.PRODUCTION_BUNDLE\\); print\\('FLOOR_PATH:', monthly_retrain.FLOOR_PATH\\)\")",
+      "Bash(python -c \"from momentum_radar import trainer; print\\('momentum trainer OK'\\); print\\('FEATURE_COLS:', len\\(trainer.FEATURE_COLS\\)\\); print\\('TARGET_HORIZONS:', trainer.TARGET_HORIZONS\\); print\\('_IC_FLOOR \\(via local\\):', 'check trainer code'\\)\")",
+      "Bash(python -c \"from momentum_radar.scripts import build_dataset; print\\('build_dataset imports OK'\\); print\\('_MIN_RETURN_20D:', build_dataset._MIN_RETURN_20D\\); print\\('_EPISODE_EXIT_RETURN:', build_dataset._EPISODE_EXIT_RETURN\\)\")",
+      "Bash(python -m pytest tests/test_monthly_retrain.py -x -q)",
+      "Bash(python -m unittest tests.test_monthly_retrain -v)",
+      "Bash(python -m unittest tests.test_monthly_retrain.TestGateAndPromote.test_kept_floor_when_below_absolute_floor -v)",
+      "Bash(python -m unittest tests.test_monthly_retrain.TestGateAndPromote -v)"
     ],
     "additionalDirectories": [
       "c:\\Users\\Romeu\\OneDrive\\Documentos\\GitHub\\DipRadar"

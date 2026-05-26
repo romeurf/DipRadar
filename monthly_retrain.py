@@ -69,31 +69,55 @@ def _data_dir() -> Path:
     """
     return Path("/data") if Path("/data").exists() else Path("/tmp")
 
-_DATA_DIR = Path("/data") if Path("/data").exists() else Path("/tmp")
 _REPO_ROOT = Path(__file__).resolve().parent
 
-PRODUCTION_DIR     = _DATA_DIR
-CANDIDATE_DIR      = _DATA_DIR / "candidate"
-ARCHIVE_DIR        = _DATA_DIR / "archive"
-SNAPSHOT_PATH      = _DATA_DIR / "universe_snapshot.parquet"
-BOOTSTRAP_PATH     = _DATA_DIR / "ml_training_base.parquet"
-# Fallback: parquet bootstrap commitado no repo (cold-start em volumes vazios).
-BOOTSTRAP_FALLBACK = _REPO_ROOT / "ml_training_base.parquet"
-# Legacy bootstrap name (compat com volumes Railway que ainda tenham o antigo).
-LEGACY_BOOTSTRAP_PATH = _DATA_DIR / "ml_training_merged.parquet"
-LEGACY_BOOTSTRAP_FALLBACK = _REPO_ROOT / "ml_training_merged.parquet"
-ALERT_DB_PATH      = _DATA_DIR / "alert_db.csv"
-TRAINING_INPUT     = _DATA_DIR / "ml_training_input.parquet"
 
-PRODUCTION_BUNDLE  = PRODUCTION_DIR / "dip_models.pkl"
-PRODUCTION_REPORT  = PRODUCTION_DIR / "ml_report.json"
-CANDIDATE_BUNDLE   = CANDIDATE_DIR / "dip_models.pkl"
-CANDIDATE_REPORT   = CANDIDATE_DIR / "ml_report.json"
-PENDING_BUNDLE     = PRODUCTION_DIR / "dip_models_pending.pkl"
-PENDING_REPORT     = PRODUCTION_DIR / "ml_report_pending.json"
-# Legacy v3 names (mantidos para ler bundles antigos durante migração)
-LEGACY_PRODUCTION_BUNDLE = PRODUCTION_DIR / "dip_models_v3.pkl"
-LEGACY_PRODUCTION_REPORT = PRODUCTION_DIR / "ml_report_v3.json"
+def _paths() -> dict:
+    """Resolve all data paths at call time against the live filesystem.
+    Railway may mount /data after this module is imported, so anything resolved
+    at import time can permanently point to /tmp by accident. Every function
+    that touches a /data path MUST call _paths() locally — do NOT cache."""
+    dd = _data_dir()
+    prod_dir = dd
+    cand_dir = dd / "candidate"
+    return {
+        "PRODUCTION_DIR":            prod_dir,
+        "CANDIDATE_DIR":             cand_dir,
+        "ARCHIVE_DIR":               dd / "archive",
+        "SNAPSHOT_PATH":             dd / "universe_snapshot.parquet",
+        "BOOTSTRAP_PATH":            dd / "ml_training_base.parquet",
+        "BOOTSTRAP_FALLBACK":        _REPO_ROOT / "ml_training_base.parquet",
+        "LEGACY_BOOTSTRAP_PATH":     dd / "ml_training_merged.parquet",
+        "LEGACY_BOOTSTRAP_FALLBACK": _REPO_ROOT / "ml_training_merged.parquet",
+        "ALERT_DB_PATH":             dd / "alert_db.csv",
+        "TRAINING_INPUT":            dd / "ml_training_input.parquet",
+        "PRODUCTION_BUNDLE":         prod_dir / "dip_models.pkl",
+        "PRODUCTION_REPORT":         prod_dir / "ml_report.json",
+        "CANDIDATE_BUNDLE":          cand_dir / "dip_models.pkl",
+        "CANDIDATE_REPORT":          cand_dir / "ml_report.json",
+        "PENDING_BUNDLE":            prod_dir / "dip_models_pending.pkl",
+        "PENDING_REPORT":            prod_dir / "ml_report_pending.json",
+        "FLOOR_PATH":                dd / "ml_floor_rho_alpha.json",
+    }
+
+
+# Module-level path attributes — accessed via external `from monthly_retrain import X`
+# or `monthly_retrain.X`. PEP 562 __getattr__ handles both. Functions defined inside
+# this module must call _paths() locally; LOAD_GLOBAL bypasses __getattr__.
+_PATH_KEYS = {
+    "PRODUCTION_DIR", "CANDIDATE_DIR", "ARCHIVE_DIR", "SNAPSHOT_PATH",
+    "BOOTSTRAP_PATH", "BOOTSTRAP_FALLBACK", "LEGACY_BOOTSTRAP_PATH",
+    "LEGACY_BOOTSTRAP_FALLBACK", "ALERT_DB_PATH", "TRAINING_INPUT",
+    "PRODUCTION_BUNDLE", "PRODUCTION_REPORT", "CANDIDATE_BUNDLE",
+    "CANDIDATE_REPORT", "PENDING_BUNDLE", "PENDING_REPORT", "FLOOR_PATH",
+}
+
+
+def __getattr__(name: str):
+    """Lazy resolution for `monthly_retrain.PRODUCTION_BUNDLE` and friends."""
+    if name in _PATH_KEYS:
+        return _paths()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gating constants
@@ -117,7 +141,7 @@ DEFAULT_GATING_RATIO = 0.90
 #                            ruído puro (random IC ≈ 0).
 # Editável em runtime via `/admin_set_floor <value>` (escreve em FLOOR_PATH).
 FLOOR_RHO_ALPHA_DEFAULT = 0.08
-FLOOR_PATH = _DATA_DIR / "ml_floor_rho_alpha.json"
+# FLOOR_PATH is resolved lazily via module __getattr__ (see _paths() above).
 
 LABEL_HORIZON_DAYS = 182  # 6 meses para resolver outcomes
 
@@ -325,31 +349,26 @@ def _load_alert_db_as_training() -> pd.DataFrame:
         log.error("[alert_db] Coluna 'ticker'/'symbol' ausente após rename — a ignorar alert_db.")
         return pd.DataFrame()
 
+    # Only set defaults for features still present in FEATURE_COLUMNS. Dead
+    # features (gross_margin, de_ratio, pe_vs_fair, atr_ratio, volume_spike,
+    # quality_score, quality_dislocation, relative_drop, ...) were removed in
+    # PR #28 — assigning defaults for them is dead code that pollutes the
+    # parquet schema and confuses readers.
+    try:
+        from ml_features import FEATURE_COLUMNS as _FC, _FALLBACK
+        live_features = set(_FC)
+    except Exception:
+        live_features = set()
+        _FALLBACK = {}
+
     defaults = {
-        "macro_score":     2,
-        "vix":             20.0,
-        "atr_ratio":       0.02,
-        "volume_spike":    df.get("volume_ratio", 1.0),
-        "pe_vs_fair":      1.0,
-        "analyst_upside":  df.get("analyst_upside", 0.10),
-        "quality_score":   0.5,
-        # ── Stage 3c: dislocation features (adicionadas em 2026-05-05) ──────
-        # Rows do alert_db.csv geradas antes deste commit não têm estas colunas.
-        # Sem default chegam como NaN ao train → KeyError ou degradação
-        # silenciosa. Valores escolhidos de ml_features._FALLBACK.
-        "quality_dislocation": 0.08,   # empresa mediana como baseline
-        "peg_ratio":        2.0,    # PEG neutro
-        "relative_drop":       0.0,    # sem queda idiossincrática
-        "month_of_year":       float(datetime.now().month),  # mês actual como proxy
+        "vix":                 _FALLBACK.get("vix", 20.0),
+        "peg_ratio":           _FALLBACK.get("peg_ratio", 2.0),
+        "month_of_year":       float(datetime.now().month),
     }
     for k, v in defaults.items():
-        if k not in df.columns:
+        if k in live_features and k not in df.columns:
             df[k] = v
-
-    if "pe" in df.columns and "pe_fair" in df.columns:
-        pe   = pd.to_numeric(df["pe"], errors="coerce")
-        fair = pd.to_numeric(df["pe_fair"], errors="coerce")
-        df["pe_vs_fair"] = (pe / fair).clip(0.1, 5.0).fillna(1.0)
 
     df["label_win"] = df["outcome_label"].isin(["WIN_STRONG", "WIN"]).astype(int)  # alinhado com _SCORE_MED/HIGH
     df["label_further_drop"] = None
@@ -636,38 +655,34 @@ def _read_v3_metrics(report_path: Path) -> dict[str, Optional[float]]:
 
 
 def _read_floor_rho_alpha() -> float:
-    """Lê o floor absoluto (cria se não existe). Editável manualmente via JSON
-    ou em runtime via :func:`set_floor_rho_alpha` (e.g. ``/admin_set_floor``)."""
+    """Read the absolute floor (creates if missing). Path is resolved at call time."""
+    floor_path = _paths()["FLOOR_PATH"]
     try:
-        if FLOOR_PATH.exists():
-            data = json.loads(FLOOR_PATH.read_text())
+        if floor_path.exists():
+            data = json.loads(floor_path.read_text())
             return float(data.get("floor_rho_alpha", FLOOR_RHO_ALPHA_DEFAULT))
     except Exception as e:
-        log.warning(f"[gating] Floor file corrupt at {FLOOR_PATH}: {e} — usando default")
+        log.warning(f"[gating] Floor file corrupt at {floor_path}: {e} — using default")
 
     try:
-        FLOOR_PATH.parent.mkdir(parents=True, exist_ok=True)
-        FLOOR_PATH.write_text(json.dumps({
+        floor_path.parent.mkdir(parents=True, exist_ok=True)
+        floor_path.write_text(json.dumps({
             "floor_rho_alpha": FLOOR_RHO_ALPHA_DEFAULT,
             "set_at":          datetime.utcnow().isoformat() + "Z",
             "comment":         f"Initial floor — default {FLOOR_RHO_ALPHA_DEFAULT}.",
         }, indent=2))
     except Exception as e:
-        log.debug(f"[gating] Não foi possível persistir floor: {e}")
+        log.debug(f"[gating] Could not persist floor: {e}")
     return FLOOR_RHO_ALPHA_DEFAULT
 
 
 def set_floor_rho_alpha(value: float, *, comment: Optional[str] = None) -> dict:
-    """Ajusta o floor absoluto em runtime e persiste em :data:`FLOOR_PATH`.
-
-    Lança ``ValueError`` se ``value`` estiver fora de ``[0.0, 0.5]`` (range
-    operacionalmente razoável). Devolve metadata com o valor anterior e novo
-    para feedback ao chamador.
-    """
+    """Adjust the absolute floor at runtime and persist to FLOOR_PATH."""
     if not isinstance(value, (int, float)) or not (0.0 <= float(value) <= 0.5):
         raise ValueError(
-            f"floor_rho_alpha fora de range [0.0, 0.5]: {value!r}"
+            f"floor_rho_alpha out of range [0.0, 0.5]: {value!r}"
         )
+    floor_path = _paths()["FLOOR_PATH"]
     old = _read_floor_rho_alpha()
     payload = {
         "floor_rho_alpha": float(value),
@@ -675,10 +690,10 @@ def set_floor_rho_alpha(value: float, *, comment: Optional[str] = None) -> dict:
         "comment":         comment or f"Manual override via set_floor_rho_alpha (prev={old:.4f}).",
         "previous":        old,
     }
-    FLOOR_PATH.parent.mkdir(parents=True, exist_ok=True)
-    FLOOR_PATH.write_text(json.dumps(payload, indent=2))
+    floor_path.parent.mkdir(parents=True, exist_ok=True)
+    floor_path.write_text(json.dumps(payload, indent=2))
     log.info(f"[gating] floor_rho_alpha: {old:.4f} → {value:.4f}")
-    return {"old": old, "new": float(value), "path": str(FLOOR_PATH)}
+    return {"old": old, "new": float(value), "path": str(floor_path)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -844,28 +859,29 @@ def gate_and_promote_v3(
 
 
 def _do_promote(result: dict) -> dict:
-    """Atomic move: candidate → production (com archive da produção anterior)."""
+    """Atomic move: candidate → production (archives the previous production bundle)."""
+    p = _paths()
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    p["ARCHIVE_DIR"].mkdir(parents=True, exist_ok=True)
 
-    if PRODUCTION_BUNDLE.exists():
-        archived_pkl = ARCHIVE_DIR / f"dip_models_{timestamp}.pkl"
-        shutil.copy2(PRODUCTION_BUNDLE, archived_pkl)
+    if p["PRODUCTION_BUNDLE"].exists():
+        archived_pkl = p["ARCHIVE_DIR"] / f"dip_models_{timestamp}.pkl"
+        shutil.copy2(p["PRODUCTION_BUNDLE"], archived_pkl)
         log.info(f"[gating] Archived production bundle → {archived_pkl.name}")
-    if PRODUCTION_REPORT.exists():
-        archived_json = ARCHIVE_DIR / f"ml_report_{timestamp}.json"
-        shutil.copy2(PRODUCTION_REPORT, archived_json)
+    if p["PRODUCTION_REPORT"].exists():
+        archived_json = p["ARCHIVE_DIR"] / f"ml_report_{timestamp}.json"
+        shutil.copy2(p["PRODUCTION_REPORT"], archived_json)
 
     promoted: list[str] = []
-    if CANDIDATE_BUNDLE.exists():
-        tmp = PRODUCTION_BUNDLE.with_suffix(".pkl.tmp")
-        shutil.copy2(CANDIDATE_BUNDLE, tmp)
-        tmp.replace(PRODUCTION_BUNDLE)
-        promoted.append(PRODUCTION_BUNDLE.name)
-    if CANDIDATE_REPORT.exists():
-        tmp = PRODUCTION_REPORT.with_suffix(".json.tmp")
-        shutil.copy2(CANDIDATE_REPORT, tmp)
-        tmp.replace(PRODUCTION_REPORT)
+    if p["CANDIDATE_BUNDLE"].exists():
+        tmp = p["PRODUCTION_BUNDLE"].with_suffix(".pkl.tmp")
+        shutil.copy2(p["CANDIDATE_BUNDLE"], tmp)
+        tmp.replace(p["PRODUCTION_BUNDLE"])
+        promoted.append(p["PRODUCTION_BUNDLE"].name)
+    if p["CANDIDATE_REPORT"].exists():
+        tmp = p["PRODUCTION_REPORT"].with_suffix(".json.tmp")
+        shutil.copy2(p["CANDIDATE_REPORT"], tmp)
+        tmp.replace(p["PRODUCTION_REPORT"])
 
     log.info(f"[gating] PROMOTED — {promoted}")
     result["promoted_files"]    = promoted
@@ -874,14 +890,15 @@ def _do_promote(result: dict) -> dict:
 
 
 def _save_pending(result: dict) -> dict:
-    """Guarda candidate como `dip_models_pending.pkl` (não promove)."""
-    if CANDIDATE_BUNDLE.exists():
-        shutil.copy2(CANDIDATE_BUNDLE, PENDING_BUNDLE)
-        log.info(f"[gating] Pending bundle: {PENDING_BUNDLE}")
-        result["pending_bundle"] = str(PENDING_BUNDLE)
-    if CANDIDATE_REPORT.exists():
-        shutil.copy2(CANDIDATE_REPORT, PENDING_REPORT)
-        result["pending_report"] = str(PENDING_REPORT)
+    """Save candidate as `dip_models_pending.pkl` (does not promote)."""
+    p = _paths()
+    if p["CANDIDATE_BUNDLE"].exists():
+        shutil.copy2(p["CANDIDATE_BUNDLE"], p["PENDING_BUNDLE"])
+        log.info(f"[gating] Pending bundle: {p['PENDING_BUNDLE']}")
+        result["pending_bundle"] = str(p["PENDING_BUNDLE"])
+    if p["CANDIDATE_REPORT"].exists():
+        shutil.copy2(p["CANDIDATE_REPORT"], p["PENDING_REPORT"])
+        result["pending_report"] = str(p["PENDING_REPORT"])
     return result
 
 
@@ -938,18 +955,19 @@ def run_monthly_retrain(
             "elapsed_s":      round(time.time() - t0, 1),
         }
 
-    # 3. Treinar candidate via ml_training.train.run_training
-    CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
+    # 3. Train candidate via ml_training.train.run_training
+    p = _paths()
+    p["CANDIDATE_DIR"].mkdir(parents=True, exist_ok=True)
     train_result: dict = {}
     try:
         from ml_training.config import N_FOLDS, PURGE_DAYS
         from ml_training.train import run_training
 
-        log.info(f"[retrain] A treinar candidate em {CANDIDATE_DIR}...")
+        log.info(f"[retrain] Training candidate in {p['CANDIDATE_DIR']}...")
         train_result = run_training(
             input_parquet=train_path,
-            output_bundle=CANDIDATE_BUNDLE,
-            output_report=CANDIDATE_REPORT,
+            output_bundle=p["CANDIDATE_BUNDLE"],
+            output_report=p["CANDIDATE_REPORT"],
             n_folds=n_folds if n_folds is not None else N_FOLDS,
             purge_days=purge_days if purge_days is not None else PURGE_DAYS,
         )
@@ -993,8 +1011,8 @@ def run_monthly_retrain(
         log.warning(f"[retrain] Dataset health check falhou (não bloqueante): {e}")
 
     # 4. Gating + atomic deploy
-    cand_metrics = _read_v3_metrics(CANDIDATE_REPORT)
-    prod_metrics = _read_v3_metrics(PRODUCTION_REPORT)
+    cand_metrics = _read_v3_metrics(p["CANDIDATE_REPORT"])
+    prod_metrics = _read_v3_metrics(p["PRODUCTION_REPORT"])
     gate = gate_and_promote_v3(
         cand_metrics=cand_metrics,
         prod_metrics=prod_metrics,

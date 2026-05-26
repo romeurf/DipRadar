@@ -1,35 +1,18 @@
 """
-ml_predictor.py — Score v3: regressor dual (model_up + model_down).
+ml_predictor.py — DIP model inference. Predicts alpha_90d (log-return excess over SPY).
 
-Score final = pred_up (predicted alpha_90d = log-return excess over SPY em 90 dias).
-  → representa o excesso de retorno sobre o SPY esperado nos 90 dias
-    seguintes ao alerta (escala log-return).
+The bundle stores its own feature_cols list — at inference we read it from there,
+not from FEATURE_COLUMNS. This module just feeds the live features dict through it.
 
-Thresholds (escala alpha_90d):
-  _SCORE_HIGH  = 0.06   alpha > +6pp sobre SPY → WIN_STRONG
-  _SCORE_MED   = 0.03   alpha > +3pp sobre SPY → WIN
-  _SCORE_FLOOR = 0.01   alpha > +1pp sobre SPY → WEAK
+Score thresholds (alpha_90d scale):
+  _SCORE_HIGH  = 0.06   alpha > +6pp over SPY → WIN_STRONG
+  _SCORE_MED   = 0.03   alpha > +3pp over SPY → WIN
+  _SCORE_FLOOR = 0.01   alpha > +1pp over SPY → WEAK
 
-Nota: model_down tem rho ≈ 0 (não prevê nada), não entra no score.
-Mantemos pred_down em MLResult apenas para diagnóstico.
+model_down (max_drawdown_60d) is kept in MLResult for diagnostics only; its IC ≈ 0.
 
-API pública (inalterada):
-  ml_score(features: dict) -> MLResult
-  is_model_ready() -> bool
-  get_model_info() -> dict
-  ml_badge(result: MLResult) -> str    # linha formatada para Telegram
-
-Features esperadas (37 — FEATURE_COLUMNS de ml_features.py):
-  Stage 0(4): macro_score, vix, spy_drawdown_5d, sector_drawdown_5d
-  Stage 1(5): gross_margin, de_ratio, pe_vs_fair, analyst_upside, quality_score
-  Stage 2(5): drop_pct_today, drawdown_52w, rsi_14, atr_ratio, volume_spike
-  Stage 3(5): rsi_oversold_strength, vix_regime, pe_attractive,
-              drop_x_drawdown, vol_x_drop
-  Stage 3b(4): return_1m, return_3m_pre, sector_relative, beta_90d
-  Stage 3c(4): quality_dislocation, peg_ratio, relative_drop, month_of_year
-  Stage 3d(2): sector_alert_count_7d, days_since_52w_high
-  Stage 3e(2): short_interest_ratio, earnings_surprise_avg
-  Stage 3f(3): vix_percentile_1y, spy_rsi_14, yield_10y_change_5d
+Public API: ml_score(features) -> MLResult, is_model_ready(), get_model_info(),
+            ml_badge(result).
 """
 
 from __future__ import annotations

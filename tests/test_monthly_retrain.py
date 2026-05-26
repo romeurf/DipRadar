@@ -23,41 +23,16 @@ sys.path.insert(0, str(ROOT))
 class TestGateAndPromote(unittest.TestCase):
 
     def setUp(self):
-        # Cada test usa um tmpdir isolado para evitar contaminação
+        # Each test uses an isolated tmpdir; we patch _data_dir so that
+        # monthly_retrain._paths() resolves all paths under it.
         from tempfile import mkdtemp
         self.tmp = Path(mkdtemp(prefix="dipradar_retrain_"))
-
-        # Patch caminhos do módulo para o tmpdir
-        import monthly_retrain as m
-        self._orig = {
-            "PRODUCTION_DIR":     m.PRODUCTION_DIR,
-            "CANDIDATE_DIR":      m.CANDIDATE_DIR,
-            "ARCHIVE_DIR":        m.ARCHIVE_DIR,
-            "PRODUCTION_BUNDLE":  m.PRODUCTION_BUNDLE,
-            "PRODUCTION_REPORT":  m.PRODUCTION_REPORT,
-            "CANDIDATE_BUNDLE":   m.CANDIDATE_BUNDLE,
-            "CANDIDATE_REPORT":   m.CANDIDATE_REPORT,
-            "PENDING_BUNDLE":     m.PENDING_BUNDLE,
-            "PENDING_REPORT":     m.PENDING_REPORT,
-            "FLOOR_PATH":         m.FLOOR_PATH,
-        }
-        m.PRODUCTION_DIR    = self.tmp
-        m.CANDIDATE_DIR     = self.tmp / "candidate"
-        m.ARCHIVE_DIR       = self.tmp / "archive"
-        m.PRODUCTION_BUNDLE = self.tmp / "dip_models.pkl"
-        m.PRODUCTION_REPORT = self.tmp / "ml_report.json"
-        m.CANDIDATE_BUNDLE  = m.CANDIDATE_DIR / "dip_models.pkl"
-        m.CANDIDATE_REPORT  = m.CANDIDATE_DIR / "ml_report.json"
-        m.PENDING_BUNDLE    = self.tmp / "dip_models_pending.pkl"
-        m.PENDING_REPORT    = self.tmp / "ml_report_pending.json"
-        m.FLOOR_PATH        = self.tmp / "ml_floor_rho_alpha.json"
-
-        m.CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
+        self._patcher = patch("monthly_retrain._data_dir", return_value=self.tmp)
+        self._patcher.start()
+        (self.tmp / "candidate").mkdir(parents=True, exist_ok=True)
 
     def tearDown(self):
-        import monthly_retrain as m
-        for k, v in self._orig.items():
-            setattr(m, k, v)
+        self._patcher.stop()
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -80,9 +55,11 @@ class TestGateAndPromote(unittest.TestCase):
         self.assertEqual(result["decision"], "FAILED")
 
     def test_kept_floor_when_below_absolute_floor(self):
-        from monthly_retrain import gate_and_promote_v3
+        from monthly_retrain import gate_and_promote_v3, FLOOR_RHO_ALPHA_DEFAULT
+        # Pick a candidate ρ_α clearly below the default floor (currently 0.08).
+        rho_below = FLOOR_RHO_ALPHA_DEFAULT / 2
         result = gate_and_promote_v3(
-            cand_metrics={"rho_alpha_mean": 0.10},
+            cand_metrics={"rho_alpha_mean": rho_below},
             prod_metrics={"rho_alpha_mean": 0.30},
         )
         self.assertEqual(result["decision"], "KEPT_FLOOR")

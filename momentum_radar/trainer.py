@@ -55,11 +55,13 @@ FEATURE_COLS = [
     "volume_up_pct_20d",     # % volume em dias de subida — pressão compradora
 ]
 
-# Alvos multi-horizonte e pesos no ensemble
+# Multi-horizon targets — alpha vs SPY removes market regime bias.
+# Trains on "will this stock outperform SPY" rather than "will market go up."
+# alpha_Xd columns are built by build_dataset.py alongside forward_return_Xd.
 TARGET_HORIZONS = [
-    ("forward_return_30d",  "L1", 0.25),
-    ("forward_return_90d",  "L2", 0.40),
-    ("forward_return_180d", "L3", 0.35),
+    ("alpha_30d",  "L1", 0.25),
+    ("alpha_90d",  "L2", 0.40),
+    ("alpha_180d", "L3", 0.35),
 ]
 
 PURGE_DAYS = 30
@@ -271,22 +273,22 @@ def run_momentum_training(
     except Exception:
         pass
 
-    _IC_FLOOR = 0.04  # não promover modelos com IC absoluto muito baixo
+    _IC_FLOOR = 0.06  # IC < 0.06 is not worth promoting — barely predictive
     if ic_ensemble < _IC_FLOOR:
-        log.warning(f"[momentum_train] IC ({ic_ensemble:.4f}) abaixo do floor ({_IC_FLOOR}) — a manter modelo actual")
+        log.warning(f"[momentum_train] IC ({ic_ensemble:.4f}) below floor ({_IC_FLOOR}) — keeping current model")
         return {
             "decision":    "KEPT",
-            "reason":      f"IC novo ({ic_ensemble:.4f}) abaixo do floor mínimo ({_IC_FLOOR})",
+            "reason":      f"New IC ({ic_ensemble:.4f}) below minimum floor ({_IC_FLOOR})",
             "ic_ensemble": ic_ensemble,
             "ic_prod":     ic_prod,
             "n_train":     len(df),
             "elapsed_s":   round(time.time() - t0, 1),
         }
     if ic_prod is not None and ic_ensemble < ic_prod * 0.90:
-        log.warning(f"[momentum_train] IC ({ic_ensemble:.4f}) < prod ({ic_prod:.4f}) × 0.90 — a manter modelo actual")
+        log.warning(f"[momentum_train] IC ({ic_ensemble:.4f}) < prod ({ic_prod:.4f}) × 0.90 — keeping current model")
         return {
             "decision":    "KEPT",
-            "reason":      f"IC novo ({ic_ensemble:.4f}) não melhora sobre produção ({ic_prod:.4f})",
+            "reason":      f"New IC ({ic_ensemble:.4f}) does not improve over production ({ic_prod:.4f})",
             "ic_ensemble": ic_ensemble,
             "ic_prod":     ic_prod,
             "n_train":     len(df),
@@ -308,27 +310,43 @@ def run_momentum_training(
         }
         log.info(f"[momentum_train] {label}: {n} amostras")
 
-    # Sector models por L2 (horizonte principal)
+    # Sector models on L2 (main horizon). Same alpha target as main models —
+    # raw returns conflate market regime with stock-specific signal.
+    # Mean-imputation per sector (instead of fillna(0)) so missing features
+    # don't pull ScaledRidge predictions toward the wrong baseline.
     sector_models: dict = {}
-    if "sector" in df.columns and "forward_return_90d" in df.columns:
+    if "sector" in df.columns and "alpha_90d" in df.columns:
         from scipy.stats import spearmanr as _spr
-        df_l2 = df.dropna(subset=["forward_return_90d"])
-        for sector, grp in df_l2.groupby("sector"):
-            if len(grp) < 100:
-                continue
-            Xs = grp[FEATURE_COLS].fillna(0).values.astype(np.float32)
-            ys = grp["forward_return_90d"].values.astype(float)
+        try:
+            from ml_training.train import _compute_col_means, _prepare_X
             from ml_training.models import ScaledRidge
-            sm = ScaledRidge(alpha=10.0)
-            sm.fit(Xs, ys)
-            # IC indicativo no train set (não cross-validado — serve para triagem)
-            try:
-                preds = sm.predict(Xs)
-                ic_train = round(float(_spr(preds, ys).statistic), 4)
-            except Exception:
-                ic_train = None
-            sector_models[sector] = {"model": sm, "n_train": len(grp), "ic_train": ic_train}
-            log.info(f"[momentum_train] Sector L2 {sector}: {len(grp)} amostras | IC_train={ic_train}")
+            _sector_infra = True
+        except ImportError:
+            _sector_infra = False
+            log.warning("[momentum_train] ml_training infra unavailable — sector models skipped")
+
+        if _sector_infra:
+            df_l2 = df.dropna(subset=["alpha_90d"])
+            for sector, grp in df_l2.groupby("sector"):
+                if len(grp) < 100:
+                    continue
+                sm = ScaledRidge(alpha=10.0)
+                col_means = _compute_col_means(grp, FEATURE_COLS)
+                Xs = _prepare_X(grp, FEATURE_COLS, col_means, sm)
+                ys = grp["alpha_90d"].values.astype(float)
+                sm.fit(Xs, ys)
+                try:
+                    preds = sm.predict(Xs)
+                    ic_train = round(float(_spr(preds, ys).statistic), 4)
+                except Exception:
+                    ic_train = None
+                sector_models[sector] = {
+                    "model":    sm,
+                    "means":    col_means,
+                    "n_train":  len(grp),
+                    "ic_train": ic_train,
+                }
+                log.info(f"[momentum_train] Sector L2 {sector}: {len(grp)} samples | IC_train={ic_train}")
 
     bundle = {
         "models":        models,         # {"L1": {...}, "L2": {...}, "L3": {...}}

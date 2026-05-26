@@ -7,8 +7,10 @@ o Breakout ML aprende a partir de dias em que um stock estava em momentum:
   - volume acima da média
   - RSI em zona de momentum (50-78)
 
-Target: forward_return_30d — quanto o stock retornou nos 30 dias seguintes.
-Horizonte mais curto que o DipRadar (90d) porque momentum fades faster.
+Targets: alpha_30d / alpha_90d / alpha_180d — excess return over SPY per horizon.
+Training on alpha removes market regime bias (raw returns conflate "market is up" with signal).
+Entry criteria are deliberately wide: return_20d, volume_ratio_20d and rsi_14 are all model
+features — the model learns optimal thresholds from the full gradient in training data.
 
 Uso:
   python scripts/build_momentum_dataset.py
@@ -23,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import sys
 import time
 from datetime import date, timedelta
@@ -42,18 +45,19 @@ _DATA_DIR   = Path("/data") if Path("/data").exists() else Path("/tmp")
 _CACHE_DIR  = _DATA_DIR / "price_cache"
 _OUTPUT     = Path(__file__).parent.parent / "momentum_training.parquet"
 
-# Critérios de entrada — dias que qualificam como "momentum"
-# Filtros propositadamente largos: o modelo aprende os thresholds óptimos sozinho.
-# O return_20d é o critério principal; RSI e volume são confirmações secundárias.
-_MIN_RETURN_20D   = 0.10    # +10% em 20 dias — critério core do breakout
-_MIN_VOLUME_RATIO = 1.20    # 20% acima da média — confirmação de volume
-_RSI_MIN          = 40.0    # mínimo liberal — captura momentum em fase inicial
-_RSI_MAX          = 85.0    # máximo alargado — modelo aprende risco de overbought
-_MIN_MARKET_CAP_B = 2.0     # liquidez mínima
+# Entry criteria — deliberately wide so the model learns optimal thresholds from data.
+# return_20d, volume_ratio_20d and rsi_14 are all model features: the model sees the
+# full gradient (10% vs 15% vs 20% return) and discovers optimal boundaries itself.
+# Pre-filtering to match the scanner would remove that gradient and reduce training data.
+_MIN_RETURN_20D   = 0.10    # +10% in 20 days — minimum to identify a plausible breakout
+_MIN_VOLUME_RATIO = 1.20    # 20% above average — confirms some buying pressure
+_RSI_MIN          = 40.0    # liberal lower bound — model learns early vs confirmed momentum
+_RSI_MAX          = 85.0    # extended upper bound — model learns overbought risk
+_MIN_MARKET_CAP_B = 2.0     # minimum liquidity
 
-# Limiar de saída de episódio (histerese): abaixo disto o episódio termina.
-# Usar metade do limiar de entrada para evitar re-triggers em correções curtas.
-_EPISODE_EXIT_RETURN = 0.05  # return_20d < 5% → episódio terminou
+# Episode exit threshold (hysteresis): below this the episode ends.
+# Half of entry threshold to avoid re-triggering on short corrections.
+_EPISODE_EXIT_RETURN = 0.05  # return_20d < 5% → episode ended (half of 10% entry)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -271,7 +275,10 @@ def build_dataset(
             alert_date = hist.index[idx]
 
             def _spy_alpha(horizon_days: int, stock_ret: Optional[float]) -> Optional[float]:
-                if stock_ret is None:
+                # Log-alpha for consistency with DIP and Core models.
+                # Arithmetic differences diverge from log differences at long horizons
+                # (e.g. 180d: stock +50%/SPY +10% gives arith=0.40, log=0.31 — a 30% gap).
+                if stock_ret is None or stock_ret <= -1.0:
                     return None
                 try:
                     spy_at  = spy_hist[spy_hist.index <= alert_date]["Close"]
@@ -280,7 +287,10 @@ def build_dataset(
                         (spy_hist.index <= alert_date + pd.Timedelta(days=horizon_days + 5))
                     ]["Close"]
                     if not spy_at.empty and not spy_fwd.empty:
-                        return round(stock_ret - float(spy_fwd.iloc[-1] / spy_at.iloc[-1] - 1), 4)
+                        spy_ret = float(spy_fwd.iloc[-1] / spy_at.iloc[-1] - 1)
+                        if spy_ret <= -1.0:
+                            return None
+                        return round(math.log1p(stock_ret) - math.log1p(spy_ret), 4)
                 except Exception:
                     pass
                 return None
