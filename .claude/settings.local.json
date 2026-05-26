@@ -71,7 +71,19 @@
       "Bash(python -m py_compile bot_commands.py main.py paper_trading.py chart_generator.py github_publisher.py alert_db.py monthly_retrain.py core_radar.py ml_predictor.py scripts/build_dip_dataset.py scripts/build_core_dataset.py scripts/refresh_core_universe.py)",
       "Bash(python -m py_compile chart_generator.py paper_trading.py main.py)",
       "Bash(python -m py_compile chart_generator.py paper_trading.py bot_commands.py)",
-      "Bash(python -m py_compile scripts/build_dip_dataset.py scripts/regenerate_training_base.py)"
+      "Bash(python -m py_compile scripts/build_dip_dataset.py scripts/regenerate_training_base.py)",
+      "Bash(python scripts/refresh_us_universe.py)",
+      "Bash(python -c \"import lxml; print\\('lxml ok:', lxml.__version__\\)\")",
+      "Bash(python -m pip install lxml -q)",
+      "Bash(python -m pip install pyarrow -q)",
+      "Bash(python -c \"import pyarrow; print\\('pyarrow ok', pyarrow.__version__\\)\")",
+      "Bash(python -c \"import sys; sys.path = [p for p in sys.path if 'DipRadar' not in p]; import pandas as pd; df = pd.read_parquet\\('core_training_base.parquet'\\); print\\('rows:', len\\(df\\)\\); print\\('tickers:', df['ticker'].nunique\\(\\) if 'ticker' in df.columns else 0\\); print\\('cols:', df.columns.tolist\\(\\)\\); print\\('targets:', [c for c in df.columns if 'alpha' in c.lower\\(\\) or 'label' in c.lower\\(\\)]\\); print\\('date range:', df['alert_date'].min\\(\\), '->', df['alert_date'].max\\(\\)\\) if 'alert_date' in df.columns else None\")",
+      "Bash(py -3.12 -c \"import pandas as pd; df = pd.read_parquet\\('core_training_base.parquet'\\); print\\('rows:', len\\(df\\)\\); print\\('tickers:', df['ticker'].nunique\\(\\) if 'ticker' in df.columns else 0\\); print\\('targets:', [c for c in df.columns if 'alpha' in c.lower\\(\\) or 'label' in c.lower\\(\\)]\\); print\\('date range:', df['alert_date'].min\\(\\) if 'alert_date' in df.columns else 'N/A', '->', df['alert_date'].max\\(\\) if 'alert_date' in df.columns else 'N/A'\\); print\\('n_cols:', len\\(df.columns\\)\\)\")",
+      "Bash(py -3.12 scripts/train_core_model.py --dry-run)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('bot_commands.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('bot_commands.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('bot_commands.py', encoding='utf-8'\\).read\\(\\)\\); print\\('bot_commands OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('backup_data.py', encoding='utf-8'\\).read\\(\\)\\); print\\('backup_data OK'\\)\")"
     ],
     "additionalDirectories": [
       "c:\\Users\\Romeu\\OneDrive\\Documentos\\GitHub\\DipRadar"
