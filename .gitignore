@@ -28,6 +28,14 @@ venv/
 data/
 /data/
 
+# ── Parquet artifacts ───────────────────────────────────────────────────
+# Exclude all parquet files except the two cold-start seeds committed to
+# the repo root. These are copied to /data/ on the first Railway deploy
+# when the volume is empty (see monthly_retrain.py BOOTSTRAP_FALLBACK).
+*.parquet
+!ml_training_base.parquet
+!core_training_base.parquet
+
 # ── Editor / OS ─────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
