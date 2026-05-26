@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from ml_features import get_feature_columns
+
 # ── Horizons ─────────────────────────────────────────────────────────────────
 # Primary target: close_90d alpha (rotação de capital em ~90 dias).
 # Blue-chips e stocks de qualidade podem sugerir hold estendido (6M+).
@@ -40,83 +42,9 @@ QUALITY_SCORE_MIN: float = 0.55
 # Alpha threshold para sugerir extensão de hold para ~6M em stocks de qualidade
 EXTEND_HOLD_ALPHA_THRESHOLD: float = 0.08  # alpha_90d > 8% → considera segurar 6M
 
-FEATURE_COLS: list[str] = [
-    "vix",
-    "drop_pct_today",
-    "drawdown_52w",
-    "rsi_14",
-    "bb_width",
-    "rsi_oversold_strength",
-    "vix_regime",
-    "drop_x_drawdown",
-    "vol_x_drop",
-    "return_1m",
-    "return_3m_pre",
-    "return_6m_pre",
-    "sector_relative",
-    "beta_90d",
-    "vol_of_vol",
-    "peg_ratio",
-    "month_of_year",
-    "sector_alert_count_7d",
-    "vix_percentile_1y",
-    "spy_rsi_14",
-    # PR #30 (Phase B): 4 raw-OHLCV features computadas point-in-time
-    # (slice <= alert_date). Sincronizadas com FEATURE_COLUMNS em ml_features.py.
-    "volume_zscore_20d",
-    "close_in_range_20d",
-    "up_days_pct_20d",
-    "true_range_pct_20d",
-    # Fase 5: sinais de qualidade e sentimento
-    "consecutive_red_days",
-    "ma_200d_ratio",
-    "insider_buy_recent",
-    "earnings_beat_rate",
-    "analyst_rating",
-    "short_interest_pct",
-    # Fase 5b: sinais avançados SEC + mercado
-    "insider_buy_amount_score",
-    "recent_8k_score",
-    "earnings_call_tone",
-    # Sector-conditioned features (v4.2): RSI/VIX/drawdown ajustados ao tipo de sector.
-    # Sincronizadas com FEATURE_COLUMNS em ml_features.py.
-    "rsi_sector_adjusted",
-    "vix_sector_signal",
-    "drawdown_sector_normalized",
-    # Market Structure (v4.3): Anchored VWAP + Volume Profile + Liquidity Sweep.
-    "vwap_from_high_ratio",
-    "volume_poc_ratio",
-    "liquidity_sweep_score",
-    # Volume Flow (Vertus-inspired): MFI + buying pressure proxy.
-    "mfi_14",
-    "volume_up_pct_20d",
-    # Entry zone / regime
-    "price_vs_52w_percentile",   # where price sits in the 52-week range (0=low, 1=high)
-    "yield_10y_change_5d",       # 5-day change in 10-year Treasury yield
-    # Dip maturity features (NVO/ADBE pattern: best entry after prolonged dip, not day 1)
-    "days_below_ma200",          # consecutive days below 200d MA — 0=just crossed, 90+=washed out
-    "decline_deceleration",      # return_1m / avg_monthly_3m: <1=slowing, >1=accelerating, <0=recovering
-    # New features (tasks 3-6)
-    "days_to_next_earnings",
-    "pe_vs_sector_median",
-    "dividend_growth_3y",
-    "sector_momentum_3m",
-]
-# Features removidas vs PR #25 (Spearman IC profiling sobre o parquet completo
-# 36929 rows confirmou 14 features inúteis):
-#
-#   • 9 constantes (std=0 → IC indefinida; bootstrap não tem fonte point-in-time):
-#       gross_margin (=0.35), de_ratio (=80.0), pe_vs_fair (=1.0),
-#       analyst_upside (=0.10), quality_score (=0.50), atr_ratio (=0.02),
-#       volume_spike (=1.0), pe_attractive (=0.0), peg_ratio (=0.20)
-#
-#   • 5 noise (|Spearman IC| < 0.01 com alpha_60d):
-#       days_since_52w_high (+0.0075), sector_drawdown_5d (-0.0072),
-#       macro_score (+0.0046), spy_drawdown_5d (+0.0026), relative_drop (+0.0004)
-#
-# Total: 34 → 20 features. Smoke test (3000 rows × 3 folds) com este corte:
-# single best IC 0.1744 → 0.1946 (+11%). Inference live em position_monitor
-# continua a computar todas as features removidas (mantidas em _FALLBACK).
+# DIP model feature list — single source of truth is FEATURE_SETS["dip_us"] in ml_features.py.
+# Do NOT edit this list here; edit FEATURE_SETS in ml_features.py instead.
+FEATURE_COLS: list[str] = get_feature_columns("dip_us")
 
 SUBSAMPLE_YEARS: Optional[list[int]] = None
 MAX_ALERTS_PER_YEAR: int = 2_000

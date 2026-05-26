@@ -158,7 +158,6 @@ YF_TICKER_COLS: list[str] = [
     "earnings_beat_rate",   # % trimestres com EPS beat (yfinance earningsHistory)
     "analyst_rating",       # consenso analistas 1-5 (yfinance recommendationMean)
     "short_interest_pct",   # short interest % do float (yfinance shortPercentOfFloat)
-    "short_interest_trend", # variação short interest (yfinance sharesShort)
 ]
 
 # Features sector-conditioned — derivadas de features existentes no parquet
@@ -601,11 +600,6 @@ def _compute_yf_features(ticker: str) -> dict:
         if sip is not None:
             result["short_interest_pct"] = round(float(sip), 4)
 
-        # short_interest_trend (usa sharesShort vs sharesShortPriorMonth)
-        ss  = info.get("sharesShort")
-        ssp = info.get("sharesShortPriorMonth")
-        if ss and ssp and ssp > 0:
-            result["short_interest_trend"] = round((ss - ssp) / ssp, 4)
     except Exception as e:
         log.debug(f"  yf_features {ticker}: {e}")
     return result
@@ -908,13 +902,10 @@ def regenerate(
             _drop = df["drop_pct_today"].fillna(-8.0).astype(float)
             _dd52 = df["drawdown_52w"].fillna(-15.0).astype(float)
             _volsp = df["volume_spike"].fillna(1.0).astype(float) if "volume_spike" in df.columns else pd.Series(1.0, index=df.index)
-            _gm   = df["gross_margin"].fillna(0.35).astype(float) if "gross_margin" in df.columns else pd.Series(0.35, index=df.index)
-            _fcf  = df["fcf_yield"].fillna(0.04).astype(float) if "fcf_yield" in df.columns else pd.Series(0.04, index=df.index)
 
             df["rsi_oversold_strength"] = (_rsi.rsub(40.0).clip(lower=0.0)).round(4)
             df["drop_x_drawdown"]       = (_drop * _dd52 / 100.0).round(4)
             df["vol_x_drop"]            = (_volsp * _drop.abs()).round(4)
-            df["quality_dislocation"]   = np.where(_fcf >= 0, (_gm * _dd52.abs() / 100.0).round(4), 0.0)
 
             # sector_alert_count_7d: nº de alertas no mesmo sector nos 7 dias anteriores
             sys.path.insert(0, str(_REPO_ROOT))
@@ -924,7 +915,7 @@ def regenerate(
                 float(_lookup.get((r["ticker"], pd.Timestamp(r["alert_date"])), 0.0))
                 for _, r in df.iterrows()
             ]
-            log.info("[compute] features derivadas: OK (rsi_oversold_strength, drop_x_drawdown, vol_x_drop, quality_dislocation, sector_alert_count_7d)")
+            log.info("[compute] features derivadas: OK (rsi_oversold_strength, drop_x_drawdown, vol_x_drop, sector_alert_count_7d)")
         except Exception as e:
             log.warning(f"[compute] features derivadas falhou: {e}")
 

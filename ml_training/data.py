@@ -43,15 +43,14 @@ def load_base_dataset(parquet_path: Path) -> pd.DataFrame:
     if "ticker" not in df.columns:
         raise KeyError(f"parquet missing ticker/symbol column: {parquet_path}")
 
-    # Load-time schema validation: catch missing columns early
-    from ml_features import FEATURE_COLUMNS
-    missing_cols = [c for c in FEATURE_COLUMNS if c not in df.columns]
+    # Load-time schema validation: all DIP model features must be present
+    missing_cols = [c for c in FEATURE_COLS if c not in df.columns]
     if missing_cols:
         raise ValueError(
-            f"FEATURE_COLUMNS missing in parquet: {missing_cols}\n"
+            f"DIP feature columns missing in parquet: {missing_cols}\n"
             f"Re-run bootstrap (build_dip_dataset.py) to regenerate the parquet."
         )
-    # Drop any extra columns not in FEATURE_COLUMNS or known metadata/target cols
+    # Drop extra columns not in FEATURE_COLS or known metadata/target cols
     meta_cols = {"ticker", "symbol", "alert_date", "alpha_90d", "label_win", "sector",
                  "return_3m", "return_6m", "spy_return_ref", "outcome_label", "price",
                  "market_cap", "market_cap_b", "_source", "source",
@@ -59,7 +58,8 @@ def load_base_dataset(parquet_path: Path) -> pd.DataFrame:
                  "max_return_60d", "max_drawdown_60d", "max_drawdown_20d", "max_drawdown_90d",
                  "alpha_60d_rank", "alpha_90d_rank", "label_upside_10_90d",
                  "label_downside_15_20d", "month_of_year"}
-    extra = [c for c in df.columns if c not in set(FEATURE_COLUMNS) | meta_cols]
+    keep = set(FEATURE_COLS) | meta_cols
+    extra = [c for c in df.columns if c not in keep]
     if extra:
         df = df.drop(columns=extra)
 
@@ -188,12 +188,11 @@ def add_cross_sectional_rank(df: pd.DataFrame, target_col: str = "alpha_60d", ra
 
 
 def build_dataset(base_df: pd.DataFrame, price_cache: dict[str, pd.DataFrame], etf_cache: dict[str, pd.DataFrame], horizon_days: int = HORIZON_DAYS, macro_price_cache: Optional[dict[str, pd.DataFrame]] = None) -> tuple[pd.DataFrame, dict[str, int]]:
-    from ml_features import FEATURE_COLUMNS, _FALLBACK, add_derived_features, add_momentum_features, add_context_features, add_raw_ohlcv_features, add_regime_features, add_short_earnings_features
-    from macro_data import get_macro_context_historical
-    if FEATURE_COLS != FEATURE_COLUMNS:
-        missing = set(FEATURE_COLUMNS) - set(FEATURE_COLS)
-        extra = set(FEATURE_COLS) - set(FEATURE_COLUMNS)
-        raise ValueError(f"FEATURE_COLS (config) != FEATURE_COLUMNS (ml_features)!\n  em ml_features mas não no config: {missing}\n  no config mas não em ml_features: {extra}")
+    from ml_features import (
+        _FALLBACK, add_derived_features, add_momentum_features, add_context_features,
+        add_raw_ohlcv_features, add_regime_features, add_short_earnings_features,
+        add_market_structure_features, add_volume_flow_features,
+    )
     sector_count_lookup = compute_sector_alert_count_7d(base_df)
     spy_hist = etf_cache.get(DEFAULT_ETF)
     combined_macro_cache: dict[str, pd.DataFrame] = {}
@@ -215,30 +214,20 @@ def build_dataset(base_df: pd.DataFrame, price_cache: dict[str, pd.DataFrame], e
         if len(hist) < 25:
             skipped["short_history"] += 1
             continue
-        macro_ctx = get_macro_context_historical(as_of_date=alert_date, sector=sector, macro_price_cache=combined_macro_cache if combined_macro_cache else None)
         fv: dict[str, float] = {}
-        for c in FEATURE_COLUMNS:
+        for c in FEATURE_COLS:
             v = row.get(c) if c in row.index else None
             fv[c] = float(v) if (v is not None and pd.notna(v)) else _FALLBACK.get(c, 0.0)
-        fv["macro_score"] = float(macro_ctx["macro_score"])
-        fv["vix"] = float(macro_ctx["vix"])
-        fv["spy_drawdown_5d"] = float(macro_ctx["spy_drawdown_5d"])
-        fv["sector_drawdown_5d"] = float(macro_ctx["sector_drawdown_5d"])
-        price_feats = _build_v2_features(row, hist)
-        for k, v in price_feats.items():
-            if not pd.notna(fv.get(k)) or fv.get(k) == _FALLBACK.get(k, 0.0):
-                fv[k] = v
-        fv["sector"] = sector  # necessário para sector-conditioned features em add_derived_features
+        fv["sector"] = sector
         add_derived_features(fv, alert_date=alert_date)
         sec_hist = etf_cache.get(etf)
         sec_slice = sec_hist[sec_hist.index <= alert_date] if sec_hist is not None else None
         spy_slice = spy_hist[spy_hist.index <= alert_date] if spy_hist is not None else None
         add_momentum_features(fv, hist, sec_slice, spy_slice)
         add_context_features(fv, price_history=hist, sector_alert_count_7d=float(sector_count_lookup.get((ticker, alert_date), 0)))
-        # PR #30: raw OHLCV features (realized_vol_20d, mom_5d_slope,
-        # volume_zscore_20d, gap_pct_5d). Computadas a partir do slice
-        # point-in-time já existente (`hist`); zero custo extra de fetching.
         add_raw_ohlcv_features(fv, hist)
+        add_market_structure_features(fv, hist)
+        add_volume_flow_features(fv, hist)
         ticker_info: Optional[dict] = None
         short_ratio = row.get("shortRatio") if "shortRatio" in row.index else None
         earnings_hist = row.get("earningsHistory") if "earningsHistory" in row.index else None

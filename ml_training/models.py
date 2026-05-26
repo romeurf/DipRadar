@@ -263,34 +263,18 @@ def stack_meta_factory() -> "object":
 # ────────────────────────────────────────────────────────────────────────────────
 
 def build_feature_lists() -> tuple[list[str], list[str]]:
-    """Devolve (FEATURE_COLS, FEATURE_COLS_BASELINE).
+    """Return (dip_features, dip_baseline).
 
-    FEATURE_COLS      = ml_features.FEATURE_COLUMNS (fonte única).
-    FEATURE_COLS_BASELINE = FEATURE_COLUMNS sem Stage-3c, 3d, 3e (controlo).
+    dip_features = FEATURE_SETS["dip_us"] — single source of truth in ml_features.py.
+    dip_baseline = dip_features minus calendar/count context features (controlled comparison).
     """
-    from ml_features import FEATURE_COLUMNS
+    from ml_features import get_feature_columns
 
-    _EXCLUDE_BASELINE = {
-        # Stage-3c dislocation
-        "quality_dislocation",
-        "relative_drop",
-        "month_of_year",
-        # Stage-3d context (v3.2)
-        "sector_alert_count_7d",
-        "days_since_52w_high",
-        # Stage-3e short/earnings (v3.3)
-        "short_interest_ratio",
-        "earnings_surprise_avg",
-        # Stage-3b multi-window (v4.0)
-        "return_6m_pre",
-        "return_12m_pre",
-        "sector_relative_6m",
-        "vol_of_vol",
-    }
+    _EXCLUDE_BASELINE = {"month_of_year", "sector_alert_count_7d"}
 
-    full = list(FEATURE_COLUMNS)
-    baseline = [c for c in FEATURE_COLUMNS if c not in _EXCLUDE_BASELINE]
-    return full, baseline
+    dip_features = get_feature_columns("dip_us")
+    baseline = [c for c in dip_features if c not in _EXCLUDE_BASELINE]
+    return dip_features, baseline
 
 
 def build_sector_model_configs(
