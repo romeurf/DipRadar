@@ -693,6 +693,22 @@ def main() -> int:
             if len(v) > 0:
                 log.info(f"{label}: mean={v.mean():.3f} std={v.std():.3f} ({len(v)} amostras)")
 
+    # Per-column stats for Core model features
+    from scripts.train_core_model import CORE_FEATURE_COLS
+    log.info(f"[stats] core feature summary ({len(CORE_FEATURE_COLS)} features):")
+    for col in CORE_FEATURE_COLS:
+        if col not in combined.columns:
+            log.info(f"  {col:30s} — MISSING")
+            continue
+        s = combined[col].dropna()
+        if len(s) == 0:
+            log.info(f"  {col:30s} — NO DATA")
+        else:
+            log.info(
+                f"  {col:30s} n={len(s):>6} mean={s.mean():>9.4f} "
+                f"std={s.std():>8.4f} nan={combined[col].isna().sum()}"
+            )
+
     return 0
 
 

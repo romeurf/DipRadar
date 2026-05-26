@@ -490,6 +490,22 @@ def main() -> int:
         v = combined["alpha_90d"].dropna()
         log.info(f"alpha_90d: mean={v.mean():.3f} std={v.std():.3f} ({len(v)} amostras)")
 
+    # Per-column stats (same format as regenerate_training_base.py)
+    from ml_features import FEATURE_COLUMNS as _FC
+    log.info("[stats] feature summary:")
+    for col in _FC:
+        if col not in combined.columns:
+            log.info(f"  {col:30s} — MISSING")
+            continue
+        s = combined[col].dropna()
+        if len(s) == 0:
+            log.info(f"  {col:30s} — NO DATA")
+        else:
+            log.info(
+                f"  {col:30s} n={len(s):>6} mean={s.mean():>9.4f} "
+                f"std={s.std():>8.4f} nan={combined[col].isna().sum()}"
+            )
+
     return 0
 
 

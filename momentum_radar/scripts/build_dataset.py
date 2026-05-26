@@ -420,6 +420,22 @@ def main() -> int:
         if col in combined.columns:
             v = combined[col].dropna()
             log.info(f"Forward return {label}: mean={v.mean():.2%} std={v.std():.2%} ({len(v)} amostras)")
+
+    # Per-column stats for Momentum model features
+    from momentum_radar.trainer import FEATURE_COLS as _MOM_FEAT
+    log.info(f"[stats] momentum feature summary ({len(_MOM_FEAT)} features):")
+    for col in _MOM_FEAT:
+        if col not in combined.columns:
+            log.info(f"  {col:30s} — MISSING")
+            continue
+        s = combined[col].dropna()
+        if len(s) == 0:
+            log.info(f"  {col:30s} — NO DATA")
+        else:
+            log.info(
+                f"  {col:30s} n={len(s):>6} mean={s.mean():>9.4f} "
+                f"std={s.std():>8.4f} nan={combined[col].isna().sum()}"
+            )
     size_mb = out_path.stat().st_size / 1e6
     log.info(f"Guardado em: {out_path} ({size_mb:.1f}MB)")
     _notify(

@@ -113,6 +113,18 @@ NEW_FEATURE_COLS: list[str] = [
     # Volume Flow
     "mfi_14",
     "volume_up_pct_20d",
+    # Dip maturity
+    "days_below_ma200",
+    "decline_deceleration",
+    # yfinance signals
+    "short_interest_pct",
+    "analyst_rating",
+    "earnings_beat_rate",
+    # New features (tasks 3-6)
+    "days_to_next_earnings",
+    "pe_vs_sector_median",
+    "dividend_growth_3y",
+    "sector_momentum_3m",
 ]
 
 # Colunas fundamentais corrigidas (PIT) — substituem valores constantes do bootstrap
@@ -960,17 +972,19 @@ def regenerate(
     elapsed = time.time() - t0
     log.info(f"[out] DONE in {elapsed:.0f}s. shape={df.shape}  size={out_path.stat().st_size/1e6:.1f} MB")
 
-    # Sanity stats finais
-    log.info("[stats] resumo das colunas novas/corrigidas:")
-    for col in NEW_FEATURE_COLS + FUNDAMENTAL_COLS + TARGET_COLS + FASE5_COLS:
+    # Sanity stats finais — all FEATURE_COLUMNS + targets
+    from ml_features import FEATURE_COLUMNS as _FC
+    stat_cols = _FC + [c for c in (TARGET_COLS + FUNDAMENTAL_COLS) if c not in _FC]
+    log.info(f"[stats] feature summary ({len(_FC)} features + targets):")
+    for col in stat_cols:
         if col not in df.columns:
             continue
         s = df[col].dropna()
         if len(s) == 0:
-            log.info(f"  {col:28s} — SEM DADOS")
+            log.info(f"  {col:30s} — NO DATA")
         else:
             log.info(
-                f"  {col:28s} n={len(s):>6} mean={s.mean():>9.4f} "
+                f"  {col:30s} n={len(s):>6} mean={s.mean():>9.4f} "
                 f"std={s.std():>8.4f} nan={df[col].isna().sum()}"
             )
 
