@@ -503,11 +503,13 @@ def _compute_alpha_90d_inline(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_training_input(include_snapshot: bool = True,
+def build_training_input(include_snapshot: bool = False,
                          include_alert_db: bool = True) -> Path:
-    """Concat: bootstrap + alert_db + snapshot (matured).
+    """Concat: bootstrap + alert_db.
 
-    Dedup: (symbol, alert_date) preferindo snapshot > alert_db > bootstrap.
+    Dedup: (ticker, alert_date) preferring alert_db > bootstrap.
+    include_snapshot is kept as a parameter for backward compat but ignored —
+    universe_snapshot was removed (partial features hurt model quality).
     """
     parts: list[pd.DataFrame] = []
 
@@ -566,18 +568,8 @@ def build_training_input(include_snapshot: bool = True,
             df_alerts["alert_date"] = pd.to_datetime(df_alerts["alert_date"])
             parts.append(df_alerts.assign(_source="alert_db"))
 
-    if include_snapshot and SNAPSHOT_PATH.exists():
-        try:
-            snap = pd.read_parquet(SNAPSHOT_PATH)
-            df_snap = _resolve_snapshot_outcomes(snap)
-            if not df_snap.empty:
-                df_snap["alert_date"] = pd.to_datetime(df_snap["alert_date"])
-                parts.append(df_snap.assign(_source="snapshot"))
-        except Exception as e:
-            log.error(f"[input] Snapshot processing falhou: {e}")
-
     if not parts:
-        raise RuntimeError("Sem dados de treino — bootstrap, alert_db e snapshot todos vazios.")
+        raise RuntimeError("No training data — bootstrap and alert_db both empty.")
 
     merged = pd.concat(parts, ignore_index=True, sort=False)
     log.info(f"[input] Concat total: {len(merged)} rows from "
@@ -879,19 +871,18 @@ def _save_pending(result: dict) -> dict:
 
 def run_monthly_retrain_v3(
     gating_ratio: float = DEFAULT_GATING_RATIO,
-    include_snapshot: bool = True,
+    include_snapshot: bool = False,   # kept for call-site compat; ignored
     include_alert_db: bool = True,
     dry_run: bool = False,
     n_folds: Optional[int] = None,
     purge_days: Optional[int] = None,
 ) -> dict:
-    """Pipeline completo de retreino mensal v3."""
+    """Monthly retrain pipeline v3. Training data: bootstrap + alert_db."""
     t0 = time.time()
     log.info("=" * 70)
     log.info(f"DipRadar — Monthly Retrain v3 ({datetime.utcnow().isoformat(timespec='seconds')}Z)")
     log.info("=" * 70)
     log.info(f"  gating_ratio     = {gating_ratio}")
-    log.info(f"  include_snapshot = {include_snapshot}")
     log.info(f"  include_alert_db = {include_alert_db}")
     log.info(f"  dry_run          = {dry_run}")
 
@@ -1034,7 +1025,6 @@ def run_monthly_retrain_v2(*args, **kwargs) -> dict:
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Monthly retrain v3 with rho_alpha gating")
     p.add_argument("--gating-ratio", type=float, default=DEFAULT_GATING_RATIO)
-    p.add_argument("--no-snapshot", action="store_true")
     p.add_argument("--no-alert-db", action="store_true")
     p.add_argument("--n-folds", type=int, default=None)
     p.add_argument("--purge-days", type=int, default=None)
@@ -1051,7 +1041,6 @@ def main() -> int:
     )
     result = run_monthly_retrain_v3(
         gating_ratio=args.gating_ratio,
-        include_snapshot=not args.no_snapshot,
         include_alert_db=not args.no_alert_db,
         dry_run=args.dry_run,
         n_folds=args.n_folds,

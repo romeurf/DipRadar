@@ -2372,36 +2372,6 @@ def run_core_scan() -> None:
         logging.error(f"[core_radar] Scan falhou: {e}", exc_info=True)
 
 
-# ── Daily Universe Snapshot (após fecho US) ────────────────────────────────────
-
-def run_universe_snapshot() -> None:
-    """
-    Snapshot diário dos ~780 tickers do ML universe.
-
-    Corre seg-sex às 22:30 Lisboa (após fecho US 22:00 UTC inverno / 21:00 UTC verão).
-    Idempotente: skip dos que já têm linha para hoje.
-    """
-    logging.info("[snapshot] A iniciar snapshot diário do universo...")
-    now_str = datetime.now(LISBON_TZ).strftime("%d/%m/%Y %H:%M")
-
-    try:
-        from universe_snapshot import run_daily_snapshot
-        stats = run_daily_snapshot()
-    except Exception as e:
-        logging.error(f"[snapshot] Erro: {e}", exc_info=True)
-        send_telegram(f"❌ *Universe Snapshot — Erro*\n`{e}`\n_⏰ {now_str}_")
-        return
-
-    rows_added = stats.get("rows_added", 0)
-    rows_skip  = stats.get("rows_skipped", 0)
-    tickers_ok = stats.get("tickers_ok", 0)
-    elapsed    = stats.get("elapsed_s", 0)
-
-    send_telegram(
-        f"📸 *Universe Snapshot — {now_str}*\n"
-        f"  ✅ {tickers_ok} tickers | +{rows_added} linhas | skip {rows_skip} | {elapsed:.0f}s"
-    )
-    logging.info(f"[snapshot] {tickers_ok} tickers, +{rows_added} linhas, {elapsed:.0f}s")
 
 
 def _get_news_sentiment_line(ticker: str) -> str:
@@ -2566,13 +2536,6 @@ def main() -> None:
             timezone=LISBON_TZ,
         ),
         id="stress", name="Portfolio Stress",
-    )
-
-    # ── Universe Snapshot: 22:30 Lisboa, seg-sex ──────────────────────────────
-    scheduler.add_job(
-        run_universe_snapshot,
-        CronTrigger(day_of_week="mon-fri", hour=22, minute=30, timezone=LISBON_TZ),
-        id="universe_snapshot", name="Universe Snapshot 22h30",
     )
 
     # ── Daily Backup: 23:30 Lisboa, seg-sex ───────────────────────────────────

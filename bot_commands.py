@@ -1492,7 +1492,6 @@ def _handle_admin_disk(parts: list[str]) -> None:
             "core_training_base.parquet",
             "momentum_training.parquet",
             "ml_momentum_training.parquet",
-            "universe_snapshot.parquet",
             "ml_training_input.parquet",
             "dip_models.pkl",
             "core_us_model.pkl",
@@ -1555,23 +1554,6 @@ def _handle_admin_disk(parts: list[str]) -> None:
                     freed += f.stat().st_size
                     f.unlink()
                     removed += 1
-        # Apagar universe_snapshot com mais de 180 dias (linhas antigas)
-        snap_path = data_dir / "universe_snapshot.parquet"
-        snap_pruned = 0
-        if snap_path.exists():
-            try:
-                import pandas as pd
-                snap = pd.read_parquet(snap_path)
-                if "snapshot_date" in snap.columns:
-                    cutoff_date = (pd.Timestamp.now() - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
-                    before = len(snap)
-                    snap = snap[snap["snapshot_date"] >= cutoff_date]
-                    snap_pruned = before - len(snap)
-                    if snap_pruned > 0:
-                        snap.to_parquet(snap_path, index=False)
-            except Exception as e:
-                logging.debug(f"[disk] snapshot prune: {e}")
-
         # Apagar parquet incompleto do /data/ — o regen usa a versão limpa do repo
         pq_removed = ""
         pq_path = data_dir / "ml_training_base.parquet"
@@ -1612,7 +1594,6 @@ def _handle_admin_disk(parts: list[str]) -> None:
         ("price_cache/fundamental_cache", _dir_size(data_dir / "price_cache" / "fundamental_cache")),
         ("price_cache/edgar_*.json",     sum(f.stat().st_size for f in (data_dir / "price_cache").glob("edgar_*.json")) if (data_dir / "price_cache").exists() else 0),
         (f"backups/ ({backup_count} ZIPs)", _dir_size(backup_dir)),
-        ("universe_snapshot.parquet",    _sz("universe_snapshot.parquet")),
         ("ml_training_base.parquet",     _sz("ml_training_base.parquet")),
         ("core_training_base.parquet",   _sz("core_training_base.parquet")),
         ("momentum_training.parquet",    _sz("momentum_training.parquet")),
@@ -2539,7 +2520,7 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                     shutil.rmtree(str(price_cache), ignore_errors=True)
                 for name in ("ml_training_base.parquet", "core_training_base.parquet",
                              "momentum_training.parquet", "ml_momentum_training.parquet",
-                             "universe_snapshot.parquet", "ml_training_input.parquet",
+                             "ml_training_input.parquet",
                              "dip_models.pkl", "core_us_model.pkl", "momentum_model.pkl",
                              "momentum_report.json", "ml_report.json"):
                     p = data_dir / name
@@ -2992,13 +2973,12 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
 
 def _handle_admin_retrain(parts: list[str]) -> None:
     """
-    /admin_retrain                    → dispara retreino mensal v3 ad-hoc (full)
-    /admin_retrain dry-run            → só constrói training input (não treina)
-    /admin_retrain dry-run no-snap    → exclui universe_snapshot.parquet
-    /admin_retrain run 0.85           → retrain real com gating_ratio override
+    /admin_retrain                    → triggers monthly retrain v3 ad-hoc (full)
+    /admin_retrain dry-run            → build training input only (no train)
+    /admin_retrain run 0.85           → real retrain with gating_ratio override
 
-    Útil para validar `/data/` no Railway sem esperar pelo cron mensal.
-    Retorna métricas (ρ_α, Brier, Top-K PnL) ou shape do training input se dry-run.
+    Training data: bootstrap parquet + alert_db (universe_snapshot removed).
+    Returns metrics (ρ_α, Brier, Top-K PnL) or training input shape if dry-run.
     """
     global _retrain_running
 
@@ -3008,7 +2988,6 @@ def _handle_admin_retrain(parts: list[str]) -> None:
 
     args = [p.lower() for p in parts[1:]]
     dry_run          = "dry-run" in args or "dry_run" in args or "dryrun" in args
-    include_snapshot = "no-snap" not in args and "no-snapshot" not in args
     include_alert_db = "no-alert-db" not in args and "no-alerts" not in args
     gating_ratio     = None
     for a in args:
@@ -3022,7 +3001,6 @@ def _handle_admin_retrain(parts: list[str]) -> None:
 
     mode_str = "DRY-RUN" if dry_run else "REAL"
     extras = []
-    if not include_snapshot: extras.append("no-snap")
     if not include_alert_db: extras.append("no-alert-db")
     if gating_ratio is not None: extras.append(f"ratio={gating_ratio}")
     extras_str = f" ({', '.join(extras)})" if extras else ""
@@ -3041,7 +3019,6 @@ def _handle_admin_retrain(parts: list[str]) -> None:
             from monthly_retrain import run_monthly_retrain_v3
             kwargs = dict(
                 dry_run=dry_run,
-                include_snapshot=include_snapshot,
                 include_alert_db=include_alert_db,
             )
             if gating_ratio is not None:

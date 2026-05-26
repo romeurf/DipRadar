@@ -61,8 +61,6 @@ _BACKUP_PATTERNS: list[str] = [
     # Historical logs (CSV)
     "/data/hist_backtest.csv",
     "/data/ml_predictions.csv",
-    # Universe snapshots (parquet)
-    "/data/universe_snapshot*.parquet",
     # DIP model — stage1 + stage2 (actual production models)
     "/data/dip_model_stage1.pkl",
     "/data/dip_model_stage2.pkl",
