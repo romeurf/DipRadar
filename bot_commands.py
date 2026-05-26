@@ -2558,8 +2558,7 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                 out_dip = data_dir / "ml_training_base.parquet"
                 ok, tail = _sub(
                     [sys.executable, str(scripts / "build_dip_dataset.py"),
-                     "--start", "1993-01-01", "--out", str(out_dip), "--force-rebuild",
-                     "--no-fundamentals"],  # EDGAR for 1518 tickers = 6+ GB; DIP features are price/volume only
+                     "--start", "1993-01-01", "--out", str(out_dip), "--force-rebuild"],
                     timeout_h=12,
                 )
                 elapsed = (_t.time() - t0) / 60
