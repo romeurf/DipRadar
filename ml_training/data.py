@@ -43,13 +43,19 @@ def load_base_dataset(parquet_path: Path) -> pd.DataFrame:
     if "ticker" not in df.columns:
         raise KeyError(f"parquet missing ticker/symbol column: {parquet_path}")
 
-    # Load-time schema validation: all DIP model features must be present
+    # Load-time schema validation: fill missing DIP features with fallback values.
+    # Raising here blocks all retrains when the cold-start seed is older than
+    # the current FEATURE_COLS list. Filling with _FALLBACK allows training to
+    # proceed; a fresh bootstrap will replace fallback values on the next overnight.
     missing_cols = [c for c in FEATURE_COLS if c not in df.columns]
     if missing_cols:
-        raise ValueError(
-            f"DIP feature columns missing in parquet: {missing_cols}\n"
-            f"Re-run bootstrap (build_dip_dataset.py) to regenerate the parquet."
+        from ml_features import _FALLBACK
+        log.warning(
+            f"Parquet missing {len(missing_cols)} DIP feature(s) — filling with _FALLBACK. "
+            f"Re-run bootstrap to fix permanently. Missing: {missing_cols}"
         )
+        for col in missing_cols:
+            df[col] = _FALLBACK.get(col, 0.0)
     # Drop extra columns not in FEATURE_COLS or known metadata/target cols
     meta_cols = {"ticker", "symbol", "alert_date", "alpha_90d", "label_win", "sector",
                  "return_3m", "return_6m", "spy_return_ref", "outcome_label", "price",

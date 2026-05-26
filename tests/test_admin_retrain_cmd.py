@@ -5,7 +5,7 @@ the threading.Thread + monthly_retrain calls. Verifies:
 
 - Argument parsing (dry-run, no-snap, gating ratio)
 - Concurrency lock (`_retrain_running` flag)
-- Dispatch into `run_monthly_retrain_v3` with correct kwargs
+- Dispatch into `run_monthly_retrain` with correct kwargs
 - Result formatting branches (DRY-RUN, PROMOTED, PENDING, FAILED)
 """
 
@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 
 class TestAdminRetrainParser(unittest.TestCase):
-    """Verifica que o handler chama `run_monthly_retrain_v3` com os
+    """Verifica que o handler chama `run_monthly_retrain` com os
     kwargs correctos consoante os args do utilizador."""
 
     def setUp(self):
@@ -42,7 +42,7 @@ class TestAdminRetrainParser(unittest.TestCase):
             return _T()
 
         with patch("bot_commands.threading.Thread", fake_thread), \
-             patch("monthly_retrain.run_monthly_retrain_v3") as mock_v3:
+             patch("monthly_retrain.run_monthly_retrain") as mock_v3:
             mock_v3.return_value = result
             bot_commands._handle_admin_retrain(parts)
             captured["mock_v3"] = mock_v3
@@ -159,7 +159,7 @@ class TestAdminRetrainParser(unittest.TestCase):
             return _T()
 
         with patch("bot_commands.threading.Thread", fake_thread), \
-             patch("monthly_retrain.run_monthly_retrain_v3", side_effect=RuntimeError("boom")):
+             patch("monthly_retrain.run_monthly_retrain", side_effect=RuntimeError("boom")):
             bot_commands._handle_admin_retrain(["/admin_retrain"])
 
         self.assertTrue(any("Retrain falhou" in r for r in self.replies))
@@ -208,7 +208,7 @@ class TestMarkdownSafety(unittest.TestCase):
             return _T()
 
         with patch("bot_commands.threading.Thread", fake_thread), \
-             patch("monthly_retrain.run_monthly_retrain_v3") as mock_v3:
+             patch("monthly_retrain.run_monthly_retrain") as mock_v3:
             mock_v3.return_value = {"decision": "FAILED", "reason": reason}
             bot_commands._handle_admin_retrain(["/admin_retrain"])
 

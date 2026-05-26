@@ -58,6 +58,17 @@ log = logging.getLogger(__name__)
 # Paths (Railway Volume primeiro, /tmp fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _data_dir() -> Path:
+    """Resolve data directory at call time — not at import time.
+
+    Railway volumes may not be mounted when the bot process starts and imports
+    this module. Evaluating Path("/data").exists() at import time can return
+    False even though /data will be available by the time any retrain function
+    runs. This function forces re-evaluation on every call so paths are always
+    resolved against the live filesystem state.
+    """
+    return Path("/data") if Path("/data").exists() else Path("/tmp")
+
 _DATA_DIR = Path("/data") if Path("/data").exists() else Path("/tmp")
 _REPO_ROOT = Path(__file__).resolve().parent
 
@@ -511,42 +522,51 @@ def build_training_input(include_snapshot: bool = False,
     include_snapshot is kept as a parameter for backward compat but ignored —
     universe_snapshot was removed (partial features hurt model quality).
     """
+    # Re-evaluate data_dir at call time — Railway may mount /data after process start.
+    _dd = _data_dir()
+    _bootstrap_path   = _dd / "ml_training_base.parquet"
+    _bootstrap_fallbk = _REPO_ROOT / "ml_training_base.parquet"
+    _legacy_path      = _dd / "ml_training_merged.parquet"
+    _legacy_fallbk    = _REPO_ROOT / "ml_training_merged.parquet"
+    _training_input   = _dd / "ml_training_input.parquet"
+    _alert_db_path    = _dd / "alert_db.csv"
+
     parts: list[pd.DataFrame] = []
 
     bootstrap_src = None
-    if BOOTSTRAP_PATH.exists() and not os.getenv("FORCE_BOOTSTRAP_FROM_REPO"):
-        bootstrap_src = BOOTSTRAP_PATH
-    elif BOOTSTRAP_FALLBACK.exists():
-        bootstrap_src = BOOTSTRAP_FALLBACK
+    if _bootstrap_path.exists() and not os.getenv("FORCE_BOOTSTRAP_FROM_REPO"):
+        bootstrap_src = _bootstrap_path
+    elif _bootstrap_fallbk.exists():
+        bootstrap_src = _bootstrap_fallbk
         log.warning(
-            f"[input] {BOOTSTRAP_PATH} ausente — fallback para parquet do repo "
-            f"({BOOTSTRAP_FALLBACK})."
+            f"[input] {_bootstrap_path} ausente — fallback para parquet do repo "
+            f"({_bootstrap_fallbk})."
         )
         # Copiar o parquet do repo para /data/ imediatamente para que deploys
         # futuros não percam o parquet regenerado (que é escrito em /data/).
         try:
             import shutil
-            BOOTSTRAP_PATH.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(BOOTSTRAP_FALLBACK, BOOTSTRAP_PATH)
-            log.info(f"[input] Parquet copiado para {BOOTSTRAP_PATH} — futuras regens escrevem aqui.")
+            _bootstrap_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(_bootstrap_fallbk, _bootstrap_path)
+            log.info(f"[input] Parquet copiado para {_bootstrap_path} — futuras regens escrevem aqui.")
         except Exception as _cp_err:
             log.warning(f"[input] Falha ao copiar para /data/: {_cp_err}")
-    elif LEGACY_BOOTSTRAP_PATH.exists():
-        bootstrap_src = LEGACY_BOOTSTRAP_PATH
+    elif _legacy_path.exists():
+        bootstrap_src = _legacy_path
         log.warning(
-            f"[input] Usar bootstrap legacy {LEGACY_BOOTSTRAP_PATH} — considera "
+            f"[input] Usar bootstrap legacy {_legacy_path} — considera "
             f"renomear para ml_training_base.parquet."
         )
-    elif LEGACY_BOOTSTRAP_FALLBACK.exists():
-        bootstrap_src = LEGACY_BOOTSTRAP_FALLBACK
+    elif _legacy_fallbk.exists():
+        bootstrap_src = _legacy_fallbk
         log.warning(
-            f"[input] Usar bootstrap legacy {LEGACY_BOOTSTRAP_FALLBACK} (repo) — considera "
+            f"[input] Usar bootstrap legacy {_legacy_fallbk} (repo) — considera "
             f"renomear para ml_training_base.parquet."
         )
     else:
         log.warning(
-            f"[input] Bootstrap parquet ausente em {BOOTSTRAP_PATH} "
-            f"e fallback {BOOTSTRAP_FALLBACK} (legacy também não encontrado)."
+            f"[input] Bootstrap parquet ausente em {_bootstrap_path} "
+            f"e fallback {_bootstrap_fallbk} (legacy também não encontrado)."
         )
 
     if bootstrap_src is not None:
@@ -599,10 +619,10 @@ def build_training_input(include_snapshot: bool = False,
         _n_90d_after = int(merged[PRIMARY_TARGET].notna().sum()) if PRIMARY_TARGET in merged.columns else 0
         log.info(f"[input] alpha_90d resolvido inline: {_n_90d_after}/{len(merged)}")
 
-    TRAINING_INPUT.parent.mkdir(parents=True, exist_ok=True)
-    merged.to_parquet(TRAINING_INPUT, index=False)
-    log.info(f"[input] Wrote {TRAINING_INPUT} ({len(merged)} rows)")
-    return TRAINING_INPUT
+    _training_input.parent.mkdir(parents=True, exist_ok=True)
+    merged.to_parquet(_training_input, index=False)
+    log.info(f"[input] Wrote {_training_input} ({len(merged)} rows)")
+    return _training_input
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -866,10 +886,10 @@ def _save_pending(result: dict) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main retrain entrypoint v3 (chamado pelo cron de main.py)
+# Main retrain entrypoint (called by cron in main.py and /admin_overnight)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_monthly_retrain_v3(
+def run_monthly_retrain(
     gating_ratio: float = DEFAULT_GATING_RATIO,
     include_snapshot: bool = False,   # kept for call-site compat; ignored
     include_alert_db: bool = True,
@@ -877,10 +897,10 @@ def run_monthly_retrain_v3(
     n_folds: Optional[int] = None,
     purge_days: Optional[int] = None,
 ) -> dict:
-    """Monthly retrain pipeline v3. Training data: bootstrap + alert_db."""
+    """Monthly retrain pipeline. Training data: bootstrap + alert_db."""
     t0 = time.time()
     log.info("=" * 70)
-    log.info(f"DipRadar — Monthly Retrain v3 ({datetime.utcnow().isoformat(timespec='seconds')}Z)")
+    log.info(f"DipRadar — Monthly Retrain ({datetime.utcnow().isoformat(timespec='seconds')}Z)")
     log.info("=" * 70)
     log.info(f"  gating_ratio     = {gating_ratio}")
     log.info(f"  include_alert_db = {include_alert_db}")
@@ -1008,22 +1028,11 @@ def run_monthly_retrain_v3(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Backward-compat alias para o main.py existente
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_monthly_retrain_v2(*args, **kwargs) -> dict:
-    """Alias retrocompatível — main.py ainda importa este nome."""
-    legacy_keys = {"algos"}
-    clean_kwargs = {k: v for k, v in kwargs.items() if k not in legacy_keys}
-    return run_monthly_retrain_v3(*args, **clean_kwargs)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Monthly retrain v3 with rho_alpha gating")
+    p = argparse.ArgumentParser(description="Monthly retrain with rho_alpha gating")
     p.add_argument("--gating-ratio", type=float, default=DEFAULT_GATING_RATIO)
     p.add_argument("--no-alert-db", action="store_true")
     p.add_argument("--n-folds", type=int, default=None)
@@ -1039,7 +1048,7 @@ def main() -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s | %(message)s",
     )
-    result = run_monthly_retrain_v3(
+    result = run_monthly_retrain(
         gating_ratio=args.gating_ratio,
         include_alert_db=not args.no_alert_db,
         dry_run=args.dry_run,

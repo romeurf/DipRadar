@@ -1,14 +1,11 @@
-"""Unit tests for the v3 retrain pipeline (gating + atomic deploy).
+"""Unit tests for the retrain pipeline (gating + atomic deploy).
 
 Foco em **lógica pura** (não exige network / yfinance). Testa:
 - gate_and_promote_v3: 5 ramos (FAILED, KEPT_FLOOR, cold start, PROMOTED, PENDING)
 - _read_floor_rho_alpha: criação automática + ler de ficheiro existente
 - _do_promote / _save_pending: copy/archive correctos
-- run_monthly_retrain_v2 alias
 
-NOTE: Não testa `run_monthly_retrain_v3` end-to-end (precisaria de yfinance).
-Smoke E2E é responsabilidade do Sprint B.4 (já passou) e da execução real
-no Railway no dia 1 do próximo mês.
+NOTE: Não testa `run_monthly_retrain` end-to-end (precisaria de yfinance).
 """
 
 import json
@@ -16,6 +13,8 @@ import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -174,23 +173,6 @@ class TestGateAndPromote(unittest.TestCase):
         m.FLOOR_PATH.write_text(json.dumps({"floor_rho_alpha": 0.30}))
         self.assertEqual(_read_floor_rho_alpha(), 0.30)
 
-    def test_v2_alias_calls_v3(self):
-        """run_monthly_retrain_v2 deve chamar v3 (backward-compat)."""
-        with patch("monthly_retrain.run_monthly_retrain_v3") as mock_v3:
-            mock_v3.return_value = {"decision": "PROMOTED"}
-            from monthly_retrain import run_monthly_retrain_v2
-            result = run_monthly_retrain_v2(gating_ratio=0.85)
-            mock_v3.assert_called_once_with(gating_ratio=0.85)
-            self.assertEqual(result["decision"], "PROMOTED")
-
-    def test_v2_alias_drops_legacy_kwargs(self):
-        """v2 alias ignora `algos` e outros args legacy do flow Stage1/Stage2."""
-        with patch("monthly_retrain.run_monthly_retrain_v3") as mock_v3:
-            mock_v3.return_value = {"decision": "PROMOTED"}
-            from monthly_retrain import run_monthly_retrain_v2
-            run_monthly_retrain_v2(algos=["xgb", "lgbm"])
-            mock_v3.assert_called_once_with()
-
 
 class TestBuildTrainingInput(unittest.TestCase):
     """Smoke do builder: bootstrap-only, sem alert_db nem snapshot."""
@@ -199,15 +181,9 @@ class TestBuildTrainingInput(unittest.TestCase):
         from tempfile import mkdtemp
         import pandas as pd
         self.tmp = Path(mkdtemp(prefix="dipradar_input_"))
-
-        import monthly_retrain as m
-        self._orig = {k: getattr(m, k) for k in (
-            "BOOTSTRAP_PATH", "ALERT_DB_PATH", "SNAPSHOT_PATH", "TRAINING_INPUT")}
-        m.BOOTSTRAP_PATH = self.tmp / "bootstrap.parquet"
-        m.ALERT_DB_PATH  = self.tmp / "alert_db.csv"
-        m.SNAPSHOT_PATH  = self.tmp / "snapshot.parquet"
-        m.TRAINING_INPUT = self.tmp / "training_input.parquet"
-
+        self._patcher = patch("monthly_retrain._data_dir", return_value=self.tmp)
+        self._patcher.start()
+        bootstrap = self.tmp / "ml_training_base.parquet"
         df = pd.DataFrame({
             "symbol":         ["AAPL", "MSFT", "GOOG"],
             "alert_date":     pd.to_datetime(["2023-01-01", "2023-01-02", "2023-01-03"]),
@@ -215,12 +191,10 @@ class TestBuildTrainingInput(unittest.TestCase):
             "label_win":      [1, 0, 1],
             "spy_return_ref": [-1.0, -0.5, -2.0],
         })
-        df.to_parquet(m.BOOTSTRAP_PATH, index=False)
+        df.to_parquet(bootstrap, index=False)
 
     def tearDown(self):
-        import monthly_retrain as m
-        for k, v in self._orig.items():
-            setattr(m, k, v)
+        self._patcher.stop()
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -236,30 +210,18 @@ class TestBuildTrainingInput(unittest.TestCase):
 
 
 class TestBootstrapFallback(unittest.TestCase):
-    """Regressão para o bug em produção (Railway dry-run): `/data/` está vazio
-    no primeiro deploy, o `BOOTSTRAP_PATH` não existe, e o pipeline falha com
-    'Sem dados de treino'. Fallback: ler o parquet bootstrap commitado no
-    root do repo.
-    """
+    """Regression: Railway cold-start — /data/ empty, fallback to repo-root parquet."""
 
     def setUp(self):
         from tempfile import mkdtemp
         import pandas as pd
         self.tmp_data = Path(mkdtemp(prefix="dipradar_data_"))
         self.tmp_repo = Path(mkdtemp(prefix="dipradar_repo_"))
-
-        import monthly_retrain as m
-        self._orig = {k: getattr(m, k) for k in (
-            "BOOTSTRAP_PATH", "BOOTSTRAP_FALLBACK", "ALERT_DB_PATH",
-            "SNAPSHOT_PATH", "TRAINING_INPUT")}
-        # Volume Railway vazio
-        m.BOOTSTRAP_PATH     = self.tmp_data / "ml_training_base.parquet"
-        # Repo root tem o parquet bootstrap
-        m.BOOTSTRAP_FALLBACK = self.tmp_repo / "ml_training_base.parquet"
-        m.ALERT_DB_PATH      = self.tmp_data / "alert_db.csv"
-        m.SNAPSHOT_PATH      = self.tmp_data / "snapshot.parquet"
-        m.TRAINING_INPUT     = self.tmp_data / "ml_training_input.parquet"
-
+        # _data_dir() returns empty tmp_data; _REPO_ROOT points to tmp_repo
+        self._patcher_dd   = patch("monthly_retrain._data_dir", return_value=self.tmp_data)
+        self._patcher_repo = patch("monthly_retrain._REPO_ROOT", self.tmp_repo)
+        self._patcher_dd.start()
+        self._patcher_repo.start()
         df = pd.DataFrame({
             "symbol":         ["AAPL", "MSFT"],
             "alert_date":     pd.to_datetime(["2023-01-01", "2023-01-02"]),
@@ -267,25 +229,19 @@ class TestBootstrapFallback(unittest.TestCase):
             "label_win":      [1, 0],
             "spy_return_ref": [-1.0, -0.5],
         })
-        df.to_parquet(m.BOOTSTRAP_FALLBACK, index=False)
+        df.to_parquet(self.tmp_repo / "ml_training_base.parquet", index=False)
 
     def tearDown(self):
-        import monthly_retrain as m
-        for k, v in self._orig.items():
-            setattr(m, k, v)
+        self._patcher_dd.stop()
+        self._patcher_repo.stop()
         import shutil
         shutil.rmtree(self.tmp_data, ignore_errors=True)
         shutil.rmtree(self.tmp_repo, ignore_errors=True)
 
     def test_falls_back_to_repo_parquet_when_data_dir_empty(self):
-        """`/data/` vazio + repo root com parquet → usa fallback."""
-        from monthly_retrain import build_training_input, BOOTSTRAP_PATH
-        # Sanity: o path do volume não existe mesmo
-        self.assertFalse(BOOTSTRAP_PATH.exists())
-
+        from monthly_retrain import build_training_input
         path = build_training_input(include_snapshot=False, include_alert_db=False)
         self.assertTrue(path.exists())
-
         import pandas as pd
         df = pd.read_parquet(path)
         self.assertEqual(len(df), 2)

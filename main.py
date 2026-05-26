@@ -1964,7 +1964,7 @@ def run_monthly_retrain() -> None:
     """
     Corre no dia 1 de cada mês às 06:00 Lisboa.
 
-    Delega para `monthly_retrain.run_monthly_retrain_v3` que faz:
+    Delega para `monthly_retrain.run_monthly_retrain` que faz:
       1. Build training input (bootstrap + alert_db + universe_snapshot)
       2. Treina candidate via `ml_training.train.run_training`
          (regressor alpha_90d + isotonic, 10 folds purgados)
@@ -2004,8 +2004,8 @@ def run_monthly_retrain() -> None:
 
     def _run_retrain():
         try:
-            from monthly_retrain import run_monthly_retrain_v3
-            _result_holder[0] = run_monthly_retrain_v3()
+            from monthly_retrain import run_monthly_retrain
+            _result_holder[0] = run_monthly_retrain()
         except Exception as e:
             _error_holder[0] = e
         finally:

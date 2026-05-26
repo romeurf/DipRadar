@@ -2327,8 +2327,8 @@ def _handle_admin_full_pipeline(parts: list[str]) -> None:
             nonlocal dip_train_res, dip_train_err2
             _plog("Fase 2 DipRadar: treino iniciado")
             try:
-                from monthly_retrain import run_monthly_retrain_v3
-                dip_train_res = run_monthly_retrain_v3() or {}
+                from monthly_retrain import run_monthly_retrain
+                dip_train_res = run_monthly_retrain() or {}
                 dec = dip_train_res.get("decision", "?")
                 _plog(f"Fase 2 DipRadar: {dec}")
             except Exception as e:
@@ -2445,7 +2445,7 @@ def _handle_admin_overnight(parts: list[str]) -> None:
     Steps (in order):
       1. Purge disk (price_cache + training parquets + snapshot) — keeps alert_db + pickles
       2. DIP dataset build  (scripts/build_dip_dataset.py --force-rebuild)
-      3. DIP model retrain  (monthly_retrain.run_monthly_retrain_v3)
+      3. DIP model retrain  (monthly_retrain.run_monthly_retrain)
       4. Core dataset build (scripts/build_core_dataset.py --force-rebuild)
       5. Core model train   (scripts/train_core_model.py)
       6. Momentum dataset   (momentum_radar/scripts/build_dataset.py)
@@ -2489,17 +2489,21 @@ def _handle_admin_overnight(parts: list[str]) -> None:
     )
 
     def _run():
-        global _retrain_running, _pipeline_log
+        global _retrain_running, _pipeline_log, _pipeline_phase, _pipeline_start
+        import time as _t
         _retrain_running = True
         _pipeline_log.clear()
-        import subprocess, sys, shutil, time as _t
+        _pipeline_start = _t.time()
+        import subprocess, sys, shutil
         from pathlib import Path
 
         data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
         scripts  = Path(__file__).parent / "scripts"
 
-        def _sub(cmd: list[str], timeout_h: float) -> tuple[bool, str]:
-            """Run subprocess, return (ok, tail_output)."""
+        def _sub(cmd: list[str], phase: str, timeout_h: float) -> tuple[bool, str]:
+            """Run subprocess, set pipeline phase, return (ok, tail_output)."""
+            global _pipeline_phase
+            _pipeline_phase = phase
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True, timeout=int(timeout_h * 3600))
                 tail = ((r.stdout or "") + (r.stderr or ""))[-600:]
@@ -2512,6 +2516,7 @@ def _handle_admin_overnight(parts: list[str]) -> None:
         try:
             # ── Step 0: Purge disk ────────────────────────────────────────────
             if not no_purge:
+                _pipeline_phase = "Step 0 — purging disk"
                 _plog("Step 0: purging disk...")
                 price_cache = data_dir / "price_cache"
                 freed = 0
@@ -2540,6 +2545,7 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                 ok, tail = _sub(
                     [sys.executable, str(scripts / "build_dip_dataset.py"),
                      "--start", "1993-01-01", "--out", str(out_dip), "--force-rebuild"],
+                    phase="Step 1/6 — DIP dataset build",
                     timeout_h=12,
                 )
                 elapsed = (_t.time() - t0) / 60
@@ -2559,12 +2565,13 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                     _reply(f"❌ <b>Step 1/6 — DIP dataset FAILED</b>\n<code>{tail[-400:]}</code>\n\n<i>Continuing with Core...</i>")
 
                 if ok:
+                    _pipeline_phase = "Step 2/6 — DIP retrain"
                     _plog("Step 2: DIP retrain started...")
                     _reply("⏳ <b>Step 2/6 — DIP retrain</b>...")
                     t0 = _t.time()
                     try:
-                        from monthly_retrain import run_monthly_retrain_v3
-                        result = run_monthly_retrain_v3() or {}
+                        from monthly_retrain import run_monthly_retrain
+                        result = run_monthly_retrain() or {}
                         dec    = result.get("decision", "?")
                         rho    = result.get("candidate_rho_alpha")
                         elapsed = (_t.time() - t0) / 60
@@ -2585,6 +2592,7 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                 ok, tail = _sub(
                     [sys.executable, str(scripts / "build_core_dataset.py"),
                      "--out", str(out_core), "--start", "1993-01-01", "--force-rebuild"],
+                    phase="Step 3/6 — Core dataset build",
                     timeout_h=4,
                 )
                 elapsed = (_t.time() - t0) / 60
@@ -2610,6 +2618,7 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                     ok4, tail4 = _sub(
                         [sys.executable, str(scripts / "train_core_model.py"),
                          "--parquet", str(out_core)],
+                        phase="Step 4/6 — Core model train",
                         timeout_h=1,
                     )
                     elapsed = (_t.time() - t0) / 60
@@ -2637,6 +2646,7 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                 mom_script = Path(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py"
                 ok, tail = _sub(
                     [sys.executable, str(mom_script), "--out", str(out_mom)],
+                    phase="Step 5/6 — Momentum dataset build",
                     timeout_h=8,
                 )
                 elapsed = (_t.time() - t0) / 60
@@ -2655,6 +2665,7 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                     _reply(f"❌ <b>Step 5/6 — Momentum dataset FAILED</b>\n<code>{tail[-400:]}</code>")
 
                 if ok:
+                    _pipeline_phase = "Step 6/6 — Momentum retrain"
                     _plog("Step 6: Momentum retrain started...")
                     _reply("⏳ <b>Step 6/6 — Momentum retrain</b>...")
                     t0 = _t.time()
@@ -2688,6 +2699,8 @@ def _handle_admin_overnight(parts: list[str]) -> None:
             _reply(f"❌ <b>Overnight pipeline crashed:</b>\n<code>{e}</code>")
         finally:
             _retrain_running = False
+            _pipeline_phase  = ""
+            _pipeline_start  = 0.0
 
     threading.Thread(target=_run, daemon=True, name="admin-overnight").start()
 
@@ -2891,8 +2904,8 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
         if train_dip:
             _plog("Phase 2 — DIP retrain: starting")
             try:
-                from monthly_retrain import run_monthly_retrain_v3
-                dip_result = run_monthly_retrain_v3() or {}
+                from monthly_retrain import run_monthly_retrain
+                dip_result = run_monthly_retrain() or {}
                 dec = dip_result.get("decision", "?")
                 rho = dip_result.get("rho_alpha_mean")
                 rho_str = f" | rho_alpha={rho:.4f}" if isinstance(rho, float) else ""
@@ -3016,14 +3029,14 @@ def _handle_admin_retrain(parts: list[str]) -> None:
         _retrain_running = True
         start_ts = time.time()
         try:
-            from monthly_retrain import run_monthly_retrain_v3
+            from monthly_retrain import run_monthly_retrain
             kwargs = dict(
                 dry_run=dry_run,
                 include_alert_db=include_alert_db,
             )
             if gating_ratio is not None:
                 kwargs["gating_ratio"] = gating_ratio
-            result = run_monthly_retrain_v3(**kwargs)
+            result = run_monthly_retrain(**kwargs)
         except Exception as e:
             logging.error(f"[admin_retrain] {e}", exc_info=True)
             _reply(f"❌ *Retrain falhou:*\n`{_md_safe(e)}`")
