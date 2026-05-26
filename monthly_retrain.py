@@ -285,21 +285,22 @@ def _load_alert_db_as_training() -> pd.DataFrame:
         sem default chegam como NaN ao train e causam KeyError ou
         degradação silenciosa do modelo.
     """
-    if not ALERT_DB_PATH.exists():
+    alert_db_path = _paths()["ALERT_DB_PATH"]
+    if not alert_db_path.exists():
         return pd.DataFrame()
 
-    # Migrar schema antes de ler — elimina os ParserWarnings causados por
-    # linhas com campo count diferente do header. Idempotente e seguro.
+    # Migrate schema before reading — eliminates ParserWarnings from rows
+    # with a field count that differs from the header. Idempotent and safe.
     try:
         from alert_db import migrate_schema
         migrate_schema()
     except Exception as _mig_err:
-        log.warning(f"[alert_db] migrate_schema falhou: {_mig_err}")
+        log.warning(f"[alert_db] migrate_schema failed: {_mig_err}")
 
     try:
-        df = pd.read_csv(ALERT_DB_PATH, engine="python")
+        df = pd.read_csv(alert_db_path, engine="python")
     except Exception as e:
-        log.warning(f"[alert_db] Falha a ler {ALERT_DB_PATH}: {e}")
+        log.warning(f"[alert_db] Failed to read {alert_db_path}: {e}")
         return pd.DataFrame()
 
     if df.empty:

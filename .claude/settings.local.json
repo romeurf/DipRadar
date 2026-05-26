@@ -96,7 +96,8 @@
       "Bash(python -m pytest tests/test_monthly_retrain.py -x -q)",
       "Bash(python -m unittest tests.test_monthly_retrain -v)",
       "Bash(python -m unittest tests.test_monthly_retrain.TestGateAndPromote.test_kept_floor_when_below_absolute_floor -v)",
-      "Bash(python -m unittest tests.test_monthly_retrain.TestGateAndPromote -v)"
+      "Bash(python -m unittest tests.test_monthly_retrain.TestGateAndPromote -v)",
+      "Bash(python -c \"import monthly_retrain; print\\('Import OK'\\); print\\('Functions:', [x for x in dir\\(monthly_retrain\\) if not x.startswith\\('_'\\)][:10]\\)\")"
     ],
     "additionalDirectories": [
       "c:\\Users\\Romeu\\OneDrive\\Documentos\\GitHub\\DipRadar"
