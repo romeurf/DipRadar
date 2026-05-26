@@ -366,6 +366,196 @@ def _sector_etf_features_pit(
         return _default
 
 
+def _process_one_ticker(
+    ticker: str,
+    price_cache: dict[str, pd.DataFrame],
+    spy_hist: Optional[pd.DataFrame],
+    sector_etf_cache: dict[str, pd.DataFrame],
+    core_tickers: set[str],
+    core_yields: dict[str, float],
+    add_fundamentals: bool,
+    cache_dir: Path,
+    today: pd.Timestamp,
+) -> list[dict]:
+    """Process one ticker: fetch per-ticker signals and generate MA200w episode rows."""
+    import yfinance as _yf
+
+    hist = price_cache.get(ticker)
+    if hist is None or len(hist) < _MIN_BARS_AHEAD_1Y + _MIN_WEEKS_FOR_MA * 5:
+        return []
+
+    rows: list[dict] = []
+
+    # Normalizar índice para timezone-naive
+    if hist.index.tz is not None:
+        hist = hist.copy()
+        hist.index = hist.index.tz_localize(None)
+
+    is_core = int(ticker in core_tickers)
+    ann_yield = core_yields.get(ticker, 0.0)
+
+    # Sector ETF and per-ticker signals (fetch once, reuse across all episodes)
+    sector = "Unknown"
+    fwd_pe_ticker: Optional[float] = None
+    dividends_ticker: Optional[pd.Series] = None
+    try:
+        info = _yf.Ticker(ticker).info or {}
+        sector = info.get("sector") or "Unknown"
+        _fpe = info.get("forwardPE")
+        if _fpe is not None:
+            try:
+                fwd_pe_ticker = float(_fpe) if math.isfinite(float(_fpe)) and float(_fpe) > 0 else None
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        _divs = _yf.Ticker(ticker).dividends
+        if _divs is not None and not _divs.empty:
+            if _divs.index.tz is not None:
+                _divs.index = _divs.index.tz_localize(None)
+            dividends_ticker = _divs
+    except Exception:
+        pass
+    etf_key = SECTOR_ETF.get(sector, "SPY")
+    _se = sector_etf_cache.get(etf_key)
+    sector_etf_hist = _se if _se is not None else sector_etf_cache.get("SPY")
+    if sector_etf_hist is not None and sector_etf_hist.index.tz is not None:
+        sector_etf_hist = sector_etf_hist.copy()
+        sector_etf_hist.index = sector_etf_hist.index.tz_localize(None)
+
+    episode_dates = _find_ma200w_episodes(hist)
+    if not episode_dates:
+        return []
+
+    for alert_date in episode_dates:
+        close_pit  = hist[hist.index <= alert_date]["Close"]
+        volume_pit = hist[hist.index <= alert_date]["Volume"] if "Volume" in hist.columns else None
+        if len(close_pit) < 21:
+            continue
+
+        price = float(close_pit.iloc[-1])
+
+        # ── Preço e MA ──────────────────────────────────────────────────
+        ma200w = _compute_weekly_ma200_pit(close_pit)
+        if ma200w is None or ma200w <= 0:
+            continue
+        price_vs_ma200w = round(price / ma200w - 1, 4)
+
+        ma_p   = min(200, len(close_pit) - 1)
+        ma200d = float(close_pit.rolling(ma_p).mean().iloc[-1]) if ma_p >= 20 else None
+        ma200d_trend = 0.0
+        if ma200d and len(close_pit) >= ma_p + 60:
+            ma200d_60d = float(close_pit.rolling(ma_p).mean().iloc[-61])
+            ma200d_trend = round((ma200d / ma200d_60d - 1) if ma200d_60d > 0 else 0.0, 4)
+
+        ret_20d = round(float(close_pit.iloc[-1] / close_pit.iloc[-21] - 1), 4) if len(close_pit) >= 21 else 0.0
+        ret_5d  = round(float(close_pit.iloc[-1] / close_pit.iloc[-6]  - 1), 4) if len(close_pit) >= 6  else 0.0
+
+        high_52w = float(close_pit.rolling(min(252, len(close_pit))).max().iloc[-1])
+        dd_52w   = round(price / high_52w - 1, 4) if high_52w > 0 else 0.0
+
+        rsi = _compute_rsi14(close_pit)
+
+        # ── Volume / fluxo institucional ────────────────────────────────
+        vol_sigs = _compute_volume_signals_pit(close_pit, volume_pit) if volume_pit is not None else {
+            "obv_trend_20d": 0.0, "up_down_vol_ratio_20d": 1.0,
+            "high_vol_up_days_20d": 0, "vol_spike_5d_vs_60d": 1.0,
+        }
+
+        # ── Setor ETF context ────────────────────────────────────────────
+        se_feats = _sector_etf_features_pit(alert_date, sector_etf_hist, price_vs_ma200w)
+
+        # ── Targets ─────────────────────────────────────────────────────
+        targets = _compute_alpha_targets(hist, alert_date, spy_hist)
+
+        # ── pe_vs_sector_median: stock fwd PE / sector median fwd PE ─────
+        from ml_features import _SECTOR_MEDIAN_FWD_PE as _SMED_PE
+        _sec_med = _SMED_PE.get(sector, 18.0)
+        if fwd_pe_ticker is not None and _sec_med > 0:
+            pe_vs_sector_med = round(min(fwd_pe_ticker / _sec_med, 5.0), 4)
+        else:
+            pe_vs_sector_med = 1.0
+
+        # ── dividend_growth_3y: PIT 3-year dividend CAGR ────────────────
+        div_growth_3y = 0.0
+        if dividends_ticker is not None and not dividends_ticker.empty:
+            try:
+                ref_d = alert_date if isinstance(alert_date, pd.Timestamp) else pd.Timestamp(alert_date)
+                cutoff_3y = ref_d - pd.DateOffset(years=3)
+                cutoff_6y = ref_d - pd.DateOffset(years=6)
+                recent_sum = float(dividends_ticker[(dividends_ticker.index > cutoff_3y) & (dividends_ticker.index <= ref_d)].sum())
+                prior_sum  = float(dividends_ticker[(dividends_ticker.index > cutoff_6y) & (dividends_ticker.index <= cutoff_3y)].sum())
+                if prior_sum > 0 and recent_sum > 0:
+                    cagr = (recent_sum / prior_sum) ** (1.0 / 3.0) - 1.0
+                    div_growth_3y = round(float(np.clip(cagr, -0.5, 1.0)), 4)
+                elif recent_sum > 0 and prior_sum == 0:
+                    div_growth_3y = 1.0
+            except Exception:
+                pass
+
+        # ── PIT Fundamentals (all historical episodes via EDGAR XBRL) ─────
+        fund: dict = {}
+        if add_fundamentals:
+            try:
+                from fundamental_history import get_pit_fundamentals
+                fund_raw = get_pit_fundamentals(
+                    ticker,
+                    alert_date.date() if hasattr(alert_date, "date") else alert_date,
+                    cache_dir / "fundamental_cache",
+                )
+                if fund_raw:
+                    fcf_yield_v = fund_raw.get("fcf_yield")
+                    if fcf_yield_v is None and fund_raw.get("_fcf_raw") and price > 0:
+                        fcf_yield_v = None
+
+                    fund = {
+                        "revenue_growth":  fund_raw.get("revenue_growth"),
+                        "gross_margin":    fund_raw.get("gross_margin"),
+                        "roe":             fund_raw.get("roe"),
+                        "fcf_yield_fund":  fcf_yield_v,
+                        "analyst_upside":  fund_raw.get("analyst_upside"),
+                        "earnings_growth": fund_raw.get("revenue_growth"),  # proxy
+                    }
+            except Exception as _fe:
+                log.debug(f"[core_fund] {ticker}@{alert_date.date()}: {_fe}")
+
+        row = {
+            "alert_date":             alert_date,
+            "ticker":                 ticker,
+            "sector":                 sector,
+            "is_core_company":        is_core,
+            "annual_yield_pct":       ann_yield,
+            "price":                  round(price, 4),
+            "price_vs_ma200w":        price_vs_ma200w,
+            "ma200d_trend_60d":       ma200d_trend,
+            "return_20d":             ret_20d,
+            "return_5d":              ret_5d,
+            "dd_from_52w_high":       dd_52w,
+            "rsi_14":                 rsi,
+            "obv_trend_20d":          vol_sigs.get("obv_trend_20d",       0.0),
+            "up_down_vol_ratio_20d":  vol_sigs.get("up_down_vol_ratio_20d", 1.0),
+            "high_vol_up_days_20d":   vol_sigs.get("high_vol_up_days_20d",  0),
+            "vol_spike_5d_vs_60d":    vol_sigs.get("vol_spike_5d_vs_60d",   1.0),
+            "sector_etf_vs_ma200w":   se_feats["sector_etf_vs_ma200w"],
+            "stock_vs_sector_spread": se_feats["stock_vs_sector_spread"],
+            "sector_return_20d":      se_feats["sector_return_20d"],
+            "pe_vs_sector_median":    pe_vs_sector_med,
+            "dividend_growth_3y":     div_growth_3y,
+            "revenue_growth":         fund.get("revenue_growth"),
+            "gross_margin":           fund.get("gross_margin"),
+            "roe":                    fund.get("roe"),
+            "fcf_yield_fund":         fund.get("fcf_yield_fund"),
+            "analyst_upside":         fund.get("analyst_upside"),
+            "earnings_growth":        fund.get("earnings_growth"),
+            "source":                 "backfill",
+            **targets,
+        }
+        rows.append(row)
+
+    return rows
+
+
 def build_core_dataset(
     tickers: list[str],
     price_cache: dict[str, pd.DataFrame],
@@ -374,200 +564,39 @@ def build_core_dataset(
     core_tickers: set[str],
     core_yields: dict[str, float],
     add_fundamentals: bool = True,
+    cache_dir: Optional[Path] = None,
 ) -> pd.DataFrame:
-    """Constrói dataset de treino para CoreML varrendo histórico de episódios MA200w."""
-    import yfinance as _yf
+    """Build CoreML training dataset. Processes tickers in parallel (4 workers)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    if cache_dir is None:
+        cache_dir = _CACHE_DIR
 
-    rows: list[dict] = []
-    n_tickers = len(tickers)
     today = pd.Timestamp.now(tz="UTC").normalize().tz_localize(None)
+    n_tickers = len(tickers)
+    all_rows: list[dict] = []
+    completed = 0
 
-    for i, ticker in enumerate(tickers):
-        hist = price_cache.get(ticker)
-        if hist is None or len(hist) < _MIN_BARS_AHEAD_1Y + _MIN_WEEKS_FOR_MA * 5:
-            continue
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {
+            pool.submit(
+                _process_one_ticker,
+                ticker, price_cache, spy_hist, sector_etf_cache,
+                core_tickers, core_yields, add_fundamentals, cache_dir, today,
+            ): ticker
+            for ticker in tickers
+        }
+        for fut in as_completed(futures):
+            ticker = futures[fut]
+            completed += 1
+            try:
+                rows = fut.result()
+                all_rows.extend(rows)
+            except Exception as e:
+                log.warning(f"  [{completed}/{n_tickers}] {ticker} FAILED: {e}")
+            if completed % 25 == 0 or completed == n_tickers:
+                log.info(f"  [{completed}/{n_tickers}] processed | {len(all_rows)} MA200w episodes so far")
 
-        # Normalizar índice para timezone-naive
-        if hist.index.tz is not None:
-            hist = hist.copy()
-            hist.index = hist.index.tz_localize(None)
-
-        is_core = int(ticker in core_tickers)
-        ann_yield = core_yields.get(ticker, 0.0)
-
-        # Sector ETF and per-ticker signals (fetch once, reuse across all episodes)
-        sector = "Unknown"
-        fwd_pe_ticker: Optional[float] = None
-        dividends_ticker: Optional[pd.Series] = None
-        try:
-            info = _yf.Ticker(ticker).info or {}
-            sector = info.get("sector") or "Unknown"
-            _fpe = info.get("forwardPE")
-            if _fpe is not None:
-                try:
-                    fwd_pe_ticker = float(_fpe) if math.isfinite(float(_fpe)) and float(_fpe) > 0 else None
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
-            _divs = _yf.Ticker(ticker).dividends
-            if _divs is not None and not _divs.empty:
-                if _divs.index.tz is not None:
-                    _divs.index = _divs.index.tz_localize(None)
-                dividends_ticker = _divs
-        except Exception:
-            pass
-        etf_key = SECTOR_ETF.get(sector, "SPY")
-        _se = sector_etf_cache.get(etf_key)
-        sector_etf_hist = _se if _se is not None else sector_etf_cache.get("SPY")
-        if sector_etf_hist is not None and sector_etf_hist.index.tz is not None:
-            sector_etf_hist = sector_etf_hist.copy()
-            sector_etf_hist.index = sector_etf_hist.index.tz_localize(None)
-
-        episode_dates = _find_ma200w_episodes(hist)
-        if not episode_dates:
-            continue
-
-        for alert_date in episode_dates:
-            close_pit  = hist[hist.index <= alert_date]["Close"]
-            volume_pit = hist[hist.index <= alert_date]["Volume"] if "Volume" in hist.columns else None
-            if len(close_pit) < 21:
-                continue
-
-            price = float(close_pit.iloc[-1])
-
-            # ── Preço e MA ──────────────────────────────────────────────────
-            ma200w = _compute_weekly_ma200_pit(close_pit)
-            if ma200w is None or ma200w <= 0:
-                continue
-            price_vs_ma200w = round(price / ma200w - 1, 4)
-
-            ma_p   = min(200, len(close_pit) - 1)
-            ma200d = float(close_pit.rolling(ma_p).mean().iloc[-1]) if ma_p >= 20 else None
-            ma200d_trend = 0.0
-            if ma200d and len(close_pit) >= ma_p + 60:
-                ma200d_60d = float(close_pit.rolling(ma_p).mean().iloc[-61])
-                ma200d_trend = round((ma200d / ma200d_60d - 1) if ma200d_60d > 0 else 0.0, 4)
-
-            ret_20d = round(float(close_pit.iloc[-1] / close_pit.iloc[-21] - 1), 4) if len(close_pit) >= 21 else 0.0
-            ret_5d  = round(float(close_pit.iloc[-1] / close_pit.iloc[-6]  - 1), 4) if len(close_pit) >= 6  else 0.0
-
-            high_52w = float(close_pit.rolling(min(252, len(close_pit))).max().iloc[-1])
-            dd_52w   = round(price / high_52w - 1, 4) if high_52w > 0 else 0.0
-
-            rsi = _compute_rsi14(close_pit)
-
-            # ── Volume / fluxo institucional ────────────────────────────────
-            vol_sigs = _compute_volume_signals_pit(close_pit, volume_pit) if volume_pit is not None else {
-                "obv_trend_20d": 0.0, "up_down_vol_ratio_20d": 1.0,
-                "high_vol_up_days_20d": 0, "vol_spike_5d_vs_60d": 1.0,
-            }
-
-            # ── Setor ETF context ────────────────────────────────────────────
-            se_feats = _sector_etf_features_pit(alert_date, sector_etf_hist, price_vs_ma200w)
-
-            # ── Targets ─────────────────────────────────────────────────────
-            targets = _compute_alpha_targets(hist, alert_date, spy_hist)
-
-            # ── pe_vs_sector_median: stock fwd PE / sector median fwd PE ─────
-            # Note: forwardPE is fetched from current yfinance info (not PIT).
-            # For Core model, this is used as a cross-sectional valuation rank —
-            # the relative ranking within sector is stable enough across time.
-            from ml_features import _SECTOR_MEDIAN_FWD_PE as _SMED_PE
-            _sec_med = _SMED_PE.get(sector, 18.0)
-            if fwd_pe_ticker is not None and _sec_med > 0:
-                pe_vs_sector_med = round(min(fwd_pe_ticker / _sec_med, 5.0), 4)
-            else:
-                pe_vs_sector_med = 1.0  # fallback: at sector median
-
-            # ── dividend_growth_3y: PIT 3-year dividend CAGR ────────────────
-            div_growth_3y = 0.0  # fallback: non-payer or no data
-            if dividends_ticker is not None and not dividends_ticker.empty:
-                try:
-                    ref_d = alert_date if isinstance(alert_date, pd.Timestamp) else pd.Timestamp(alert_date)
-                    cutoff_3y = ref_d - pd.DateOffset(years=3)
-                    cutoff_6y = ref_d - pd.DateOffset(years=6)
-                    recent_sum = float(dividends_ticker[(dividends_ticker.index > cutoff_3y) & (dividends_ticker.index <= ref_d)].sum())
-                    prior_sum  = float(dividends_ticker[(dividends_ticker.index > cutoff_6y) & (dividends_ticker.index <= cutoff_3y)].sum())
-                    if prior_sum > 0 and recent_sum > 0:
-                        cagr = (recent_sum / prior_sum) ** (1.0 / 3.0) - 1.0
-                        div_growth_3y = round(float(np.clip(cagr, -0.5, 1.0)), 4)
-                    elif recent_sum > 0 and prior_sum == 0:
-                        div_growth_3y = 1.0   # initiated dividends
-                except Exception:
-                    pass
-
-            # ── PIT Fundamentals (all historical episodes via EDGAR XBRL) ─────
-            # Uses fundamental_history.get_pit_fundamentals() which fetches
-            # SEC EDGAR XBRL company facts (cached once per ticker, 30-day TTL)
-            # and extracts the values filed BEFORE alert_date (no look-ahead).
-            # Falls back to yfinance quarterly for pre-XBRL episodes (<2009).
-            fund: dict = {}
-            if add_fundamentals:
-                try:
-                    from fundamental_history import get_pit_fundamentals
-                    fund_raw = get_pit_fundamentals(
-                        ticker,
-                        alert_date.date() if hasattr(alert_date, "date") else alert_date,
-                        cache_dir / "fundamental_cache",
-                    )
-                    if fund_raw:
-                        # FCF yield: use Tiingo's direct value, or compute from raw+price
-                        fcf_yield_v = fund_raw.get("fcf_yield")
-                        if fcf_yield_v is None and fund_raw.get("_fcf_raw") and price > 0:
-                            # Rough estimate: FCF / (price × shares_outstanding)
-                            # shares not available here — skip; Tiingo tier provides it directly
-                            fcf_yield_v = None
-
-                        fund = {
-                            "revenue_growth":  fund_raw.get("revenue_growth"),
-                            "gross_margin":    fund_raw.get("gross_margin"),
-                            "roe":             fund_raw.get("roe"),
-                            "fcf_yield_fund":  fcf_yield_v,
-                            "analyst_upside":  fund_raw.get("analyst_upside"),
-                            "earnings_growth": fund_raw.get("revenue_growth"),  # proxy
-                        }
-                except Exception as _fe:
-                    log.debug(f"[core_fund] {ticker}@{alert_date.date()}: {_fe}")
-
-            row = {
-                "alert_date":             alert_date,
-                "ticker":                 ticker,
-                "sector":                 sector,
-                "is_core_company":        is_core,
-                "annual_yield_pct":       ann_yield,
-                "price":                  round(price, 4),
-                "price_vs_ma200w":        price_vs_ma200w,
-                "ma200d_trend_60d":       ma200d_trend,
-                "return_20d":             ret_20d,
-                "return_5d":              ret_5d,
-                "dd_from_52w_high":       dd_52w,
-                "rsi_14":                 rsi,
-                "obv_trend_20d":          vol_sigs.get("obv_trend_20d",       0.0),
-                "up_down_vol_ratio_20d":  vol_sigs.get("up_down_vol_ratio_20d", 1.0),
-                "high_vol_up_days_20d":   vol_sigs.get("high_vol_up_days_20d",  0),
-                "vol_spike_5d_vs_60d":    vol_sigs.get("vol_spike_5d_vs_60d",   1.0),
-                "sector_etf_vs_ma200w":   se_feats["sector_etf_vs_ma200w"],
-                "stock_vs_sector_spread": se_feats["stock_vs_sector_spread"],
-                "sector_return_20d":      se_feats["sector_return_20d"],
-                "pe_vs_sector_median":    pe_vs_sector_med,
-                "dividend_growth_3y":     div_growth_3y,
-                "revenue_growth":         fund.get("revenue_growth"),
-                "gross_margin":           fund.get("gross_margin"),
-                "roe":                    fund.get("roe"),
-                "fcf_yield_fund":         fund.get("fcf_yield_fund"),
-                "analyst_upside":         fund.get("analyst_upside"),
-                "earnings_growth":        fund.get("earnings_growth"),
-                "source":                 "backfill",
-                **targets,
-            }
-            rows.append(row)
-
-        if (i + 1) % 50 == 0 or (i + 1) == n_tickers:
-            log.info(f"  [{i+1}/{n_tickers}] {ticker} | {len(rows)} episódios MA200w total")
-
-    return pd.DataFrame(rows)
+    return pd.DataFrame(all_rows)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -651,6 +680,7 @@ def main() -> int:
         core_tickers=core_tickers,
         core_yields=core_yields,
         add_fundamentals=not args.no_fundamentals,
+        cache_dir=cache_dir,
     )
 
     if new_df.empty:
