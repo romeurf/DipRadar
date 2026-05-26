@@ -36,9 +36,10 @@ log = logging.getLogger("collect_sentiment")
 
 _DATA_DIR       = Path("/data") if Path("/data").exists() else Path("/tmp")
 _SENTIMENT_PATH = _DATA_DIR / "news_sentiment.parquet"
-_MAX_HEADLINES  = 5      # por ticker por run
-_MAX_AGE_HOURS  = 48     # só headlines das últimas 48h
-_SLEEP_BETWEEN  = 0.15   # seg entre tickers (rate limit yfinance)
+_MAX_HEADLINES  = 3      # per ticker per run (was 5 — reduce API calls)
+_MAX_AGE_HOURS  = 48     # only headlines from last 48h
+_SLEEP_BETWEEN  = 0.15   # sec between tickers (yfinance rate limit)
+_SLEEP_API      = 1.5    # sec between Haiku calls — keeps us at ~40 req/min (tier limit: 50)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -60,7 +61,7 @@ def _build_client():
 
 
 def _score_headline(ticker: str, headline: str, client) -> Optional[float]:
-    """Classifica headline com Claude Haiku. Devolve 1.0, 0.0 ou -1.0."""
+    """Score headline with Claude Haiku. Returns 1.0, 0.0, or -1.0."""
     try:
         msg = client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -75,6 +76,7 @@ def _score_headline(ticker: str, headline: str, client) -> Optional[float]:
                 ),
             }],
         )
+        time.sleep(_SLEEP_API)  # 1.5s → ~40 req/min, safely under 50 req/min tier limit
         answer = msg.content[0].text.strip().upper()
         if "POSITIVE" in answer:
             return 1.0
@@ -83,6 +85,7 @@ def _score_headline(ticker: str, headline: str, client) -> Optional[float]:
         return 0.0
     except Exception as e:
         log.debug(f"[sentiment] score failed ({ticker}): {e}")
+        time.sleep(_SLEEP_API)  # also sleep on error to back off
         return None
 
 
