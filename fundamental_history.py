@@ -156,10 +156,43 @@ def _get_cik(ticker: str, cache_dir: Path) -> Optional[str]:
     return _CIK_MAP.get(ticker.upper().replace(".", ""))
 
 
+# Only the XBRL concepts we actually query — strip everything else before caching.
+# Raw EDGAR company facts JSON is 2–20 MB per ticker; keeping only these
+# concepts reduces it to ~20–80 KB, preventing disk overflow on multi-ticker builds.
+_NEEDED_CONCEPTS: set[str] = {
+    "Revenues",
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "RevenueFromContractWithCustomer",
+    "SalesRevenueNet",
+    "GrossProfit",
+    "NetCashProvidedByUsedInOperatingActivities",
+    "PaymentsToAcquirePropertyPlantAndEquipment",
+    "PaymentsForCapitalImprovements",
+    "LongTermDebt",
+    "LongTermDebtAndCapitalLeaseObligations",
+    "LongTermDebtNoncurrent",
+    "StockholdersEquity",
+    "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+    "NetIncomeLoss",
+    "ProfitLoss",
+    "CommonStockSharesOutstanding",
+}
+
+
+def _slim_facts(data: dict) -> dict:
+    """Keep only needed XBRL concepts from a raw EDGAR company facts response."""
+    gaap = data.get("facts", {}).get("us-gaap", {})
+    slim_gaap = {k: v for k, v in gaap.items() if k in _NEEDED_CONCEPTS}
+    return {
+        "entityName": data.get("entityName", ""),
+        "facts": {"us-gaap": slim_gaap},
+    }
+
+
 def _edgar_facts(cik: str, cache_dir: Path) -> dict:
-    """Descarrega e cacheia o JSON de company facts do EDGAR."""
+    """Download and cache a slim EDGAR company facts dict for one CIK."""
     cache_file = cache_dir / f"edgar_{cik}.json"
-    # Cache de 30 dias (fundamentais mudam trimestralmente)
+    # 30-day cache (fundamentals change quarterly)
     if cache_file.exists() and (time.time() - cache_file.stat().st_mtime) < 86400 * 30:
         try:
             return json.loads(cache_file.read_text(encoding="utf-8"))
@@ -172,10 +205,10 @@ def _edgar_facts(cik: str, cache_dir: Path) -> dict:
         if resp.status_code == 404:
             return {}
         resp.raise_for_status()
-        data = resp.json()
+        data = _slim_facts(resp.json())   # strip to needed concepts before caching
         cache_dir.mkdir(parents=True, exist_ok=True)
         cache_file.write_text(json.dumps(data), encoding="utf-8")
-        time.sleep(0.12)  # ~8 req/s (limit é 10)
+        time.sleep(0.12)  # ~8 req/s (limit is 10)
         return data
     except Exception as e:
         log.debug(f"[edgar] facts {cik}: {e}")
