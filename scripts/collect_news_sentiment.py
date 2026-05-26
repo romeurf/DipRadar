@@ -256,6 +256,79 @@ def get_sentiment_features(
         return {f"news_sentiment_{d}d": 0.0 for d in lookbacks}
 
 
+def score_ticker_now(ticker: str) -> str:
+    """Score current headlines for a single ticker at alert time.
+
+    Called once per real alert — never called in batch for the full universe.
+    Returns a one-line summary string for inclusion in the alert message,
+    e.g. "📰 2 positive · 1 neutral" or "" if no recent headlines / no API key.
+    Also stores new rows in the sentiment parquet for future training.
+    """
+    client = _build_client()
+    if client is None:
+        return ""
+
+    headlines = _fetch_recent_headlines(ticker, max_age_h=_MAX_AGE_HOURS)
+    if not headlines:
+        return ""
+
+    # Load existing hashes to avoid re-scoring
+    existing_hashes: set[str] = set()
+    existing_rows: list[dict] = []
+    if _SENTIMENT_PATH.exists():
+        try:
+            ex = pd.read_parquet(_SENTIMENT_PATH)
+            if "hash" in ex.columns:
+                existing_hashes = set(ex["hash"].dropna().tolist())
+            existing_rows = ex.to_dict("records")
+        except Exception:
+            pass
+
+    new_rows: list[dict] = []
+    scores: list[float] = []
+    scored_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    for h in headlines:
+        h_hash = _headline_hash(h["headline"])
+        if h_hash in existing_hashes:
+            # Already scored — look up existing score
+            continue
+        s = _score_headline(ticker, h["headline"], client)
+        if s is not None:
+            scores.append(s)
+            new_rows.append({
+                "ticker":         ticker,
+                "published_date": h["published_date"],
+                "headline":       h["headline"],
+                "sentiment":      s,
+                "hash":           h_hash,
+                "scored_at":      scored_at,
+            })
+            existing_hashes.add(h_hash)
+
+    # Persist new rows
+    if new_rows:
+        try:
+            all_rows = existing_rows + new_rows
+            df = pd.DataFrame(all_rows)
+            _DATA_DIR.mkdir(parents=True, exist_ok=True)
+            df.to_parquet(_SENTIMENT_PATH, index=False)
+        except Exception as e:
+            log.warning(f"[sentiment] Failed to save for {ticker}: {e}")
+
+    if not scores:
+        return ""
+
+    pos = sum(1 for s in scores if s > 0)
+    neg = sum(1 for s in scores if s < 0)
+    neu = sum(1 for s in scores if s == 0)
+    parts = []
+    if pos: parts.append(f"{pos} positive")
+    if neg: parts.append(f"{neg} negative")
+    if neu: parts.append(f"{neu} neutral")
+    return "📰 " + " · ".join(parts) if parts else ""
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s", datefmt="%H:%M:%S")
     result = collect_sentiment()

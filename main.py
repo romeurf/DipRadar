@@ -1767,6 +1767,10 @@ def run_scan() -> None:
                     no_liquidity=_no_liquidity,
                 )
 
+                sentiment_line = _get_news_sentiment_line(sym)
+                if sentiment_line:
+                    alert_text = alert_text + f"\n{sentiment_line}"
+
                 ranked_entries.append({
                     "symbol": sym, "dip_score": score, "tier": tier,
                     "fundamentals": fund, "earnings_date": get_earnings_date(sym),
@@ -2320,6 +2324,9 @@ def run_core_scan() -> None:
         for c in top:
             try:
                 msg = format_core_alert(c)
+                sentiment_line = _get_news_sentiment_line(c["ticker"])
+                if sentiment_line:
+                    msg += f"\n{sentiment_line}"
                 if c["ticker"] in existing_core:
                     msg += "\n\n_⚠️ Já tens posição CORE aberta neste ticker._"
                 send_telegram(msg)
@@ -2397,21 +2404,18 @@ def run_universe_snapshot() -> None:
     logging.info(f"[snapshot] {tickers_ok} tickers, +{rows_added} linhas, {elapsed:.0f}s")
 
 
-# ── News Sentiment Collection (22:15 Lisboa, seg-sex) ────────────────────────
+def _get_news_sentiment_line(ticker: str) -> str:
+    """Score current headlines for ticker at alert time. Returns one-line summary or ''.
 
-def run_news_sentiment_job() -> None:
-    """Recolha diária de headlines + classificação LLM para acumulação de feature."""
+    Called once per real alert — never in batch for the full universe.
+    Silently returns '' on any error (never blocks an alert).
+    """
     try:
-        from scripts.collect_news_sentiment import collect_sentiment
-        result = collect_sentiment()
-        logging.info(
-            f"[sentiment] Concluído: {result.get('n_new',0)} novas | "
-            f"{result.get('n_scored',0)} classificadas | "
-            f"{result.get('n_skipped',0)} duplicadas | "
-            f"{result.get('elapsed_s',0)}s"
-        )
+        from scripts.collect_news_sentiment import score_ticker_now
+        return score_ticker_now(ticker)
     except Exception as e:
-        logging.warning(f"[sentiment] Falhou (não crítico): {e}")
+        logging.debug(f"[sentiment] {ticker}: {e}")
+        return ""
 
 
 # ── Daily Backup Job (23:30 Lisboa, seg-sex) ──────────────────────────────────
@@ -2590,13 +2594,6 @@ def main() -> None:
         lambda: run_daily_check(send_telegram),
         CronTrigger(day_of_week="mon-fri", hour=22, minute=0, timezone=LISBON_TZ),
         id="position_monitor", name="Position Monitor 22h00",
-    )
-
-    # ── News Sentiment: 22:15 Lisboa, seg-sex ─────────────────────────────────
-    scheduler.add_job(
-        run_news_sentiment_job,
-        CronTrigger(day_of_week="mon-fri", hour=22, minute=15, timezone=LISBON_TZ),
-        id="news_sentiment", name="News Sentiment 22h15",
     )
 
     # ── Saturday Weekly Report: sábado 10:00 Lisboa ───────────────────────────
