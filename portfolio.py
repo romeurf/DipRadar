@@ -1,29 +1,32 @@
 """
-portfolio.py — Gestão de carteira activa e liquidez.
+portfolio.py — Active portfolio and liquidity management.
+
+US-only scope: this module tracks ONLY US-listed individual stocks. ETFs and
+non-US exchange tickers (.DE/.L/.AS/...) are filtered out across all entry
+points (DIRECT_TICKERS, HOLDING_* env vars). European/ETF positions belong
+to Phase 2 (not yet implemented).
 
 Backend dual:
-  1. Google Sheets (primário) — se GOOGLE_SHEETS_CREDENTIALS e GOOGLE_SHEET_ID
-     estiverem definidos como variáveis de ambiente no Railway.
-  2. Ficheiro local JSON (fallback) — comportamento anterior, garante que o bot
-     arranca mesmo sem Google Sheets configurado.
+  1. Google Sheets (primary) — if GOOGLE_SHEETS_CREDENTIALS and GOOGLE_SHEET_ID
+     are set as Railway environment variables.
+  2. Local JSON file (fallback) — previous behaviour, guarantees the bot
+     starts even without Google Sheets configured.
 
-Estrutura da folha Google Sheets:
-  Aba "Liquidez"  → linha 2, coluna A: valor float
-  Aba "Posicoes"  → cabeçalho na linha 1:
+Google Sheets layout:
+  "Liquidez"  → row 2, column A: float value
+  "Posicoes"  → header on row 1:
     Ticker | Entry_Date | Entry_Price | Quantity | Entry_Category |
     Entry_Score | Last_Price | Last_Score | Last_Update | Degradation_Alerted
 
-Cache write-through:
-  Dados são carregados para memória na primeira leitura.
-  Escritas vão SEMPRE para Google Sheets primeiro, depois actualizam a cache.
-  Leituras usam sempre a cache (zero chamadas extra à API).
+Write-through cache:
+  Loaded into memory on first read. Writes always go to Sheets first, then
+  update the cache. Reads use cache only (zero extra API calls).
 
-Variáveis de ambiente esperadas no Railway:
-  HOLDING_<TICKER>=shares,avg_cost  — posições holding (ex: HOLDING_CRWD=10,180.50)
-  HOLDING_EUNL=shares,avg_cost      — será mapeado automaticamente para EUNL.DE
-  PPR_SHARES=<float>                — actualizado manualmente no Railway
-  PPR_AVG_COST=<float>              — actualizado manualmente no Railway
-  FLIP_FUND_EUR=<float>             — capital do Flip Fund
+Environment variables on Railway:
+  HOLDING_<TICKER>=shares,avg_cost  — US ticker holdings (e.g. HOLDING_CRWD=10,180.50)
+                                       Non-US/ETF tickers are ignored with a warning.
+  PPR_SHARES, PPR_AVG_COST          — manual PPR tracking
+  FLIP_FUND_EUR=<float>             — Flip Fund capital
 """
 
 from __future__ import annotations
@@ -40,23 +43,20 @@ from universe import is_etf
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────
-DIRECT_TICKERS = ["NVO", "ADBE", "UBER", "EUNL.DE", "MSFT", "PINS", "ADP", "CRM", "VICI",
+# US-only manual holdings. Used for:
+#   - portfolio snapshot / position-size suggestions
+#   - "📦 already in portfolio" badge on scan alerts
+#   - sell-signal monitoring (lack of momentum, structural deterioration)
+# Phase 2 (European markets) will reintroduce non-US tickers under a separate list.
+# ─────────────────────────────────────────────────────────────────────────
+DIRECT_TICKERS = ["NVO", "ADBE", "UBER", "MSFT", "PINS", "ADP", "CRM", "VICI",
                    "CRWD", "PLTR", "NOW", "DUOL"]
 
-USD_TICKERS = {
-    "NVO", "ADBE", "UBER", "MSFT", "PINS", "ADP", "CRM", "VICI",
-    "CRWD", "PLTR", "NOW", "DUOL",
-}
-EUR_TICKERS = {"EUNL.DE", "IS3N.DE", "ALV.DE", "IEMA"}
+USD_TICKERS = set(DIRECT_TICKERS)
+EUR_TICKERS: set[str] = set()  # Phase 2 — currently empty (US-only mode)
 
-# Mapa de aliases: env vars sem sufixo → ticker correcto para yfinance
-# Permite usar HOLDING_EUNL=... no Railway sem ter de configurar HOLDING_EUNL.DE
-_TICKER_ALIASES: dict[str, str] = {
-    "EUNL":  "EUNL.DE",
-    "IS3N":  "IS3N.DE",
-    "ALV":   "ALV.DE",
-    "IEMA":  "IEMA.L",
-}
+# No EU aliases — non-US env vars are ignored (see _load_holdings_from_env).
+_TICKER_ALIASES: dict[str, str] = {}
 
 
 def _float_env(key: str, default: float = 0.0) -> float:
@@ -120,26 +120,31 @@ def _reload_from_override(path=None) -> None:
 # ─────────────────────────────────────────────────────────────────────────
 
 def _parse_holdings_env() -> list[tuple[str, float, float]]:
-    """Constrói HOLDINGS a partir das env vars HOLDING_<TICKER>=shares[,avg_cost].
-    Aplica _TICKER_ALIASES para normalizar tickers sem sufixo de bolsa
-    (ex: HOLDING_EUNL → EUNL.DE).
+    """Build HOLDINGS from HOLDING_<TICKER>=shares[,avg_cost] env vars.
+
+    US-only filter: tickers containing a dot (.DE, .L, .AS, …) and known ETFs
+    are skipped with a warning. Phase 2 will reintroduce non-US support.
     """
     result: list[tuple[str, float, float]] = []
     for key, val in os.environ.items():
         if not key.startswith("HOLDING_"):
             continue
-        raw_ticker = key[len("HOLDING_"):].strip().upper()
-        if not raw_ticker:
+        ticker = key[len("HOLDING_"):].strip().upper()
+        if not ticker:
             continue
-        # Normaliza alias (ex: EUNL → EUNL.DE)
-        ticker = _TICKER_ALIASES.get(raw_ticker, raw_ticker)
+        if "." in ticker:
+            log.warning(f"[portfolio] Ignoring non-US ticker from {key} (US-only mode): {ticker}")
+            continue
+        if is_etf(ticker):
+            log.warning(f"[portfolio] Ignoring ETF from {key} (US-only mode): {ticker}")
+            continue
         parts = [p.strip() for p in val.split(",")]
         try:
             shares = float(parts[0]) if parts else 0.0
             avg    = float(parts[1]) if len(parts) > 1 else 0.0
             result.append((ticker, shares, avg))
         except (ValueError, IndexError):
-            log.warning(f"[portfolio] env var malformada: {key}={val}")
+            log.warning(f"[portfolio] malformed env var: {key}={val}")
     return result
 
 

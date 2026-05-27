@@ -54,18 +54,6 @@ _TIINGO_CONFIRMABLE_CRITERIA: set[str] = {"drawdown_52w_pct", "price_below", "pr
 
 WATCHLIST: list[dict[str, Any]] = [
 
-    # ── CORE EUROPEU ───────────────────────────────────────────────────────────
-    {
-        "symbol":   "IEMA.L",
-        "name":     "iShares MSCI EM IMI UCITS ETF",
-        "slot":     "P1",
-        "category": CAT_GROWTH,
-        "criteria": [
-            {"type": "drawdown_52w_pct", "value": 12.0},
-        ],
-        "notes": "Entrada imediata com excesso do fundo de emergência. Diversificação Emerging Markets. Ticker LSE.",
-    },
-
     # ── DIVIDENDO / REIT ──────────────────────────────────────────────────────
     {
         "symbol":   "O",
@@ -164,18 +152,6 @@ WATCHLIST: list[dict[str, Any]] = [
             {"type": "drawdown_52w_pct", "value": 30.0},
         ],
         "notes": "Semicondutores/AI infra. Slot P3. Entrar apenas com queda >30% dos máximos.",
-    },
-
-    # ── EUROPA ────────────────────────────────────────────────────────────────────
-    {
-        "symbol":   "ALV.DE",
-        "name":     "Allianz",
-        "slot":     "P3",
-        "category": CAT_HIGH_CONVICTION,
-        "criteria": [
-            {"type": "drawdown_52w_pct", "value": 15.0},
-        ],
-        "notes": "Seguradora europeia de qualidade. Dip >15% dos máximos.",
     },
 
 ]

@@ -83,10 +83,7 @@ USER_PORTFOLIO: list[str] = [
     "ADP", "CRM", "VICI", "CRWD", "PLTR", "NOW", "DUOL",
 ]
 
-USER_WATCHLIST: list[str] = [
-    "O", "MDT", "ABBV", "LMT", "RTX",
-    "PANW", "TSM", "AVGO", "ALV.DE",
-]
+USER_WATCHLIST: list[str] = []
 
 
 # ─────────────────────────────────────────────────────────────────────────
