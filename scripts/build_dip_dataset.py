@@ -72,15 +72,18 @@ _MIN_BARS_AHEAD = 95     # minimum trading days required for 90d target
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Target adicional: max_drawdown_90d (modelo de risco do DipRadar)
+# Additional risk target: max drawdown over a forward window.
+# Computed at both 60d (RISK_TARGET — matches ml_training/config.py) and 90d
+# (matches the alpha_90d horizon) so future experiments can swap without
+# rebuilding the parquet.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _compute_max_drawdown_90d(
+def _compute_max_drawdown(
     hist: pd.DataFrame,
     alert_date: pd.Timestamp,
-    horizon_days: int = 90,
+    horizon_days: int,
 ) -> Optional[float]:
-    """Drawdown máximo nos `horizon_days` dias após alert_date."""
+    """Max drawdown (most negative return vs entry price) over `horizon_days` after alert_date."""
     entry_slice = hist[hist.index <= alert_date]
     if entry_slice.empty:
         return None
@@ -291,7 +294,9 @@ def build_dip_dataset(
             if not math.isfinite(row_base.get("alpha_90d", float("nan"))):
                 continue  # no valid target → unusable for training
 
-            row_base["max_drawdown_90d"] = _compute_max_drawdown_90d(hist, alert_date) or 0.0
+            # Both horizons: 60d is the trained RISK_TARGET; 90d matches alpha horizon.
+            row_base["max_drawdown_60d"] = _compute_max_drawdown(hist, alert_date, horizon_days=60) or 0.0
+            row_base["max_drawdown_90d"] = _compute_max_drawdown(hist, alert_date, horizon_days=90) or 0.0
 
             # Step 7: PIT fundamentals (optional — requires EDGAR/Tiingo)
             if add_fundamentals:

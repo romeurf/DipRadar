@@ -18,7 +18,6 @@ import argparse
 import logging
 import pickle
 import sys
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -29,6 +28,12 @@ from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error
 from sklearn.preprocessing import QuantileTransformer
+
+# Add repo root to sys.path so we can import core_bundle.
+_REPO_ROOT_FOR_IMPORT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT_FOR_IMPORT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT_FOR_IMPORT))
+from core_bundle import CoreModelBundle  # noqa: E402  pickle-compat shared dataclass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("train_core_model")
@@ -72,20 +77,9 @@ CORE_FEATURE_COLS: list[str] = [
 
 TARGET = "alpha_1y"  # 1-year excess return vs SPY
 
-
-@dataclass
-class CoreModelBundle:
-    model: GradientBoostingRegressor
-    feature_cols: list[str]
-    scaler: QuantileTransformer
-    impute_medians: dict        # median fill values for NaN features at inference time
-    train_date: str
-    n_train: int
-    cv_rmse: float
-    cv_r2: float
-    alpha_p10: float   # 10th percentile of predicted alpha (conservative threshold)
-    alpha_p50: float   # median predicted alpha
-    alpha_p90: float   # 90th percentile (strong signal)
+# CoreModelBundle is now defined in core_bundle.py (top-level module) so
+# joblib.load can resolve __main__.CoreModelBundle regardless of which module
+# is __main__ at load time (train_core_model in subprocess vs main.py in bot).
 
 
 def _load_dataset(parquet_path: Path) -> pd.DataFrame:

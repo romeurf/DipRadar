@@ -431,6 +431,32 @@ def main() -> int:
             v = combined[col].dropna()
             log.info(f"Forward return {label}: mean={v.mean():.2%} std={v.std():.2%} ({len(v)} amostras)")
 
+    # ── Alpha sanity check: diagnose negative-IC bugs at the source ──
+    # alpha_Xd = log1p(stock_ret) - log1p(spy_ret), so it should correlate
+    # strongly with forward_return_Xd (raw stock return). A correlation <0.8
+    # means SPY history is misaligned, or the alpha computation has a sign
+    # or horizon mismatch. The training-time IC check is downstream; this
+    # one catches the bug before it ever reaches the parquet.
+    log.info("[alpha-sanity] Correlations (alpha_Xd vs forward_return_Xd) — must be >= 0.80:")
+    for horizon in ("30d", "90d", "180d"):
+        a_col = f"alpha_{horizon}"
+        f_col = f"forward_return_{horizon}"
+        if a_col in combined.columns and f_col in combined.columns:
+            pair = combined[[a_col, f_col]].dropna()
+            n_pair = len(pair)
+            if n_pair >= 30:
+                corr = pair[a_col].corr(pair[f_col])
+                mean_a, std_a = pair[a_col].mean(), pair[a_col].std()
+                flag = "OK" if (corr is not None and corr >= 0.80) else "*** SUSPECT ***"
+                log.info(
+                    f"  alpha_{horizon}: n={n_pair:>6}  corr={corr:>+.4f}  "
+                    f"mean={mean_a:>+.4f}  std={std_a:>.4f}  [{flag}]"
+                )
+            else:
+                log.info(f"  alpha_{horizon}: insufficient pairs ({n_pair} < 30) — cannot evaluate")
+        else:
+            log.warning(f"  alpha_{horizon}: missing {a_col} or {f_col} in parquet")
+
     # Per-column stats for Momentum model features
     from momentum_radar.trainer import FEATURE_COLS as _MOM_FEAT
     log.info(f"[stats] momentum feature summary ({len(_MOM_FEAT)} features):")

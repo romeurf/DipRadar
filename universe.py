@@ -39,15 +39,18 @@ _CACHE_DAYS = 7
 _US_STATIC_FILE = Path(__file__).parent / "us_universe_static.json"
 
 # ─────────────────────────────────────────────────────────────────────────
-# ETFs — used as sector/benchmark proxies internally; excluded from ML.
-# Only US-listed ETFs that could appear in the universe and need exclusion.
+# US equity benchmarks + US sector ETFs only.
+# Foreign-listed instruments (iShares EU brands, Xtrackers, Lyxor, etc.)
+# go in portfolio._HOLDING_DENY_LIST — they have no business in this shared set
+# which feeds main.scan skip, allocation_engine routing, universe filter, and
+# portfolio price computation. Phase 2 (European markets) will revisit.
+# Commodity/bond/EM ETFs (GLD/SLV/TLT/HYG/LQD/EEM) removed — they aren't in the
+# US equity scan universe; if reintroduced later, evaluate per-consumer impact.
 # ─────────────────────────────────────────────────────────────────────────
 ETF_TICKERS: set[str] = {
-    "SPY", "QQQ", "IVV", "VTI", "VOO",    # S&P 500 / total market
-    "EEM", "IEMA",                          # EM — watchlist / internal use
-    "GLD", "SLV",                           # commodities
-    "TLT", "HYG", "LQD",                   # bonds
-    # Sector ETFs (used internally for sector_relative; excluded from ML universe)
+    # US equity benchmarks (5)
+    "SPY", "QQQ", "IVV", "VTI", "VOO",
+    # US sector ETFs (11) — used internally for sector_relative; excluded from ML universe
     "XLK", "XLV", "XLF", "XLE", "XLI", "XLY", "XLP", "XLU", "XLRE", "XLC", "XLB",
 }
 

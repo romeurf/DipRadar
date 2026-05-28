@@ -22,7 +22,8 @@ Equação final:
 API pública (compatível com toda a base de código existente):
   calculate_score(features, ml_prob)                    — motor puro
   score_from_fundamentals(fund, ml_prob, earnings_days) — adaptador market_client
-  format_score_v2_breakdown(result)                     — bloco Telegram
+  format_score_breakdown(result)                        — bloco Telegram
+                                                          (format_score_v2_breakdown alias kept)
   calculate_dip_score(fund, sym, ..., ml_prob)          — shim retro-compat
   build_score_breakdown(fund, sym, ..., ml_prob)        — shim retro-compat
   is_bluechip(fund)                                     — mantido sem alterações
@@ -786,7 +787,20 @@ def score_from_fundamentals(
 # 11. Formata o breakdown para Telegram
 # ---------------------------------------------------------------------------
 
-def format_score_v2_breakdown(
+def _divergence_label(d: float) -> str:
+    """Human-readable label for the divergence value.
+
+    Thresholds match _compute_divergence (score.py): 0.15 / 0.30.
+    Divergência measures how far market price has drifted from business quality.
+    """
+    if d >= 0.30:
+        return "dislocation forte — padrão histórico de reversão"
+    if d >= 0.15:
+        return "dislocation moderada (fundamentais > preço)"
+    return "sem dislocation significativa"
+
+
+def format_score_breakdown(
     result: dict,
     conflict_state: object | None = None,
     conflict_msg: str | None = None,
@@ -808,7 +822,8 @@ def format_score_v2_breakdown(
     badge = "🔥" if fs >= 80 else ("⭐" if fs >= 55 else "📊")
     lines = [
         f"{badge} *Score: {fs:.1f}/100*",
-        f"  🏗️  Quality *{q*100:.0f}%*  ·  💰 Value *{v*100:.0f}%*  ·  ⏱️ Timing *{t*100:.0f}%*  ·  🎯 Divergência *{d*100:.0f}%*",
+        f"  🏗️  Quality *{q*100:.0f}%*  ·  💰 Value *{v*100:.0f}%*  ·  ⏱️ Timing *{t*100:.0f}%*",
+        f"  🎯 Divergência *{d*100:.0f}%* — _{_divergence_label(d)}_",
         f"  📊 Confiança: *{conf*100:.0f}%* (cobertura: {data_cov*100:.0f}% × qualidade: {qual_conf*100:.0f}%)" + (" ⚠️" if skip else ""),
     ]
 
@@ -854,6 +869,11 @@ def format_score_v2_breakdown(
         lines.append(f"💡 _{conflict_msg}_")
 
     return "\n".join(lines)
+
+
+# Back-compat: external callers (paper_trading, tests) may still import the old name.
+format_score_v2_breakdown = format_score_breakdown
+
 
 # ---------------------------------------------------------------------------
 # 12. is_bluechip — mantido sem alterações

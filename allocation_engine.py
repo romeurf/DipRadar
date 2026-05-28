@@ -272,6 +272,10 @@ class AllocationContext:
     cash_available_eur:    float                = 0.0
     monthly_budget_eur:    float                = field(default_factory=lambda: _MONTHLY_BUDGET_EUR)
     existing_position_pct: float                = 0.0      # 0.10 = 10% do portfolio actual
+    # Portfolio total in EUR — used to compute "would this trade push the sector
+    # over the concentration cap?" without rejecting the whole trade. 0.0 = unknown,
+    # falls back to the legacy "reject at cap" behaviour.
+    portfolio_total_eur:   float                = 0.0
     # Backward-compat — aceita callers antigos que passam dip_score
     dip_score:             float                = 0.0
 
@@ -572,16 +576,32 @@ def _size(ctx: AllocationContext, category: str) -> tuple[float, float, list[str
             )
         amount *= _corr_mult
 
-    # 6) Sector concentration cap — a visão do DipRadar exige limite por sector.
-    # Default: 35% do portfolio máximo num único sector.
-    # Garante diversificação e evita risco concentrado em Tech ou Energy.
+    # 6) Sector concentration cap — limit per-sector exposure (default 35%).
+    # When portfolio_total_eur is known, REDUCE the trade so the sector lands
+    # exactly at the cap instead of rejecting outright. Preserves the user's
+    # ability to take the best opportunity even when a sector is near the cap.
+    # When portfolio_total_eur is unknown (legacy callers), fall back to the
+    # old binary "reject at cap" behaviour.
     _SECTOR_CAP = float(os.environ.get("SECTOR_CONCENTRATION_CAP", "0.35"))
-    if category != CAT_CORE and ctx.existing_sector_pct >= _SECTOR_CAP:
-        notes.append(
-            f"Sector {ctx.sector or 'desconhecido'} no limite "
-            f"({ctx.existing_sector_pct*100:.0f}% >= {_SECTOR_CAP*100:.0f}% max)"
-        )
-        return 0.0, raw_amount, notes
+    if category != CAT_CORE:
+        if ctx.existing_sector_pct >= _SECTOR_CAP:
+            notes.append(
+                f"Sector {ctx.sector or 'desconhecido'} no limite "
+                f"({ctx.existing_sector_pct*100:.0f}% >= {_SECTOR_CAP*100:.0f}% max)"
+            )
+            return 0.0, raw_amount, notes
+        if ctx.portfolio_total_eur > 0:
+            current_sector_eur = ctx.existing_sector_pct * ctx.portfolio_total_eur
+            sector_cap_eur     = _SECTOR_CAP * ctx.portfolio_total_eur
+            room_in_sector     = max(0.0, sector_cap_eur - current_sector_eur)
+            if amount > room_in_sector:
+                pct_after = (current_sector_eur + room_in_sector) / ctx.portfolio_total_eur
+                notes.append(
+                    f"Sector {ctx.sector or 'desconhecido'} ({ctx.existing_sector_pct*100:.0f}% → "
+                    f"{pct_after*100:.0f}%): capped a €{room_in_sector:.0f} para não passar "
+                    f"{_SECTOR_CAP*100:.0f}%"
+                )
+                amount = room_in_sector
 
     # 6) Bonus de tema/trend (ex: fotónica, GLP-1, IA) — não aplica a CORE
     if category != CAT_CORE:
@@ -611,8 +631,9 @@ def _size(ctx: AllocationContext, category: str) -> tuple[float, float, list[str
                 f"Slowdown perto do cap (actual {ctx.existing_position_pct*100:.0f}%) ×{_SLOWDOWN_MULT}"
             )
 
-    # 6) Cap por liquidez disponível
-    if ctx.cash_available_eur > 0 and amount > ctx.cash_available_eur:
+    # 6) Cap por liquidez disponível (já líquida de gastos do dia — ver main.py).
+    # cash_available_eur >= 0 always: 0 means "no cash left today", not "unknown".
+    if amount > ctx.cash_available_eur:
         notes.append(f"Cap liquidez €{ctx.cash_available_eur:.0f}")
         amount = ctx.cash_available_eur
 
@@ -620,6 +641,15 @@ def _size(ctx: AllocationContext, category: str) -> tuple[float, float, list[str
     if 0 < amount < _MIN_TICKET_EUR:
         notes.append(f"Abaixo do mínimo €{_MIN_TICKET_EUR:.0f} → 0 (acumular cash)")
         amount = 0.0
+
+    # 8) Persistir o gasto do dia para multi-alert awareness em scans futuros
+    #    do mesmo dia. Sobrevive a restarts do Railway (via state.py).
+    if amount > 0:
+        try:
+            import state as _state
+            _state.add_today_flip_spent(float(amount))
+        except Exception as e:
+            logging.debug(f"[alloc] daily-spent tracker update failed: {e}")
 
     return round(amount, 0), raw_amount, notes
 
@@ -810,6 +840,39 @@ def format_allocation_telegram(
             lines.append(f"   _≈ {shares:.4f} shares @ ${current_price:.2f}_")
     else:
         lines.append(f"💶 *Sugestão*: €0 — _não comprar agora_")
+
+    # Cumulative daily spend visibility — read AFTER suggest_allocation already
+    # added decision.amount_eur to today's tracker. ctx.cash_available_eur is
+    # whatever was passed in (already net of prior same-day spend by main.py).
+    try:
+        import state as _state_disp
+        spent_today = float(_state_disp.get_today_flip_spent())
+        if spent_today > 0 or decision.amount_eur > 0:
+            # cash_available_eur is what was left BEFORE this trade was committed.
+            # remaining_after = cash_available - amount of THIS trade.
+            remaining_after = max(0.0, ctx.cash_available_eur - decision.amount_eur)
+            lines.append(
+                f"📊 *Restante hoje*: €{remaining_after:.0f} "
+                f"_(já comprometido hoje: €{spent_today:.0f})_"
+            )
+    except Exception:
+        pass
+
+    # Sector concentration visibility — show current → projected sector %.
+    if (
+        decision.amount_eur > 0
+        and ctx.sector
+        and ctx.portfolio_total_eur > 0
+    ):
+        _sector_cap_disp = float(os.environ.get("SECTOR_CONCENTRATION_CAP", "0.35"))
+        _sector_after = (
+            (ctx.existing_sector_pct * ctx.portfolio_total_eur + decision.amount_eur)
+            / ctx.portfolio_total_eur
+        )
+        lines.append(
+            f"🏭 *{ctx.sector}*: {ctx.existing_sector_pct*100:.0f}% → "
+            f"{_sector_after*100:.0f}% _(cap {_sector_cap_disp*100:.0f}%)_"
+        )
 
     exit_human = {
         "NEVER":         "Sem target de venda (acumular sempre)",

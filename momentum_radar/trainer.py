@@ -99,14 +99,19 @@ def _is_tree(m) -> bool:
 
 
 def _walk_forward_ic(df: pd.DataFrame, feats: list[str], target: str) -> tuple[float, float]:
-    """Walk-forward CV purged — devolve (mean_IC, IC_SR)."""
-    try:
-        from ml_training.train import _fit_model, _split_val, _prepare_X, _compute_col_means
-        _has_infra = True
-    except ImportError:
-        _has_infra = False
+    """Walk-forward purged CV — returns (mean_IC, IC_SR).
 
+    Always uses the ml_training infra. The previous numpy fallback dropped
+    LightGBM's feature names and produced spurious predictions (LGBM warns
+    "X does not have valid feature names, but LGBMRegressor was fitted with
+    feature names"). If ml_training isn't importable, we crash explicitly
+    so the bug surfaces instead of silently producing inverted IC.
+    """
+    from ml_training.train import _fit_model, _split_val, _prepare_X, _compute_col_means
+
+    n_before = len(df)
     df = df.dropna(subset=[target]).sort_values("date").reset_index(drop=True)
+    log.info(f"[momentum_train/{target}] dropna({target}): {n_before} → {len(df)} rows")
     df["date"] = pd.to_datetime(df["date"])
     n = len(df)
     if n < 100:
@@ -128,29 +133,14 @@ def _walk_forward_ic(df: pd.DataFrame, feats: list[str], target: str) -> tuple[f
 
         m = _make_momentum_model()
 
-        if _has_infra:
-            col_means = _compute_col_means(tr, feats)
-            X_tr = _prepare_X(tr, feats, col_means, m)
-            X_te = _prepare_X(te, feats, col_means, m)
-            y_tr = tr[target].values.astype(float)
-            y_te = te[target].values
-            sw_tr = np.ones(len(X_tr), dtype=np.float32)
-            X_t, y_t, sw_t, X_v, y_v = _split_val(X_tr, y_tr, sw_tr)
-            m = _fit_model(m, X_t, y_t, sw_t, X_v, y_v)
-        else:
-            col_means = {
-                col: float(tr[col].dropna().mean()) if col in tr.columns and tr[col].notna().any() else 0.0
-                for col in feats
-            }
-            def _prep(df_):
-                r = df_[feats].copy()
-                for c in feats:
-                    if c in r.columns and r[c].isna().any():
-                        r[c] = r[c].fillna(col_means.get(c, 0.0))
-                return r.values.astype(np.float32)
-            X_tr = _prep(tr); y_tr = tr[target].values.astype(float)
-            X_te = _prep(te); y_te = te[target].values
-            m.fit(X_tr, y_tr)
+        col_means = _compute_col_means(tr, feats)
+        X_tr = _prepare_X(tr, feats, col_means, m)
+        X_te = _prepare_X(te, feats, col_means, m)
+        y_tr = tr[target].values.astype(float)
+        y_te = te[target].values
+        sw_tr = np.ones(len(X_tr), dtype=np.float32)
+        X_t, y_t, sw_t, X_v, y_v = _split_val(X_tr, y_tr, sw_tr)
+        m = _fit_model(m, X_t, y_t, sw_t, X_v, y_v)
 
         preds = m.predict(X_te)
         ic = _spearman(preds, y_te)
@@ -165,41 +155,24 @@ def _walk_forward_ic(df: pd.DataFrame, feats: list[str], target: str) -> tuple[f
 
 
 def _train_final_model(df: pd.DataFrame, feats: list[str], target: str):
-    """Treina modelo final no dataset completo.
+    """Train final model on the full dataset.
 
-    LightGBM trata NaN nativamente — means devolvido como {} para
-    compatibilidade com o scanner (que tenta imputation mas LGBM ignora).
+    Same infra requirement as _walk_forward_ic. LightGBM handles NaN natively,
+    so means is returned as {} for tree models (scanner attempts imputation
+    but LGBM ignores it).
     """
-    try:
-        from ml_training.train import _fit_model, _split_val, _prepare_X, _compute_col_means
-        _has_infra = True
-    except ImportError:
-        _has_infra = False
+    from ml_training.train import _fit_model, _split_val, _prepare_X, _compute_col_means
 
     df = df.dropna(subset=[target]).reset_index(drop=True)
     m = _make_momentum_model()
 
-    if _has_infra:
-        col_means = _compute_col_means(df, feats)
-        X = _prepare_X(df, feats, col_means, m)
-        y = df[target].values.astype(float)
-        sw = np.ones(len(X), dtype=np.float32)
-        X_t, y_t, sw_t, X_v, y_v = _split_val(X, y, sw)
-        m = _fit_model(m, X_t, y_t, sw_t, X_v, y_v)
-        means = {} if _is_tree(m) else col_means
-    else:
-        col_means = {
-            col: float(df[col].dropna().mean()) if col in df.columns and df[col].notna().any() else 0.0
-            for col in feats
-        }
-        r = df[feats].copy()
-        for c in feats:
-            if c in r.columns and r[c].isna().any():
-                r[c] = r[c].fillna(col_means.get(c, 0.0))
-        X = r.values.astype(np.float32)
-        y = df[target].values.astype(float)
-        m.fit(X, y)
-        means = col_means
+    col_means = _compute_col_means(df, feats)
+    X = _prepare_X(df, feats, col_means, m)
+    y = df[target].values.astype(float)
+    sw = np.ones(len(X), dtype=np.float32)
+    X_t, y_t, sw_t, X_v, y_v = _split_val(X, y, sw)
+    m = _fit_model(m, X_t, y_t, sw_t, X_v, y_v)
+    means = {} if _is_tree(m) else col_means
 
     return m, means, len(df)
 
@@ -241,6 +214,28 @@ def run_momentum_training(
             df[_tcol] = df[_tcol].clip(_p1, _p99)
 
     log.info(f"[momentum_train] Dataset: {len(df)} amostras | {df['ticker'].nunique()} tickers")
+
+    # ── Alpha vs forward-return sanity check ──
+    # alpha_Xd is log(stock) - log(spy); it must correlate strongly with the
+    # raw forward stock return for the dataset to be usable. A correlation
+    # <0.8 means SPY history is misaligned or alpha has a sign/horizon bug.
+    # We log the result so it shows up even when the builder hasn't been
+    # re-run since the latest fix.
+    log.info("[momentum_train] Alpha sanity (alpha_Xd vs forward_return_Xd):")
+    for _target_col, _label, _w in TARGET_HORIZONS:
+        _fwd_col = _target_col.replace("alpha_", "forward_return_")
+        if _target_col in df.columns and _fwd_col in df.columns:
+            _pair = df[[_target_col, _fwd_col]].dropna()
+            if len(_pair) >= 30:
+                _corr = _pair[_target_col].corr(_pair[_fwd_col])
+                _flag = "OK" if (_corr is not None and _corr >= 0.80) else "*** SUSPECT ***"
+                log.info(
+                    f"  {_label} {_target_col}: n={len(_pair)} corr={_corr:+.4f} [{_flag}]"
+                )
+            else:
+                log.warning(f"  {_label} {_target_col}: only {len(_pair)} non-null pairs")
+        else:
+            log.warning(f"  {_label} {_target_col}: missing column {_target_col} or {_fwd_col}")
 
     # Walk-forward IC por horizonte
     horizon_results: dict[str, dict] = {}

@@ -1217,7 +1217,7 @@ def build_alert(
         f"{earn_warn}"
         f"{valuation_block}"
         f"{theme_line}"
-        f"\n{score_breakdown}"   # Score V2 como score único — imediato após fundamentais
+        f"\n{score_breakdown}"   # Score block immediately after fundamentals
         f"{ml_line}"             # ML logo após o score
         f"{signal_narrative_text}\n"
         f"\n*Estratégia:* {strategy}"
@@ -1287,13 +1287,12 @@ def analyze_ticker(symbol: str) -> str:
         }
         ml_result = ml_score(ml_features, symbol=symbol)
 
-        # ── Score V2 Engine (Chunk 9) ──────────────────────────────
-        ml_prob_v2 = ml_result.win_prob if ml_result.model_ready else None
-        score_data = score_from_fundamentals(fund, ml_prob=ml_prob_v2)
+        # ── Score engine ─────────────────────────────────────────
+        ml_prob_score = ml_result.win_prob if ml_result.model_ready else None
+        score_data = score_from_fundamentals(fund, ml_prob=ml_prob_score)
         score      = score_data["final_score"]
-        v2_note    = format_score_v2_breakdown(score_data)
         logging.info(
-            f"[v2/analisar] {symbol}: {score:.1f} | "
+            f"[score/analisar] {symbol}: {score:.1f} | "
             f"skip={score_data.get('skip_recommended')} "
             f"trap={score_data.get('is_value_trap')}"
         )
@@ -1425,7 +1424,7 @@ def allocate_ticker(symbol: str) -> str:
         spy_change    = get_spy_change()
         score, _      = calculate_dip_score(fund, symbol, earnings_days, sector_change=sector_chg)
 
-        # Score V2 com fund_only_score + is_preprofit (Fases 1+4)
+        # Score engine with fund_only_score + is_preprofit
         try:
             from score import score_from_fundamentals
             v2_result      = score_from_fundamentals(fund, earnings_days=earnings_days)
@@ -1472,11 +1471,28 @@ def allocate_ticker(symbol: str) -> str:
             logging.warning(f"[allocate] regime macro indisponível: {e}")
             regime_color, regime_mult = "GREEN", 1.0
 
-        # 5) Liquidez disponível
+        # 5) Liquidez disponível — subtraído de gastos já comprometidos hoje
+        #    (state.get_today_flip_spent persiste em /data/, sobrevive a deploys).
         try:
-            cash_eur = float(get_liquidity() or 0.0)
+            cash_raw = float(get_liquidity() or 0.0)
         except Exception:
-            cash_eur = 0.0
+            cash_raw = 0.0
+        try:
+            import state as _state_alloc
+            spent_today = float(_state_alloc.get_today_flip_spent())
+        except Exception:
+            spent_today = 0.0
+        cash_eur = max(0.0, cash_raw - spent_today)
+
+        # 5c) Portfolio total — usado pelo Allocation Engine para o sector cap
+        #     (reduzir vs rejeitar quando o trade empurra o sector para o limite).
+        try:
+            from portfolio import get_portfolio_snapshot
+            _snap = get_portfolio_snapshot(usd_eur=get_usdeur())
+            portfolio_total_eur = float(_snap.get("total_eur", 0.0) or 0.0)
+        except Exception as e:
+            logging.debug(f"[allocate] portfolio snapshot failed: {e}")
+            portfolio_total_eur = 0.0
 
         # 5b) Concentração actual deste ticker no portfolio (cost basis EUR)
         try:
@@ -1512,6 +1528,7 @@ def allocate_ticker(symbol: str) -> str:
             monthly_budget_eur    = float(os.environ["MONTHLY_BUDGET_EUR"]),
             existing_position_pct = existing_pct,
             existing_sector_pct   = _get_sector_pct(fund.get("sector", ""), usd_eur=get_usdeur()),
+            portfolio_total_eur   = portfolio_total_eur,
             portfolio_correlation  = _get_portfolio_correlation(symbol),
         )
         decision = suggest_allocation(ctx)
@@ -1633,9 +1650,9 @@ def run_scan() -> None:
                         f"prob={ml_result.win_prob:.2f} conf={ml_result.confidence_label}"
                     )
 
-                # ── Score V2 Engine (Chunk 9) ──────────────────────────────
-                ml_prob_v2 = ml_result.win_prob if ml_result.model_ready else None
-                score_data = score_from_fundamentals(fund, ml_prob=ml_prob_v2)
+                # ── Score engine ─────────────────────────────────────────
+                ml_prob_score = ml_result.win_prob if ml_result.model_ready else None
+                score_data = score_from_fundamentals(fund, ml_prob=ml_prob_score)
 
                 if score_data.get("skip_recommended"):
                     append_rejected_log({

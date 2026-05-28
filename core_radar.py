@@ -31,6 +31,11 @@ _UNIVERSE_FILE = _REPO_DIR / "core_universe.json"
 _DATA_DIR      = Path("/data") if Path("/data").exists() else _REPO_DIR
 _MODEL_PATH    = _DATA_DIR / "core_us_model.pkl"
 
+# Import CoreModelBundle at module load time so its _register_in_main() runs
+# BEFORE any joblib.load — otherwise the unpickler raises AttributeError on
+# __main__.CoreModelBundle. Mirrors the DipModels / ml_predictor pattern.
+from core_bundle import CoreModelBundle  # noqa: F401  pickle-compat
+
 # ── ML model (loaded lazily on first call to is_model_ready()) ────────────────
 _core_model_bundle = None
 _core_model_checked = False

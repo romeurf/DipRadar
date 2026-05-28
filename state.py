@@ -31,7 +31,7 @@ import json
 import logging
 import os
 import tempfile
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 # ── Directório de persistência ─────────────────────────────────────────────
@@ -115,6 +115,48 @@ def save_alerts(alerted: set) -> None:
 
 def clear_alerts() -> None:
     _save_json("alerted_today.json", [])
+
+
+# ── Daily flip spend tracker ──────────────────────────────────────────────
+# Tracks how much EUR the bot's allocation engine has already committed today,
+# across multi-alert scans. Persisted to /data/daily_flip_spent.json so it
+# survives Railway restarts (in-process dict would silently reset on deploy).
+#
+# Used by allocation_engine to shrink "available cash" passed into sizing as
+# alerts stack within the same day. Auto-prunes to last 7 days.
+
+def _today_iso() -> str:
+    return date.today().isoformat()
+
+
+def load_daily_flip_spent() -> dict:
+    """Return {YYYY-MM-DD: amount_eur} for today + recent prior days."""
+    return _load_json("daily_flip_spent.json", default={}) or {}
+
+
+def get_today_flip_spent() -> float:
+    data = load_daily_flip_spent()
+    return float(data.get(_today_iso(), 0.0))
+
+
+def add_today_flip_spent(amount_eur: float) -> float:
+    """Increment today's committed amount; return new running total."""
+    if amount_eur <= 0:
+        return get_today_flip_spent()
+    data = load_daily_flip_spent()
+    today = _today_iso()
+    data[today] = float(data.get(today, 0.0)) + float(amount_eur)
+    cutoff = (date.today() - timedelta(days=7)).isoformat()
+    data = {k: v for k, v in data.items() if k >= cutoff}
+    _save_json("daily_flip_spent.json", data)
+    return data[today]
+
+
+def reset_today_flip_spent() -> None:
+    """Manual reset (e.g. after a sell or pipeline correction)."""
+    data = load_daily_flip_spent()
+    data[_today_iso()] = 0.0
+    _save_json("daily_flip_spent.json", data)
 
 
 # ── Weekly log ────────────────────────────────────────────────────────────

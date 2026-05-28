@@ -58,6 +58,14 @@ EUR_TICKERS: set[str] = set()  # Phase 2 — currently empty (US-only mode)
 # No EU aliases — non-US env vars are ignored (see _load_holdings_from_env).
 _TICKER_ALIASES: dict[str, str] = {}
 
+# Known foreign-listed instruments the user has historically held under
+# HOLDING_* env vars. Rejected in _parse_holdings_env so they never reach
+# yfinance lookups. Kept LOCAL to portfolio.py because the semantics —
+# "skip in env-var parse" — are narrower than universe.ETF_TICKERS, which has
+# downstream consequences in main scan, allocation routing, and price
+# computation. Phase 2 (European markets) will revisit.
+_HOLDING_DENY_LIST: set[str] = {"EUNL", "IS3N", "IEMA", "ALV"}
+
 
 def _float_env(key: str, default: float = 0.0) -> float:
     try:
@@ -134,6 +142,9 @@ def _parse_holdings_env() -> list[tuple[str, float, float]]:
             continue
         if "." in ticker:
             log.warning(f"[portfolio] Ignoring non-US ticker from {key} (US-only mode): {ticker}")
+            continue
+        if ticker in _HOLDING_DENY_LIST:
+            log.warning(f"[portfolio] Ignoring foreign-listed instrument from {key} (US-only mode): {ticker}")
             continue
         if is_etf(ticker):
             log.warning(f"[portfolio] Ignoring ETF from {key} (US-only mode): {ticker}")
