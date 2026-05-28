@@ -1,4 +1,4 @@
-"""DipModelsV3 dataclass + save/load + ml_report.json — cells 32, 33."""
+"""DipModels dataclass + save/load + ml_report.json."""
 
 from __future__ import annotations
 
@@ -14,25 +14,19 @@ log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DipModelsV3 — replica EXACTA do notebook (cell 32)
+# DipModels — canonical bundle dataclass
 # ─────────────────────────────────────────────────────────────────────────────
-# Notebook define a classe em ``__main__`` antes de pickle.dump. Em produção,
-# ``ml_predictor.py`` regista uma versão compatível em ``__main__.DipModelsV3``
-# para que joblib.load resolva a referência.
+# Pickled in production as ``dip_models.pkl``. Loaded at runtime by
+# ``ml_predictor.py``, which registers a shim in ``__main__`` so the unpickler
+# resolves the class reference regardless of which module is __main__.
 #
-# Esta versão tem TODOS os campos que o notebook produz (14), incluindo
-# score_calibrator e métricas — ao contrário da versão truncada de 8 campos
-# em ml_predictor.py. O ml_predictor consegue ler ambas porque usa
-# ``_to_dict`` com aliases canónicos.
+# ``DipModelsV3`` is kept as a module-level alias so bundles pickled under the
+# old name continue to load. Do not remove the alias until all on-disk bundles
+# have been retrained under the new name.
 
 @dataclass
-class DipModelsV3:
-    """Bundle ML v3 com calibrator e métricas completas.
-
-    Picklado em produção como ``dip_models.pkl`` (nome canonical após PR
-    robustez 2026-05; legacy era ``dip_models_v3.pkl``). Carregado em runtime
-    por ``ml_predictor.py`` (que regista um shim com ``__main__.DipModelsV3``).
-    """
+class DipModels:
+    """ML bundle with calibrator and full metrics. Saved as ``dip_models.pkl``."""
     model_up:         Any
     model_down:       Any
     feature_cols:     list
@@ -47,22 +41,26 @@ class DipModelsV3:
     rho_down:         Optional[float] = None
     topk_pnl:         Optional[float] = None
     fold_metrics:     list = field(default_factory=list)
-    # Modelos por sector individual (um ScaledRidge por sector GICS).
-    # Cada entrada: {sector_name: {"model": <fitted ScaledRidge>, "n_train": int}}
-    # Em inference: usa sector model exclusivamente se existir; global como fallback.
-    # Ausente em bundles antigos → inference usa apenas modelo global.
+    # Per-sector models (one ScaledRidge per GICS sector).
+    # Each entry: {sector_name: {"model": <fitted ScaledRidge>, "n_train": int}}
+    # Inference: use sector model if available; global as fallback.
+    # Absent in old bundles → inference uses only the global model.
     sector_models:    dict = field(default_factory=dict)
 
 
-def _register_in_main() -> None:
-    """Garante que ``__main__.DipModelsV3`` aponta para esta classe.
+# Backwards-compatible alias. Existing pickles reference `DipModelsV3` in
+# `__main__`; mapping the name to the canonical class keeps them loadable.
+DipModelsV3 = DipModels
 
-    Necessário para ``joblib.dump(bundle, ...)`` produzir um pickle que possa
-    ser carregado em produção (onde ``__main__`` é ``main.py``, sem a classe).
-    """
+
+def _register_in_main() -> None:
+    """Ensure ``__main__.DipModels`` (and the legacy alias) resolve to this class."""
     main_mod = sys.modules.get("__main__")
-    if main_mod is not None and not hasattr(main_mod, "DipModelsV3"):
-        main_mod.DipModelsV3 = DipModelsV3  # type: ignore[attr-defined]
+    if main_mod is None:
+        return
+    for name in ("DipModels", "DipModelsV3"):
+        if not hasattr(main_mod, name):
+            setattr(main_mod, name, DipModels)
 
 
 _register_in_main()
@@ -72,7 +70,7 @@ _register_in_main()
 # Save/Load (cell 32)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def save_bundle(bundle: DipModelsV3, path: Path) -> Path:
+def save_bundle(bundle: DipModels, path: Path) -> Path:
     """Pickle via joblib (mais robusto para árvores grandes)."""
     import joblib
     path = Path(path)
@@ -83,7 +81,7 @@ def save_bundle(bundle: DipModelsV3, path: Path) -> Path:
     return path
 
 
-def load_bundle(path: Path) -> DipModelsV3:
+def load_bundle(path: Path) -> DipModels:
     """Round-trip joblib.load com sanity asserts.
 
     Raise se o objecto carregado não tiver ``model_up``/``model_down``.
@@ -103,7 +101,7 @@ def load_bundle(path: Path) -> DipModelsV3:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_report(
-    bundle: DipModelsV3,
+    bundle: DipModels,
     summary_df: "object",  # pd.DataFrame, evita import top-level
     brier_oof: float,
     win_rate_alpha: float,

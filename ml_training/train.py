@@ -9,7 +9,7 @@ Inclui também ``run_training()`` — orchestrator end-to-end usado por
   4. Walk-forward CV
   5. Seleccionar champion (IC máximo com PnL>0)
   6. Treinar champion full + isotonic calibrator OOF
-  7. Empacotar DipModelsV3 + escrever ml_report.json
+  7. Package DipModels + write ml_report.json
 """
 
 from __future__ import annotations
@@ -394,7 +394,7 @@ class PlattCalibrator:
 class EnsembleRegressor:
     """Wrapper picklable que expõe `.predict()` como soma ponderada de N modelos.
 
-    Drop-in para `model_up` / `model_down` em `DipModelsV3`. Cada base
+    Drop-in for `model_up` / `model_down` in `DipModels`. Each base
     model é treinado no MESMO feature set (validado pelo orchestrator)
     com early stopping. As previsões são combinadas via weights >= 0
     que somam 1.0 (proporcionais ao IC de cada modelo em walk-forward CV).
@@ -743,7 +743,7 @@ def run_training(
     Returns
     -------
     dict com chaves:
-      - ``bundle``         : DipModelsV3
+      - ``bundle``         : DipModels
       - ``report``         : dict (conteúdo do ml_report.json)
       - ``summary``        : pd.DataFrame com IC/PnL por modelo
       - ``oof_pred``       : dict[name, np.ndarray]
@@ -752,7 +752,7 @@ def run_training(
       - ``brier_oof``      : float
       - ``n_oof``          : int
     """
-    from ml_training.bundle import DipModelsV3, build_report, save_bundle, save_report
+    from ml_training.bundle import DipModels, build_report, save_bundle, save_report
     from ml_training.data import load_base_dataset
     from ml_training.models import build_feature_lists, build_model_configs
 
@@ -1017,7 +1017,7 @@ def run_training(
     win_rate_alpha = float((df[_active_target] > CALIBRATOR_THRESHOLD).mean())
 
     # Bundle
-    bundle = DipModelsV3(
+    bundle = DipModels(
         model_up=champ_alpha,
         model_down=champ_down,
         feature_cols=feats_used,

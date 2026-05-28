@@ -5,7 +5,7 @@ Cobertura:
   - cv: winsorize, spearman_safe, topk_pnl, temporal_weights, build_walk_forward_folds
   - models: factories + feature lists
   - data: compute_sector_alert_count_7d, spy_max_return_forward, days_since_52w_high
-  - bundle: DipModelsV3 dataclass + save/load round-trip + report build
+  - bundle: DipModels dataclass + save/load round-trip + report build
   - train: walk_forward_cv smoke (com modelo Ridge para ser rápido)
 
 Corre com: ``python3 tests/test_ml_training.py``
@@ -239,29 +239,31 @@ class TestData(unittest.TestCase):
 
 class TestBundle(unittest.TestCase):
     def test_bundle_dataclass_fields(self):
-        from ml_training.bundle import DipModelsV3
+        from ml_training.bundle import DipModels
         from dataclasses import fields
-        names = {f.name for f in fields(DipModelsV3)}
-        # 14 campos (replica notebook cell 32)
+        names = {f.name for f in fields(DipModels)}
         expected = {
             "model_up", "model_down", "feature_cols", "score_calibrator",
             "n_train_samples", "train_date", "champion_name", "schema_version",
             "momentum_feats", "rho_mean", "rho_alpha", "rho_down", "topk_pnl",
-            "fold_metrics",
+            "fold_metrics", "sector_models",
         }
         self.assertEqual(names, expected)
 
     def test_bundle_registered_in_main(self):
-        from ml_training.bundle import DipModelsV3
+        from ml_training.bundle import DipModels, DipModelsV3
         main_mod = sys.modules.get("__main__")
-        self.assertIs(main_mod.DipModelsV3, DipModelsV3)
+        self.assertIs(main_mod.DipModels, DipModels)
+        # Legacy alias must still resolve to the same class for old pickles
+        self.assertIs(main_mod.DipModelsV3, DipModels)
+        self.assertIs(DipModelsV3, DipModels)
 
     def test_bundle_round_trip(self):
-        from ml_training.bundle import DipModelsV3, save_bundle, load_bundle
+        from ml_training.bundle import DipModels, save_bundle, load_bundle
         from sklearn.linear_model import Ridge
         m_up = Ridge().fit(np.array([[1.0], [2.0], [3.0]]), np.array([1.0, 2.0, 3.0]))
         m_down = Ridge().fit(np.array([[1.0], [2.0], [3.0]]), np.array([0.1, 0.2, 0.3]))
-        bundle = DipModelsV3(
+        bundle = DipModels(
             model_up=m_up,
             model_down=m_down,
             feature_cols=["x"],
@@ -285,8 +287,8 @@ class TestBundle(unittest.TestCase):
             self.assertAlmostEqual(loaded.rho_alpha, 0.30)
 
     def test_build_report_keys(self):
-        from ml_training.bundle import DipModelsV3, build_report
-        bundle = DipModelsV3(
+        from ml_training.bundle import DipModels, build_report
+        bundle = DipModels(
             model_up=None, model_down=None,
             feature_cols=["a", "b", "c"],
             n_train_samples=100,
@@ -311,7 +313,8 @@ class TestBundle(unittest.TestCase):
         self.assertAlmostEqual(report["metrics"]["rho_alpha_mean"], 0.30)
         self.assertAlmostEqual(report["metrics"]["brier_oof"], 0.22)
         self.assertAlmostEqual(report["metrics"]["win_rate_alpha"], 0.65)
-        self.assertEqual(report["target"]["name"], "alpha_60d")
+        # PRIMARY_TARGET is alpha_90d in ml_training/config.py; update if it changes.
+        self.assertEqual(report["target"]["name"], "alpha_90d")
 
     def test_metrics_from_report_handles_missing(self):
         from ml_training.bundle import metrics_from_report

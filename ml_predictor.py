@@ -28,22 +28,19 @@ import joblib
 import numpy as np
 
 
-# ── Compatibilidade com bundles v3 picklados em Colab ─────────────────────────────────────
-# O notebook colab_bootstrap.ipynb define a classe `DipModelsV3` em `__main__`
-# antes de fazer pickle.dump. Quando o bundle é carregado em Railway (onde
-# `__main__` é main.py, que não tem a classe), o unpickler falha com:
-#   AttributeError: Can't get attribute 'DipModelsV3' on <module '__main__'>
-# Definimos aqui e registamos em __main__ para que o unpickler a encontre.
+# ── Pickle compatibility: ensure DipModels resolves under __main__ ──
+# Notebook/training code pickles DipModels with __main__ as the owning module.
+# When loaded in the bot process (where __main__ is main.py), the unpickler
+# raises AttributeError unless we register the class on __main__ ourselves.
+#
+# Local stub: kept as fallback for minimal installs where ml_training isn't
+# importable. MUST stay field-for-field aligned with ml_training/bundle.py.
+# When ml_training is available, we rebind to the canonical class so any new
+# field added there is picked up without editing this stub.
 
 @dataclass
-class DipModelsV3:
-    """Stub de compatibilidade para bundles picklados com __main__.DipModelsV3.
-
-    BUG FIX v4.1: alinhado com ml_training/bundle.py (14 campos) para que
-    score_calibrator, rho_alpha, topk_pnl não sejam perdidos ao carregar bundles
-    gerados pelo training pipeline. Se __main__.DipModelsV3 tiver menos campos
-    que o bundle, joblib.load falha silenciosamente e o calibrador não é usado.
-    """
+class DipModels:
+    """Fallback stub for pickled bundles. Canonical class is ml_training.bundle.DipModels."""
     model_up:         Any
     model_down:       Any
     feature_cols:     list
@@ -58,14 +55,25 @@ class DipModelsV3:
     rho_down:         Any  = None
     topk_pnl:         Any  = None
     fold_metrics:     list = field(default_factory=list)
+    sector_models:    dict = field(default_factory=dict)
 
 
-# Registar em __main__ para o unpickler resolver `__main__.DipModelsV3`.
-# Idempotente: se já existir (e.g. re-import), não causa problemas.
+try:
+    from ml_training.bundle import DipModels as _CanonicalDipModels
+    DipModels = _CanonicalDipModels  # type: ignore[misc,assignment]
+except Exception:  # pragma: no cover — keep local stub
+    pass
+
+# Legacy alias for unpickling old bundles that reference __main__.DipModelsV3.
+DipModelsV3 = DipModels
+
+# Register on __main__ so the unpickler resolves both names.
 try:
     _main_mod = sys.modules.get("__main__")
-    if _main_mod is not None and not hasattr(_main_mod, "DipModelsV3"):
-        _main_mod.DipModelsV3 = DipModelsV3
+    if _main_mod is not None:
+        for _name in ("DipModels", "DipModelsV3"):
+            if not hasattr(_main_mod, _name):
+                setattr(_main_mod, _name, DipModels)
 except Exception:  # pragma: no cover
     pass
 
@@ -84,7 +92,7 @@ def _to_dict(obj: Any) -> dict:
 
     Aceita:
       - dict (passa-through)
-      - dataclass instance (e.g. DipModelsV3)
+      - dataclass instance (e.g. DipModels)
       - objecto com __dict__
 
     Mapeia field names em alias canonónicos para que o resto do código
@@ -495,9 +503,7 @@ def ml_score(
     # Score = alpha_90d previsto (log-return excess sobre SPY).
     score = float(pred_up)
 
-    # Normalizar para [0,1] usando o calibrator do bundle (se existir).
-    # BUG FIX v4.1: DipModelsV3 stub agora tem score_calibrator → calibrador
-    # é efectivamente usado (antes estava a ser descartado por campo em falta).
+    # Normalize to [0,1] using the bundle's calibrator (if present).
     score_calibrator = _bundle.get("score_calibrator") if _bundle else None
     win_prob = _score_to_prob(score, calibrator=score_calibrator)
 
