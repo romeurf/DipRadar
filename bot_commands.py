@@ -1237,7 +1237,7 @@ def _handle_admin_check_config() -> None:
                 f"features={info.get('n_features','?')}"
             )
         else:
-            lines.append("  DIP (dip_us): NOT trained — run /admin_run_pipeline --dip")
+            lines.append("  DIP (dip_us): NOT trained — run /admin_retrain")
     except Exception as e:
         lines.append(f"  DIP (dip_us): error checking — {e}")
 
@@ -1260,28 +1260,65 @@ def _handle_admin_check_config() -> None:
                 f"n_train={rep.get('n_train','?')} | sectors={rep.get('n_sectors','?')}"
             )
         else:
-            lines.append("  Momentum (momentum_us): NOT trained — run /admin_run_pipeline --momentum")
+            lines.append("  Momentum (momentum_us): NOT trained — run /admin_momentum_retrain")
     except Exception as e:
         lines.append(f"  Momentum (momentum_us): error checking — {e}")
 
-    # CORE model — rule-based scoring, no ML pickle; check dataset exists
-    try:
-        from pathlib import Path as _Pc
-        _data_c = _Pc("/data") if _Pc("/data").exists() else _Pc("/tmp")
-        _core_ds = _data_c / "core_training_base.parquet"
-        _core_repo = _Pc(__file__).parent / "core_training_base.parquet"
-        if _core_ds.exists() or _core_repo.exists():
-            _ds_path = _core_ds if _core_ds.exists() else _core_repo
-            import pandas as _pd
-            _nrows = len(_pd.read_parquet(_ds_path, columns=["ticker"]))
-            lines.append(
-                f"  CORE (core_us): rule-based scoring (no ML pkl) | "
-                f"training dataset: {_nrows:,} rows"
+    # CORE model — rule-based scoring, no ML pickle; check dataset stats are reported below
+    lines.append("  CORE (core_us): rule-based scoring (no ML pkl)")
+
+    # ── Training datasets — verify all 3 parquets are complete ───────────────
+    lines.append("")
+    lines.append("Training datasets:")
+
+    from pathlib import Path as _Pp
+    import pandas as _pdp
+    _data_p = _Pp("/data") if _Pp("/data").exists() else _Pp("/tmp")
+
+    def _parquet_stats(label: str, primary: _Pp, repo_fallback: _Pp | None = None) -> str:
+        """Return a one-line summary of a parquet's size, rows, tickers, date range."""
+        path = primary if primary.exists() else (repo_fallback if repo_fallback and repo_fallback.exists() else None)
+        if path is None:
+            return f"  {label}: MISSING"
+        try:
+            size_mb = path.stat().st_size / 1e6
+            df = _pdp.read_parquet(path)
+            n_rows  = len(df)
+            n_tick  = df["ticker"].nunique() if "ticker" in df.columns else "?"
+            # Date column may be "alert_date" (DIP), "date" (Momentum), or "snapshot_date" (Core)
+            date_col = next((c for c in ("alert_date", "date", "snapshot_date") if c in df.columns), None)
+            if date_col is not None:
+                _dates = _pdp.to_datetime(df[date_col], errors="coerce").dropna()
+                if not _dates.empty:
+                    d_first = _dates.min().strftime("%Y-%m-%d")
+                    d_last  = _dates.max().strftime("%Y-%m-%d")
+                    date_str = f" | {d_first} → {d_last}"
+                else:
+                    date_str = ""
+            else:
+                date_str = ""
+            return (
+                f"  {label}: {n_rows:,} rows | {n_tick} tickers | "
+                f"{size_mb:.1f} MB{date_str} | {path.name}"
             )
-        else:
-            lines.append("  CORE (core_us): rule-based scoring | dataset missing — run /admin_run_pipeline --core")
-    except Exception as e:
-        lines.append(f"  CORE (core_us): error checking — {e}")
+        except Exception as exc:
+            return f"  {label}: error reading {path.name} — {exc}"
+
+    lines.append(_parquet_stats(
+        "DIP      (ml_training_base.parquet)",
+        _data_p / "ml_training_base.parquet",
+        _Pp(__file__).parent / "ml_training_base.parquet",
+    ))
+    lines.append(_parquet_stats(
+        "CORE     (core_training_base.parquet)",
+        _data_p / "core_training_base.parquet",
+        _Pp(__file__).parent / "core_training_base.parquet",
+    ))
+    lines.append(_parquet_stats(
+        "Momentum (momentum_training.parquet)",
+        _data_p / "momentum_training.parquet",
+        _Pp(__file__).parent / "momentum_radar" / "momentum_training.parquet",
+    ))
 
     _reply("\n".join(lines))
 
