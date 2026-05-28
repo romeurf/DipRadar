@@ -1183,6 +1183,148 @@ def _handle_ml_accuracy() -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
+# ── /admin_features ──────────────────────────────────────────────────────────
+
+def _handle_admin_features(parts: list[str]) -> None:
+    """Print per-feature stats for a model's training parquet.
+
+    Usage:
+      /admin_features dip       — DIP parquet feature stats
+      /admin_features core      — Core parquet feature stats
+      /admin_features momentum  — Momentum parquet feature stats
+
+    Output (one line per feature):
+      col_name  n=<rows>  mean=<float>  std=<float>  nan=<count>
+    """
+    from pathlib import Path as _P
+    import pandas as _pd
+
+    model = (parts[1].lower() if len(parts) > 1 else "").strip()
+    if model not in ("dip", "core", "momentum"):
+        _reply(
+            "<b>/admin_features [dip|core|momentum]</b>\n\n"
+            "Pick one model to inspect its training parquet feature stats:\n"
+            "  <code>/admin_features dip</code>\n"
+            "  <code>/admin_features core</code>\n"
+            "  <code>/admin_features momentum</code>"
+        )
+        return
+
+    _dd = _P("/data") if _P("/data").exists() else _P("/tmp")
+    _repo = _P(__file__).parent
+
+    if model == "dip":
+        path = _dd / "ml_training_base.parquet"
+        if not path.exists():
+            path = _repo / "ml_training_base.parquet"
+        try:
+            from ml_features import get_feature_columns
+            feat_cols = get_feature_columns("dip_us")
+        except Exception:
+            feat_cols = None
+        title = "DIP (dip_us)"
+    elif model == "core":
+        path = _dd / "core_training_base.parquet"
+        if not path.exists():
+            path = _repo / "core_training_base.parquet"
+        try:
+            from ml_features import get_feature_columns
+            feat_cols = get_feature_columns("core_us")
+        except Exception:
+            feat_cols = None
+        title = "CORE (core_us)"
+    else:  # momentum
+        path = _dd / "momentum_training.parquet"
+        if not path.exists():
+            path = _repo / "momentum_radar" / "momentum_training.parquet"
+        try:
+            from momentum_radar.trainer import FEATURE_COLS as feat_cols
+        except Exception:
+            feat_cols = None
+        title = "Momentum (momentum_us)"
+
+    if not path.exists():
+        _reply(f"<b>{title}</b>\n\nParquet not found.\nExpected: <code>{path}</code>")
+        return
+
+    try:
+        df = _pd.read_parquet(path)
+    except Exception as exc:
+        _reply(f"<b>{title}</b>\n\nFailed to read parquet:\n<code>{exc}</code>")
+        return
+
+    n_total = len(df)
+    lines = [
+        f"<b>{title}</b>",
+        f"<code>{path}</code>",
+        f"{n_total:,} rows total",
+        "",
+    ]
+
+    # Targets (always show first if present)
+    target_cols = ["alpha_30d", "alpha_90d", "alpha_180d",
+                   "alpha_1y", "alpha_2y",
+                   "forward_return_30d", "forward_return_90d", "forward_return_180d"]
+    targets_present = [c for c in target_cols if c in df.columns]
+
+    # Features
+    if feat_cols is None:
+        # No registry — show everything except meta columns
+        meta = {"ticker", "alert_date", "date", "snapshot_date", "sector", "price",
+                "_source", "source", "label_win"}
+        feats_present = [c for c in df.columns if c not in meta and c not in target_cols]
+    else:
+        feats_present = list(feat_cols)
+
+    def _stat_line(col: str) -> str:
+        if col not in df.columns:
+            return f"  {col:30s} — MISSING"
+        s = _pd.to_numeric(df[col], errors="coerce")
+        n = int(s.notna().sum())
+        nan = int(s.isna().sum())
+        if n == 0:
+            return f"  {col:30s} — NO DATA (nan={nan})"
+        return (
+            f"  {col:30s} n={n:>6} mean={s.mean():>9.4f} "
+            f"std={s.std():>8.4f} nan={nan}"
+        )
+
+    if targets_present:
+        lines.append("<b>Targets:</b>")
+        for c in targets_present:
+            lines.append(_stat_line(c))
+        lines.append("")
+
+    lines.append(f"<b>Features ({len(feats_present)}):</b>")
+    missing = []
+    for c in feats_present:
+        if feat_cols is not None and c not in df.columns:
+            missing.append(c)
+        lines.append(_stat_line(c))
+
+    if missing:
+        lines.append("")
+        lines.append(f"<b>⚠️ MISSING features ({len(missing)}):</b> {', '.join(missing)}")
+
+    # Telegram has a 4096 char limit per message — chunk if needed
+    body = "\n".join(lines)
+    if len(body) <= 3900:
+        _reply(f"<pre>{body}</pre>")
+        return
+    # Chunk by lines, keep each msg under 3900 chars
+    chunk: list[str] = []
+    size = 0
+    for ln in lines:
+        if size + len(ln) + 1 > 3900:
+            _reply("<pre>" + "\n".join(chunk) + "</pre>")
+            chunk = []
+            size = 0
+        chunk.append(ln)
+        size += len(ln) + 1
+    if chunk:
+        _reply("<pre>" + "\n".join(chunk) + "</pre>")
+
+
 # ── /admin_check_config ──────────────────────────────────────────────────────────
 
 def _handle_admin_check_config() -> None:
@@ -4460,7 +4602,8 @@ def _handle_command(text: str) -> None:
                 "`/admin_pending_info`         → Inspect pending candidate bundle\n\n"
                 "*Data*\n"
                 "`/mldata`                     → ML training database stats\n"
-                "`/mldata update`              → Force outcome resolution update\n\n"
+                "`/mldata update`              → Force outcome resolution update\n"
+                "`/admin_features <model>`     → Per-feature stats (n / mean / std / nan)\n\n"
                 "_← Back: `/help`_"
             )
         elif topic in ("admin", "sys", "system"):
@@ -4757,6 +4900,9 @@ def _handle_command(text: str) -> None:
 
     elif cmd in ("/admin_check_config", "/check_config"):
         _handle_admin_check_config()
+
+    elif cmd == "/admin_features":
+        _handle_admin_features(parts)
 
     elif cmd in ("/ml_accuracy", "/backtest_ml"):
         _handle_ml_accuracy()
