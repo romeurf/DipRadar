@@ -97,7 +97,10 @@
       "Bash(python -m unittest tests.test_monthly_retrain -v)",
       "Bash(python -m unittest tests.test_monthly_retrain.TestGateAndPromote.test_kept_floor_when_below_absolute_floor -v)",
       "Bash(python -m unittest tests.test_monthly_retrain.TestGateAndPromote -v)",
-      "Bash(python -c \"import monthly_retrain; print\\('Import OK'\\); print\\('Functions:', [x for x in dir\\(monthly_retrain\\) if not x.startswith\\('_'\\)][:10]\\)\")"
+      "Bash(python -c \"import monthly_retrain; print\\('Import OK'\\); print\\('Functions:', [x for x in dir\\(monthly_retrain\\) if not x.startswith\\('_'\\)][:10]\\)\")",
+      "Bash(python -m unittest tests.test_monthly_retrain.TestGateAndPromote tests.test_monthly_retrain.TestMetricsRead -v)",
+      "Bash(python)",
+      "Bash(python -c \"import ast; src=open\\('watchlist.py',encoding='utf-8'\\).read\\(\\); tree=ast.parse\\(src\\); [print\\(s.value\\) for n in ast.walk\\(tree\\) if isinstance\\(n,ast.Dict\\) for k,v in zip\\(n.keys,n.values\\) if isinstance\\(k,ast.Constant\\) and k.value=='symbol' and isinstance\\(v,ast.Constant\\) for s in [v]]\")"
     ],
     "additionalDirectories": [
       "c:\\Users\\Romeu\\OneDrive\\Documentos\\GitHub\\DipRadar"
