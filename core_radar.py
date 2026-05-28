@@ -41,6 +41,9 @@ _core_model_bundle = None
 _core_model_checked = False
 
 
+_MIN_CV_R2_FOR_USE = 0.05  # Below this, ML predictions are no better than the mean
+
+
 def _load_core_model():
     global _core_model_bundle, _core_model_checked
     if _core_model_checked:
@@ -52,11 +55,19 @@ def _load_core_model():
     try:
         import joblib
         _core_model_bundle = joblib.load(_MODEL_PATH)
+        cv_r2 = float(getattr(_core_model_bundle, "cv_r2", 0.0))
         log.info(
             f"[core_radar] ML model loaded: n_train={_core_model_bundle.n_train} "
             f"train_date={_core_model_bundle.train_date} "
-            f"CV_RMSE={_core_model_bundle.cv_rmse:.4f}"
+            f"CV_RMSE={_core_model_bundle.cv_rmse:.4f} CV_R²={cv_r2:.3f}"
         )
+        if cv_r2 < _MIN_CV_R2_FOR_USE:
+            log.warning(
+                f"[core_radar] ML model loaded but CV_R²={cv_r2:.3f} < {_MIN_CV_R2_FOR_USE} "
+                f"floor — predictions are worse than the mean. Falling back to rule-based "
+                f"scoring. Investigate training data quality or model architecture before "
+                f"trusting this bundle."
+            )
         return _core_model_bundle
     except Exception as e:
         log.error(f"[core_radar] Failed to load ML model: {e}")
@@ -64,21 +75,35 @@ def _load_core_model():
 
 
 def is_model_ready() -> bool:
-    """Return True if the core_us ML model is loaded and ready to score."""
-    return _load_core_model() is not None
+    """Return True if the core_us ML model is loaded AND its CV R² beats the floor.
+
+    A bundle that loads but has CV_R² < _MIN_CV_R2_FOR_USE is treated as not ready
+    because its predictions don't beat the mean — using it would actively hurt.
+    """
+    bundle = _load_core_model()
+    if bundle is None:
+        return False
+    cv_r2 = float(getattr(bundle, "cv_r2", 0.0))
+    return cv_r2 >= _MIN_CV_R2_FOR_USE
 
 
 def _ml_score(signals: dict, annual_yield_pct: float) -> float | None:
     """Score a candidate using the ML model. Returns predicted alpha_1y converted
-    to 0-100 scale, or None if the model is not ready.
+    to 0-100 scale, or None if the model is not ready or has poor CV quality.
 
     Conversion: score = clamp(50 + alpha_1y * 250, 0, 100)
       alpha_1y =  0.00 → score 50  (no edge vs SPY)
       alpha_1y = +0.20 → score 100 (20% outperformance expected)
       alpha_1y = -0.20 → score   0 (underperformance expected)
+
+    Quality gate: if the bundle's CV R² is below _MIN_CV_R2_FOR_USE, predictions
+    are worse than the mean → return None so the caller falls back to rule-based.
     """
     bundle = _load_core_model()
     if bundle is None:
+        return None
+    cv_r2 = float(getattr(bundle, "cv_r2", 0.0))
+    if cv_r2 < _MIN_CV_R2_FOR_USE:
         return None
     try:
         import numpy as np

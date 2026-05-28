@@ -403,6 +403,18 @@ def _compute_pit_fundamentals_row(
             if col in fund and fund[col] is not None:
                 result[col] = float(fund[col])
 
+        # Optional PIT extras used downstream by add_derived_features.
+        # trailing_pe + earnings_growth let peg_ratio compute properly instead
+        # of staying at _FALLBACK (2.0). These keys aren't in FUNDAMENTAL_COLS
+        # so we return them as extras; the caller updates row_base with the
+        # whole dict.
+        for col in ("trailing_pe", "earnings_growth", "forward_pe"):
+            if col in fund and fund[col] is not None:
+                try:
+                    result[col] = float(fund[col])
+                except (TypeError, ValueError):
+                    pass
+
         # fcf_yield precisa do preço de mercado (fcf / market_cap)
         fcf_raw = fund.get("_fcf_raw") or fund.get("fcf_raw")
         if fcf_raw is not None and price > 0:

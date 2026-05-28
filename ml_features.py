@@ -268,14 +268,22 @@ FEATURE_SETS: dict[str, list[str]] = {
         "consecutive_red_days", "ma_200d_ratio", "price_vs_52w_percentile",
         "peg_ratio",
         "insider_buy_recent", "insider_buy_amount_score", "recent_8k_score",
-        "short_interest_pct",
-        "days_to_next_earnings",  # earnings proximity risk: avoid buying 3d before report
         # Dip maturity — distinguishes premature from washed-out entries
         "days_below_ma200", "decline_deceleration",
         # Macro / regime
         "vix_percentile_1y", "spy_rsi_14", "yield_10y_change_5d",
-        # Calendar
+        # Calendar / sector pressure
         "month_of_year", "sector_alert_count_7d",
+        # ── Removed 2026-05-28 ──
+        # Two features dropped because they CANNOT be PIT-computed for historical
+        # rows without introducing look-ahead bias:
+        #   short_interest_pct    → yfinance returns CURRENT value; no PIT source.
+        #   days_to_next_earnings → CURRENT calendar (or alert proximity to
+        #                           next-earnings-from-today); both leak the future.
+        # The other 7 that were briefly dropped are back — root causes fixed in
+        # the build pipeline (sec_guard yfinance code recognition + ordering
+        # of PIT fundamentals before add_derived_features + post-hoc
+        # sector_alert_count_7d window aggregation).
     ],
     "core_us": [
         # Fundamental quality — primary signals for Core

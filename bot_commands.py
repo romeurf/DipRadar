@@ -1227,9 +1227,16 @@ def _handle_admin_features(parts: list[str]) -> None:
         path = _dd / "core_training_base.parquet"
         if not path.exists():
             path = _repo / "core_training_base.parquet"
+        # The Core trainer uses scripts/train_core_model.py:CORE_FEATURE_COLS,
+        # NOT ml_features.FEATURE_SETS["core_us"] (which is the aspirational
+        # registry shape, not what the trainer actually consumes). Match the
+        # trainer's truth.
         try:
-            from ml_features import get_feature_columns
-            feat_cols = get_feature_columns("core_us")
+            import sys
+            _scripts_path = _repo / "scripts"
+            if str(_scripts_path) not in sys.path:
+                sys.path.insert(0, str(_scripts_path))
+            from train_core_model import CORE_FEATURE_COLS as feat_cols
         except Exception:
             feat_cols = None
         title = "CORE (core_us)"
@@ -1264,7 +1271,8 @@ def _handle_admin_features(parts: list[str]) -> None:
     # Targets (always show first if present)
     target_cols = ["alpha_30d", "alpha_90d", "alpha_180d",
                    "alpha_1y", "alpha_2y",
-                   "forward_return_30d", "forward_return_90d", "forward_return_180d"]
+                   "forward_return_30d", "forward_return_90d", "forward_return_180d",
+                   "max_drawdown_60d", "max_drawdown_90d"]
     targets_present = [c for c in target_cols if c in df.columns]
 
     # Features
@@ -1406,15 +1414,26 @@ def _handle_admin_check_config() -> None:
     except Exception as e:
         lines.append(f"  Momentum (momentum_us): error checking — {e}")
 
-    # CORE model — has ML scoring (GradientBoostingRegressor on alpha_1y); falls back to rule-based.
+    # CORE model — has ML scoring (GradientBoostingRegressor on alpha_1y) but
+    # gated by CV_R² ≥ core_radar._MIN_CV_R2_FOR_USE. Below that, falls back to
+    # rule-based scoring even if the pkl is on disk.
     try:
         import core_radar as _cr
         if _cr.is_model_ready():
             b = _cr._core_model_bundle
             lines.append(
-                f"  CORE (core_us): ML ready | n_train={b.n_train} | "
+                f"  CORE (core_us): ML active | n_train={b.n_train} | "
                 f"CV_RMSE={b.cv_rmse:.4f} | CV_R²={b.cv_r2:.3f} | "
                 f"alpha_p50={b.alpha_p50:.3f} | train_date={b.train_date}"
+            )
+        elif _cr._core_model_bundle is not None:
+            # Loaded but failed quality gate.
+            b = _cr._core_model_bundle
+            cv_r2 = float(getattr(b, "cv_r2", 0.0))
+            lines.append(
+                f"  CORE (core_us): rule-based fallback "
+                f"(ML pkl loaded but CV_R²={cv_r2:.3f} < "
+                f"{_cr._MIN_CV_R2_FOR_USE} floor — predictions worse than mean)"
             )
         else:
             lines.append(

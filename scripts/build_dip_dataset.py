@@ -260,13 +260,23 @@ def build_dip_dataset(
             except Exception as e:
                 log.debug(f"  ml_features failed {ticker}@{alert_date.date()}: {e}")
 
-            # Step 4: derived features (rsi_oversold_strength, vix_regime, etc.)
+            # Step 4: PIT fundamentals FIRST (Tiingo/EDGAR/yfinance).
+            # MUST run before add_derived_features so peg_ratio etc. can read
+            # revenue_growth / trailing_pe from the result.
+            if add_fundamentals:
+                try:
+                    fund = _compute_pit_fundamentals_row(pd.Series(row_base), cache_dir)
+                    row_base.update(fund)
+                except Exception:
+                    pass   # _FALLBACK already in row_base from step 1
+
+            # Step 5: derived features (peg_ratio + rsi_oversold_strength etc.)
             try:
                 add_derived_features(row_base, alert_date=alert_date)
             except Exception as e:
                 log.debug(f"  derived_features failed {ticker}@{alert_date.date()}: {e}")
 
-            # Step 5: sector-conditioned features
+            # Step 6: sector-conditioned features
             try:
                 sec_type = _SECTOR_TYPE.get(sector, "cyclical")
                 rsi_thr  = _RSI_OVERSOLD_THRESHOLD.get(sec_type, 32.0)
@@ -282,7 +292,7 @@ def build_dip_dataset(
             except Exception as e:
                 log.debug(f"  sector_features failed {ticker}@{alert_date.date()}: {e}")
 
-            # Step 6: target — alpha_90d
+            # Step 7: target — alpha_90d
             try:
                 targets = _compute_alpha_targets_row(
                     pd.Series(row_base), price_cache, spy_hist
@@ -298,15 +308,10 @@ def build_dip_dataset(
             row_base["max_drawdown_60d"] = _compute_max_drawdown(hist, alert_date, horizon_days=60) or 0.0
             row_base["max_drawdown_90d"] = _compute_max_drawdown(hist, alert_date, horizon_days=90) or 0.0
 
-            # Step 7: PIT fundamentals (optional — requires EDGAR/Tiingo)
-            if add_fundamentals:
-                try:
-                    fund = _compute_pit_fundamentals_row(pd.Series(row_base), cache_dir)
-                    row_base.update(fund)
-                except Exception:
-                    pass   # _FALLBACK already in row_base from step 1
-
-            # Step 8: Phase 5 signals (EDGAR Form 4 / 8-K) — gated by sec_guard
+            # Step 8: Phase 5 signals (EDGAR Form 4 / 8-K) — gated by sec_guard.
+            # With the sec_guard fix (yfinance country/exchange recognition),
+            # this branch now actually runs for US tickers instead of always
+            # falling through to the _FALLBACK constants.
             if add_fase5 and has_sec:
                 try:
                     f5 = _compute_fase5_row(pd.Series(row_base), price_cache)
@@ -480,6 +485,35 @@ def main() -> int:
         new_df["source"] = "simulated"
         combined = new_df.sort_values("alert_date").reset_index(drop=True)
         log.info(f"Dataset novo: {len(combined)} episódios")
+
+    # ── Post-hoc: sector_alert_count_7d ──
+    # Counts how many OTHER dip alerts within ±7 days are in the same sector.
+    # Computed here (after the full merge) because it needs the whole dataset
+    # to be present — can't be computed row-by-row during the per-ticker loop.
+    # The bot's live scanner uses an in-memory counter against alert_db.csv;
+    # this gives the training set the equivalent signal historically.
+    if "sector" in combined.columns and "alert_date" in combined.columns:
+        try:
+            _adates = pd.to_datetime(combined["alert_date"])
+            combined["sector_alert_count_7d"] = 0
+            for sector_name, sector_group in combined.groupby("sector"):
+                if not sector_name:
+                    continue
+                sec_dates = pd.to_datetime(sector_group["alert_date"]).values.astype("datetime64[D]")
+                sec_dates.sort()
+                # For each row in this sector, count entries within ±7 days using searchsorted
+                idx = sector_group.index
+                for row_idx, alert_d in zip(idx, pd.to_datetime(sector_group["alert_date"]).values.astype("datetime64[D]")):
+                    lo = np.searchsorted(sec_dates, alert_d - np.timedelta64(7, "D"), side="left")
+                    hi = np.searchsorted(sec_dates, alert_d + np.timedelta64(7, "D"), side="right")
+                    combined.at[row_idx, "sector_alert_count_7d"] = max(0, (hi - lo) - 1)
+            log.info(
+                f"[post-hoc] sector_alert_count_7d computed: "
+                f"mean={combined['sector_alert_count_7d'].mean():.2f} "
+                f"std={combined['sector_alert_count_7d'].std():.2f}"
+            )
+        except Exception as _e:
+            log.warning(f"[post-hoc] sector_alert_count_7d failed: {_e}")
 
     # ── Guardar ───────────────────────────────────────────────────────────────
     out_path.parent.mkdir(parents=True, exist_ok=True)

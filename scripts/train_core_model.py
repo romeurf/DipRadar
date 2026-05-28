@@ -180,6 +180,12 @@ def train(parquet_path: Path, dry_run: bool = False) -> CoreModelBundle:
     log.info(f"Cross-validating with TimeSeriesSplit(n_splits=5) on {len(X)} rows...")
     cv_rmse, cv_r2 = _cross_validate(X, y, model_params)
     log.info(f"CV result: RMSE={cv_rmse:.4f} R²={cv_r2:.3f}")
+    if cv_r2 < 0.05:
+        log.warning(
+            f"CV R²={cv_r2:.3f} is below 0.05 — model predictions don't beat the mean. "
+            "Bundle is still saved for diagnostics, but core_radar will fall back to "
+            "rule-based scoring (see core_radar._MIN_CV_R2_FOR_USE)."
+        )
 
     if dry_run:
         log.info("Dry run — model NOT saved.")
