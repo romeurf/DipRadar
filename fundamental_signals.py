@@ -175,7 +175,12 @@ def _ensure_cik_map() -> None:
 
 
 _edgar_submissions_cache: dict[str, dict] = {}  # cache em memória por sessão
-_EDGAR_CACHE_MAX = 250  # máximo de tickers em cache — evita OOM em Railway (512MB)
+# Cap chosen to cover the full ~1500-ticker US universe in a single bulk
+# build_dip_dataset run without LRU eviction churn. Each submissions JSON is
+# ~50–200 KB, so 2000 entries ≈ 200–400 MB worst case — still well under the
+# Railway 512 MB ceiling but big enough to avoid the 6× refetch the old cap of
+# 250 was forcing.
+_EDGAR_CACHE_MAX = 2000
 
 
 def _edgar_submissions(ticker: str) -> dict:

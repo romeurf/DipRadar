@@ -73,6 +73,10 @@ _KNOWN_DELISTED: set[str] = {
     "WRK",     # WestRock → merger with Smurfit (2024)
     "CTLT",    # Catalent → acquired by Novo Holdings (2024)
     "DAY",     # Dayforce (formerly Ceridian) → ticker changed from CDAY
+    "ANSS",    # Ansys → acquired by Synopsys (2025)
+    # FI and MMC also showed yfinance 404 in recent logs but both are still
+    # active S&P 500 tickers — almost certainly transient yfinance issues;
+    # do NOT add them here or we lose real training rows.
 }
 
 # ─────────────────────────────────────────────────────────────────────────

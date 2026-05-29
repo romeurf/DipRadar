@@ -2097,7 +2097,12 @@ def _handle_admin_dip_dataset(parts: list[str]) -> None:
             if force_rebuild:
                 cmd += ["--force-rebuild"]
 
-            _TIMEOUT = 6 * 3600
+            # 12h timeout: with the sec_guard fix, EDGAR is now called for every
+            # US ticker (1500+). Even with the per-ticker submissions cache,
+            # each filing requires XML parsing — the bulk historical run is
+            # significantly slower than the old "skip-EDGAR" path. 12h leaves
+            # margin over the observed 6h-baseline + EDGAR overhead.
+            _TIMEOUT = 12 * 3600
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=_TIMEOUT)
 
             if result.returncode == 0:
