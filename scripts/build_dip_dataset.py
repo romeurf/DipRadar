@@ -90,6 +90,8 @@ _EDGAR_DEPENDENT_FEATURES: frozenset[str] = frozenset({
     "peg_ratio",
     "insider_buy_recent",
     "insider_buy_amount_score",
+    "insider_sell_recent",
+    "insider_sell_amount_score",
     "recent_8k_score",
     "earnings_call_tone",
     "earnings_beat_rate",

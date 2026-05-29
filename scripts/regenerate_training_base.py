@@ -145,12 +145,14 @@ TARGET_COLS: list[str] = [
 
 # Features Fase 5 — EDGAR PIT + preços
 FASE5_COLS: list[str] = [
-    "consecutive_red_days",    # PIT via price_cache
-    "ma_200d_ratio",           # PIT via price_cache
-    "insider_buy_recent",      # PIT via SEC Form 4 (EDGAR)
-    "insider_buy_amount_score",# PIT via SEC Form 4 (EDGAR)
-    "recent_8k_score",         # PIT via SEC 8-K (EDGAR)
-    "earnings_call_tone",      # PIT via SEC 8-K texto (EDGAR)
+    "consecutive_red_days",      # PIT via price_cache
+    "ma_200d_ratio",             # PIT via price_cache
+    "insider_buy_recent",        # PIT via SEC Form 4 — code A
+    "insider_buy_amount_score",  # PIT via SEC Form 4 — code A magnitude
+    "insider_sell_recent",       # PIT via SEC Form 4 — code D
+    "insider_sell_amount_score", # PIT via SEC Form 4 — code D magnitude
+    "recent_8k_score",           # PIT via SEC 8-K
+    "earnings_call_tone",        # PIT via SEC 8-K text
 ]
 
 # Features yfinance — valores actuais por ticker (não PIT, mas melhor que fallback 0)
@@ -552,6 +554,7 @@ def _compute_fase5_row(
     _NAN = float("nan")
     _EDGAR_ONLY = {
         "insider_buy_recent", "insider_buy_amount_score",
+        "insider_sell_recent", "insider_sell_amount_score",
         "recent_8k_score", "earnings_call_tone",
     }
     fv: dict[str, float] = {
@@ -595,6 +598,8 @@ def _compute_fase5_row(
         from fundamental_signals import (
             insider_buy_recent,
             insider_buy_amount_score,
+            insider_sell_recent,
+            insider_sell_amount_score,
             classify_recent_8k,
             earnings_call_tone as _earnings_tone,
         )
@@ -611,6 +616,20 @@ def _compute_fase5_row(
             score, _amt = insider_buy_amount_score(ticker, lookback_days=30, as_of_date=alert_dt)
             if score is not None and _math.isfinite(float(score)):
                 fv["insider_buy_amount_score"] = float(score)
+        except Exception:
+            pass
+        # Sell side — parallel to buys. EDGAR-confirmed "no sales in window" =
+        # 0.0 (real signal). NaN = no coverage / fetch failed.
+        try:
+            v = insider_sell_recent(ticker, lookback_days=30, as_of_date=alert_dt)
+            if v is not None and _math.isfinite(float(v)):
+                fv["insider_sell_recent"] = float(v)
+        except Exception:
+            pass
+        try:
+            s_score, _s_amt = insider_sell_amount_score(ticker, lookback_days=30, as_of_date=alert_dt)
+            if s_score is not None and _math.isfinite(float(s_score)):
+                fv["insider_sell_amount_score"] = float(s_score)
         except Exception:
             pass
         try:

@@ -278,15 +278,19 @@ def _filing_primary_url(cik_int: int, acc_clean: str, primary_doc: str = "") -> 
 
 
 def _parse_form4_xml(accession_no: str, cik: str, primary_doc: str = "") -> dict:
-    """Parseia um Form 4 XML e devolve {amount_usd, is_purchase, name, title}.
+    """Parse a Form 4 XML and return both purchase AND sale info.
 
-    Extrai:
-    - amount_usd : valor total das compras (shares × price)
-    - is_purchase: True se houve aquisição (code A)
-    - name        : nome do insider (ex: "John Smith")
-    - title       : cargo (ex: "Chief Executive Officer", "Director")
+    Returns a dict with:
+      - amount_usd       : total purchase value (shares × price)         [legacy alias for buy]
+      - is_purchase      : True if any acquisition (code A)              [legacy alias]
+      - sale_amount_usd  : total sale value (shares × price)             [NEW]
+      - is_sale          : True if any disposition (code D)              [NEW]
+      - name             : insider name
+      - title            : role (e.g. "Chief Executive Officer", "Director")
 
-    Usa xml.etree.ElementTree — sem dependências extra.
+    Both sides are returned from the same filing so callers can score buys
+    and sells independently — a CEO disposing of shares carries a very
+    different signal from a CEO buying them, and many filings have both.
     """
     import requests
     import xml.etree.ElementTree as ET
@@ -308,7 +312,7 @@ def _parse_form4_xml(accession_no: str, cik: str, primary_doc: str = "") -> dict
     except Exception:
         return {}
 
-    # ── Identidade do insider ─────────────────────────────────────────────────
+    # ── Insider identity ──────────────────────────────────────────────────
     name  = root.findtext(".//reportingOwner/reportingOwnerId/rptOwnerName", "").strip()
     title = root.findtext(
         ".//reportingOwner/reportingOwnerRelationship/officerTitle", ""
@@ -319,26 +323,36 @@ def _parse_form4_xml(accession_no: str, cik: str, primary_doc: str = "") -> dict
     if not title and is_director:
         title = "Director"
 
-    # ── Transacções ───────────────────────────────────────────────────────────
-    total_amount = 0.0
-    has_purchase = False
+    # ── Transactions: split by acquired (A=buy) vs disposed (D=sell) ──────
+    buy_amount  = 0.0
+    sell_amount = 0.0
+    has_buy     = False
+    has_sell    = False
     for txn in root.findall(".//nonDerivativeTransaction"):
         code = txn.findtext(".//transactionAcquiredDisposedCode/value", "").strip()
-        if code != "A":  # A = Acquired (compra); D = Disposed (venda)
-            continue
-        has_purchase = True
         try:
             shares = float(txn.findtext(".//transactionShares/value", "0") or 0)
             price  = float(txn.findtext(".//transactionPricePerShare/value", "0") or 0)
-            total_amount += shares * price
+            amt    = shares * price
         except (ValueError, TypeError):
-            pass
+            continue
+        if code == "A":
+            has_buy = True
+            buy_amount += amt
+        elif code == "D":
+            has_sell = True
+            sell_amount += amt
 
     return {
-        "amount_usd":  total_amount,
-        "is_purchase": has_purchase,
-        "name":        name,
-        "title":       title,
+        # Buy side (legacy key names preserved)
+        "amount_usd":      buy_amount,
+        "is_purchase":     has_buy,
+        # Sell side (new)
+        "sale_amount_usd": sell_amount,
+        "is_sale":         has_sell,
+        # Identity
+        "name":            name,
+        "title":           title,
     }
 
 
@@ -439,14 +453,122 @@ def insider_buy_amount_score(ticker: str, lookback_days: int = 60, as_of_date: "
         return NaN, 0.0
 
 
+def insider_sell_recent(ticker: str, lookback_days: int = 30, as_of_date: "date | None" = None) -> float:
+    """1.0 if any insider sale (Form 4 code D) in the last `lookback_days`, else 0.0.
+
+    NaN if the ticker has no EDGAR coverage (non-US). 0.0 means EDGAR confirmed
+    no sales in the window — semantically very different from NaN.
+    """
+    try:
+        data   = _edgar_submissions(ticker)
+        cik    = data.get("cik", "")
+        if not cik:
+            return NaN
+        cik_str = str(cik).zfill(10)
+        recent  = data.get("filings", {}).get("recent", {})
+        forms        = recent.get("form", [])
+        dates_filed  = recent.get("filingDate", [])
+        accessions   = recent.get("accessionNumber", [])
+        primary_docs = recent.get("primaryDocument", [""] * len(forms))
+        as_of  = as_of_date or date.today()
+        cutoff = as_of - timedelta(days=lookback_days)
+        for form, filed_str, acc, pdoc in zip(forms, dates_filed, accessions, primary_docs):
+            if form not in ("4", "4/A"):
+                continue
+            try:
+                filed = date.fromisoformat(filed_str[:10])
+                if not (cutoff <= filed <= as_of):
+                    continue
+            except ValueError:
+                continue
+            parsed = _parse_form4_xml(acc, cik_str, primary_doc=str(pdoc or ""))
+            if parsed.get("is_sale"):
+                return 1.0
+        return 0.0
+    except Exception:
+        return NaN
+
+
+def insider_sell_amount_score(ticker: str, lookback_days: int = 60, as_of_date: "date | None" = None) -> tuple[float, float]:
+    """Normalised sale-magnitude score + raw USD amount.
+
+    Mirrors insider_buy_amount_score: same scoring scale
+      0.0 = no sales
+      0.3 = small sales (<$100k)
+      0.7 = significant sales ($100k-$1M)
+      1.0 = very large sales (>$1M)
+
+    Returns (NaN, 0.0) if the ticker has no EDGAR coverage.
+    Returns (0.0, 0.0) if EDGAR confirmed no sales — semantically different.
+    """
+    try:
+        data   = _edgar_submissions(ticker)
+        cik    = data.get("cik", "")
+        if not cik:
+            return NaN, 0.0
+        cik_str = str(cik).zfill(10)
+        recent  = data.get("filings", {}).get("recent", {})
+        forms        = recent.get("form", [])
+        dates_filed  = recent.get("filingDate", [])
+        accessions   = recent.get("accessionNumber", [])
+        primary_docs = recent.get("primaryDocument", [""] * len(forms))
+        as_of  = as_of_date or date.today()
+        cutoff = as_of - timedelta(days=lookback_days)
+
+        total_sale = 0.0
+        top_name   = ""
+        top_title  = ""
+        top_amount = 0.0
+
+        for form, filed_str, acc, pdoc in zip(forms, dates_filed, accessions, primary_docs):
+            if form not in ("4", "4/A"):
+                continue
+            try:
+                filed = date.fromisoformat(filed_str[:10])
+                if not (cutoff <= filed <= as_of):
+                    continue
+            except ValueError:
+                continue
+            parsed = _parse_form4_xml(acc, cik_str, primary_doc=str(pdoc or ""))
+            if parsed.get("is_sale"):
+                amt = parsed.get("sale_amount_usd", 0)
+                total_sale += amt
+                if amt > top_amount:
+                    top_amount = amt
+                    top_name   = parsed.get("name", "")
+                    top_title  = parsed.get("title", "")
+
+        if total_sale <= 0:
+            return 0.0, 0.0
+
+        import math
+        score = math.log10(max(total_sale, 1000)) / math.log10(10_000_000)
+        # Store details for narrative use, in a separate cache so buy details aren't clobbered
+        _last_insider_sell_details[ticker.upper()] = {
+            "name":   top_name,
+            "title":  top_title,
+            "amount": round(total_sale, 0),
+        }
+        return round(float(min(score, 1.0)), 3), round(total_sale, 0)
+    except Exception as e:
+        log.debug(f"[insider_sell_amount] {ticker}: {e}")
+        return NaN, 0.0
+
+
 # Cache em memória dos detalhes do último insider e 8-K por ticker
 _last_insider_details: dict[str, dict] = {}
+_last_insider_sell_details: dict[str, dict] = {}
 _last_8k_details: dict[str, dict] = {}
 
 
 def get_insider_details(ticker: str) -> dict:
     """Devolve {name, title, amount} do insider com maior compra recente."""
     return _last_insider_details.get(ticker.upper(), {})
+
+
+def get_insider_sell_details(ticker: str) -> dict:
+    """Return {name, title, amount} of the largest recent insider SALE."""
+    return _last_insider_sell_details.get(ticker.upper(), {})
 
 
 def get_8k_details(ticker: str) -> dict:
@@ -813,14 +935,31 @@ def compute_fundamental_signals(
             result["insider_buy_amount_usd"]   = 0.0
 
         try:
+            result["insider_sell_recent"] = insider_sell_recent(ticker)
+        except Exception as e:
+            log.error(f"[signals] insider_sell_recent {ticker}: {e}")
+            result["insider_sell_recent"] = NaN
+
+        try:
+            _sscore, _samount = insider_sell_amount_score(ticker)
+            result["insider_sell_amount_score"] = _sscore
+            result["insider_sell_amount_usd"]   = _samount
+        except Exception as e:
+            log.error(f"[signals] insider_sell_amount {ticker}: {e}")
+            result["insider_sell_amount_score"] = NaN
+            result["insider_sell_amount_usd"]   = 0.0
+
+        try:
             result["recent_8k_score"] = classify_recent_8k(ticker)
         except Exception as e:
             log.error(f"[signals] 8k_class {ticker}: {e}")
             result["recent_8k_score"] = NaN
     else:
-        result["insider_buy_recent"]      = NaN
-        result["insider_buy_amount_score"] = NaN
-        result["recent_8k_score"]          = NaN
+        result["insider_buy_recent"]        = NaN
+        result["insider_buy_amount_score"]  = NaN
+        result["insider_sell_recent"]       = NaN
+        result["insider_sell_amount_score"] = NaN
+        result["recent_8k_score"]           = NaN
 
     # Short interest trend (yfinance, US + alguns internacionais)
     try:

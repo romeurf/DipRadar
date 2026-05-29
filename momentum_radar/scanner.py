@@ -149,9 +149,59 @@ def _calc_momentum_signals(hist: pd.DataFrame) -> dict:
 
 
 # Cache por sector para o scan completo: sem cache, cada candidato que passa os filtros
-# faz uma chamada API ao ETF do seu sector — 50 candidatos em 5 sectores = 50 chamadas
-# em vez de 5. O cache é por instância de scan (dict mutável como default arg é intencional).
+# faz uma chamada API ao ETF do seu sector — 50 candidatos em 5 sectores = 5 chamadas
+# em vez de 50. O cache é por instância de scan (dict mutável como default arg é intencional).
 _SECTOR_ETF_CACHE: dict[str, float] = {}
+
+
+def _add_insider_signals_inline(signals: dict, ticker: str) -> None:
+    """Mutate `signals` to include the 4 PIT insider features.
+
+    Used by the live scanner: only the candidates that pass quality/score
+    gates get the (relatively expensive) EDGAR queries. NaN propagation
+    matches the training-time semantics — no SEC coverage / non-US ticker
+    leaves all four insider keys as NaN, and the ml_predictor downstream
+    imputes to _FALLBACK so Ridge models don't NaN-out.
+    """
+    _NAN = float("nan")
+    signals.setdefault("insider_buy_recent", _NAN)
+    signals.setdefault("insider_buy_amount_score", _NAN)
+    signals.setdefault("insider_sell_recent", _NAN)
+    signals.setdefault("insider_sell_amount_score", _NAN)
+    try:
+        from fundamental_signals import (
+            insider_buy_recent as _ibr,
+            insider_buy_amount_score as _ibas,
+            insider_sell_recent as _isr,
+            insider_sell_amount_score as _isas,
+        )
+        import math as _m
+        try:
+            v = _ibr(ticker, lookback_days=30)
+            if v is not None and _m.isfinite(float(v)):
+                signals["insider_buy_recent"] = float(v)
+        except Exception:
+            pass
+        try:
+            s, _amt = _ibas(ticker, lookback_days=30)
+            if s is not None and _m.isfinite(float(s)):
+                signals["insider_buy_amount_score"] = float(s)
+        except Exception:
+            pass
+        try:
+            v = _isr(ticker, lookback_days=30)
+            if v is not None and _m.isfinite(float(v)):
+                signals["insider_sell_recent"] = float(v)
+        except Exception:
+            pass
+        try:
+            s, _amt = _isas(ticker, lookback_days=30)
+            if s is not None and _m.isfinite(float(s)):
+                signals["insider_sell_amount_score"] = float(s)
+        except Exception:
+            pass
+    except ImportError:
+        pass
 
 
 def _sector_return_20d(sector: str, _cache: dict = _SECTOR_ETF_CACHE) -> float:
@@ -506,6 +556,12 @@ def scan_momentum_universe(
                 except Exception:
                     pass
                 continue
+
+            # Insider activity — fetched after rule-based score gate so we
+            # don't pay the EDGAR cost on tickers that won't be alerts. NaN
+            # propagates if no SEC coverage (the live ml_score path treats
+            # NaN via _FALLBACK at the per-feature resolver).
+            _add_insider_signals_inline(signals, ticker)
 
             ml = _ml_score_momentum(signals)
 

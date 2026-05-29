@@ -53,6 +53,13 @@ FEATURE_COLS = [
     # Volume Flow
     "mfi_14",                # Money Flow Index 14d — acumulação institucional
     "volume_up_pct_20d",     # % volume em dias de subida — pressão compradora
+    # Insider activity (Form 4, PIT). Buys after a breakout = smart money
+    # confirming; sells = distribution. NaN propagates for pre-2003 episodes
+    # and non-US tickers (LightGBM handles natively).
+    "insider_buy_recent",
+    "insider_buy_amount_score",
+    "insider_sell_recent",
+    "insider_sell_amount_score",
 ]
 
 # Multi-horizon targets — alpha vs SPY removes market regime bias.

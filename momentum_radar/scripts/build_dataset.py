@@ -59,6 +59,12 @@ _MIN_MARKET_CAP_B = 2.0     # minimum liquidity
 # Half of entry threshold to avoid re-triggering on short corrections.
 _EPISODE_EXIT_RETURN = 0.05  # return_20d < 5% → episode ended (half of 10% entry)
 
+# Pre-EDGAR cutoff for insider features. Episodes before this date skip the
+# SEC fetch entirely and leave insider features at NaN (the model treats
+# this as "no coverage" rather than "EDGAR said no activity").
+import datetime as _dt
+_MOM_EDGAR_CUTOFF = _dt.date(2003, 1, 1)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers de preços
@@ -295,11 +301,54 @@ def build_dataset(
                     pass
                 return None
 
+            # ── Insider activity (Form 4, PIT). NaN for pre-2003 / non-US ──
+            _alert_d = alert_date.date()
+            _NAN = float("nan")
+            _ib_r, _ib_a, _is_r, _is_a = _NAN, _NAN, _NAN, _NAN
+            if _alert_d >= _MOM_EDGAR_CUTOFF:
+                try:
+                    from fundamental_signals import (
+                        insider_buy_recent as _ibr,
+                        insider_buy_amount_score as _ibas,
+                        insider_sell_recent as _isr,
+                        insider_sell_amount_score as _isas,
+                    )
+                    try:
+                        v = _ibr(ticker, lookback_days=30, as_of_date=_alert_d)
+                        if v is not None and np.isfinite(float(v)):
+                            _ib_r = float(v)
+                    except Exception:
+                        pass
+                    try:
+                        s, _ = _ibas(ticker, lookback_days=30, as_of_date=_alert_d)
+                        if s is not None and np.isfinite(float(s)):
+                            _ib_a = float(s)
+                    except Exception:
+                        pass
+                    try:
+                        v = _isr(ticker, lookback_days=30, as_of_date=_alert_d)
+                        if v is not None and np.isfinite(float(v)):
+                            _is_r = float(v)
+                    except Exception:
+                        pass
+                    try:
+                        s, _ = _isas(ticker, lookback_days=30, as_of_date=_alert_d)
+                        if s is not None and np.isfinite(float(s)):
+                            _is_a = float(s)
+                    except Exception:
+                        pass
+                except ImportError:
+                    pass
+
             rows.append({
                 "ticker":              ticker,
                 "date":                alert_date.date().isoformat(),
                 "sector":              sector,
                 **feats,
+                "insider_buy_recent":         _ib_r,
+                "insider_buy_amount_score":   _ib_a,
+                "insider_sell_recent":        _is_r,
+                "insider_sell_amount_score":  _is_a,
                 "forward_return_30d":  round(fwd_30, 4),
                 "forward_return_90d":  round(fwd_90, 4)  if fwd_90  is not None else None,
                 "forward_return_180d": round(fwd_180, 4) if fwd_180 is not None else None,

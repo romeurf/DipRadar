@@ -72,14 +72,16 @@ FEATURE_COLUMNS: list[str] = [
     # Each captures a dimension orthogonal to the existing technical features.
     "consecutive_red_days",  # consecutive down days before alert — capitulation signal
     "ma_200d_ratio",         # price / 200-day MA — how far below long-term average
-    "insider_buy_recent",    # 1 if insider purchase in last 30d (SEC Form 4)
+    "insider_buy_recent",    # 1 if insider purchase in last 30d (SEC Form 4 code A)
+    "insider_sell_recent",   # 1 if insider disposal in last 30d (SEC Form 4 code D)
     "earnings_beat_rate",    # fraction of last 4 quarters beating EPS estimates
     "analyst_rating",        # analyst consensus: 1=Strong Buy … 5=Strong Sell
     "short_interest_pct",    # short interest as % of float — squeeze potential
     # Phase 5b: advanced signals (Form 4 amount + 8-K + short trend + earnings tone)
-    "insider_buy_amount_score",  # normalised magnitude of insider purchases [0,1]
-    "recent_8k_score",           # 8-K event type: -1=restatement, +1=M&A target
-    "earnings_call_tone",        # last earnings call sentiment [-1=pessimistic, +1=confident]; NaN when unavailable (XGBoost learns split direction natively)
+    "insider_buy_amount_score",   # normalised magnitude of insider purchases [0,1]
+    "insider_sell_amount_score",  # normalised magnitude of insider sales [0,1]
+    "recent_8k_score",            # 8-K event type: -1=restatement, +1=M&A target
+    "earnings_call_tone",         # last earnings call sentiment [-1=pessimistic, +1=confident]; NaN when unavailable (XGBoost learns split direction natively)
     # Sector-conditioned features (v4.2): RSI, VIX and drawdown adjusted by sector type.
     # VIX=35 means different things for growth vs commodity vs defensive sectors.
     # Captures deviation from sector's normal regime — orthogonal to global model.
@@ -211,13 +213,15 @@ _FALLBACK: dict[str, float] = {
     # Fase 5: sinais de qualidade e sentimento
     "consecutive_red_days": 3.0,      # 3 dias consecutivos — neutro
     "ma_200d_ratio": 0.90,            # 10% below MA200 — typical dip
-    "insider_buy_recent": 0.0,        # sem compra insider — caso mais comum
-    "earnings_beat_rate": 0.50,       # 50% — neutro (random)
-    "analyst_rating": 2.5,            # entre Buy e Hold — neutro
-    "short_interest_pct": 0.05,       # 5% — typical short interest
+    "insider_buy_recent": 0.0,         # sem compra insider — caso mais comum
+    "insider_sell_recent": 0.0,        # no insider sale — most common case
+    "earnings_beat_rate": 0.50,        # 50% — neutro (random)
+    "analyst_rating": 2.5,             # entre Buy e Hold — neutro
+    "short_interest_pct": 0.05,        # 5% — typical short interest
     # Phase 5b: advanced signals
-    "insider_buy_amount_score": 0.0,  # no insider buys — most common case
-    "recent_8k_score": 0.0,           # no recent 8-K or neutral
+    "insider_buy_amount_score": 0.0,   # no insider buys — most common case
+    "insider_sell_amount_score": 0.0,  # no insider sales — most common case
+    "recent_8k_score": 0.0,            # no recent 8-K or neutral
     "earnings_call_tone": float("nan"),  # NaN = call not available; XGBoost learns split direction for missing data
     # Sector-conditioned features (v4.2)
     "rsi_sector_adjusted": 0.0,       # 0 = RSI na norma do sector (sem sinal de oversold)
@@ -267,7 +271,12 @@ FEATURE_SETS: dict[str, list[str]] = {
         # Entry zone / valuation
         "consecutive_red_days", "ma_200d_ratio", "price_vs_52w_percentile",
         "peg_ratio",
-        "insider_buy_recent", "insider_buy_amount_score", "recent_8k_score",
+        # Insider activity — both sides, both presence-flag and amount-score.
+        # A CEO buying after a dip and a CEO dumping after a rally are very
+        # different signals; separating buys / sells lets the model price both.
+        "insider_buy_recent", "insider_buy_amount_score",
+        "insider_sell_recent", "insider_sell_amount_score",
+        "recent_8k_score",
         # Earnings quality + sell-side view (now PIT via yfinance.earnings_dates +
         # .recommendations history, sliced at alert_date in
         # fundamental_history._yf_pit_earnings_signals).
