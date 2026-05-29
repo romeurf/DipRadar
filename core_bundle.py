@@ -19,8 +19,15 @@ from typing import Any
 
 @dataclass
 class CoreModelBundle:
-    """ML bundle for the core_us model. Saved as /data/core_us_model.pkl."""
-    model:            Any         # GradientBoostingRegressor
+    """ML bundle for the core_us model. Saved as /data/core_us_model.pkl.
+
+    cv_ic is the primary quality metric — Spearman rank correlation between
+    out-of-fold predictions and the true target. It tolerates the heavy tails
+    of alpha_1y much better than R² and is the industry-standard quant metric.
+    champion_name tells you which model architecture won (GBR vs Ridge) across
+    the purged-CV evaluation.
+    """
+    model:            Any         # GradientBoostingRegressor OR Ridge (after champion selection)
     feature_cols:     list
     scaler:           Any         # QuantileTransformer
     impute_medians:   dict        # median fill values for NaN features at inference
@@ -31,6 +38,11 @@ class CoreModelBundle:
     alpha_p10:        float
     alpha_p50:        float
     alpha_p90:        float
+    # ── Added 2026-05-29 — IC + champion selection ──
+    # cv_ic and champion_name default to neutral values for backward compatibility
+    # with bundles trained before this field existed (joblib will assign defaults).
+    cv_ic:            float = 0.0
+    champion_name:    str = "GBR"
 
 
 def _register_in_main() -> None:

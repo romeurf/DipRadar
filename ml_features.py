@@ -268,6 +268,10 @@ FEATURE_SETS: dict[str, list[str]] = {
         "consecutive_red_days", "ma_200d_ratio", "price_vs_52w_percentile",
         "peg_ratio",
         "insider_buy_recent", "insider_buy_amount_score", "recent_8k_score",
+        # Earnings quality + sell-side view (now PIT via yfinance.earnings_dates +
+        # .recommendations history, sliced at alert_date in
+        # fundamental_history._yf_pit_earnings_signals).
+        "earnings_beat_rate", "analyst_rating",
         # Dip maturity — distinguishes premature from washed-out entries
         "days_below_ma200", "decline_deceleration",
         # Macro / regime

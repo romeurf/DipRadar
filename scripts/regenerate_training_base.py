@@ -387,7 +387,7 @@ def _compute_pit_fundamentals_row(
     """
     import sys
     sys.path.insert(0, str(_REPO_ROOT))
-    from fundamental_history import get_pit_fundamentals
+    from fundamental_history import get_pit_fundamentals, _yf_pit_earnings_signals
     from ml_features import _FALLBACK
 
     ticker     = str(row["ticker"])
@@ -396,7 +396,19 @@ def _compute_pit_fundamentals_row(
 
     fund = get_pit_fundamentals(ticker, alert_date, cache_dir)
 
+    # Earnings beat-rate + analyst rating are sourced separately because they
+    # come from yfinance.earnings_dates / yfinance.recommendations which are
+    # only accessible via the live Ticker, not the cached quarterly tables.
+    try:
+        earn_signals = _yf_pit_earnings_signals(ticker, alert_date, cache_dir)
+    except Exception:
+        earn_signals = {}
+
     result = {col: _FALLBACK.get(col, 0.0) for col in FUNDAMENTAL_COLS}
+    if "earnings_beat_rate" in earn_signals:
+        result["earnings_beat_rate"] = earn_signals["earnings_beat_rate"]
+    if "analyst_rating" in earn_signals:
+        result["analyst_rating"] = earn_signals["analyst_rating"]
 
     if fund:
         for col in ("gross_margin", "de_ratio", "revenue_growth", "quality_score"):

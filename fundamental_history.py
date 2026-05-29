@@ -501,6 +501,162 @@ def _yf_quarterly(ticker: str, alert_date: date, cache_dir: Path) -> dict:
     return valid if len(valid) >= 2 else {}
 
 
+# ── PIT analyst rating + earnings beat rate ──────────────────────────────────
+# yfinance returns the FULL historical earnings/recommendations table for a
+# ticker, not just a current snapshot. So we can implement PIT-correct lookups:
+# slice the table by alert_date and take only entries that were already public
+# at that moment. Cached per-ticker on disk to avoid 1500 fresh yfinance calls
+# on every rebuild.
+
+_PIT_EARNINGS_TTL_SECONDS = 7 * 24 * 3600
+
+
+def _yf_pit_earnings_signals(
+    ticker: str,
+    alert_date: date,
+    cache_dir: Path,
+) -> dict:
+    """Return PIT analyst_rating + earnings_beat_rate for (ticker, alert_date).
+
+    earnings_beat_rate:
+        fraction of the last 4 earnings releases strictly before alert_date
+        that beat consensus EPS (surprise %% > 0). Range [0, 1]; NaN if fewer
+        than 2 prior releases are available.
+
+    analyst_rating:
+        most recent analyst recommendation mean (1=Strong Buy … 5=Strong Sell)
+        with grade date <= alert_date. NaN if none available.
+
+    Both rely on yfinance's full-history tables for the ticker. Cached on disk
+    per ticker; ~14-day TTL covers the live-scan re-use without re-fetching.
+    Returns {} if neither signal is computable.
+    """
+    import json as _json
+    import time as _time
+
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"yf_pit_earnings_{ticker.replace('.', '_').replace('^', '')}.json"
+
+    raw: dict | None = None
+    if cache_path.exists() and (_time.time() - cache_path.stat().st_mtime) < _PIT_EARNINGS_TTL_SECONDS:
+        try:
+            raw = _json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            raw = None
+
+    if raw is None:
+        try:
+            import yfinance as yf
+            tk = yf.Ticker(ticker)
+
+            edates_payload: list[dict] = []
+            try:
+                edf = tk.earnings_dates
+                if edf is not None and not edf.empty:
+                    # Each row: index is the earnings date (with TZ); columns
+                    # commonly: 'EPS Estimate', 'Reported EPS', 'Surprise(%)'
+                    for ts, row in edf.iterrows():
+                        try:
+                            d = ts.date().isoformat() if hasattr(ts, "date") else str(ts)[:10]
+                        except Exception:
+                            d = str(ts)[:10]
+                        edates_payload.append({
+                            "date": d,
+                            "estimate": _sf(row.get("EPS Estimate")),
+                            "reported": _sf(row.get("Reported EPS")),
+                            "surprise_pct": _sf(row.get("Surprise(%)")),
+                        })
+            except Exception as _e:
+                log.debug(f"[yf_pit] {ticker}: earnings_dates failed: {_e}")
+
+            recs_payload: list[dict] = []
+            try:
+                rdf = tk.recommendations
+                if rdf is not None and not rdf.empty:
+                    # Historical recommendations table; aim to get a "rating"
+                    # mean per row. Some yfinance versions return a granular
+                    # firm-by-firm log (Date/Firm/To Grade/From Grade/Action),
+                    # others return a monthly count by bucket (period column +
+                    # strongBuy/buy/hold/sell/strongSell columns).
+                    cols = {c.lower(): c for c in rdf.columns}
+                    if {"strongbuy", "buy", "hold", "sell", "strongsell"} <= set(cols):
+                        # Monthly bucket form — synthesize a numeric mean (1..5)
+                        for _, row in rdf.iterrows():
+                            try:
+                                d = str(row.get(cols.get("period", ""), ""))[:10] if "period" in cols else None
+                                if not d:
+                                    # fall back to index if not in the row
+                                    pass
+                                sb = float(row[cols["strongbuy"]] or 0)
+                                b  = float(row[cols["buy"]] or 0)
+                                h  = float(row[cols["hold"]] or 0)
+                                s  = float(row[cols["sell"]] or 0)
+                                ss = float(row[cols["strongsell"]] or 0)
+                                total = sb + b + h + s + ss
+                                if total > 0:
+                                    mean = (1*sb + 2*b + 3*h + 4*s + 5*ss) / total
+                                    recs_payload.append({"date": d, "rating_mean": round(mean, 3)})
+                            except Exception:
+                                continue
+                    else:
+                        # Granular form — collapse each Date to nearest 1-5 score
+                        _GRADE_MAP = {
+                            "STRONG BUY": 1.0, "BUY": 2.0, "OUTPERFORM": 2.0,
+                            "OVERWEIGHT": 2.0, "ACCUMULATE": 2.0,
+                            "HOLD": 3.0, "NEUTRAL": 3.0, "MARKET PERFORM": 3.0,
+                            "EQUAL-WEIGHT": 3.0, "EQUAL WEIGHT": 3.0,
+                            "UNDERPERFORM": 4.0, "UNDERWEIGHT": 4.0, "SELL": 4.0,
+                            "STRONG SELL": 5.0,
+                        }
+                        for ts, row in rdf.iterrows():
+                            try:
+                                d = ts.date().isoformat() if hasattr(ts, "date") else str(ts)[:10]
+                            except Exception:
+                                d = str(ts)[:10]
+                            grade_col = cols.get("to grade") or cols.get("tograde")
+                            if not grade_col:
+                                continue
+                            g = str(row.get(grade_col, "")).strip().upper()
+                            score = _GRADE_MAP.get(g)
+                            if score is not None:
+                                recs_payload.append({"date": d, "rating_mean": score})
+            except Exception as _e:
+                log.debug(f"[yf_pit] {ticker}: recommendations failed: {_e}")
+
+            raw = {"earnings_dates": edates_payload, "recommendations": recs_payload}
+            try:
+                cache_path.write_text(_json.dumps(raw), encoding="utf-8")
+            except Exception:
+                pass
+            time.sleep(0.3)  # gentle rate-limit
+        except Exception as e:
+            log.debug(f"[yf_pit] {ticker}: top-level fetch failed: {e}")
+            raw = {"earnings_dates": [], "recommendations": []}
+
+    result: dict = {}
+
+    # ── earnings_beat_rate ──
+    edates = raw.get("earnings_dates") or []
+    prior = [e for e in edates if e.get("date") and date.fromisoformat(e["date"][:10]) < alert_date]
+    prior.sort(key=lambda e: e["date"], reverse=True)
+    last4 = prior[:4]
+    valid_surprises = [e["surprise_pct"] for e in last4 if e.get("surprise_pct") is not None]
+    if len(valid_surprises) >= 2:
+        beats = sum(1 for s in valid_surprises if s > 0)
+        result["earnings_beat_rate"] = round(beats / len(valid_surprises), 4)
+
+    # ── analyst_rating ──
+    recs = raw.get("recommendations") or []
+    prior_recs = [r for r in recs if r.get("date") and r.get("rating_mean") is not None
+                  and date.fromisoformat(r["date"][:10]) <= alert_date]
+    if prior_recs:
+        prior_recs.sort(key=lambda r: r["date"], reverse=True)
+        result["analyst_rating"] = round(float(prior_recs[0]["rating_mean"]), 3)
+
+    return result
+
+
 # ── API pública ───────────────────────────────────────────────────────────────
 
 def get_pit_fundamentals(

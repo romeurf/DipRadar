@@ -41,7 +41,14 @@ _core_model_bundle = None
 _core_model_checked = False
 
 
-_MIN_CV_R2_FOR_USE = 0.05  # Below this, ML predictions are no better than the mean
+# Primary quality gate: Spearman IC ≥ 0.04. The Core trainer now reports IC
+# alongside R²; IC tolerates alpha_1y's heavy tails much better than R² does
+# and is the industry-standard quant metric. We keep _MIN_CV_R2_FOR_USE as a
+# legacy fallback for bundles trained before cv_ic existed (those default to
+# cv_ic=0.0 via the dataclass default, which fails the IC gate just like a
+# missing R² did the old gate).
+_MIN_CV_IC_FOR_USE = 0.04
+_MIN_CV_R2_FOR_USE = 0.05  # kept for compat with older bundles (cv_ic absent)
 
 
 def _load_core_model():
@@ -55,18 +62,22 @@ def _load_core_model():
     try:
         import joblib
         _core_model_bundle = joblib.load(_MODEL_PATH)
+        cv_ic = float(getattr(_core_model_bundle, "cv_ic", 0.0))
         cv_r2 = float(getattr(_core_model_bundle, "cv_r2", 0.0))
+        champion = str(getattr(_core_model_bundle, "champion_name", "GBR"))
         log.info(
-            f"[core_radar] ML model loaded: n_train={_core_model_bundle.n_train} "
+            f"[core_radar] ML model loaded: champion={champion} "
+            f"n_train={_core_model_bundle.n_train} "
             f"train_date={_core_model_bundle.train_date} "
-            f"CV_RMSE={_core_model_bundle.cv_rmse:.4f} CV_R²={cv_r2:.3f}"
+            f"CV_IC={cv_ic:+.4f} CV_RMSE={_core_model_bundle.cv_rmse:.4f} "
+            f"CV_R²={cv_r2:+.3f}"
         )
-        if cv_r2 < _MIN_CV_R2_FOR_USE:
+        if cv_ic < _MIN_CV_IC_FOR_USE:
             log.warning(
-                f"[core_radar] ML model loaded but CV_R²={cv_r2:.3f} < {_MIN_CV_R2_FOR_USE} "
-                f"floor — predictions are worse than the mean. Falling back to rule-based "
-                f"scoring. Investigate training data quality or model architecture before "
-                f"trusting this bundle."
+                f"[core_radar] ML model loaded but CV_IC={cv_ic:+.4f} < "
+                f"{_MIN_CV_IC_FOR_USE} floor — predictions barely better than random. "
+                f"Falling back to rule-based scoring. Either retrain after fresh data "
+                f"arrives or accept that Core stays rule-based for this generation."
             )
         return _core_model_bundle
     except Exception as e:
@@ -75,16 +86,16 @@ def _load_core_model():
 
 
 def is_model_ready() -> bool:
-    """Return True if the core_us ML model is loaded AND its CV R² beats the floor.
+    """Return True if the core_us ML model passes the CV IC floor.
 
-    A bundle that loads but has CV_R² < _MIN_CV_R2_FOR_USE is treated as not ready
-    because its predictions don't beat the mean — using it would actively hurt.
+    Older bundles without cv_ic default to 0.0, which correctly fails the IC
+    gate — equivalent to the old "below R² floor" behaviour.
     """
     bundle = _load_core_model()
     if bundle is None:
         return False
-    cv_r2 = float(getattr(bundle, "cv_r2", 0.0))
-    return cv_r2 >= _MIN_CV_R2_FOR_USE
+    cv_ic = float(getattr(bundle, "cv_ic", 0.0))
+    return cv_ic >= _MIN_CV_IC_FOR_USE
 
 
 def _ml_score(signals: dict, annual_yield_pct: float) -> float | None:
@@ -102,8 +113,8 @@ def _ml_score(signals: dict, annual_yield_pct: float) -> float | None:
     bundle = _load_core_model()
     if bundle is None:
         return None
-    cv_r2 = float(getattr(bundle, "cv_r2", 0.0))
-    if cv_r2 < _MIN_CV_R2_FOR_USE:
+    cv_ic = float(getattr(bundle, "cv_ic", 0.0))
+    if cv_ic < _MIN_CV_IC_FOR_USE:
         return None
     try:
         import numpy as np

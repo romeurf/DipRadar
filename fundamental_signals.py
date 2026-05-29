@@ -176,40 +176,88 @@ def _ensure_cik_map() -> None:
 
 _edgar_submissions_cache: dict[str, dict] = {}  # cache em memória por sessão
 # Cap chosen to cover the full ~1500-ticker US universe in a single bulk
-# build_dip_dataset run without LRU eviction churn. Each submissions JSON is
-# ~50–200 KB, so 2000 entries ≈ 200–400 MB worst case — still well under the
-# Railway 512 MB ceiling but big enough to avoid the 6× refetch the old cap of
-# 250 was forcing.
+# build_dip_dataset run without LRU eviction churn.
 _EDGAR_CACHE_MAX = 2000
+
+# Disk cache for EDGAR submissions — survives across subprocess invocations.
+# Without this, every `build_dip_dataset.py --force-rebuild` re-downloads all
+# ~1500 submissions JSONs (>100 MB of HTTP). With it, the first run populates
+# the cache and subsequent runs read straight from disk.
+#
+# Submissions index entries are append-only (immutable historical filings),
+# so the only reason to refresh is to pick up new filings. A 7-day TTL is
+# generous for live use and harmless for historical PIT lookups.
+from pathlib import Path as _DiskPath
+_EDGAR_DISK_CACHE_DIR = (
+    _DiskPath("/data/edgar_submissions") if _DiskPath("/data").exists()
+    else _DiskPath("/tmp/edgar_submissions")
+)
+_EDGAR_DISK_TTL_SECONDS = 7 * 24 * 3600   # 7 days
 
 
 def _edgar_submissions(ticker: str) -> dict:
-    """Retorna o JSON de submissions EDGAR para um ticker US. Raises se falhar.
+    """Return the EDGAR submissions JSON for a US ticker. Raises on failure.
 
-    Cache em memória por sessão — evita 147k HTTP requests no regen ao carregar
-    os dados de cada ticker apenas uma vez independentemente do número de linhas.
+    Three-tier cache: process-memory → disk (7-day TTL) → SEC HTTP. The disk
+    tier matters most because each `build_dip_dataset.py` invocation is a
+    fresh subprocess with an empty memory cache.
     """
     import requests
+    import json as _json
+    import os as _os
+    import time as _time
+
     base = ticker.upper().split(".")[0]
     if "." in ticker:
-        raise ValueError(f"{ticker} não é um ticker US (sem cobertura EDGAR)")
+        raise ValueError(f"{ticker} is not a US ticker (no EDGAR coverage)")
 
+    # Tier 1: in-memory cache (fastest)
     if base in _edgar_submissions_cache:
         return _edgar_submissions_cache[base]
 
+    # Tier 2: disk cache
+    try:
+        _EDGAR_DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        disk_path = _EDGAR_DISK_CACHE_DIR / f"{base}.json"
+        if disk_path.exists():
+            age = _time.time() - disk_path.stat().st_mtime
+            if age < _EDGAR_DISK_TTL_SECONDS:
+                try:
+                    data = _json.loads(disk_path.read_text(encoding="utf-8"))
+                    _edgar_submissions_cache[base] = data
+                    return data
+                except Exception:
+                    # Corrupt file — fall through and refetch
+                    pass
+    except Exception:
+        # Disk unavailable; fall through to HTTP
+        pass
+
+    # Tier 3: HTTP fetch from SEC
     _ensure_cik_map()
     cik = _CIK_MAP.get(base)
     if not cik:
-        raise ValueError(f"{base} sem CIK EDGAR")
+        raise ValueError(f"{base} not in EDGAR CIK map")
     r = requests.get(
         f"https://data.sec.gov/submissions/CIK{cik}.json",
         headers=_EDGAR_HEADERS, timeout=15,
     )
     if r.status_code == 404:
-        raise ValueError(f"{base} sem cobertura EDGAR (404)")
+        raise ValueError(f"{base} not covered by EDGAR (404)")
     r.raise_for_status()
     data = r.json()
-    # LRU simples: se o cache atingiu o limite, remove os 50 mais antigos
+
+    # Promote to disk cache (best-effort)
+    try:
+        _EDGAR_DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        disk_path = _EDGAR_DISK_CACHE_DIR / f"{base}.json"
+        tmp = disk_path.with_suffix(".json.tmp")
+        tmp.write_text(_json.dumps(data), encoding="utf-8")
+        _os.replace(tmp, disk_path)
+    except Exception:
+        pass
+
+    # Simple LRU on the memory cache
     if len(_edgar_submissions_cache) >= _EDGAR_CACHE_MAX:
         for k in list(_edgar_submissions_cache.keys())[:50]:
             del _edgar_submissions_cache[k]

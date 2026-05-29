@@ -1414,26 +1414,30 @@ def _handle_admin_check_config() -> None:
     except Exception as e:
         lines.append(f"  Momentum (momentum_us): error checking — {e}")
 
-    # CORE model — has ML scoring (GradientBoostingRegressor on alpha_1y) but
-    # gated by CV_R² ≥ core_radar._MIN_CV_R2_FOR_USE. Below that, falls back to
+    # CORE model — has ML scoring (champion-of GBR vs Ridge on alpha_1y) gated
+    # by CV IC ≥ core_radar._MIN_CV_IC_FOR_USE. Below that, falls back to
     # rule-based scoring even if the pkl is on disk.
     try:
         import core_radar as _cr
         if _cr.is_model_ready():
             b = _cr._core_model_bundle
+            cv_ic = float(getattr(b, "cv_ic", 0.0))
+            champion = str(getattr(b, "champion_name", "GBR"))
             lines.append(
-                f"  CORE (core_us): ML active | n_train={b.n_train} | "
-                f"CV_RMSE={b.cv_rmse:.4f} | CV_R²={b.cv_r2:.3f} | "
-                f"alpha_p50={b.alpha_p50:.3f} | train_date={b.train_date}"
+                f"  CORE (core_us): ML active | champion={champion} | "
+                f"n_train={b.n_train} | CV_IC={cv_ic:+.4f} | "
+                f"CV_R²={b.cv_r2:+.3f} | alpha_p50={b.alpha_p50:.3f} | "
+                f"train_date={b.train_date}"
             )
         elif _cr._core_model_bundle is not None:
             # Loaded but failed quality gate.
             b = _cr._core_model_bundle
-            cv_r2 = float(getattr(b, "cv_r2", 0.0))
+            cv_ic = float(getattr(b, "cv_ic", 0.0))
+            champion = str(getattr(b, "champion_name", "GBR"))
             lines.append(
                 f"  CORE (core_us): rule-based fallback "
-                f"(ML pkl loaded but CV_R²={cv_r2:.3f} < "
-                f"{_cr._MIN_CV_R2_FOR_USE} floor — predictions worse than mean)"
+                f"(ML pkl loaded — champion={champion}, CV_IC={cv_ic:+.4f} < "
+                f"{_cr._MIN_CV_IC_FOR_USE} floor)"
             )
         else:
             lines.append(
