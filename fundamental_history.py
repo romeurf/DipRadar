@@ -432,6 +432,62 @@ def _yf_quarterly(ticker: str, alert_date: date, cache_dir: Path) -> dict:
         fcf = op_cf + (capex or 0)  # capex já é negativo no yfinance
     result["_fcf_raw"] = fcf
 
+    # ── PIT trailing PE + earnings growth (needed for peg_ratio) ──
+    # Sum the 4 quarters ending at-or-before this PIT cutoff to get TTM
+    # Net Income, divide by shares outstanding to get TTM EPS, then PE.
+    # Earnings growth = (TTM_NI_now / TTM_NI_year_ago) - 1.
+    # Best-effort: silently skip if any required field is missing.
+    try:
+        # Sort all periods by date so we can walk window slices.
+        all_periods = []
+        for period_str in raw.get("fin", {}):
+            try:
+                period_end = date.fromisoformat(period_str[:10])
+                all_periods.append((period_end, period_str))
+            except ValueError:
+                continue
+        all_periods.sort()  # ascending date
+
+        # Identify the most-recent period whose assumed filing <= alert_date.
+        cutoff_idx = None
+        for i, (period_end, _) in enumerate(all_periods):
+            if period_end + timedelta(days=45) <= alert_date:
+                cutoff_idx = i
+        if cutoff_idx is not None and cutoff_idx >= 3:
+            # TTM = sum of net income over the 4 periods ending at cutoff_idx.
+            ttm_window = all_periods[cutoff_idx - 3:cutoff_idx + 1]
+            ttm_ni = 0.0
+            ok = True
+            for _, key in ttm_window:
+                ni_q = _get(raw["fin"][key], "Net Income", "Net Income From Continuing Operations")
+                if ni_q is None:
+                    ok = False
+                    break
+                ttm_ni += ni_q
+            if ok and cutoff_idx >= 7:
+                # Prior-year TTM: the 4 periods ending one year before cutoff_idx.
+                py_window = all_periods[cutoff_idx - 7:cutoff_idx - 3]
+                py_ni = 0.0
+                py_ok = True
+                for _, key in py_window:
+                    ni_q = _get(raw["fin"][key], "Net Income", "Net Income From Continuing Operations")
+                    if ni_q is None:
+                        py_ok = False
+                        break
+                    py_ni += ni_q
+                if py_ok and py_ni != 0:
+                    result["earnings_growth"] = round((ttm_ni - py_ni) / abs(py_ni), 4)
+
+            # trailing_pe = price / EPS_ttm; needs entry price (from caller) AND
+            # shares outstanding. We pass eps_ttm separately so the caller can
+            # finish the PE calc with the row's actual entry price.
+            shares = _get(bs, "Common Stock Shares Outstanding",
+                          "Shares Outstanding", "Ordinary Shares Number")
+            if ok and shares and shares > 0 and ttm_ni > 0:
+                result["_eps_ttm"] = ttm_ni / shares
+    except Exception as _e:
+        log.debug(f"[yf_q] {ticker}: PE/growth calc failed: {_e}")
+
     score = 0.0
     if result.get("gross_margin", 0) > 0.35:
         score += 0.25

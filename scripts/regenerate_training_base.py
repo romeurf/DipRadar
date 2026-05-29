@@ -404,16 +404,24 @@ def _compute_pit_fundamentals_row(
                 result[col] = float(fund[col])
 
         # Optional PIT extras used downstream by add_derived_features.
-        # trailing_pe + earnings_growth let peg_ratio compute properly instead
-        # of staying at _FALLBACK (2.0). These keys aren't in FUNDAMENTAL_COLS
-        # so we return them as extras; the caller updates row_base with the
-        # whole dict.
-        for col in ("trailing_pe", "earnings_growth", "forward_pe"):
-            if col in fund and fund[col] is not None:
-                try:
-                    result[col] = float(fund[col])
-                except (TypeError, ValueError):
-                    pass
+        # earnings_growth + trailing_pe let peg_ratio compute properly instead
+        # of staying at _FALLBACK (2.0). _yf_quarterly returns _eps_ttm (PIT
+        # TTM EPS); we combine it with the row's entry price here to produce
+        # trailing_pe — keeping the PE PIT-correct (uses the price at the
+        # alert date, not yfinance's current price).
+        if "earnings_growth" in fund and fund["earnings_growth"] is not None:
+            try:
+                result["earnings_growth"] = float(fund["earnings_growth"])
+            except (TypeError, ValueError):
+                pass
+        _eps_ttm = fund.get("_eps_ttm")
+        if _eps_ttm is not None and price > 0:
+            try:
+                eps = float(_eps_ttm)
+                if eps > 0:
+                    result["trailing_pe"] = round(price / eps, 4)
+            except (TypeError, ValueError):
+                pass
 
         # fcf_yield precisa do preço de mercado (fcf / market_cap)
         fcf_raw = fund.get("_fcf_raw") or fund.get("fcf_raw")

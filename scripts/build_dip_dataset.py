@@ -173,7 +173,10 @@ def build_dip_dataset(
         exchange = ""
         try:
             import yfinance as yf
-            info     = yf.Ticker(ticker).fast_info if hasattr(yf.Ticker(ticker), "fast_info") else {}
+            # Note: the previous fast_info line was a no-op (overwritten on
+            # the next line by .info). The slow .info call is the one we
+            # actually need because is_us_universe checks marketCap which
+            # fast_info doesn't reliably populate.
             info     = yf.Ticker(ticker).info or {}
             sector   = info.get("sector") or "Unknown"
             country  = info.get("country") or ""
