@@ -100,7 +100,21 @@
       "Bash(python -c \"import monthly_retrain; print\\('Import OK'\\); print\\('Functions:', [x for x in dir\\(monthly_retrain\\) if not x.startswith\\('_'\\)][:10]\\)\")",
       "Bash(python -m unittest tests.test_monthly_retrain.TestGateAndPromote tests.test_monthly_retrain.TestMetricsRead -v)",
       "Bash(python)",
-      "Bash(python -c \"import ast; src=open\\('watchlist.py',encoding='utf-8'\\).read\\(\\); tree=ast.parse\\(src\\); [print\\(s.value\\) for n in ast.walk\\(tree\\) if isinstance\\(n,ast.Dict\\) for k,v in zip\\(n.keys,n.values\\) if isinstance\\(k,ast.Constant\\) and k.value=='symbol' and isinstance\\(v,ast.Constant\\) for s in [v]]\")"
+      "Bash(python -c \"import ast; src=open\\('watchlist.py',encoding='utf-8'\\).read\\(\\); tree=ast.parse\\(src\\); [print\\(s.value\\) for n in ast.walk\\(tree\\) if isinstance\\(n,ast.Dict\\) for k,v in zip\\(n.keys,n.values\\) if isinstance\\(k,ast.Constant\\) and k.value=='symbol' and isinstance\\(v,ast.Constant\\) for s in [v]]\")",
+      "Bash(python -m unittest tests.test_ml_training.TestBundle -v)",
+      "Bash(git fetch *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('bot_commands.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK: bot_commands.py parses cleanly'\\)\")",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\Romeu\\\\OneDrive\\\\Documentos\\\\GitHub\\\\DipRadar\" -Recurse -Directory)",
+      "Bash(Select-Object -First 20 FullName)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/build_dip_dataset.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('core_bundle.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('core_radar.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('scripts/train_core_model.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK: all 3 files parse'\\)\")",
+      "Bash(python -m unittest tests.test_allocation_engine -v)",
+      "Bash(python -m unittest discover tests -p \"test_allocation*\" -v)",
+      "Bash(python -c \"from tests import test_allocation_engine\")",
+      "Bash(python -m unittest tests.test_allocation_engine.test_etf_core_priority -v)",
+      "Bash(MONTHLY_BUDGET_EUR=1050 FLIP_FUND_EUR=105 python -c ' *)",
+      "Bash(MONTHLY_BUDGET_EUR=1050 FLIP_FUND_EUR=105 SECTOR_CONCENTRATION_CAP=0.35 python -c ' *)",
+      "Bash(python -c 'import ast; src = open\\('\\\\''ml_features.py'\\\\'', encoding='\\\\''utf-8'\\\\''\\).read\\(\\); tree = ast.parse\\(src\\); fc = [] *)"
     ],
     "additionalDirectories": [
       "c:\\Users\\Romeu\\OneDrive\\Documentos\\GitHub\\DipRadar"
