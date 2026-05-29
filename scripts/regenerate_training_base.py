@@ -404,7 +404,13 @@ def _compute_pit_fundamentals_row(
     except Exception:
         earn_signals = {}
 
-    result = {col: _FALLBACK.get(col, 0.0) for col in FUNDAMENTAL_COLS}
+    # Fundamental columns are EDGAR/yfinance-historical dependent. Initialise
+    # them to NaN so missing data propagates as "missing", not as a constant
+    # the model interprets as signal. Real values overwrite NaN below; missing
+    # ones stay NaN through to the parquet and the trainer handles them per
+    # model type (LGBM native; Ridge col-mean impute via _prepare_X).
+    _NAN = float("nan")
+    result: dict = {col: _NAN for col in FUNDAMENTAL_COLS}
     if "earnings_beat_rate" in earn_signals:
         result["earnings_beat_rate"] = earn_signals["earnings_beat_rate"]
     if "analyst_rating" in earn_signals:
@@ -531,6 +537,7 @@ def _compute_fase5_row(
     """
     from ml_features import _FALLBACK
     from sec_guard import has_sec_filings as _has_sec
+    import math as _math
 
     ticker     = str(row["ticker"])
     alert_date = pd.Timestamp(row["alert_date"])
@@ -539,7 +546,18 @@ def _compute_fase5_row(
     alert_dt   = alert_date.date()
 
     hist = _slice_history(price_cache.get(ticker), alert_date)
-    fv: dict[str, float] = {k: _FALLBACK.get(k, 0.0) for k in FASE5_COLS}
+    # Initialise: price-based columns (always computable) get their _FALLBACK
+    # baseline; EDGAR-dependent ones start at NaN so missing data propagates
+    # as "missing", not as a constant the model interprets as signal.
+    _NAN = float("nan")
+    _EDGAR_ONLY = {
+        "insider_buy_recent", "insider_buy_amount_score",
+        "recent_8k_score", "earnings_call_tone",
+    }
+    fv: dict[str, float] = {
+        k: (_NAN if k in _EDGAR_ONLY else _FALLBACK.get(k, 0.0))
+        for k in FASE5_COLS
+    }
 
     # Price-based signals (PIT — always computed regardless of SEC eligibility)
     if hist is not None and len(hist) >= 2:
@@ -564,11 +582,14 @@ def _compute_fase5_row(
         except Exception as e:
             log.debug(f"  fase5 price {ticker}@{alert_dt}: {e}")
 
-    # EDGAR-based signals — only for US-domiciled tickers with SEC filings
+    # EDGAR-based signals — only for US-domiciled tickers with SEC filings.
+    # Non-SEC tickers return now: EDGAR columns stay at NaN so the model sees
+    # "no coverage" instead of a fake 0/0.0 that would look like "no buys" or
+    # "no 8-K events".
     _ticker_exchange = str(row.get("exchange", "") or "")
     _ticker_country  = str(row.get("country", "") or "")
     if not _has_sec(ticker, _ticker_country, _ticker_exchange):
-        return {k: fv.get(k, _FALLBACK.get(k, 0.0)) for k in FASE5_COLS}
+        return fv
 
     try:
         from fundamental_signals import (
@@ -577,35 +598,37 @@ def _compute_fase5_row(
             classify_recent_8k,
             earnings_call_tone as _earnings_tone,
         )
-        # Form 4 insider buying
+        # Form 4 insider buying. NaN stays if function returns None
+        # (lookup failed / no submissions cache); 0.0 is a REAL signal of
+        # "EDGAR responded with no Form 4 in window" — those are different.
         try:
-            fv["insider_buy_recent"] = float(insider_buy_recent(ticker, lookback_days=30, as_of_date=alert_dt) or 0.0)
+            v = insider_buy_recent(ticker, lookback_days=30, as_of_date=alert_dt)
+            if v is not None and _math.isfinite(float(v)):
+                fv["insider_buy_recent"] = float(v)
         except Exception:
             pass
         try:
-            score, _ = insider_buy_amount_score(ticker, lookback_days=30, as_of_date=alert_dt)
-            if score is not None:
+            score, _amt = insider_buy_amount_score(ticker, lookback_days=30, as_of_date=alert_dt)
+            if score is not None and _math.isfinite(float(score)):
                 fv["insider_buy_amount_score"] = float(score)
         except Exception:
             pass
-        # 8-K classification
         try:
             score_8k = classify_recent_8k(ticker, lookback_days=60, as_of_date=alert_dt)
-            if score_8k is not None:
+            if score_8k is not None and _math.isfinite(float(score_8k)):
                 fv["recent_8k_score"] = float(score_8k)
         except Exception:
             pass
-        # Earnings call tone
         try:
             tone = _earnings_tone(ticker, lookback_days=90, as_of_date=alert_dt)
-            if tone is not None:
+            if tone is not None and _math.isfinite(float(tone)):
                 fv["earnings_call_tone"] = float(tone)
         except Exception:
             pass
     except ImportError as e:
-        log.debug(f"  fase5 EDGAR {ticker}: fundamental_signals não disponível ({e})")
+        log.debug(f"  fase5 EDGAR {ticker}: fundamental_signals not available ({e})")
 
-    return {k: fv.get(k, _FALLBACK.get(k, 0.0)) for k in FASE5_COLS}
+    return fv
 
 
 def _compute_yf_features(ticker: str) -> dict:

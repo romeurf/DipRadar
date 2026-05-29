@@ -70,6 +70,39 @@ _EPISODE_EXIT  = -0.02   # return_20d > -2% → episode ended (recovery)
 
 _MIN_BARS_AHEAD = 95     # minimum trading days required for 90d target
 
+# Features that depend on data only available post-EDGAR / post-yfinance
+# historical coverage. For rows where the source legitimately has no data
+# (pre-2003 episodes, non-SEC tickers, IPOs with <8 quarters of history),
+# these stay NaN through the parquet so the model sees "missing", not a
+# constant that looks like signal.
+#
+# Approximate coverage cutoffs (used by _is_edgar_likely_covered below):
+#   peg_ratio                  — needs 8 quarters of TTM NI; usually post-2003
+#   earnings_beat_rate         — yfinance.earnings_dates; sparse pre-2005
+#   analyst_rating             — yfinance.recommendations; sparse pre-2005
+#   insider_buy_recent         — SEC Form 4 mandatory since 1934 but EDGAR
+#                                full-text coverage solid post-2003
+#   insider_buy_amount_score   — same
+#   recent_8k_score            — EDGAR 8-K coverage solid post-1996
+#   earnings_call_tone         — earnings call transcripts in 8-K Item 2.02
+#                                post-2002
+_EDGAR_DEPENDENT_FEATURES: frozenset[str] = frozenset({
+    "peg_ratio",
+    "insider_buy_recent",
+    "insider_buy_amount_score",
+    "recent_8k_score",
+    "earnings_call_tone",
+    "earnings_beat_rate",
+    "analyst_rating",
+})
+
+# Conservative single cutoff: episodes before this date won't even attempt an
+# EDGAR fetch — saves HTTP cost and keeps NaN clean. Companies that DO have
+# pre-2003 data are still flagged NaN here, which is the right call since
+# coverage is too patchy to be reliable signal pre-2003.
+import datetime as _dt
+_EDGAR_COVERAGE_CUTOFF = _dt.date(2003, 1, 1)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Additional risk target: max drawdown over a forward window.
@@ -196,8 +229,21 @@ def build_dip_dataset(
                 continue
             entry_price = float(pit_hist["Close"].iloc[-1])
 
-            # Step 1: initialize ALL features from _FALLBACK
-            row_base: dict = {col: _FALLBACK[col] for col in FEATURE_COLUMNS}
+            # Step 1: initialize features.
+            # Technical / macro features get _FALLBACK (always computable from
+            # price history + macro feeds).
+            # EDGAR / yfinance-historical features get NaN so that companies
+            # without coverage (mostly pre-2009 dates and non-SEC tickers)
+            # propagate "missing" through to training instead of being silently
+            # coerced to a constant the model interprets as signal.
+            # Tree models (LightGBM / XGBoost) handle NaN natively; linear
+            # models (Ridge) get column-mean imputation in _prepare_X. Either
+            # way the row contributes nothing to those columns' learning.
+            _NAN = float("nan")
+            row_base: dict = {
+                col: (_NAN if col in _EDGAR_DEPENDENT_FEATURES else _FALLBACK[col])
+                for col in FEATURE_COLUMNS
+            }
             row_base.update({
                 "ticker":     ticker,
                 "alert_date": alert_date,
@@ -266,12 +312,19 @@ def build_dip_dataset(
             # Step 4: PIT fundamentals FIRST (Tiingo/EDGAR/yfinance).
             # MUST run before add_derived_features so peg_ratio etc. can read
             # revenue_growth / trailing_pe from the result.
+            # Skipped for pre-2003 episodes — yfinance.quarterly_financials and
+            # yfinance.recommendations don't go back reliably. peg_ratio,
+            # earnings_beat_rate, analyst_rating stay NaN.
             if add_fundamentals:
-                try:
-                    fund = _compute_pit_fundamentals_row(pd.Series(row_base), cache_dir)
-                    row_base.update(fund)
-                except Exception:
-                    pass   # _FALLBACK already in row_base from step 1
+                _alert_d_fund = pd.Timestamp(alert_date).date()
+                if _alert_d_fund < _EDGAR_COVERAGE_CUTOFF:
+                    pass  # leave NaN in EDGAR-dependent fields; technicals already set
+                else:
+                    try:
+                        fund = _compute_pit_fundamentals_row(pd.Series(row_base), cache_dir)
+                        row_base.update(fund)
+                    except Exception:
+                        pass   # EDGAR-dependent fields stay NaN
 
             # Step 5: derived features (peg_ratio + rsi_oversold_strength etc.)
             try:
@@ -311,18 +364,22 @@ def build_dip_dataset(
             row_base["max_drawdown_60d"] = _compute_max_drawdown(hist, alert_date, horizon_days=60) or 0.0
             row_base["max_drawdown_90d"] = _compute_max_drawdown(hist, alert_date, horizon_days=90) or 0.0
 
-            # Step 8: Phase 5 signals (EDGAR Form 4 / 8-K) — gated by sec_guard.
-            # With the sec_guard fix (yfinance country/exchange recognition),
-            # this branch now actually runs for US tickers instead of always
-            # falling through to the _FALLBACK constants.
-            if add_fase5 and has_sec:
+            # Step 8: Phase 5 signals (EDGAR Form 4 / 8-K) — gated by sec_guard
+            # AND by the pre-EDGAR-coverage cutoff. For episodes before 2003
+            # we skip the EDGAR fetch entirely; the EDGAR-dependent features
+            # stay at the NaN they were initialised with, so the model sees
+            # "missing data" rather than a 0 that looks like "no insider buys".
+            _alert_d = pd.Timestamp(alert_date).date()
+            _pre_edgar = _alert_d < _EDGAR_COVERAGE_CUTOFF
+            if add_fase5 and has_sec and not _pre_edgar:
                 try:
                     f5 = _compute_fase5_row(pd.Series(row_base), price_cache)
                     row_base.update(f5)
                 except Exception:
-                    pass   # _FALLBACK already in row_base from step 1
+                    pass   # EDGAR fields stay NaN from step 1
             elif add_fase5 and not has_sec:
-                # Non-US ticker (ADR): price-based signals from fase5 still valid
+                # Non-US ticker (ADR): price-based signals from fase5 still valid;
+                # EDGAR-dependent fields stay at the NaN they started with.
                 try:
                     f5_price_only = _compute_fase5_row(pd.Series(row_base), price_cache)
                     for k in ("consecutive_red_days", "ma_200d_ratio"):

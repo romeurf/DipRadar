@@ -18,6 +18,7 @@ Public API: ml_score(features) -> MLResult, is_model_ready(), get_model_info(),
 from __future__ import annotations
 
 import logging
+import math
 import pickle
 import sys
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -219,7 +220,18 @@ class MLResult:
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _resolve_feature(raw: dict, col: str) -> float:
-    """Resolve uma feature com fallback via aliases e escala se necessário."""
+    """Resolve a feature with alias fallback and scaling.
+
+    NaN policy: the build_features pipeline now leaves EDGAR-dependent features
+    as NaN when source data is missing (pre-2003 episodes, sparse coverage).
+    At training time the trainer handles NaN per model type (native for LGBM,
+    col-mean imputation for Ridge). At inference time we don't have access to
+    the training col_means, so we impute to ml_features._FALLBACK — these are
+    set to plausibly-neutral values close to typical col_means and were the
+    semantics used by Ridge models pre-NaN-flow. LGBM models tolerate the
+    constant gracefully; the alternative (passing NaN to a Ridge .predict)
+    would emit NaN through the calibrator and produce no score at all.
+    """
     val = raw.get(col)
     if val is None:
         for src, dst in _FEATURE_MAP.items():
@@ -227,17 +239,30 @@ def _resolve_feature(raw: dict, col: str) -> float:
                 val = raw[src]
                 break
     if val is None:
-        return 0.0
+        # truly absent → fall back to the trained-time neutral value
+        from ml_features import _FALLBACK as _FB
+        return float(_FB.get(col, 0.0))
+
     fn = _SCALE_FUNCS.get(col)
     if fn:
         try:
             val = fn(val)
         except Exception:
-            val = 0.0
+            val = None
+
     try:
-        return float(val) if val is not None else 0.0
+        f = float(val) if val is not None else float("nan")
     except (TypeError, ValueError):
-        return 0.0
+        f = float("nan")
+
+    if math.isnan(f):
+        # Source had the column but value was NaN (e.g. pre-EDGAR episode at
+        # training time leaked through, or live yfinance fetch failed) →
+        # same _FALLBACK substitution as the absent case.
+        from ml_features import _FALLBACK as _FB
+        return float(_FB.get(col, 0.0))
+
+    return f
 
 
 def _build_feature_vector(raw: dict, columns: list[str]) -> np.ndarray:

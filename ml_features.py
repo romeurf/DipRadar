@@ -407,6 +407,11 @@ def add_derived_features(features: dict, alert_date: Optional[Any] = None) -> di
     features["vol_x_drop"] = round(volsp * abs(drop), 4)
     # Standard PEG: trailing_PE / EPS_growth% (Lynch: <1 undervalued, >2 expensive)
     # earnings_growth preferred; fall back to revenue_growth if not available.
+    # If neither PE nor growth is available → NaN (not _FALLBACK 2.0). The model
+    # treats NaN as "missing data" (native in LGBM, mean-imputed in Ridge via
+    # the bundle's col_means at inference) instead of misreading the constant
+    # as a real "neutral PEG" signal. Affects pre-2003 episodes and any ticker
+    # without enough quarterly history.
     _tpe = features.get("trailing_pe", float("nan"))
     _eg  = features.get("earnings_growth", features.get("revenue_growth", float("nan")))
     _tpe = float(_tpe) if _tpe is not None else float("nan")
@@ -414,18 +419,18 @@ def add_derived_features(features: dict, alert_date: Optional[Any] = None) -> di
     if math.isfinite(_tpe) and _tpe > 0 and math.isfinite(_eg) and _eg > 0.005:
         features["peg_ratio"] = round(float(min(_tpe / (_eg * 100.0), 10.0)), 4)
     else:
-        features["peg_ratio"] = _FALLBACK["peg_ratio"]
+        features["peg_ratio"] = float("nan")
     # pe_vs_sector_median: stock forward PE relative to sector median forward PE.
     # <1.0 = trading at a discount to sector peers (potential entry for Core).
-    # Uses forwardPE key stored in features by build_features / bootstrap.
+    # Same NaN-propagation policy as peg_ratio.
     _fwd_pe = features.get("forward_pe")
     _fwd_pe = float(_fwd_pe) if _fwd_pe is not None else float("nan")
     sector_for_pe = str(features.get("sector", "Unknown") or "Unknown")
     _sec_med_pe = _SECTOR_MEDIAN_FWD_PE.get(sector_for_pe, 18.0)
     if math.isfinite(_fwd_pe) and _fwd_pe > 0 and _sec_med_pe > 0:
         features["pe_vs_sector_median"] = round(float(min(_fwd_pe / _sec_med_pe, 5.0)), 4)
-    else:
-        features.setdefault("pe_vs_sector_median", _FALLBACK["pe_vs_sector_median"])
+    elif "pe_vs_sector_median" not in features:
+        features["pe_vs_sector_median"] = float("nan")
 
     sec_dd = float(features.get("sector_drawdown_5d", _FALLBACK["sector_drawdown_5d"]))
     features["relative_drop"] = round(drop - sec_dd, 4)
@@ -617,6 +622,48 @@ def build_features(
                 pass
     except Exception as e:
         logger.error(f"build_features[{ticker}]: fundamental_signals failed: {e}")
+
+    # Stage 6 — Sector pressure context.
+    # sector_alert_count_7d is computed post-hoc at training time (pandas
+    # window across the parquet). At inference time we have to source the
+    # same signal differently: count of bot alerts in the same sector over
+    # the past 7 calendar days from alert_db. Without this, the model would
+    # see the value at training (real variance) and 0 at inference (every
+    # call) — classic train/inference skew. We compute it once here so the
+    # call site doesn't have to repeat.
+    try:
+        from datetime import datetime as _dt_cls, timedelta as _td
+        from pathlib import Path as _AdbP
+
+        _data_dir = _AdbP("/data") if _AdbP("/data").exists() else _AdbP("/tmp")
+        _adb_path = _data_dir / "alert_db.csv"
+        if _adb_path.exists() and sector and sector != "Unknown":
+            _ref_date = pd.Timestamp(alert_date) if alert_date is not None else pd.Timestamp(_dt_cls.utcnow())
+            _ref_date = _ref_date.tz_localize(None) if getattr(_ref_date, "tz", None) is not None else _ref_date
+            _window_start = _ref_date - pd.Timedelta(days=7)
+
+            try:
+                _adb = pd.read_csv(_adb_path, usecols=["sector", "date_iso"], engine="python", on_bad_lines="skip")
+            except Exception:
+                try:
+                    _adb = pd.read_csv(_adb_path, engine="python", on_bad_lines="skip")
+                    _adb = _adb[[c for c in ("sector", "date_iso") if c in _adb.columns]]
+                except Exception:
+                    _adb = None
+
+            if _adb is not None and not _adb.empty and {"sector", "date_iso"} <= set(_adb.columns):
+                _adb["date_iso"] = pd.to_datetime(_adb["date_iso"], errors="coerce")
+                _mask = (
+                    _adb["sector"].astype(str).str.casefold() == str(sector).casefold()
+                ) & (
+                    _adb["date_iso"] >= _window_start
+                ) & (
+                    _adb["date_iso"] <= _ref_date
+                )
+                features["sector_alert_count_7d"] = float(int(_mask.sum()))
+            # else: leave at the _FALLBACK 0.0 set at dict init
+    except Exception as _e:
+        logger.debug(f"build_features[{ticker}]: sector_alert_count_7d failed: {_e}")
 
     return features
 
