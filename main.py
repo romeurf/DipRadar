@@ -2704,16 +2704,37 @@ def main() -> None:
     )
 
     # ── PPR auto-scrape: 22:30 Lisboa, seg-sex ────────────────────────────────
-    # Fetches the day's NAV from investing.com after market close. Silent on
-    # failure (snapshot keeps the last successful NAV). No notification on
-    # success either — too chatty for a daily background refresh.
+    # Tries investing.com first (daily granularity), falls back to Banco
+    # Invest monthly PDF when CF-blocked. To avoid hammering Banco Invest's
+    # CDN with a 245KB PDF every weekday for the same monthly value, the
+    # job skips when NAV is < 7 days old AND was last fetched from the PDF
+    # source (i.e., investing.com isn't working anyway).
     def _run_ppr_auto_scrape():
         try:
             from state import get_ppr, set_ppr_nav
+            from datetime import date as _date
             import ppr_scraper
             existing = get_ppr()
             if not existing or existing.get("shares", 0) <= 0:
-                return  # no PPR configured — skip
+                return  # no PPR configured
+
+            # Politeness gate: skip if the last PDF-sourced NAV is fresh.
+            # Investing.com still gets attempted because its data is daily,
+            # so we only suppress when the PDF was the last source AND the
+            # NAV is < 7 days old (PDFs update monthly anyway).
+            nav_dt_str   = existing.get("nav_updated")
+            last_source  = (existing.get("nav_source") or "").lower()
+            if nav_dt_str and "pdf" in last_source:
+                try:
+                    age = (_date.today() - _date.fromisoformat(nav_dt_str)).days
+                    if age < 7:
+                        logging.debug(
+                            f"[ppr] auto-scrape skipped: PDF-sourced NAV is {age}d old"
+                        )
+                        return
+                except Exception:
+                    pass
+
             isin = existing.get("isin", "PTARMJHM0003")
             result = ppr_scraper.fetch_ppr_nav(isin)
             if not result or not result.get("nav"):
@@ -2727,7 +2748,10 @@ def main() -> None:
                 )
                 return
             set_ppr_nav(nav, source=result.get("source", "investing.com"))
-            logging.info(f"[ppr] auto-scraped NAV: €{nav:.4f} ({isin})")
+            logging.info(
+                f"[ppr] auto-scraped NAV: €{nav:.4f} ({isin}) "
+                f"from {result.get('source', '?')}"
+            )
         except Exception as e:
             logging.error(f"[ppr] auto-scrape exception: {e}", exc_info=True)
     scheduler.add_job(

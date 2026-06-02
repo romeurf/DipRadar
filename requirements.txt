@@ -33,3 +33,7 @@ vaderSentiment>=3.3.2
 # from Railway datacenter IPs; cloudscraper transparently solves the JS
 # challenges). Imported lazily — bot still boots if missing.
 cloudscraper>=1.2.71
+
+# PDF parsing for Banco Invest monthly PPR reports (fallback when
+# investing.com is Cloudflare-blocked). Lazy-imported.
+pypdf>=4.0.0

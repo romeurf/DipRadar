@@ -164,10 +164,88 @@ def fetch_ppr_nav_investing(isin: str) -> Optional[dict]:
     return out
 
 
-def fetch_ppr_nav(isin: str) -> Optional[dict]:
-    """Main entry. Currently tries investing.com only.
+def fetch_ppr_nav_banco_invest_pdf(isin: str) -> Optional[dict]:
+    """Fetch NAV from Banco Invest's monthly PDF — fallback when investing.com fails.
 
-    Future: add fallbacks (Banco Invest monthly PDF parse, APFIPP
-    calculator) when investing.com fails or rate-limits.
+    URL pattern: bancoinvest.pt/docs/default-source/ppr/<isin_lower>_mensal.pdf
+    The PDF is a static file (no Cloudflare gate) so plain requests works.
+
+    PDF structure (validated June 2026):
+      Page 1 contains "Valor da UP: 7.4053€ | Abr-26:+6,3%" near the gestor
+      commentary, with reference date like "30/Abr/2026" at the top.
+
+    Updates monthly (typically 5–7 days after month-end). The returned NAV
+    is end-of-previous-month, so it can be up to ~35 days stale during the
+    transition window — but for a PPR (long-term hold, no daily trading
+    decisions) this is sufficient.
     """
-    return fetch_ppr_nav_investing(isin)
+    url = f"https://www.bancoinvest.pt/docs/default-source/ppr/{isin.lower().strip()}_mensal.pdf"
+
+    try:
+        r = requests.get(url, headers=_HEADERS, timeout=30)
+        r.raise_for_status()
+        pdf_bytes = r.content
+    except requests.RequestException as e:
+        logger.warning(f"[ppr_scraper] PDF fetch {isin}: {e}")
+        return None
+    except Exception as e:
+        logger.warning(f"[ppr_scraper] PDF fetch {isin} unexpected: {e}")
+        return None
+
+    try:
+        import pypdf
+        import io
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    except ImportError:
+        logger.warning("[ppr_scraper] pypdf not installed — cannot parse PDF fallback")
+        return None
+    except Exception as e:
+        logger.warning(f"[ppr_scraper] PDF parse {isin}: {e}")
+        return None
+
+    # Pattern: "Valor da UP: 7.4053€" — case-insensitive, tolerates extra whitespace
+    nav_match = re.search(r'Valor\s+da\s+UP[:\s]+([\d.,]+)', text, re.IGNORECASE)
+    if not nav_match:
+        logger.warning(
+            f"[ppr_scraper] PDF {isin}: 'Valor da UP' pattern not found "
+            f"(PDF format may have changed)"
+        )
+        return None
+
+    nav = _parse_pt_number(nav_match.group(1))
+    if nav is None or nav <= 0:
+        logger.warning(f"[ppr_scraper] PDF {isin}: invalid NAV '{nav_match.group(1)}'")
+        return None
+
+    out = {"nav": nav, "source": "bancoinvest.pt PDF (mensal)", "url": url}
+
+    # Reference date — "30/Abr/2026" near the top
+    date_match = re.search(r'(\d{1,2})/([A-Za-z]+)/(\d{4})', text)
+    if date_match:
+        out["report_date"] = date_match.group(0)
+
+    # Monthly return — "Abr-26:+6,3%"
+    month_match = re.search(r'[A-Za-z]+-\d{2}:\s*([+\-]?[\d.,]+)%', text)
+    if month_match:
+        ch = _parse_pt_number(month_match.group(1))
+        if ch is not None:
+            out["change_pct_month"] = ch
+
+    return out
+
+
+def fetch_ppr_nav(isin: str) -> Optional[dict]:
+    """Main entry. Tries investing.com first (live daily), falls back to
+    Banco Invest monthly PDF if investing.com is Cloudflare-blocked.
+
+    On Railway IPs investing.com almost always returns 403; the PDF is the
+    realistic primary source. On developer machines / Anthropic infra,
+    investing.com works → it stays first for daily granularity when possible.
+    """
+    result = fetch_ppr_nav_investing(isin)
+    if result and result.get("nav"):
+        return result
+
+    logger.info(f"[ppr_scraper] investing.com unavailable for {isin}, trying Banco Invest PDF")
+    return fetch_ppr_nav_banco_invest_pdf(isin)
