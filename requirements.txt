@@ -28,3 +28,8 @@ google-auth>=2.28.0
 
 # News headline sentiment (free, offline, no API key)
 vaderSentiment>=3.3.2
+
+# Cloudflare bypass for PPR NAV scraping (investing.com 403s plain requests
+# from Railway datacenter IPs; cloudscraper transparently solves the JS
+# challenges). Imported lazily — bot still boots if missing.
+cloudscraper>=1.2.71

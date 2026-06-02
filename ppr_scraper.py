@@ -8,11 +8,16 @@ visible without JavaScript or login.
 PPR NAVs update once per business day after market close (~17h–22h Lisbon).
 Recommended cadence: 1× per day after 22h Lisbon (cron in main.py).
 
-Anti-bot considerations:
-  - Realistic User-Agent + Accept-Language (Portuguese page expects pt-PT)
-  - Single GET, no JS execution needed
-  - On Cloudflare gate or page-structure change, returns None and the
-    caller falls back to last cached NAV (or manual /ppr nav input)
+Anti-bot two-stage strategy:
+  1. cloudscraper (if installed) — solves Cloudflare JS challenges
+     transparently. Required for Railway datacenter IPs which plain
+     `requests` gets 403'd on.
+  2. requests fallback with rich browser headers — works for non-CF
+     pages or weaker protections.
+
+If both fail, returns None and the caller falls back to last cached NAV
+(or manual /ppr nav input). PPR NAVs change once per day max, so a few
+hours of staleness is acceptable.
 
 The regex patterns target investing.com's React markup as of June 2026.
 Pattern updates should go here when the site refactors (caller code
@@ -35,11 +40,58 @@ _USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
+# Rich headers that look like a real Chrome browser. Helps with weaker
+# anti-bot setups; cloudscraper handles the Cloudflare challenges itself.
 _HEADERS = {
-    "User-Agent":      _USER_AGENT,
-    "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
-    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "User-Agent":                _USER_AGENT,
+    "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language":           "pt-PT,pt;q=0.9,en;q=0.8",
+    "Accept-Encoding":           "gzip, deflate, br",
+    "Cache-Control":             "no-cache",
+    "Pragma":                    "no-cache",
+    "Sec-Ch-Ua":                 '"Chromium";v="120", "Not_A Brand";v="8"',
+    "Sec-Ch-Ua-Mobile":          "?0",
+    "Sec-Ch-Ua-Platform":        '"Windows"',
+    "Sec-Fetch-Dest":            "document",
+    "Sec-Fetch-Mode":            "navigate",
+    "Sec-Fetch-Site":            "none",
+    "Sec-Fetch-User":            "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Referer":                   "https://pt.investing.com/",
 }
+
+
+def _http_get_with_cf_bypass(url: str, timeout: int = 25) -> Optional[str]:
+    """Attempt to fetch a URL handling Cloudflare. Returns HTML text or None.
+
+    Stage 1: cloudscraper (Cloudflare JS challenge solver). Lazy-imported
+    so the bot still boots if the package isn't installed.
+    Stage 2: plain requests with rich browser headers. Works for non-CF
+    pages and some weaker WAFs.
+    """
+    # Stage 1: cloudscraper
+    try:
+        import cloudscraper
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+        r = scraper.get(url, headers=_HEADERS, timeout=timeout)
+        if r.status_code == 200 and r.text:
+            return r.text
+        logger.debug(f"[ppr_scraper] cloudscraper got status {r.status_code} for {url}")
+    except ImportError:
+        logger.info("[ppr_scraper] cloudscraper not installed — skipping CF bypass stage")
+    except Exception as e:
+        logger.warning(f"[ppr_scraper] cloudscraper failed: {e}")
+
+    # Stage 2: plain requests with rich headers
+    try:
+        r = requests.get(url, headers=_HEADERS, timeout=timeout)
+        r.raise_for_status()
+        return r.text
+    except requests.RequestException as e:
+        logger.warning(f"[ppr_scraper] plain requests failed for {url}: {e}")
+        return None
 
 # Investing.com markup (subject to refactors):
 #   <span data-test="instrument-price-last">7,683</span>
@@ -80,15 +132,8 @@ def fetch_ppr_nav_investing(isin: str) -> Optional[dict]:
     Returns None on failure (network error, page structure changed, etc.).
     """
     url = _INVESTING_URL_TEMPLATE.format(isin_lower=isin.lower().strip())
-    try:
-        r = requests.get(url, headers=_HEADERS, timeout=20)
-        r.raise_for_status()
-        html = r.text
-    except requests.RequestException as e:
-        logger.warning(f"[ppr_scraper] investing.com {isin} HTTP: {e}")
-        return None
-    except Exception as e:
-        logger.warning(f"[ppr_scraper] investing.com {isin} unexpected: {e}")
+    html = _http_get_with_cf_bypass(url)
+    if not html:
         return None
 
     nav_match = _NAV_RE.search(html)
