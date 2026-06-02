@@ -159,8 +159,6 @@ Sistema vivo que aprende com os seus próprios erros:
 | Variável | Fonte | Descrição |
 |----------|-------|-----------|
 | `TIINGO_API_KEY` | api.tiingo.com | EOD de qualidade |
-| `ALPHAVANTAGE_API_KEY` | alphavantage.co (25 req/dia) | Revisões de analistas |
-| `FMP_API_KEY` | financialmodelingprep.com (250 req/dia) | Upgrades/downgrades |
 | `FRED_API_KEY` | fred.stlouisfed.org | Recession probability |
 | `TAVILY_API_KEY` | tavily.com | Catalisadores e notícias |
 

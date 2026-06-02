@@ -1387,8 +1387,6 @@ def _handle_admin_check_config() -> None:
         ("MONTHLY_BUDGET_EUR",      "Orcamento mensal",      True,  "Ex: 1050"),
         ("FLIP_FUND_EUR",           "Capital Flip Fund",     True,  "Ex: 500 — o Tesoureiro usa isto para sizing"),
         ("TIINGO_API_KEY",          "Tiingo EOD",            False, "Dados EOD (fallback yfinance se ausente)"),
-        ("ALPHAVANTAGE_API_KEY",    "Alpha Vantage",         False, "25 req/dia gratis — revisoes analistas"),
-        ("FMP_API_KEY",             "FMP",                   False, "250 req/dia gratis — upgrades/downgrades"),
         ("FRED_API_KEY",            "FRED (Fed Reserve)",    False, "Gratis — recession probability mais precisa"),
         ("SECTOR_CONCENTRATION_CAP","Sector cap",            False, "Default 35% — limite de exposicao por sector"),
         ("TELEGRAM_TOKEN",          "Telegram Bot",          True,  "Token do bot"),

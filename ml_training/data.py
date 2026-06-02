@@ -259,8 +259,6 @@ def build_dataset(base_df: pd.DataFrame, price_cache: dict[str, pd.DataFrame], e
                 ticker,
                 price_history=hist,  # já sliced point-in-time
                 alert_date=alert_date,
-                use_alphavantage=False,  # sem API key extra no treino
-                use_fmp=False,
             )
             for _k, _v in _fase5.items():
                 if _k not in FEATURE_COLUMNS:

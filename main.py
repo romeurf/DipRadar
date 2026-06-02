@@ -113,7 +113,7 @@ logging.basicConfig(
 import warnings as _w
 _w.filterwarnings(
     "ignore",
-    message=".*Ticker\\.earnings.*deprecated.*",
+    message=r".*Ticker\.earnings.*deprecated.*",
     category=DeprecationWarning,
 )
 
@@ -2563,16 +2563,6 @@ def main() -> None:
         _missing_config.append(
             "MONTHLY_BUDGET_EUR — orcamento mensal em euros "
             "(ex: MONTHLY_BUDGET_EUR=850). O Tesoureiro precisa disto para sizing."
-        )
-    if not os.environ.get("ALPHAVANTAGE_API_KEY"):
-        _missing_config.append(
-            "ALPHAVANTAGE_API_KEY — chave gratuita em alphavantage.co "
-            "(25 req/dia). Melhora previsao de revisoes de analistas."
-        )
-    if not os.environ.get("FMP_API_KEY"):
-        _missing_config.append(
-            "FMP_API_KEY — chave gratuita em financialmodelingprep.com "
-            "(250 req/dia). Melhora sinais de revisoes de analistas."
         )
     if _missing_config:
         logging.warning(

@@ -13,14 +13,13 @@ Camadas de dados (gratuitas):
   Camada 2 — yfinance info (sem API key):
     earnings_beat_rate, analyst_rating, short_interest_pct
 
-  Camada 3 — SEC EDGAR Form 4 (gratuito, sem key):
-    insider_buy_recent
+  Camada 3 — SEC EDGAR Form 4 + 8-K + earnings calls (gratuito, sem key):
+    insider_buy_recent, insider_sell_recent, classify_recent_8k,
+    earnings_call_tone, insider_buy/sell_amount_score
 
-  Camada 4 — Alpha Vantage (free tier, 25 req/day):
-    env var: ALPHAVANTAGE_API_KEY (https://www.alphavantage.co/support/#api-key)
-
-  Camada 5 — Financial Modeling Prep (free tier, 250 req/day):
-    env var: FMP_API_KEY (https://financialmodelingprep.com/developer/docs)
+Removidas em commit posterior (não eram consumidas pelos modelos):
+  Camada 4 — Alpha Vantage earnings revision
+  Camada 5 — FMP analyst revision trend
 
 Valores de retorno:
   float        → calculado com sucesso
@@ -40,9 +39,6 @@ import numpy as np
 import pandas as pd
 
 log = logging.getLogger(__name__)
-
-_ALPHAVANTAGE_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "")
-_FMP_KEY          = os.getenv("FMP_API_KEY", "")
 
 NaN = float("nan")
 
@@ -769,154 +765,13 @@ def earnings_call_tone(ticker: str, lookback_days: int = 90, as_of_date: "date |
         return NaN
 
 
-# ── Camada 4: Alpha Vantage ────────────────────────────────────────────────────
-
-def alphavantage_earnings_revision(ticker: str) -> float:
-    """Tendência de revisões de EPS dos analistas via Alpha Vantage.
-
-    Retorna valor normalizado [-1, +1]:
-      +1 = apenas upgrades recentes
-       0 = sem revisões ou neutro
-      -1 = apenas downgrades recentes
-
-    Raises ValueError se ALPHAVANTAGE_API_KEY não está definida.
-    Propaga requests.HTTPError em falhas de API.
-    """
-    if not _ALPHAVANTAGE_KEY:
-        raise ValueError(
-            "ALPHAVANTAGE_API_KEY não definida. "
-            "Cria a env var no Railway com a tua chave gratuita de alphavantage.co"
-        )
-    import requests
-    # Earnings estimate consensus
-    r = requests.get(
-        "https://www.alphavantage.co/query",
-        params={
-            "function": "EARNINGS",
-            "symbol": ticker,
-            "apikey": _ALPHAVANTAGE_KEY,
-        },
-        timeout=15,
-    )
-    r.raise_for_status()
-    data = r.json()
-
-    # Verificar rate limit
-    if "Note" in data or "Information" in data:
-        raise RuntimeError(
-            f"Alpha Vantage rate limit atingido para {ticker}. "
-            f"Free tier: 25 req/day. Mensagem: {data.get('Note') or data.get('Information')}"
-        )
-
-    # Parsear últimas 4 estimativas de EPS
-    quarterly = data.get("quarterlyEarnings", [])[:4]
-    if not quarterly:
-        return NaN
-
-    surprises = []
-    for q in quarterly:
-        est = q.get("estimatedEPS")
-        actual = q.get("reportedEPS")
-        if est is not None and actual is not None:
-            try:
-                e, a = float(est), float(actual)
-                if abs(e) > 0.001:
-                    surprises.append((a - e) / abs(e))
-            except (ValueError, TypeError):
-                pass
-
-    if not surprises:
-        return NaN
-
-    # Tendência: surpresas recentes a melhorar ou piorar?
-    avg = float(np.mean(surprises))
-    return round(float(np.clip(avg, -2.0, 2.0)), 4)
-
-
-# ── Camada 5: Financial Modeling Prep ─────────────────────────────────────────
-
-# FMP circuit breaker: after N consecutive auth-style failures (401/403),
-# disable FMP for the rest of the session. The free tier blocks some
-# endpoints, and once that happens it never recovers within a session —
-# retrying just spams logs and wastes latency.
-_FMP_CONSECUTIVE_FAILS = 0
-_FMP_DISABLED          = False
-_FMP_FAIL_THRESHOLD    = 3
-
-
-def _fmp_circuit_check() -> bool:
-    """Return True if FMP is still allowed to be called."""
-    return not _FMP_DISABLED
-
-
-def _fmp_circuit_record(success: bool, status_code: Optional[int] = None) -> None:
-    """Update the circuit breaker. Auth-style failures (401/403) trip it after
-    _FMP_FAIL_THRESHOLD consecutive occurrences."""
-    global _FMP_CONSECUTIVE_FAILS, _FMP_DISABLED
-    if success:
-        _FMP_CONSECUTIVE_FAILS = 0
-        return
-    # Only count auth/permission errors towards the trip — transient network
-    # errors shouldn't permanently disable FMP.
-    if status_code in (401, 403):
-        _FMP_CONSECUTIVE_FAILS += 1
-        if _FMP_CONSECUTIVE_FAILS >= _FMP_FAIL_THRESHOLD and not _FMP_DISABLED:
-            _FMP_DISABLED = True
-            log.warning(
-                f"[signals] FMP desactivado para a sessão após "
-                f"{_FMP_FAIL_THRESHOLD} falhas {status_code} consecutivas. "
-                f"Free tier não tem permissão para este endpoint, ou key expirada. "
-                f"Restantes chamadas devolvem NaN sem fazer pedido HTTP."
-            )
-
-
-def fmp_analyst_revision_trend(ticker: str, n_recent: int = 10) -> float:
-    """Tendência de revisões de analistas via FMP API.
-
-    Retorna [-1, +1]: +1 = só upgrades, -1 = só downgrades.
-    Raises ValueError se FMP_API_KEY não está definida.
-    Devolve NaN silenciosamente se o circuit breaker desactivou FMP.
-    """
-    if not _FMP_KEY:
-        raise ValueError(
-            "FMP_API_KEY não definida. "
-            "Cria a env var no Railway com a tua chave gratuita de financialmodelingprep.com"
-        )
-    if not _fmp_circuit_check():
-        return NaN
-    import requests
-    try:
-        r = requests.get(
-            f"https://financialmodelingprep.com/api/v3/analyst-stock-recommendations/{ticker}",
-            params={"limit": n_recent, "apikey": _FMP_KEY},
-            timeout=15,
-        )
-        if r.status_code in (401, 403):
-            _fmp_circuit_record(success=False, status_code=r.status_code)
-            return NaN
-        r.raise_for_status()
-        _fmp_circuit_record(success=True)
-    except requests.RequestException as e:
-        sc = getattr(e.response, "status_code", None) if hasattr(e, "response") else None
-        _fmp_circuit_record(success=False, status_code=sc)
-        raise
-    data = r.json()
-
-    if not data or not isinstance(data, list):
-        return NaN
-
-    _UPGRADE   = {"buy", "outperform", "overweight", "strong buy", "accumulate"}
-    _DOWNGRADE = {"sell", "underperform", "underweight", "strong sell", "reduce"}
-
-    upgrades   = sum(1 for x in data if x.get("newGrade", "").lower() in _UPGRADE)
-    downgrades = sum(1 for x in data if x.get("newGrade", "").lower() in _DOWNGRADE)
-    total = len(data)
-
-    if total == 0:
-        return NaN
-
-    trend = (upgrades - downgrades) / total
-    return round(float(np.clip(trend, -1.0, 1.0)), 4)
+# Camadas 4 (Alpha Vantage) e 5 (FMP) foram removidas — os sinais que
+# produziam (earnings_revision_av, analyst_revision_fmp) nunca foram
+# consumidos por FEATURE_COLUMNS nem por nenhum scorer/modelo. Eram dead
+# code que consumia quota de APIs gratuitas para gerar valores que iam
+# directos para o vazio. analyst_rating + earnings_beat_rate (yfinance,
+# Camada 2) cobrem o mesmo terreno conceptual e ESSES sim entram em
+# features.
 
 
 # ── Orquestrador ──────────────────────────────────────────────────────────────
@@ -925,8 +780,8 @@ def compute_fundamental_signals(
     ticker: str,
     price_history: Optional[pd.DataFrame] = None,
     alert_date: Optional[Any] = None,
-    use_alphavantage: bool = bool(_ALPHAVANTAGE_KEY),
-    use_fmp: bool = bool(_FMP_KEY),
+    use_alphavantage: bool = False,   # DEPRECATED — ignored, kept for arg-compat
+    use_fmp: bool = False,             # DEPRECATED — ignored, kept for arg-compat
 ) -> dict[str, float]:
     """Computa todos os sinais de qualidade e sentimento.
 
@@ -1025,25 +880,6 @@ def compute_fundamental_signals(
     else:
         result["earnings_call_tone"] = NaN
 
-    # Camada 4: Alpha Vantage
-    if use_alphavantage:
-        try:
-            result["earnings_revision_av"] = alphavantage_earnings_revision(ticker)
-        except Exception as e:
-            log.error(f"[signals] alphavantage {ticker}: {e}")
-            result["earnings_revision_av"] = NaN
-
-    # Camada 5: FMP
-    if use_fmp and _fmp_circuit_check():
-        try:
-            result["analyst_revision_fmp"] = fmp_analyst_revision_trend(ticker)
-        except Exception as e:
-            # Downgraded ERROR → DEBUG: the circuit breaker already issues
-            # one WARNING when it trips, so per-ticker spam is pointless.
-            log.debug(f"[signals] fmp {ticker}: {e}")
-            result["analyst_revision_fmp"] = NaN
-    elif use_fmp:
-        # Circuit open — silent NaN, no HTTP call.
-        result["analyst_revision_fmp"] = NaN
+    # Camadas 4 (Alpha Vantage) e 5 (FMP) removidas — ver nota acima da função.
 
     return result
