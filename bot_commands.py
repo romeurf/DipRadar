@@ -1038,111 +1038,153 @@ def _handle_admin_test_feed(parts: list[str]) -> None:
 # ── /sync_portfolio ──────────────────────────────────────────────────────────────
 
 def _handle_sync_portfolio(parts: list[str]) -> None:
-    """/sync_portfolio — sincroniza a carteira actual via Telegram.
+    """/sync_portfolio — bulk-import existing holdings into the Telegram ledger.
+
+    Use case: you already own positions (from before the bot, or from a broker
+    export). /buy registers AND debits liquidity (purchase semantics). This
+    command registers WITHOUT touching liquidity — for migrating existing
+    holdings.
 
     Uso:
-      /sync_portfolio                         → ver estado actual
-      /sync_portfolio AAPL:10:150 MSFT:5:300  → substituir carteira
-      /sync_portfolio clear                   → limpar override (volta a usar env vars)
+      /sync_portfolio                                    → ver estado actual
+      /sync_portfolio NVO:25:85.50 MSFT:12:410          → importar várias
+      /sync_portfolio NVO:25:85.50 --no-conviction      → não criar convicção
 
-    Formato: TICKER:shares:preco_medio_usd
-      Exemplo: /sync_portfolio NVO:25:85.50 ADBE:8:420 CRWD:5:280
+    Formato: TICKER:shares:preço_médio_usd
 
-    Os dados ficam em /data/portfolio_override.json (persistido no Railway Volume).
-    As env vars HOLDING_* continuam como backup se o override for limpo.
+    Cada ticker importado:
+      1. Vai para _cache["positions"] via portfolio.register_existing_position
+         (sem afectar liquidez — assume-se que já é tua há tempo)
+      2. Auto-cria convicção via conviction_radar (excepto ETFs/PPR/foreign
+         e --no-conviction). Tipo auto-classificado por ML.
+
+    Idempotente: tickers já no ledger são saltados (não sobrescrevem).
+    Para alterar preço médio: /sell + /buy, ou /conviction transition.
+
+    As env vars HOLDING_* foram DESCONTINUADAS — usa este comando ou /buy.
     """
-    from pathlib import Path
-    import json
+    from portfolio import get_positions, register_existing_position
 
-    _OVERRIDE_PATH = Path("/data/portfolio_override.json") if Path("/data").exists() \
-        else Path("/tmp/portfolio_override.json")
+    no_conviction = "--no-conviction" in parts
+    entries = [p for p in parts[1:] if p != "--no-conviction"]
 
     # Sem argumentos → mostrar estado actual
-    if len(parts) < 2:
-        if _OVERRIDE_PATH.exists():
-            try:
-                data = json.loads(_OVERRIDE_PATH.read_text(encoding="utf-8"))
-                holdings = data.get("holdings", {})
-                lines = ["Carteira actual (override activo):"]
-                for ticker, pos in sorted(holdings.items()):
-                    lines.append(
-                        f"  {ticker}: {pos['shares']} shares @ ${pos['avg_cost']:.2f}"
-                    )
-                lines.append("")
-                lines.append("Para actualizar: /sync_portfolio TICK:shares:preco ...")
-                lines.append("Para limpar: /sync_portfolio clear")
-                _reply("\n".join(lines))
-            except Exception as e:
-                _reply(f"Erro a ler override: {e}")
-        else:
+    if not entries:
+        positions = get_positions()
+        if not positions:
             _reply(
-                "Sem override activo — a usar env vars HOLDING_* do Railway.\n\n"
-                "Para sincronizar a tua carteira actual:\n"
-                "/sync_portfolio NVO:25:85.50 ADBE:8:420 CRWD:5:280\n"
-                "(formato: TICKER:shares:preco_medio_usd)"
+                "💼 *Carteira vazia.*\n\n"
+                "Para bulk-import (sem afectar liquidez):\n"
+                "`/sync_portfolio NVO:25:85.50 MSFT:12:410 UBER:30:65`\n\n"
+                "Para comprar (debita liquidez):\n"
+                "`/buy TICKER PREÇO SHARES`\n\n"
+                "_Formato bulk: TICKER:shares:preço_médio_usd_"
             )
-        return
-
-    # Limpar override
-    if parts[1].lower() == "clear":
-        if _OVERRIDE_PATH.exists():
-            _OVERRIDE_PATH.unlink()
-            _reply("Override limpo. A usar env vars HOLDING_* do Railway.")
-        else:
-            _reply("Sem override activo.")
-        return
-
-    # Parsear nova carteira
-    holdings: dict = {}
-    errors: list[str] = []
-    for entry in parts[1:]:
-        try:
-            parts_entry = entry.split(":")
-            if len(parts_entry) < 2:
-                errors.append(f"Formato inválido: {entry} (usa TICKER:shares ou TICKER:shares:preco)")
-                continue
-            ticker     = parts_entry[0].upper().strip()
-            shares     = float(parts_entry[1])
-            avg_cost   = float(parts_entry[2]) if len(parts_entry) > 2 else 0.0
-            holdings[ticker] = {"shares": shares, "avg_cost": avg_cost}
-        except (ValueError, IndexError):
-            errors.append(f"Erro a parsear: {entry}")
-
-    if errors:
-        _reply("Erros:\n" + "\n".join(errors))
-        return
-
-    if not holdings:
-        _reply("Nenhuma posição válida. Formato: TICKER:shares:preco_medio_usd")
-        return
-
-    # Guardar override
-    try:
-        _OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            "holdings":   holdings,
-            "updated_at": datetime.now().isoformat(),
-            "updated_by": "telegram_sync",
-        }
-        _OVERRIDE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-        lines = ["Carteira actualizada:"]
-        for ticker, pos in sorted(holdings.items()):
-            lines.append(f"  {ticker}: {pos['shares']} shares @ ${pos['avg_cost']:.2f}")
-        lines.append("")
-        lines.append(f"Guardado em {_OVERRIDE_PATH}")
-        lines.append("Activo a partir de agora. Para limpar: /sync_portfolio clear")
+            return
+        lines = [f"💼 *Carteira actual* ({len(positions)} posições)"]
+        for sym in sorted(positions.keys()):
+            pos = positions[sym]
+            lines.append(
+                f"  • *{sym}*: {pos.get('shares', 0):g} @ ${pos.get('avg_price', 0):.2f}"
+                f" _({pos.get('category', '?')})_"
+            )
+        lines += [
+            "",
+            "_Para adicionar mais: `/sync_portfolio TICK:shares:preço ...`_",
+            "_Para remover: `/sell TICKER PREÇO`_",
+        ]
         _reply("\n".join(lines))
+        return
 
-        # Recarregar a carteira em portfolio.py (se suportado)
+    # Parse entries
+    parsed: list[tuple[str, float, float]] = []
+    errors: list[str] = []
+    for entry in entries:
         try:
-            import portfolio as _pf
-            _pf._reload_from_override(_OVERRIDE_PATH)
-        except Exception:
-            pass  # reload opcional
+            bits = entry.split(":")
+            if len(bits) < 3:
+                errors.append(f"`{entry}` — falta preço (TICKER:shares:preço)")
+                continue
+            ticker = bits[0].upper().strip()
+            shares = float(bits[1])
+            price  = float(bits[2])
+            if shares <= 0 or price <= 0:
+                errors.append(f"`{entry}` — shares e preço têm de ser > 0")
+                continue
+            parsed.append((ticker, shares, price))
+        except (ValueError, IndexError):
+            errors.append(f"`{entry}` — erro a parsear")
 
-    except Exception as e:
-        _reply(f"Erro ao guardar override: {e}")
+    if errors and not parsed:
+        _reply("⚠️ *Sem entradas válidas:*\n" + "\n".join(f"  • {e}" for e in errors))
+        return
+
+    imported: list[tuple[str, float, float]] = []
+    already:  list[str] = []
+    convictions_created: list[tuple[str, str]] = []
+    conviction_errors:   list[tuple[str, str]] = []
+
+    for ticker, shares, price in parsed:
+        try:
+            result = register_existing_position(ticker, price, shares)
+            if result["action"] == "imported":
+                imported.append((ticker, shares, price))
+            else:
+                already.append(ticker)
+        except Exception as e:
+            errors.append(f"`{ticker}` — registo falhou: {e}")
+            continue
+
+        # Auto-create conviction (unless --no-conviction or deny-list)
+        if no_conviction:
+            continue
+        try:
+            import conviction_radar as cr
+            deny = cr._get_deny_list()
+            if ticker in deny or "." in ticker:
+                continue
+            if cr.get_by_ticker(ticker):
+                continue  # already a conviction
+            current = cr._fetch_price(ticker, fallback=price)
+            hist    = cr._fetch_price_history(ticker, period="6mo")
+            auto_type = cr._classify_type_from_signals(ticker, current, hist)
+            cr.add_conviction(
+                ticker, price, shares, auto_type,
+                trailing_high = current if auto_type == "MOMENTUM" else None,
+                note          = "imported via /sync_portfolio",
+            )
+            convictions_created.append((ticker, auto_type))
+        except Exception as e:
+            conviction_errors.append((ticker, str(e)))
+
+    # Build reply
+    lines = ["💼 *Bulk-import resultado*"]
+    if imported:
+        lines.append(f"\n✅ *{len(imported)} posições importadas* (sem alteração de liquidez):")
+        for t, s, p in imported:
+            lines.append(f"  • *{t}*: {s:g} @ ${p:.2f}")
+    if already:
+        lines.append(f"\n♻️ *{len(already)} já no ledger* (saltadas):")
+        lines.append("  " + ", ".join(already))
+    if convictions_created:
+        lines.append(f"\n🧠 *{len(convictions_created)} convicções auto-criadas:*")
+        for t, tp in convictions_created:
+            lines.append(f"  • {t} → {tp}")
+    if conviction_errors:
+        lines.append(f"\n⚠️ *Convicção falhou para:*")
+        for t, e in conviction_errors:
+            lines.append(f"  • {t}: _{e}_")
+    if errors:
+        lines.append(f"\n❌ *Erros:*")
+        for e in errors:
+            lines.append(f"  • {e}")
+
+    lines += [
+        "",
+        "_Vê com `/portfolio` ou `/conviction list`._",
+        "_Faz `/conviction transition TICKER CORE` para os holds de longo prazo._",
+    ]
+    _reply("\n".join(lines))
 
 
 # ── /ml_accuracy ─────────────────────────────────────────────────────────────────

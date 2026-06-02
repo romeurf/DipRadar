@@ -2,15 +2,30 @@
 portfolio.py — Active portfolio and liquidity management.
 
 US-only scope: this module tracks ONLY US-listed individual stocks. ETFs and
-non-US exchange tickers (.DE/.L/.AS/...) are filtered out across all entry
-points (DIRECT_TICKERS, HOLDING_* env vars). European/ETF positions belong
-to Phase 2 (not yet implemented).
+non-US exchange tickers (.DE/.L/.AS/...) are filtered out at /buy entry.
+
+═══ Source of truth ═══
+
+Holdings are managed EXCLUSIVELY via Telegram commands. There is one ledger:
+  _cache["positions"]  ←  /buy, /sell, /sync_portfolio (bulk import),
+                          /conviction add (auto-buy)
+                          Persisted to _dipr_portfolio.json (Railway volume).
+
+DEPRECATED: HOLDING_* environment variables are no longer parsed at
+startup. If still set on Railway, they are silently ignored — use
+/sync_portfolio TICK:shares:price [TICK:shares:price ...] to bulk-import
+existing positions without affecting liquidity (one-time migration), or
+/buy individually for new positions.
+
+The module-level HOLDINGS list is kept for backward-import compatibility
+but is always empty. Callers should use get_holdings_tuples() which derives
+the same (ticker, shares, avg) shape from _cache["positions"].
 
 Backend dual:
   1. Google Sheets (primary) — if GOOGLE_SHEETS_CREDENTIALS and GOOGLE_SHEET_ID
      are set as Railway environment variables.
-  2. Local JSON file (fallback) — previous behaviour, guarantees the bot
-     starts even without Google Sheets configured.
+  2. Local JSON file (fallback) — guarantees the bot starts even without
+     Google Sheets configured.
 
 Google Sheets layout:
   "Liquidez"  → row 2, column A: float value
@@ -22,10 +37,8 @@ Write-through cache:
   Loaded into memory on first read. Writes always go to Sheets first, then
   update the cache. Reads use cache only (zero extra API calls).
 
-Environment variables on Railway:
-  HOLDING_<TICKER>=shares,avg_cost  — US ticker holdings (e.g. HOLDING_CRWD=10,180.50)
-                                       Non-US/ETF tickers are ignored with a warning.
-  PPR_SHARES, PPR_AVG_COST          — manual PPR tracking
+Environment variables on Railway (remaining):
+  PPR_SHARES, PPR_AVG_COST          — manual PPR tracking (separate ledger)
   FLIP_FUND_EUR=<float>             — Flip Fund capital
 """
 
@@ -159,12 +172,11 @@ def _parse_holdings_env() -> list[tuple[str, float, float]]:
     return result
 
 
-# Variáveis públicas exigidas pelo main.py
-# Override de /sync_portfolio tem precedência sobre env vars HOLDING_*
-_override_holdings = _load_override()
-HOLDINGS: list[tuple[str, float, float]] = _override_holdings if _override_holdings else _parse_holdings_env()
-if _override_holdings:
-    log.info(f"[portfolio] Override /sync_portfolio activo: {len(HOLDINGS)} posicoes")
+# Variáveis públicas exigidas pelo main.py.
+# HOLDINGS é DEPRECATED — kept empty for import-compat. Use get_holdings_tuples()
+# para obter as posições actuais (derivadas de _cache["positions"], i.e. /buy etc.).
+# A migração one-time de env vars HOLDING_* faz-se via /sync_portfolio TICK:shares:price.
+HOLDINGS: list[tuple[str, float, float]] = []
 PPR_SHARES   = _float_env("PPR_SHARES")
 PPR_AVG_COST = _float_env("PPR_AVG_COST")
 
@@ -381,6 +393,80 @@ def get_liquidity() -> float:
 def get_positions() -> dict:
     _ensure_cache()
     return dict(_cache["positions"])  # cópia defensiva
+
+
+def get_holdings_tuples() -> list[tuple[str, float, float]]:
+    """Return _cache["positions"] in (ticker, shares, avg_price) tuple shape.
+
+    Replacement for the deprecated module-level HOLDINGS variable. Callers
+    that iterate `for sym, shares, avg in HOLDINGS:` should switch to
+    `for sym, shares, avg in get_holdings_tuples():` so they pick up the
+    current Telegram-managed state instead of the empty deprecated list.
+    """
+    _ensure_cache()
+    out: list[tuple[str, float, float]] = []
+    for sym, pos in _cache["positions"].items():
+        try:
+            shares = float(pos.get("shares", 0) or 0)
+            avg    = float(pos.get("avg_price", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if shares <= 0:
+            continue
+        out.append((sym.upper().strip(), shares, avg))
+    return out
+
+
+def register_existing_position(
+    symbol:   str,
+    price:    float,
+    shares:   float,
+    category: str = "",
+    name:     str = "",
+) -> dict:
+    """Add a position you ALREADY OWN to the ledger WITHOUT touching liquidity.
+
+    Use case: bulk-import existing holdings via /sync_portfolio. The bot's
+    /buy command both records the position AND debits liquidity (because it
+    assumes you just made the purchase now). For migrating prior holdings
+    that you've owned for months/years, debiting liquidity would be wrong.
+
+    Idempotent: if symbol already exists in the ledger, returns
+    {"action": "exists"} without overwriting.
+    """
+    symbol = _TICKER_ALIASES.get(symbol.upper().strip(), symbol.upper().strip())
+    _ensure_cache()
+
+    positions = _cache["positions"]
+    if symbol in positions:
+        return {"action": "exists", "position": positions[symbol]}
+
+    cost = round(price * shares, 2)
+    if is_etf(symbol):
+        category = "ETF"
+
+    now_str = datetime.now().strftime("%d/%m/%Y")
+    now_iso = datetime.now().date().isoformat()
+    now_hm  = datetime.now().strftime("%d/%m %H:%M")
+
+    positions[symbol] = {
+        "symbol":              symbol,
+        "name":                name or symbol,
+        "shares":              round(shares, 6),
+        "avg_price":           round(price, 4),
+        "total_cost":          cost,
+        "category":            category or "Manual import",
+        "entry_score":         None,
+        "entry_date":          now_str,
+        "entry_date_iso":      now_iso,
+        "last_score":          None,
+        "last_price":          None,
+        "last_update":         now_hm,
+        "degradation_alerted": False,
+        "imported":            True,  # marker that this didn't go through /buy
+    }
+    _flush()
+    return {"action": "imported", "position": positions[symbol]}
 
 
 def get_position(symbol: str) -> dict | None:

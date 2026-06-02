@@ -42,7 +42,7 @@ from market_client import (
     get_macro_context,
 )
 from portfolio import (
-    HOLDINGS, PPR_SHARES, PPR_AVG_COST,
+    get_holdings_tuples, PPR_SHARES, PPR_AVG_COST,
     DIRECT_TICKERS, FLIP_FUND_EUR, suggest_position_size,
     get_positions, update_position_data,
     mark_degradation_alerted, reset_degradation_flag,
@@ -326,7 +326,7 @@ def _pnl_emoji(v: float) -> str:
 def _get_snapshot() -> dict:
     usd_eur = get_usdeur()
     return get_portfolio_snapshot(
-        HOLDINGS, PPR_SHARES, PPR_AVG_COST, usd_eur
+        get_holdings_tuples(), PPR_SHARES, PPR_AVG_COST, usd_eur
     )
 
 def send_heartbeat() -> None:
@@ -430,7 +430,7 @@ def send_heartbeat() -> None:
             lines += ["", "*🚨 Alertas de concentração:*"] + concentration_warnings
 
     earnings_alerts = []
-    for sym, shares, _ in HOLDINGS:
+    for sym, shares, _ in get_holdings_tuples():
         if not shares:
             continue
         # FIX Bug 1: ETFs não têm earnings — evita 404 no yfinance (ex: EUNL.DE)
@@ -1395,7 +1395,7 @@ def _get_portfolio_correlation(new_ticker: str, lookback_days: int = 90) -> floa
     Retorna 0.0 se não houver posições ou dados insuficientes.
     """
     try:
-        positions = [sym for sym, _, _ in HOLDINGS if sym not in {"EUNL.DE", "PPR"}]
+        positions = [sym for sym, _, _ in get_holdings_tuples() if sym not in {"EUNL.DE", "PPR"}]
         if not positions:
             return 0.0
         import yfinance as yf
