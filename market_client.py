@@ -553,7 +553,7 @@ def get_earnings_date(symbol: str) -> str | None:
     return dt.strftime("%d/%m/%Y")
 
 
-def get_portfolio_snapshot(holdings, ppr_shares, ppr_avg_cost, usd_eur):
+def get_portfolio_snapshot(holdings, ppr_shares, ppr_avg_cost, usd_eur, etfs=None):
     """
     Calcula o snapshot actual da carteira.
 
@@ -682,6 +682,56 @@ def get_portfolio_snapshot(holdings, ppr_shares, ppr_avg_cost, usd_eur):
     total_eur  += ppr_value_eur
     total_cost += ppr_cost
 
+    # ── ETFs passivos (state-managed via /etf) ───────────────────────────────
+    # Live prices via yfinance when available; falls back to avg_cost if the
+    # ticker doesn't resolve (e.g., typo or delisted). EUR-listed ETFs
+    # (Xetra .DE, London .L) return price in EUR — no fx conversion needed.
+    # USD-listed are converted via usd_eur. Currency inference: assume EUR
+    # unless ticker has no dot suffix and is in known USD universe — for
+    # ETFs the user manages this list themselves, we keep it simple.
+    etf_value_eur = 0.0
+    etf_cost_eur  = 0.0
+    etfs_snapshot: list[dict] = []
+    if etfs:
+        for etf_ticker, pos in etfs.items():
+            try:
+                shares   = float(pos.get("shares", 0) or 0)
+                avg_cost = float(pos.get("avg_cost", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if shares <= 0:
+                continue
+            # Live price attempt
+            live_price = None
+            try:
+                time.sleep(1)
+                _info = yf.Ticker(etf_ticker).fast_info
+                live_price = getattr(_info, "last_price", None)
+                if live_price is not None:
+                    live_price = float(live_price)
+            except Exception as _ep:
+                logging.debug(f"ETF live price {etf_ticker}: {_ep}")
+            # Currency: Xetra/LSE/etc. assumed EUR (price is in listing currency).
+            # If the user enters a USD-listed ETF without a dot suffix, we apply
+            # usd_eur. Heuristic: dot in ticker → assume EUR; no dot → assume USD.
+            fx_etf = 1.0 if "." in etf_ticker else usd_eur
+            price_used = live_price if (live_price and live_price > 0) else avg_cost
+            value_eur  = shares * price_used * fx_etf
+            cost_eur   = shares * avg_cost   * fx_etf
+            etf_value_eur += value_eur
+            etf_cost_eur  += cost_eur
+            etfs_snapshot.append({
+                "ticker":     etf_ticker,
+                "shares":     shares,
+                "avg_cost":   avg_cost,
+                "live_price": round(live_price, 4) if live_price else None,
+                "value_eur":  round(value_eur, 2),
+                "pnl_total":  round(value_eur - cost_eur, 2),
+                "stale":      live_price is None,
+            })
+    total_eur  += etf_value_eur
+    total_cost += etf_cost_eur
+
     # ── Agregação P&L ────────────────────────────────────────────────────────
     agg_day   = sum(p["pnl_day"]   for p in positions if p["pnl_day"]   is not None)
     agg_week  = sum(p["pnl_week"]  for p in positions if p["pnl_week"]  is not None)
@@ -711,6 +761,8 @@ def get_portfolio_snapshot(holdings, ppr_shares, ppr_avg_cost, usd_eur):
         "cost_complete":  cost_complete,   # False = pnl_total pode estar subestimado
         "positions":      positions,
         "ppr_value":      round(ppr_value_eur, 2),
+        "etfs":           etfs_snapshot,    # list[dict] with live prices when available
+        "etf_total":      round(etf_value_eur, 2),
         "usd_eur":        usd_eur,
     }
 

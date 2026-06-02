@@ -163,6 +163,74 @@ def clear_ppr() -> None:
     _save_json(_PPR_FILE, {"shares": 0.0, "avg_cost": 0.0, "updated": _today_iso()})
 
 
+# ── ETFs (passive holdings, snapshot-only) ─────────────────────────────────
+# Same pattern as PPR: Telegram-managed, no env vars, no contamination of
+# the active scan / conviction / ML pipeline. For European-listed ETFs
+# (Xetra, LSE) that the user holds but doesn't actively trade — they should
+# show up in the aggregate snapshot value but never trigger alerts.
+
+_ETFS_FILE = "etfs.json"
+
+
+def get_etfs() -> dict:
+    """Return {ticker: {shares, avg_cost}} dict. Empty if none configured."""
+    data = _load_json(_ETFS_FILE, default={}) or {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict = {}
+    for tkr, pos in data.items():
+        if not isinstance(pos, dict):
+            continue
+        try:
+            shares   = float(pos.get("shares", 0) or 0)
+            avg_cost = float(pos.get("avg_cost", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if shares <= 0:
+            continue
+        out[str(tkr).upper().strip()] = {
+            "shares":   shares,
+            "avg_cost": avg_cost,
+            "updated":  pos.get("updated", ""),
+        }
+    return out
+
+
+def set_etf(ticker: str, shares: float, avg_cost: float) -> dict:
+    """Upsert one ETF. Use shares=0 to remove via the same code path."""
+    data = _load_json(_ETFS_FILE, default={}) or {}
+    if not isinstance(data, dict):
+        data = {}
+    key = ticker.upper().strip()
+    if shares <= 0:
+        data.pop(key, None)
+    else:
+        data[key] = {
+            "shares":   float(shares),
+            "avg_cost": float(avg_cost),
+            "updated":  _today_iso(),
+        }
+    _save_json(_ETFS_FILE, data)
+    return get_etfs()
+
+
+def remove_etf(ticker: str) -> bool:
+    """Remove one ETF. Returns True if removed."""
+    data = _load_json(_ETFS_FILE, default={}) or {}
+    if not isinstance(data, dict):
+        return False
+    key = ticker.upper().strip()
+    if key not in data:
+        return False
+    data.pop(key)
+    _save_json(_ETFS_FILE, data)
+    return True
+
+
+def clear_etfs() -> None:
+    _save_json(_ETFS_FILE, {})
+
+
 def load_daily_flip_spent() -> dict:
     """Return {YYYY-MM-DD: amount_eur} for today + recent prior days."""
     return _load_json("daily_flip_spent.json", default={}) or {}

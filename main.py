@@ -337,12 +337,14 @@ def _pnl_emoji(v: float) -> str:
 
 def _get_snapshot() -> dict:
     usd_eur = get_usdeur()
-    # PPR is Telegram-managed via /ppr — refresh each call so /ppr set
-    # changes take effect immediately, no restart needed.
+    # PPR + ETFs are Telegram-managed (state-backed) — refresh each call
+    # so /ppr set / /etf set changes take effect immediately, no restart.
     from portfolio import _get_ppr_values
+    from state import get_etfs
     ppr_shares, ppr_avg_cost = _get_ppr_values()
+    etfs = get_etfs()
     return get_portfolio_snapshot(
-        get_holdings_tuples(), ppr_shares, ppr_avg_cost, usd_eur
+        get_holdings_tuples(), ppr_shares, ppr_avg_cost, usd_eur, etfs=etfs
     )
 
 def send_heartbeat() -> None:

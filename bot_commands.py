@@ -4632,6 +4632,147 @@ def _handle_ppr(parts: list[str]) -> None:
     _reply(f"⚠️ Sub-comando `{sub}` desconhecido. Usa: `show`, `set`, `clear`.")
 
 
+# ── /etf handler ─────────────────────────────────────────────────────────────────
+#
+# Passive ETF tracker. Same pattern as /ppr — Telegram-managed state, lives
+# outside the active scan / conviction / ML pipeline. Live prices fetched
+# via yfinance when ticker resolves (use exchange suffix: SXR8.DE, IS3N.DE,
+# CSPX.L, etc.), falls back to avg_cost if the ticker doesn't resolve.
+
+def _handle_etf(parts: list[str]) -> None:
+    from state import get_etfs, set_etf, remove_etf, clear_etfs
+    import yfinance as _yf
+
+    sub = parts[1].lower() if len(parts) > 1 else "show"
+
+    if sub in ("show", "list", ""):
+        etfs = get_etfs()
+        if not etfs:
+            _reply(
+                "📊 *ETFs* — nenhum configurado.\n\n"
+                "Para adicionar (com sufixo do mercado: `.DE` Xetra, `.L` Londres):\n"
+                "  `/etf set SXR8.DE 5 450.50`\n"
+                "  `/etf set IS3N.DE 10 32.40`\n\n"
+                "_Tickers sem ponto assumem USD (NYSE/Nasdaq)._"
+            )
+            return
+        lines = [f"📊 *ETFs* ({len(etfs)} posições)"]
+        total_value = 0.0
+        total_cost  = 0.0
+        for tkr in sorted(etfs.keys()):
+            pos = etfs[tkr]
+            shares = pos["shares"]
+            avg    = pos["avg_cost"]
+            # Live price attempt
+            live = None
+            try:
+                _info = _yf.Ticker(tkr).fast_info
+                _p = getattr(_info, "last_price", None)
+                if _p and float(_p) > 0:
+                    live = float(_p)
+            except Exception:
+                pass
+            cost   = shares * avg
+            if live:
+                value = shares * live
+                pnl   = value - cost
+                pnl_pct = (live / avg - 1) * 100 if avg > 0 else 0
+                arrow = "📈" if pnl >= 0 else "📉"
+                lines.append(
+                    f"  {arrow} *{tkr}* | {shares:g} @ €{avg:.2f} → €{live:.2f}"
+                    f"  ({pnl:+,.2f} / {pnl_pct:+.1f}%)"
+                )
+                total_value += value
+            else:
+                value = cost  # fallback
+                lines.append(
+                    f"  ⚪ *{tkr}* | {shares:g} @ €{avg:.2f} _(sem live price)_"
+                    f"  €{value:,.2f}"
+                )
+                total_value += value
+            total_cost += cost
+        total_pnl = total_value - total_cost
+        pnl_pct_total = (total_value / total_cost - 1) * 100 if total_cost > 0 else 0
+        lines += [
+            "",
+            f"💼 *Total ETFs:* €{total_value:,.2f}",
+            f"   Custo: €{total_cost:,.2f} | P&L: €{total_pnl:+,.2f} ({pnl_pct_total:+.1f}%)",
+            "",
+            "_Adicionar: `/etf set TICKER SHARES PREÇO`_",
+            "_Remover:   `/etf remove TICKER`_",
+        ]
+        _reply("\n".join(lines))
+        return
+
+    if sub == "set":
+        if len(parts) < 5:
+            _reply(
+                "⚠️ Uso: `/etf set TICKER SHARES PREÇO_MÉDIO`\n"
+                "_Exemplo: `/etf set SXR8.DE 5 450.50`_\n"
+                "_Usa o sufixo do mercado (.DE Xetra, .L Londres) para live prices._"
+            )
+            return
+        ticker = parts[2].upper().strip()
+        try:
+            shares = float(parts[3])
+            avg    = float(parts[4])
+        except ValueError:
+            _reply("⚠️ Shares e preço têm de ser números.")
+            return
+        if shares < 0 or avg < 0:
+            _reply("⚠️ Shares e preço não podem ser negativos.")
+            return
+        # Sanity check
+        cost = shares * avg
+        if cost > 500_000:
+            _reply(
+                f"⚠️ *Valor suspeito:* {shares} × €{avg:.2f} = *€{cost:,.2f}*\n"
+                f"_Mais de €500k num único ETF — confirma os valores._"
+            )
+            return
+        # Try live price for confirmation
+        live_str = ""
+        try:
+            _info = _yf.Ticker(ticker).fast_info
+            _p = getattr(_info, "last_price", None)
+            if _p and float(_p) > 0:
+                live_val = shares * float(_p)
+                live_str = f"\n  📡 Preço actual: €{float(_p):.2f} → valor live: *€{live_val:,.2f}*"
+            else:
+                live_str = f"\n  ⚠️ _yfinance sem dados para `{ticker}` — vai usar custo médio no snapshot._"
+        except Exception:
+            live_str = f"\n  ⚠️ _yfinance falhou para `{ticker}` — usa fallback custo médio._"
+
+        set_etf(ticker, shares, avg)
+        _reply(
+            f"✅ *ETF actualizado — {ticker}*\n\n"
+            f"  Unidades: *{shares:g}*\n"
+            f"  Custo médio: *€{avg:.4f}*\n"
+            f"  Custo total: *€{cost:,.2f}*"
+            f"{live_str}\n\n"
+            f"_Vê todos: `/etf`_"
+        )
+        return
+
+    if sub == "remove":
+        if len(parts) < 3:
+            _reply("⚠️ Uso: `/etf remove TICKER`")
+            return
+        ticker = parts[2].upper().strip()
+        if remove_etf(ticker):
+            _reply(f"🗑️ *{ticker}* removida do tracker de ETFs.")
+        else:
+            _reply(f"⚠️ *{ticker}* não está no tracker.")
+        return
+
+    if sub == "clear":
+        clear_etfs()
+        _reply("✅ *Tracker de ETFs limpo.* Snapshot já não os inclui.")
+        return
+
+    _reply(f"⚠️ Sub-comando `{sub}` desconhecido. Usa: `show`, `set`, `remove`, `clear`.")
+
+
 # ── /liquidez handler ─────────────────────────────────────────────────────────────
 
 def _handle_liquidez(parts: list[str]) -> None:
@@ -5377,6 +5518,10 @@ def _handle_command(text: str) -> None:
     elif cmd == "/ppr":
         if not _check_rate(cmd_key): return
         _handle_ppr(parts)
+
+    elif cmd == "/etf":
+        if not _check_rate(cmd_key): return
+        _handle_etf(parts)
 
     elif cmd == "/liquidez":
         if not _check_rate(cmd_key): return
