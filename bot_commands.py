@@ -4711,12 +4711,95 @@ def _handle_ppr(parts: list[str]) -> None:
         )
         return
 
+    if sub == "scrape":
+        # /ppr scrape — auto-fetch NAV from investing.com using stored ISIN
+        from state import set_ppr_nav
+        existing = get_ppr()
+        if not existing or existing.get("shares", 0) <= 0:
+            _reply("⚠️ Define primeiro o custo base com `/ppr set SHARES PREÇO_MÉDIO`.")
+            return
+        isin = existing.get("isin", "PTARMJHM0003")
+        _reply(f"_🔍 A consultar cotação de `{isin}` no investing.com..._")
+        try:
+            import ppr_scraper
+            result = ppr_scraper.fetch_ppr_nav(isin)
+        except Exception as e:
+            _reply(f"❌ Erro no scraper: `{e}`")
+            return
+        if not result or not result.get("nav"):
+            _reply(
+                f"⚠️ Não foi possível obter NAV de `{isin}` via investing.com.\n\n"
+                f"_Causa provável: alteração na estrutura da página ou rate limit._\n"
+                f"_Faz `/ppr nav <valor>` manual com a cotação do banco._"
+            )
+            return
+        nav = result["nav"]
+        avg = existing.get("avg_cost", 0)
+        if avg > 0 and (nav > avg * 10 or nav < avg / 10):
+            _reply(
+                f"⚠️ Cotação obtida (€{nav:.4f}) suspeita vs preço médio "
+                f"(€{avg:.4f}). Não aplicada. Verifica manualmente."
+            )
+            return
+        set_ppr_nav(nav, source=result.get("source", "investing.com"))
+
+        shares = existing.get("shares", 0)
+        cost   = shares * avg
+        value  = shares * nav
+        pnl    = value - cost
+        pnl_pct = (nav / avg - 1) * 100 if avg > 0 else 0
+        arrow = "📈" if pnl >= 0 else "📉"
+        extras = []
+        if result.get("change_pct") is not None:
+            extras.append(f"variação dia: {result['change_pct']:+.2f}%")
+        if result.get("status"):
+            extras.append(result["status"])
+        extras_str = " | ".join(extras) if extras else ""
+        _reply(
+            f"✅ *NAV actualizada via scraper*\n\n"
+            f"  ISIN: `{isin}`\n"
+            f"  NAV: *€{nav:.4f}*\n"
+            f"  Fonte: _{result.get('source', 'investing.com')}_"
+            + (f"\n  Estado: _{extras_str}_" if extras_str else "")
+            + f"\n\n"
+            f"  Valor actual: *€{value:,.2f}*\n"
+            f"  {arrow} P&L: *€{pnl:+,.2f}* ({pnl_pct:+.2f}%)\n\n"
+            f"_Auto-scrape diário 22h30 Lisboa._"
+        )
+        return
+
+    if sub == "isin":
+        # /ppr isin <NEW_ISIN> — change which fund the scraper targets
+        from state import set_ppr_isin
+        if len(parts) < 3:
+            existing = get_ppr()
+            cur_isin = existing.get("isin", "PTARMJHM0003")
+            _reply(
+                f"💰 *PPR ISIN actual:* `{cur_isin}`\n\n"
+                f"_Para alterar (caso tenhas outro PPR):_\n"
+                f"  `/ppr isin NOVO_ISIN`\n\n"
+                f"_Exemplo: `/ppr isin PTBPPHM0008`_\n"
+                f"_Confirma no investing.com que o fundo aparece em "
+                f"pt.investing.com/funds/<ISIN_minusculo>_"
+            )
+            return
+        new_isin = parts[2].upper().strip()
+        if len(new_isin) != 12:
+            _reply(f"⚠️ ISIN inválido (deve ter 12 caracteres): `{new_isin}`")
+            return
+        set_ppr_isin(new_isin)
+        _reply(
+            f"✅ ISIN actualizado: `{new_isin}`\n"
+            f"_Próximo `/ppr scrape` vai usar este ISIN._"
+        )
+        return
+
     if sub == "clear":
         clear_ppr()
         _reply("✅ *PPR limpa.* Snapshot da carteira já não a inclui.")
         return
 
-    _reply(f"⚠️ Sub-comando `{sub}` desconhecido. Usa: `show`, `set`, `nav`, `clear`.")
+    _reply(f"⚠️ Sub-comando `{sub}` desconhecido. Usa: `show`, `set`, `nav`, `scrape`, `isin`, `clear`.")
 
 
 # ── /etf handler ─────────────────────────────────────────────────────────────────

@@ -2703,6 +2703,39 @@ def main() -> None:
         id="conviction_monitor", name="Conviction Monitor 22h05",
     )
 
+    # ── PPR auto-scrape: 22:30 Lisboa, seg-sex ────────────────────────────────
+    # Fetches the day's NAV from investing.com after market close. Silent on
+    # failure (snapshot keeps the last successful NAV). No notification on
+    # success either — too chatty for a daily background refresh.
+    def _run_ppr_auto_scrape():
+        try:
+            from state import get_ppr, set_ppr_nav
+            import ppr_scraper
+            existing = get_ppr()
+            if not existing or existing.get("shares", 0) <= 0:
+                return  # no PPR configured — skip
+            isin = existing.get("isin", "PTARMJHM0003")
+            result = ppr_scraper.fetch_ppr_nav(isin)
+            if not result or not result.get("nav"):
+                logging.warning(f"[ppr] auto-scrape failed for {isin} (no nav)")
+                return
+            nav = result["nav"]
+            avg = existing.get("avg_cost", 0)
+            if avg > 0 and (nav > avg * 10 or nav < avg / 10):
+                logging.warning(
+                    f"[ppr] auto-scrape: NAV {nav} suspicious vs avg {avg} — skipped"
+                )
+                return
+            set_ppr_nav(nav, source=result.get("source", "investing.com"))
+            logging.info(f"[ppr] auto-scraped NAV: €{nav:.4f} ({isin})")
+        except Exception as e:
+            logging.error(f"[ppr] auto-scrape exception: {e}", exc_info=True)
+    scheduler.add_job(
+        _run_ppr_auto_scrape,
+        CronTrigger(day_of_week="mon-fri", hour=22, minute=30, timezone=LISBON_TZ),
+        id="ppr_auto_scrape", name="PPR Auto-Scrape 22h30",
+    )
+
     # ── Conviction auto-sync: 06:00 Lisboa, mon-sun ───────────────────────────
     # Walks portfolio.get_positions() and creates conviction records for any
     # holding not yet tracked AND not in deny-list (ETFs, foreign-listed, PPR).

@@ -137,14 +137,19 @@ def _today_iso() -> str:
 _PPR_FILE = "ppr.json"
 
 
+_DEFAULT_PPR_ISIN = "PTARMJHM0003"  # Invest Tendências Globais PPR (Banco Invest)
+
+
 def get_ppr() -> dict:
-    """Return {shares, avg_cost, current_nav, nav_updated}.
+    """Return {shares, avg_cost, current_nav, nav_updated, isin, nav_source}.
 
     current_nav: optional manually-updated NAV per unit (€). When set,
     the snapshot uses it to compute live value + P&L. When None, value
     falls back to shares × avg_cost (frozen at cost basis, no P&L).
 
     nav_updated: ISO date of last NAV update (helps user see staleness).
+    isin: which PPR fund (default PTARMJHM0003); used by the scraper.
+    nav_source: "manual" or "investing.com" or fallback identifier.
     """
     data = _load_json(_PPR_FILE, default={}) or {}
     if not isinstance(data, dict):
@@ -155,6 +160,8 @@ def get_ppr() -> dict:
         "current_nav": float(data.get("current_nav", 0) or 0) or None,
         "nav_updated": data.get("nav_updated") or None,
         "updated":     data.get("updated") or None,
+        "isin":        (data.get("isin") or _DEFAULT_PPR_ISIN).upper().strip(),
+        "nav_source":  data.get("nav_source") or None,
     }
 
 
@@ -173,9 +180,13 @@ def set_ppr(shares: float, avg_cost: float) -> dict:
     return payload
 
 
-def set_ppr_nav(current_nav: float) -> dict:
-    """Update just the NAV (price per unit). For manual updates from broker
-    statements — PPRs don't have a yfinance/CMVM live-price source."""
+def set_ppr_nav(current_nav: float, source: str = "manual") -> dict:
+    """Update just the NAV (price per unit).
+
+    source: "manual" (default, /ppr nav), "investing.com" (scraper auto-update),
+            or any other identifier the caller wants to record. Used by the
+            display to show provenance ("Cotação obtida de investing.com").
+    """
     existing = get_ppr()
     payload = {
         "shares":      existing.get("shares", 0.0),
@@ -183,7 +194,20 @@ def set_ppr_nav(current_nav: float) -> dict:
         "current_nav": float(current_nav),
         "nav_updated": _today_iso(),
         "updated":     existing.get("updated") or _today_iso(),
+        "isin":        existing.get("isin") or _DEFAULT_PPR_ISIN,
+        "nav_source":  source,
     }
+    _save_json(_PPR_FILE, payload)
+    return payload
+
+
+def set_ppr_isin(isin: str) -> dict:
+    """Change the PPR ISIN (which fund the scraper queries). Preserves all
+    other PPR state."""
+    existing = get_ppr()
+    payload = dict(existing)
+    payload["isin"]    = isin.upper().strip()
+    payload["updated"] = _today_iso()
     _save_json(_PPR_FILE, payload)
     return payload
 
