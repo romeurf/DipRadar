@@ -973,16 +973,27 @@ def render_list() -> str:
         return "_Sem convicções activas. Usa `/conviction add TICKER PREÇO SHARES TIPO`._"
 
     out = ["🧠 *Convicções activas*", ""]
+    n_core = n_lock = 0
     for p in sorted(positions, key=lambda x: x.entry_date):
         cur = _fetch_price(p.ticker, fallback=p.entry_price)
         pnl_pct = (cur / p.entry_price - 1.0) * 100.0
         emoji   = "📈" if pnl_pct >= 0 else "📉"
         sign    = "+" if pnl_pct >= 0 else ""
+        lock_badge = " 🔒" if p.never_sell else ""
+        if p.position_type == "CORE":
+            n_core += 1
+        if p.never_sell:
+            n_lock += 1
         out.append(
-            f"  {emoji} *{p.ticker}* ({p.position_type}) | {p.shares:g}x @ ${p.entry_price:.2f} → ${cur:.2f}"
+            f"  {emoji} *{p.ticker}* ({p.position_type}){lock_badge} | "
+            f"{p.shares:g}x @ ${p.entry_price:.2f} → ${cur:.2f}"
             f"  {sign}{pnl_pct:.1f}% | dia {p.days_held}"
         )
-    out += ["", "_Detalhe: `/conviction TICKER`_"]
+    out += [
+        "",
+        f"_{len(positions)} posições | {n_core} CORE | {n_lock} 🔒 never_sell_",
+        "_Detalhe: `/conviction TICKER` | Lock: `/conviction lock TICKER`_",
+    ]
     return "\n".join(out)
 
 
