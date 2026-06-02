@@ -105,6 +105,18 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s"
 )
 
+# Suppress known-harmless yfinance deprecation noise. Ticker.earnings has
+# been deprecated for years but several internal yfinance scrapers still
+# call it — every alert/scan/conviction-eval emits the warning. Filtering
+# at module level keeps logs readable. Re-enable per-call if needed via
+# warnings.catch_warnings().
+import warnings as _w
+_w.filterwarnings(
+    "ignore",
+    message=".*Ticker\\.earnings.*deprecated.*",
+    category=DeprecationWarning,
+)
+
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
 DROP_THRESHOLD    = float(os.environ.get("DROP_THRESHOLD", "8"))

@@ -835,24 +835,71 @@ def alphavantage_earnings_revision(ticker: str) -> float:
 
 # ── Camada 5: Financial Modeling Prep ─────────────────────────────────────────
 
+# FMP circuit breaker: after N consecutive auth-style failures (401/403),
+# disable FMP for the rest of the session. The free tier blocks some
+# endpoints, and once that happens it never recovers within a session —
+# retrying just spams logs and wastes latency.
+_FMP_CONSECUTIVE_FAILS = 0
+_FMP_DISABLED          = False
+_FMP_FAIL_THRESHOLD    = 3
+
+
+def _fmp_circuit_check() -> bool:
+    """Return True if FMP is still allowed to be called."""
+    return not _FMP_DISABLED
+
+
+def _fmp_circuit_record(success: bool, status_code: Optional[int] = None) -> None:
+    """Update the circuit breaker. Auth-style failures (401/403) trip it after
+    _FMP_FAIL_THRESHOLD consecutive occurrences."""
+    global _FMP_CONSECUTIVE_FAILS, _FMP_DISABLED
+    if success:
+        _FMP_CONSECUTIVE_FAILS = 0
+        return
+    # Only count auth/permission errors towards the trip — transient network
+    # errors shouldn't permanently disable FMP.
+    if status_code in (401, 403):
+        _FMP_CONSECUTIVE_FAILS += 1
+        if _FMP_CONSECUTIVE_FAILS >= _FMP_FAIL_THRESHOLD and not _FMP_DISABLED:
+            _FMP_DISABLED = True
+            log.warning(
+                f"[signals] FMP desactivado para a sessão após "
+                f"{_FMP_FAIL_THRESHOLD} falhas {status_code} consecutivas. "
+                f"Free tier não tem permissão para este endpoint, ou key expirada. "
+                f"Restantes chamadas devolvem NaN sem fazer pedido HTTP."
+            )
+
+
 def fmp_analyst_revision_trend(ticker: str, n_recent: int = 10) -> float:
     """Tendência de revisões de analistas via FMP API.
 
     Retorna [-1, +1]: +1 = só upgrades, -1 = só downgrades.
     Raises ValueError se FMP_API_KEY não está definida.
+    Devolve NaN silenciosamente se o circuit breaker desactivou FMP.
     """
     if not _FMP_KEY:
         raise ValueError(
             "FMP_API_KEY não definida. "
             "Cria a env var no Railway com a tua chave gratuita de financialmodelingprep.com"
         )
+    if not _fmp_circuit_check():
+        return NaN
     import requests
-    r = requests.get(
-        f"https://financialmodelingprep.com/api/v3/analyst-stock-recommendations/{ticker}",
-        params={"limit": n_recent, "apikey": _FMP_KEY},
-        timeout=15,
-    )
-    r.raise_for_status()
+    try:
+        r = requests.get(
+            f"https://financialmodelingprep.com/api/v3/analyst-stock-recommendations/{ticker}",
+            params={"limit": n_recent, "apikey": _FMP_KEY},
+            timeout=15,
+        )
+        if r.status_code in (401, 403):
+            _fmp_circuit_record(success=False, status_code=r.status_code)
+            return NaN
+        r.raise_for_status()
+        _fmp_circuit_record(success=True)
+    except requests.RequestException as e:
+        sc = getattr(e.response, "status_code", None) if hasattr(e, "response") else None
+        _fmp_circuit_record(success=False, status_code=sc)
+        raise
     data = r.json()
 
     if not data or not isinstance(data, list):
@@ -987,11 +1034,16 @@ def compute_fundamental_signals(
             result["earnings_revision_av"] = NaN
 
     # Camada 5: FMP
-    if use_fmp:
+    if use_fmp and _fmp_circuit_check():
         try:
             result["analyst_revision_fmp"] = fmp_analyst_revision_trend(ticker)
         except Exception as e:
-            log.error(f"[signals] fmp {ticker}: {e}")
+            # Downgraded ERROR → DEBUG: the circuit breaker already issues
+            # one WARNING when it trips, so per-ticker spam is pointless.
+            log.debug(f"[signals] fmp {ticker}: {e}")
             result["analyst_revision_fmp"] = NaN
+    elif use_fmp:
+        # Circuit open — silent NaN, no HTTP call.
+        result["analyst_revision_fmp"] = NaN
 
     return result
