@@ -4556,6 +4556,82 @@ def _handle_conviction(parts: list[str]) -> None:
         _reply(f"❌ Erro no deep-dive de {ticker}: `{e}`")
 
 
+# ── /ppr handler ─────────────────────────────────────────────────────────────────
+#
+# PPR (Plano Poupança Reforma) — Telegram-managed, replaces the deprecated
+# PPR_SHARES / PPR_AVG_COST env vars which caused a €19B snapshot bug when
+# set wrong. State lives in /data/ppr.json (state.get_ppr / set_ppr).
+
+def _handle_ppr(parts: list[str]) -> None:
+    from state import get_ppr, set_ppr, clear_ppr
+
+    sub = parts[1].lower() if len(parts) > 1 else "show"
+
+    if sub in ("show", ""):
+        s = get_ppr()
+        shares = s.get("shares", 0)
+        avg    = s.get("avg_cost", 0)
+        if shares <= 0 or avg <= 0:
+            _reply(
+                "💰 *PPR* — sem valores configurados.\n\n"
+                "Para definir:\n"
+                "  `/ppr set SHARES PREÇO_MÉDIO`\n\n"
+                "_Exemplo: `/ppr set 100 50.25` → 100 unidades a €50.25 = €5,025 total_\n"
+                "_Para limpar: `/ppr clear`_"
+            )
+            return
+        value = shares * avg
+        _reply(
+            f"💰 *PPR* — configurado\n\n"
+            f"  Unidades: *{shares:g}*\n"
+            f"  Preço médio: *€{avg:.4f}*\n"
+            f"  Valor estimado: *€{value:,.2f}*\n\n"
+            f"_Actualizar: `/ppr set SHARES PREÇO`_\n"
+            f"_Limpar:    `/ppr clear`_"
+        )
+        return
+
+    if sub == "set":
+        if len(parts) < 4:
+            _reply("⚠️ Uso: `/ppr set SHARES PREÇO_MÉDIO`\n_Exemplo: `/ppr set 100 50.25`_")
+            return
+        try:
+            shares = float(parts[2])
+            avg    = float(parts[3])
+        except ValueError:
+            _reply("⚠️ Shares e preço têm de ser números.")
+            return
+        if shares < 0 or avg < 0:
+            _reply("⚠️ Shares e preço não podem ser negativos.")
+            return
+        # Sanity check: if value > €1M, almost certainly a typo
+        value = shares * avg
+        if value > 1_000_000:
+            _reply(
+                f"⚠️ *Valor suspeito:* {shares} × €{avg:.4f} = *€{value:,.2f}*\n\n"
+                f"_Mais de €1M — provável typo. Se for mesmo este valor, "
+                f"corre o comando outra vez com `--force` no fim:_\n"
+                f"  `/ppr set {parts[2]} {parts[3]} --force`"
+            )
+            return
+        set_ppr(shares, avg)
+        _reply(
+            f"✅ *PPR actualizada*\n\n"
+            f"  Unidades: *{shares:g}*\n"
+            f"  Preço médio: *€{avg:.4f}*\n"
+            f"  Valor estimado: *€{value:,.2f}*\n\n"
+            f"_Verifica com `/portfolio` ou `/carteira`._"
+        )
+        return
+
+    if sub == "clear":
+        clear_ppr()
+        _reply("✅ *PPR limpa.* Snapshot da carteira já não a inclui.")
+        return
+
+    _reply(f"⚠️ Sub-comando `{sub}` desconhecido. Usa: `show`, `set`, `clear`.")
+
+
 # ── /liquidez handler ─────────────────────────────────────────────────────────────
 
 def _handle_liquidez(parts: list[str]) -> None:
@@ -5297,6 +5373,10 @@ def _handle_command(text: str) -> None:
     elif cmd == "/conviction":
         if not _check_rate(cmd_key): return
         _handle_conviction(parts)
+
+    elif cmd == "/ppr":
+        if not _check_rate(cmd_key): return
+        _handle_ppr(parts)
 
     elif cmd == "/liquidez":
         if not _check_rate(cmd_key): return

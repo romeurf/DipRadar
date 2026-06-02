@@ -337,8 +337,12 @@ def _pnl_emoji(v: float) -> str:
 
 def _get_snapshot() -> dict:
     usd_eur = get_usdeur()
+    # PPR is Telegram-managed via /ppr — refresh each call so /ppr set
+    # changes take effect immediately, no restart needed.
+    from portfolio import _get_ppr_values
+    ppr_shares, ppr_avg_cost = _get_ppr_values()
     return get_portfolio_snapshot(
-        get_holdings_tuples(), PPR_SHARES, PPR_AVG_COST, usd_eur
+        get_holdings_tuples(), ppr_shares, ppr_avg_cost, usd_eur
     )
 
 def send_heartbeat() -> None:

@@ -129,6 +129,40 @@ def _today_iso() -> str:
     return date.today().isoformat()
 
 
+# ── PPR (Plano Poupança Reforma) — Telegram-managed ────────────────────────
+# Migrated from PPR_SHARES / PPR_AVG_COST env vars (which caused a €19B
+# bug when set with wrong values and were never wired into /sync_portfolio).
+# Single source of truth: /data/ppr.json, mutated via /ppr set|clear.
+
+_PPR_FILE = "ppr.json"
+
+
+def get_ppr() -> dict:
+    """Return {shares: float, avg_cost: float}. Empty dict if not set."""
+    data = _load_json(_PPR_FILE, default={}) or {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        "shares":   float(data.get("shares", 0) or 0),
+        "avg_cost": float(data.get("avg_cost", 0) or 0),
+    }
+
+
+def set_ppr(shares: float, avg_cost: float) -> dict:
+    """Overwrite PPR holdings. Use 0 for both to effectively clear."""
+    payload = {
+        "shares":   float(shares),
+        "avg_cost": float(avg_cost),
+        "updated":  _today_iso(),
+    }
+    _save_json(_PPR_FILE, payload)
+    return payload
+
+
+def clear_ppr() -> None:
+    _save_json(_PPR_FILE, {"shares": 0.0, "avg_cost": 0.0, "updated": _today_iso()})
+
+
 def load_daily_flip_spent() -> dict:
     """Return {YYYY-MM-DD: amount_eur} for today + recent prior days."""
     return _load_json("daily_flip_spent.json", default={}) or {}

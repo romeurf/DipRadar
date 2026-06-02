@@ -177,8 +177,28 @@ def _parse_holdings_env() -> list[tuple[str, float, float]]:
 # para obter as posições actuais (derivadas de _cache["positions"], i.e. /buy etc.).
 # A migração one-time de env vars HOLDING_* faz-se via /sync_portfolio TICK:shares:price.
 HOLDINGS: list[tuple[str, float, float]] = []
-PPR_SHARES   = _float_env("PPR_SHARES")
-PPR_AVG_COST = _float_env("PPR_AVG_COST")
+
+# PPR — DEPRECATED env vars (PPR_SHARES / PPR_AVG_COST), kept as fallback
+# only. Authoritative source is state.get_ppr() — set via /ppr command.
+# Reason: env vars caused a €19B portfolio-snapshot bug when set with the
+# wrong number of zeros. Telegram-managed state is verifiable + correctable.
+def _get_ppr_values() -> tuple[float, float]:
+    """Returns (shares, avg_cost) from state (preferred) or env vars (fallback)."""
+    try:
+        from state import get_ppr
+        s = get_ppr()
+        if s and (s.get("shares") or s.get("avg_cost")):
+            return float(s["shares"]), float(s["avg_cost"])
+    except Exception:
+        pass
+    # Fallback to legacy env vars (will be removed in a future cleanup)
+    return _float_env("PPR_SHARES"), _float_env("PPR_AVG_COST")
+
+
+# Eager-load for backwards compat (some callers import PPR_SHARES directly).
+# main.py's _get_snapshot uses these — refreshed each call via _get_ppr_values
+# at the snapshot-time level. Direct importers see the boot-time values.
+PPR_SHARES, PPR_AVG_COST = _get_ppr_values()
 
 
 # ─────────────────────────────────────────────────────────────────────────
