@@ -4251,6 +4251,7 @@ def _handle_conviction(parts: list[str]) -> None:
             "  `/conviction list` — todas as posições activas + P&L\n"
             "  `/conviction TICKER` — deep-dive condensado (sinais hold/close)\n"
             "  `/conviction close TICKER PREÇO [motivo]` — fechar e gravar outcome\n"
+            "  `/conviction delete TICKER` — remover sem gravar outcome (para corrigir enganos)\n"
             "  `/conviction transition TICKER TIPO` — mudar tipo (ex: DIP→MOMENTUM)\n"
             "  `/conviction outcomes` — histórico de saídas\n\n"
             "_Exemplo:_\n"
@@ -4284,28 +4285,26 @@ def _handle_conviction(parts: list[str]) -> None:
                 _reply("⚠️ PICO tem de ser um número.")
                 return
         try:
-            pos = cr.add_conviction(ticker, price, shares, ptype, trailing_high=trailing_high)
+            cr.add_conviction(ticker, price, shares, ptype, trailing_high=trailing_high)
         except ValueError as e:
             _reply(f"⚠️ {e}")
             return
         except Exception as e:
             _reply(f"❌ Erro ao adicionar: `{e}`")
             return
-        snap_bits = []
-        if pos.entry_score is not None:
-            snap_bits.append(f"Score actual: {pos.entry_score:.0f}/100")
-        if pos.entry_win_prob is not None:
-            snap_bits.append(f"Win-prob: {pos.entry_win_prob*100:.0f}%")
-        if pos.initial_pred_alpha is not None:
-            snap_bits.append(f"Alpha previsto: {pos.initial_pred_alpha*100:+.1f}pp")
-        snap_line = ("\n   _" + " | ".join(snap_bits) + "_") if snap_bits else ""
-        trail_str = f" | pico anchor ${pos.trailing_high:.2f}" if ptype == "MOMENTUM" else ""
-        _reply(
-            f"✅ *Convicção aberta — {ticker}*\n\n"
-            f"  💰 {shares:g}x @ ${price:.2f} ({ptype}){trail_str}"
-            f"{snap_line}\n\n"
-            f"_Vigilância diária activada. `/conviction {ticker}` para deep-dive._"
-        )
+        # Show the full deep-dive immediately — much more informative than
+        # a one-line score snapshot, and tailored to the position type
+        # (MOMENTUM gets trailing stop + RSI + MA20; DIP gets win-prob delta;
+        # CORE gets quality-score block). User sees triggers + verdict in
+        # the same reply that confirmed the add.
+        try:
+            dive = cr.render_deep_dive(ticker)
+            _reply(f"✅ *Convicção aberta — {ticker}*\n\n{dive}")
+        except Exception as e:
+            _reply(
+                f"✅ *Convicção aberta — {ticker}* ({ptype})\n"
+                f"_(deep-dive falhou: {e}. Tenta `/conviction {ticker}`.)_"
+            )
         return
 
     if sub == "list":
@@ -4314,6 +4313,28 @@ def _handle_conviction(parts: list[str]) -> None:
 
     if sub == "outcomes":
         _reply(cr.render_outcomes())
+        return
+
+    if sub == "delete":
+        # /conviction delete TICKER — silent removal (for fixing mistakes).
+        # Does NOT write to conviction_outcomes.json. Use `close` for real exits.
+        if len(parts) < 3:
+            _reply("⚠️ Uso: `/conviction delete TICKER`\n"
+                   "_Remove sem gravar outcome. Para fechar uma trade real usa `close`._")
+            return
+        ticker = parts[2].upper().strip()
+        try:
+            removed = cr.delete_conviction(ticker)
+        except Exception as e:
+            _reply(f"❌ Erro: `{e}`")
+            return
+        if not removed:
+            _reply(f"⚠️ Convicção *{ticker}* não encontrada.")
+            return
+        _reply(
+            f"🗑️ *{ticker} removida* (sem outcome gravado).\n"
+            f"_Podes voltar a `/conviction add {ticker} …` com os valores correctos._"
+        )
         return
 
     if sub == "close":

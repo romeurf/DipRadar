@@ -245,6 +245,24 @@ def close_conviction(ticker: str, exit_price: float, reason: str = "manual") -> 
     return outcome
 
 
+def delete_conviction(ticker: str) -> bool:
+    """Silently remove a position WITHOUT writing to conviction_outcomes.json.
+
+    For fixing mistakes (wrong type, wrong price, wrong shares). Use
+    close_conviction() instead for legitimate exits — that one logs the
+    outcome for performance tracking.
+    """
+    ticker = ticker.upper().strip()
+    positions = load_convictions()
+    before = len(positions)
+    positions = [p for p in positions if p.ticker != ticker]
+    if len(positions) == before:
+        return False
+    save_convictions(positions)
+    logger.info(f"[conviction] deleted {ticker} (silent — no outcome logged)")
+    return True
+
+
 def transition_type(ticker: str, new_type: str) -> Optional[ConvictionPosition]:
     """Manually change position_type (DIP → MOMENTUM most common)."""
     new_type = new_type.upper().strip()
