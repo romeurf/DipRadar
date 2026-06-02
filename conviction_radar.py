@@ -1120,10 +1120,14 @@ def auto_sync_from_portfolio(send_telegram: Optional[Callable[[str], None]] = No
     existing = {p.ticker for p in load_convictions()}
     added: list[tuple[str, str]] = []
     skipped: list[tuple[str, str]] = []
+    already: list[str] = []
+
+    portfolio_count = len(portfolio_positions)
 
     for sym, info in portfolio_positions.items():
         ticker = sym.upper().strip()
         if ticker in existing:
+            already.append(ticker)
             continue
         if ticker in deny:
             skipped.append((ticker, "deny-list (ETF/non-equity)"))
@@ -1172,8 +1176,17 @@ def auto_sync_from_portfolio(send_telegram: Optional[Callable[[str], None]] = No
         except Exception as e:
             logger.warning(f"[conviction] auto-sync telegram failed: {e}")
 
-    return {"added": len(added), "skipped": len(skipped),
-            "items": [(t, p, "added") for t, p in added] + [(t, "-", r) for t, r in skipped]}
+    return {
+        "added":           len(added),
+        "skipped":         len(skipped),
+        "already_tracked": len(already),
+        "portfolio_count": portfolio_count,
+        "items": (
+            [(t, p, "added")   for t, p in added] +
+            [(t, "-", r)        for t, r in skipped] +
+            [(t, "-", "já em convicção") for t in already]
+        ),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -4422,13 +4422,35 @@ def _handle_conviction(parts: list[str]) -> None:
         except Exception as e:
             _reply(f"❌ Erro no auto-sync: `{e}`")
             return
-        lines = [f"🔄 *Auto-sync resultado:* {result['added']} adicionadas, {result['skipped']} saltadas"]
+
+        port_count = result.get("portfolio_count", 0)
+        if port_count == 0:
+            _reply(
+                "🔄 *Auto-sync — carteira vazia*\n\n"
+                "_O `portfolio.get_positions()` devolveu 0 entradas — não há nada para sincronizar._\n\n"
+                "*Como popular a carteira:*\n"
+                "  1️⃣ `/conviction add TICKER PREÇO SHARES TIPO` — auto-faz `/buy` também\n"
+                "  2️⃣ `/buy TICKER PREÇO SHARES` — auto-cria convicção também\n"
+                "  3️⃣ Definir env vars `HOLDING_X=TICKER:SHARES:PREÇO` no Railway e reiniciar\n\n"
+                "_Vê o que tens com `/portfolio`._"
+            )
+            return
+
+        lines = [
+            f"🔄 *Auto-sync resultado* (carteira: {port_count} posições)",
+            f"  ✅ Adicionadas: {result['added']}",
+            f"  ⏭️ Saltadas: {result['skipped']} (ETFs/foreign/erro)",
+            f"  ♻️ Já trackeadas: {result['already_tracked']}",
+            "",
+        ]
         for item in result.get("items", []):
             t, p, r = item
             if r == "added":
                 lines.append(f"  ✅ {t} → {p}")
+            elif r == "já em convicção":
+                lines.append(f"  ♻️ {t} _(já em convicção)_")
             else:
-                lines.append(f"  ⏭️ {t} ({r})")
+                lines.append(f"  ⏭️ {t} _({r})_")
         _reply("\n".join(lines))
         return
 
