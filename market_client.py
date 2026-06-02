@@ -553,7 +553,7 @@ def get_earnings_date(symbol: str) -> str | None:
     return dt.strftime("%d/%m/%Y")
 
 
-def get_portfolio_snapshot(holdings, ppr_shares, ppr_avg_cost, usd_eur, etfs=None):
+def get_portfolio_snapshot(holdings, ppr_shares, ppr_avg_cost, usd_eur, etfs=None, ppr_current_nav=None):
     """
     Calcula o snapshot actual da carteira.
 
@@ -661,23 +661,31 @@ def get_portfolio_snapshot(holdings, ppr_shares, ppr_avg_cost, usd_eur, etfs=Non
             "cost_missing": ref_cost is None or float(ref_cost or 0) <= 0,
         })
 
-    # ── PPR (ISIN PTARMJHM0003, proxy ACWI para P&L %) ───────────────────────
-    ppr_cost      = ppr_shares * ppr_avg_cost
-    ppr_value_eur = ppr_cost
-
+    # ── PPR (state-managed via /ppr) ─────────────────────────────────────────
+    # Cost basis = shares × avg_cost (always known).
+    # Current value: if user set a NAV via /ppr nav, use shares × current_nav
+    # (real P&L). Otherwise fall back to ACWI-proxy P&L on top of cost basis.
+    ppr_cost = ppr_shares * ppr_avg_cost
     ppr_pnl_day = ppr_pnl_week = ppr_pnl_month = None
 
-    pp = _get_prices("ACWI")
-    if pp and pp.get("now") and pp["now"] > 0:
-        acwi_now = pp["now"]
-        if pp.get("yesterday") and pp["yesterday"] > 0:
-            ppr_pnl_day   = ppr_value_eur * (acwi_now - pp["yesterday"]) / pp["yesterday"]
-        if pp.get("week_ago") and pp["week_ago"] > 0:
-            ppr_pnl_week  = ppr_value_eur * (acwi_now - pp["week_ago"]) / pp["week_ago"]
-        if pp.get("month_ago") and pp["month_ago"] > 0:
-            ppr_pnl_month = ppr_value_eur * (acwi_now - pp["month_ago"]) / pp["month_ago"]
+    if ppr_current_nav and ppr_current_nav > 0:
+        # User-supplied NAV — real value and real total P&L.
+        ppr_value_eur = ppr_shares * float(ppr_current_nav)
+        # Daily/weekly/monthly deltas not available without a price series for
+        # the PPR NAV — leave them None (display layer should hide or show "—").
     else:
-        logging.warning(f"PPR ({PPR_ISIN}): ACWI sem dados — P&L não calculado")
+        # No NAV: value frozen at cost; use ACWI proxy for day/week/month deltas
+        # so the user has *some* signal rather than zero.
+        ppr_value_eur = ppr_cost
+        pp = _get_prices("ACWI")
+        if pp and pp.get("now") and pp["now"] > 0:
+            acwi_now = pp["now"]
+            if pp.get("yesterday") and pp["yesterday"] > 0:
+                ppr_pnl_day   = ppr_value_eur * (acwi_now - pp["yesterday"]) / pp["yesterday"]
+            if pp.get("week_ago") and pp["week_ago"] > 0:
+                ppr_pnl_week  = ppr_value_eur * (acwi_now - pp["week_ago"]) / pp["week_ago"]
+            if pp.get("month_ago") and pp["month_ago"] > 0:
+                ppr_pnl_month = ppr_value_eur * (acwi_now - pp["month_ago"]) / pp["month_ago"]
 
     total_eur  += ppr_value_eur
     total_cost += ppr_cost

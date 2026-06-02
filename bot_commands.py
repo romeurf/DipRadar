@@ -4563,7 +4563,7 @@ def _handle_conviction(parts: list[str]) -> None:
 # set wrong. State lives in /data/ppr.json (state.get_ppr / set_ppr).
 
 def _handle_ppr(parts: list[str]) -> None:
-    from state import get_ppr, set_ppr, clear_ppr
+    from state import get_ppr, set_ppr, set_ppr_nav, clear_ppr
 
     sub = parts[1].lower() if len(parts) > 1 else "show"
 
@@ -4571,24 +4571,58 @@ def _handle_ppr(parts: list[str]) -> None:
         s = get_ppr()
         shares = s.get("shares", 0)
         avg    = s.get("avg_cost", 0)
+        nav    = s.get("current_nav")
+        nav_dt = s.get("nav_updated")
         if shares <= 0 or avg <= 0:
             _reply(
                 "💰 *PPR* — sem valores configurados.\n\n"
-                "Para definir:\n"
-                "  `/ppr set SHARES PREÇO_MÉDIO`\n\n"
-                "_Exemplo: `/ppr set 100 50.25` → 100 unidades a €50.25 = €5,025 total_\n"
+                "*Setup inicial (custo base):*\n"
+                "  `/ppr set SHARES PREÇO_MÉDIO`\n"
+                "  _Ex: `/ppr set 100 50.25` → 100 unidades a €50.25_\n\n"
+                "*Update cotação (NAV actual do banco):*\n"
+                "  `/ppr nav NOVO_NAV`\n"
+                "  _Ex: `/ppr nav 52.80` → cotação actual €52.80/unidade_\n\n"
+                "_Sem NAV: valor = custo (não há live tracking automático para PPRs)._\n"
                 "_Para limpar: `/ppr clear`_"
             )
             return
-        value = shares * avg
-        _reply(
-            f"💰 *PPR* — configurado\n\n"
-            f"  Unidades: *{shares:g}*\n"
-            f"  Preço médio: *€{avg:.4f}*\n"
-            f"  Valor estimado: *€{value:,.2f}*\n\n"
-            f"_Actualizar: `/ppr set SHARES PREÇO`_\n"
-            f"_Limpar:    `/ppr clear`_"
-        )
+        cost = shares * avg
+        if nav and nav > 0:
+            value = shares * nav
+            pnl   = value - cost
+            pnl_pct = (nav / avg - 1) * 100 if avg > 0 else 0
+            arrow = "📈" if pnl >= 0 else "📉"
+            stale_note = ""
+            if nav_dt:
+                from datetime import date as _date
+                try:
+                    age = (_date.today() - _date.fromisoformat(nav_dt)).days
+                    if age > 30:
+                        stale_note = f" ⚠️ NAV com {age} dias (desactualizada — corre `/ppr nav` se possível)"
+                    else:
+                        stale_note = f" _(NAV de há {age} dias)_"
+                except Exception:
+                    pass
+            _reply(
+                f"💰 *PPR* — configurada com NAV live\n\n"
+                f"  Unidades: *{shares:g}*\n"
+                f"  Custo médio: *€{avg:.4f}*\n"
+                f"  NAV actual: *€{nav:.4f}*{stale_note}\n"
+                f"  Custo total: *€{cost:,.2f}*\n"
+                f"  Valor actual: *€{value:,.2f}*\n"
+                f"  {arrow} P&L: *€{pnl:+,.2f}* ({pnl_pct:+.2f}%)\n\n"
+                f"_Update NAV: `/ppr nav NOVO_VALOR`_"
+            )
+        else:
+            _reply(
+                f"💰 *PPR* — sem NAV (valor frozen no custo)\n\n"
+                f"  Unidades: *{shares:g}*\n"
+                f"  Preço médio: *€{avg:.4f}*\n"
+                f"  Valor (= custo): *€{cost:,.2f}*\n\n"
+                f"⚠️ _Sem NAV definida, o snapshot trata a PPR como sem variação._\n"
+                f"_Para tracking de P&L: lê a cotação actual no teu banco e corre:_\n"
+                f"  `/ppr nav NOVO_NAV`"
+            )
         return
 
     if sub == "set":
@@ -4604,23 +4638,76 @@ def _handle_ppr(parts: list[str]) -> None:
         if shares < 0 or avg < 0:
             _reply("⚠️ Shares e preço não podem ser negativos.")
             return
-        # Sanity check: if value > €1M, almost certainly a typo
         value = shares * avg
         if value > 1_000_000:
             _reply(
                 f"⚠️ *Valor suspeito:* {shares} × €{avg:.4f} = *€{value:,.2f}*\n\n"
-                f"_Mais de €1M — provável typo. Se for mesmo este valor, "
-                f"corre o comando outra vez com `--force` no fim:_\n"
+                f"_Mais de €1M — provável typo. Confirma com `--force` se for mesmo:_\n"
                 f"  `/ppr set {parts[2]} {parts[3]} --force`"
             )
-            return
+            if "--force" not in parts:
+                return
         set_ppr(shares, avg)
+        existing_nav = get_ppr().get("current_nav")
+        nav_hint = ""
+        if not existing_nav:
+            nav_hint = (
+                f"\n\n_Para ver P&L real, faz `/ppr nav <cotação_actual>` "
+                f"quando souberes a NAV do dia (lê no teu banco)._"
+            )
         _reply(
-            f"✅ *PPR actualizada*\n\n"
+            f"✅ *PPR actualizada* (custo base)\n\n"
             f"  Unidades: *{shares:g}*\n"
             f"  Preço médio: *€{avg:.4f}*\n"
-            f"  Valor estimado: *€{value:,.2f}*\n\n"
-            f"_Verifica com `/portfolio` ou `/carteira`._"
+            f"  Custo total: *€{value:,.2f}*"
+            f"{nav_hint}"
+        )
+        return
+
+    if sub == "nav":
+        if len(parts) < 3:
+            _reply(
+                "⚠️ Uso: `/ppr nav NOVA_COTAÇÃO`\n\n"
+                "_Lê a cotação actual da PPR no teu banco (extracto/app) e "
+                "introduz aqui. Snapshot passa a usar este valor para calcular "
+                "P&L real até actualizares de novo._\n\n"
+                "_Exemplo: `/ppr nav 52.80`_"
+            )
+            return
+        try:
+            nav = float(parts[2])
+        except ValueError:
+            _reply("⚠️ NAV tem de ser um número.")
+            return
+        if nav <= 0:
+            _reply("⚠️ NAV tem de ser positiva.")
+            return
+        existing = get_ppr()
+        shares = existing.get("shares", 0)
+        avg    = existing.get("avg_cost", 0)
+        if shares <= 0 or avg <= 0:
+            _reply("⚠️ Define primeiro o custo base com `/ppr set SHARES PREÇO_MÉDIO`.")
+            return
+        # Sanity: refuse NAVs absurdly far from avg_cost (likely typo)
+        if avg > 0 and (nav > avg * 10 or nav < avg / 10):
+            _reply(
+                f"⚠️ *NAV suspeita:* €{nav:.4f} vs preço médio €{avg:.4f} "
+                f"(diferença >10×). Provável typo. Confirma o valor antes de inserir."
+            )
+            return
+        set_ppr_nav(nav)
+        value = shares * nav
+        cost  = shares * avg
+        pnl   = value - cost
+        pnl_pct = (nav / avg - 1) * 100
+        arrow = "📈" if pnl >= 0 else "📉"
+        _reply(
+            f"✅ *NAV da PPR actualizada*\n\n"
+            f"  NAV: *€{nav:.4f}* (era €{avg:.4f} na entrada)\n"
+            f"  Valor actual: *€{value:,.2f}*\n"
+            f"  {arrow} P&L: *€{pnl:+,.2f}* ({pnl_pct:+.2f}%)\n\n"
+            f"_Snapshot passa a usar este NAV até nova actualização._\n"
+            f"_Recomendado: actualizar pelo menos 1× por mês._"
         )
         return
 
@@ -4629,7 +4716,7 @@ def _handle_ppr(parts: list[str]) -> None:
         _reply("✅ *PPR limpa.* Snapshot da carteira já não a inclui.")
         return
 
-    _reply(f"⚠️ Sub-comando `{sub}` desconhecido. Usa: `show`, `set`, `clear`.")
+    _reply(f"⚠️ Sub-comando `{sub}` desconhecido. Usa: `show`, `set`, `nav`, `clear`.")
 
 
 # ── /etf handler ─────────────────────────────────────────────────────────────────

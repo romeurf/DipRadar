@@ -138,29 +138,64 @@ _PPR_FILE = "ppr.json"
 
 
 def get_ppr() -> dict:
-    """Return {shares: float, avg_cost: float}. Empty dict if not set."""
+    """Return {shares, avg_cost, current_nav, nav_updated}.
+
+    current_nav: optional manually-updated NAV per unit (€). When set,
+    the snapshot uses it to compute live value + P&L. When None, value
+    falls back to shares × avg_cost (frozen at cost basis, no P&L).
+
+    nav_updated: ISO date of last NAV update (helps user see staleness).
+    """
     data = _load_json(_PPR_FILE, default={}) or {}
     if not isinstance(data, dict):
         return {}
     return {
-        "shares":   float(data.get("shares", 0) or 0),
-        "avg_cost": float(data.get("avg_cost", 0) or 0),
+        "shares":      float(data.get("shares", 0) or 0),
+        "avg_cost":    float(data.get("avg_cost", 0) or 0),
+        "current_nav": float(data.get("current_nav", 0) or 0) or None,
+        "nav_updated": data.get("nav_updated") or None,
+        "updated":     data.get("updated") or None,
     }
 
 
 def set_ppr(shares: float, avg_cost: float) -> dict:
-    """Overwrite PPR holdings. Use 0 for both to effectively clear."""
+    """Overwrite PPR core holdings (shares + avg_cost). Keeps any current_nav
+    that's already set, so /ppr set after /ppr nav doesn't lose the NAV."""
+    existing = get_ppr()
     payload = {
-        "shares":   float(shares),
-        "avg_cost": float(avg_cost),
-        "updated":  _today_iso(),
+        "shares":      float(shares),
+        "avg_cost":    float(avg_cost),
+        "current_nav": existing.get("current_nav"),
+        "nav_updated": existing.get("nav_updated"),
+        "updated":     _today_iso(),
+    }
+    _save_json(_PPR_FILE, payload)
+    return payload
+
+
+def set_ppr_nav(current_nav: float) -> dict:
+    """Update just the NAV (price per unit). For manual updates from broker
+    statements — PPRs don't have a yfinance/CMVM live-price source."""
+    existing = get_ppr()
+    payload = {
+        "shares":      existing.get("shares", 0.0),
+        "avg_cost":    existing.get("avg_cost", 0.0),
+        "current_nav": float(current_nav),
+        "nav_updated": _today_iso(),
+        "updated":     existing.get("updated") or _today_iso(),
     }
     _save_json(_PPR_FILE, payload)
     return payload
 
 
 def clear_ppr() -> None:
-    _save_json(_PPR_FILE, {"shares": 0.0, "avg_cost": 0.0, "updated": _today_iso()})
+    _save_json(_PPR_FILE, {
+        "shares":      0.0,
+        "avg_cost":    0.0,
+        "current_nav": None,
+        "nav_updated": None,
+        "updated":     _today_iso(),
+    })
 
 
 # ── ETFs (passive holdings, snapshot-only) ─────────────────────────────────

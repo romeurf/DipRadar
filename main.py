@@ -340,11 +340,14 @@ def _get_snapshot() -> dict:
     # PPR + ETFs are Telegram-managed (state-backed) — refresh each call
     # so /ppr set / /etf set changes take effect immediately, no restart.
     from portfolio import _get_ppr_values
-    from state import get_etfs
+    from state import get_etfs, get_ppr
     ppr_shares, ppr_avg_cost = _get_ppr_values()
+    ppr_state = get_ppr()
+    ppr_current_nav = ppr_state.get("current_nav") if ppr_state else None
     etfs = get_etfs()
     return get_portfolio_snapshot(
-        get_holdings_tuples(), ppr_shares, ppr_avg_cost, usd_eur, etfs=etfs
+        get_holdings_tuples(), ppr_shares, ppr_avg_cost, usd_eur,
+        etfs=etfs, ppr_current_nav=ppr_current_nav,
     )
 
 def send_heartbeat() -> None:
