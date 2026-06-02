@@ -4107,6 +4107,24 @@ def _handle_buy(parts: list[str]) -> None:
     liq        = result["liquidity"]
     liq_warn   = "\n⚠️ _Liquidez ficou negativa — faz `/liquidez +VALOR` para corrigir._" if result["liq_warning"] else ""
 
+    # If a conviction already exists for this ticker, flag it so the user
+    # decides if they want to re-anchor the thesis to the new average price.
+    conviction_tail = ""
+    try:
+        import conviction_radar as cr
+        existing_conv = cr.get_by_ticker(symbol)
+        if existing_conv:
+            conviction_tail = (
+                f"\n\n🧠 _Convicção {symbol} já activa "
+                f"({existing_conv.position_type} @ ${existing_conv.entry_price:.2f}). "
+                f"Preço médio mudou para ${pos['avg_price']:.2f} — se quiseres reflectir "
+                f"o DCA na tese, fecha e reabre:_\n"
+                f"  `/conviction close {symbol} {price:.2f} dca`\n"
+                f"  `/conviction add {symbol} {pos['avg_price']:.2f} {pos['shares']} {existing_conv.position_type}`"
+            )
+    except Exception as e:
+        logging.debug(f"[buy→conviction hint] {symbol}: {e}")
+
     _reply(
         f"✅ {action_str} — *{symbol}*\n\n"
         f"  💰 Compra: *{shares}x* @ *${price:.2f}* = *${result['cost']:.2f}*\n"
@@ -4115,6 +4133,7 @@ def _handle_buy(parts: list[str]) -> None:
         + (f"\n  🎯 Score entrada: *{score}/100*" if score is not None else "")
         + f"\n\n  💵 Liquidez restante: *€{liq:.2f}*"
         + liq_warn
+        + conviction_tail
     )
 
 
@@ -4171,12 +4190,37 @@ def _handle_sell(parts: list[str]) -> None:
     if result["action"] == "partial":
         remaining_str = f"\n  📦 Restam: *{result['remaining']}x*"
 
+    # Auto-sync conviction tracker: full close → auto-close conviction;
+    # partial → leave a hint for the user.
+    conviction_tail = ""
+    try:
+        import conviction_radar as cr
+        existing_conv = cr.get_by_ticker(symbol)
+        if existing_conv:
+            if result["action"] == "closed":
+                outcome = cr.close_conviction(symbol, price, reason="sold-via-/sell")
+                if outcome:
+                    conviction_tail = (
+                        f"\n\n🧠 _Convicção {symbol} fechada automaticamente "
+                        f"({outcome['pnl_pct']:+.1f}% / {outcome['days_held']}d). "
+                        f"Gravado em conviction_outcomes.json._"
+                    )
+            else:
+                conviction_tail = (
+                    f"\n\n🧠 _Convicção {symbol} continua activa (venda parcial). "
+                    f"Usa `/conviction close {symbol} {price:.2f}` se também quiseres "
+                    f"encerrar a tese._"
+                )
+    except Exception as e:
+        logging.debug(f"[sell→conviction sync] {symbol}: {e}")
+
     _reply(
         f"{em} {action} — *{symbol}*\n\n"
         f"  💰 Vendido: *{result['shares_sold']}x* @ *${price:.2f}* = *${result['proceeds']:.2f}*\n"
         f"  {'📈' if pnl >= 0 else '📉'} P&L: *${pnl:+.2f}* ({pct:+.1f}%)"
         + remaining_str
         + f"\n\n  💵 Liquidez: *€{result['liquidity']:.2f}*"
+        + conviction_tail
     )
 
 
