@@ -2677,6 +2677,21 @@ def main() -> None:
         id="position_monitor", name="Position Monitor 22h00",
     )
 
+    # ── Conviction monitor: 22:05 Lisboa, seg-sex (5min após position_monitor) ─
+    # Parallel track for user's hunch-driven positions. Same engine, isolated
+    # state (personal_positions.json + conviction_outcomes.json).
+    def _run_conviction_monitor():
+        try:
+            import conviction_radar
+            conviction_radar.run_daily_check(send_telegram)
+        except Exception as e:
+            logging.error(f"[conviction] daily check failed: {e}", exc_info=True)
+    scheduler.add_job(
+        _run_conviction_monitor,
+        CronTrigger(day_of_week="mon-fri", hour=22, minute=5, timezone=LISBON_TZ),
+        id="conviction_monitor", name="Conviction Monitor 22h05",
+    )
+
     # ── Saturday Weekly Report: sábado 10:00 Lisboa ───────────────────────────
     scheduler.add_job(
         send_saturday_report,

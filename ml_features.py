@@ -37,98 +37,78 @@ from score import score_from_fundamentals, _safe_float
 
 logger = logging.getLogger(__name__)
 
+# FEATURE_COLUMNS — the DIP model's feature schema.
+#
+# Each entry MUST be in FEATURE_SETS["dip_us"] below; the two are the single
+# source of truth for what build_dip_dataset writes and ml_predictor reads.
+# Momentum and Core models live in their own self-contained worlds with their
+# own feature lists (momentum_radar/trainer.FEATURE_COLS,
+# scripts/train_core_model.CORE_FEATURE_COLS) — they never touch
+# FEATURE_COLUMNS or FEATURE_SETS.
+#
+# Audit policy: any entry here that doesn't appear in FEATURE_SETS["dip_us"]
+# is dead code and should be removed; any entry there that isn't here is
+# a bug.
 FEATURE_COLUMNS: list[str] = [
+    # Macro / regime
     "vix",
+    "vix_regime",
+    "vix_percentile_1y",
+    "spy_rsi_14",
+    "yield_10y_change_5d",
+    # Drop / timing
     "drop_pct_today",
     "drawdown_52w",
     "rsi_14",
     "bb_width",
     "rsi_oversold_strength",
-    "vix_regime",
     "drop_x_drawdown",
     "vol_x_drop",
+    # Pre-drop trend context
     "return_1m",
     "return_3m_pre",
-    "return_6m_pre",
     "sector_relative",
-    "beta_90d",
-    "vol_of_vol",
-    "peg_ratio",           # trailing_PE / (EPS_growth%) — Lynch PEG: <1 undervalued, >2 expensive
+    # Volume / structure (capitulation + stop-hunt signals)
+    "volume_zscore_20d",
+    "close_in_range_20d",
+    "true_range_pct_20d",
+    "vwap_from_high_ratio",
+    "volume_poc_ratio",
+    "liquidity_sweep_score",
+    "mfi_14",
+    # Sector-relative oversold
+    "rsi_sector_adjusted",
+    "drawdown_sector_normalized",
+    # Entry zone / valuation
+    "consecutive_red_days",
+    "ma_200d_ratio",
+    "price_vs_52w_percentile",
+    "peg_ratio",
+    # Insider activity (Form 4, PIT)
+    "insider_buy_recent",
+    "insider_buy_amount_score",
+    "insider_sell_recent",
+    "insider_sell_amount_score",
+    # SEC 8-K + earnings call sentiment
+    "recent_8k_score",
+    "earnings_call_tone",
+    # Earnings quality + sell-side view
+    "earnings_beat_rate",
+    "analyst_rating",
+    # Dip maturity
+    "days_below_ma200",
+    "decline_deceleration",
+    # Calendar / sector pressure
     "month_of_year",
     "sector_alert_count_7d",
-    "vix_percentile_1y",
-    "spy_rsi_14",
-    # PR #30 (Phase B): 4 raw-OHLCV features orthogonal to existing ones
-    # (vol_of_vol and bb_width already cover close-to-close volatility).
-    # IC profiling on full parquet eliminated 3 initial candidates:
-    # (realized_vol_20d ρ=0.81 with vol_of_vol → redundant; mom_5d_slope
-    # ρ=0.0; gap_pct_5d ρ=0.0). These 4 capture distinct dimensions:
-    "volume_zscore_20d",   # (today_vol − mean_20d) / std_20d  — institutional flow
-    "close_in_range_20d",  # mean((C−L)/(H−L)) last 20 — where price closes in daily range
-    "up_days_pct_20d",     # fraction of last 20 sessions with positive return
-    "true_range_pct_20d",  # mean(TR_d / Close_d) last 20 — intraday volatility
-    # ── Quality and sentiment signals (Phase 5) ──────────────────────────────
-    # Sourced from yfinance + SEC EDGAR + Alpha Vantage/FMP (free tiers).
-    # Each captures a dimension orthogonal to the existing technical features.
-    "consecutive_red_days",  # consecutive down days before alert — capitulation signal
-    "ma_200d_ratio",         # price / 200-day MA — how far below long-term average
-    "insider_buy_recent",    # 1 if insider purchase in last 30d (SEC Form 4 code A)
-    "insider_sell_recent",   # 1 if insider disposal in last 30d (SEC Form 4 code D)
-    "earnings_beat_rate",    # fraction of last 4 quarters beating EPS estimates
-    "analyst_rating",        # analyst consensus: 1=Strong Buy … 5=Strong Sell
-    "short_interest_pct",    # short interest as % of float — squeeze potential
-    # Phase 5b: advanced signals (Form 4 amount + 8-K + short trend + earnings tone)
-    "insider_buy_amount_score",   # normalised magnitude of insider purchases [0,1]
-    "insider_sell_amount_score",  # normalised magnitude of insider sales [0,1]
-    "recent_8k_score",            # 8-K event type: -1=restatement, +1=M&A target
-    "earnings_call_tone",         # last earnings call sentiment [-1=pessimistic, +1=confident]; NaN when unavailable (XGBoost learns split direction natively)
-    # Sector-conditioned features (v4.2): RSI, VIX and drawdown adjusted by sector type.
-    # VIX=35 means different things for growth vs commodity vs defensive sectors.
-    # Captures deviation from sector's normal regime — orthogonal to global model.
-    "rsi_sector_adjusted",       # max(0, threshold_sector - rsi) — how oversold vs sector norm
-    "vix_sector_signal",         # VIX × factor_sector / 40 — growth reacts negatively, defensive positively
-    "drawdown_sector_normalized",# drawdown / typical_drawdown_sector — 0=normal, -3=extreme capitulation
-    # ── Market Structure (v4.3): Anchored VWAP + Volume Profile + Liquidity Sweep ──
-    # Captures where volume actually traded (POC), average institutional cost
-    # since the high (anchored VWAP), and recent stop-hunts (liquidity sweep).
-    # Orthogonal to existing technical features — adds microstructure dimension.
-    "vwap_from_high_ratio",      # (price - VWAP_since_52w_high) / VWAP — negative = below institutional cost
-    "volume_poc_ratio",          # (price - POC_90d) / POC — negative = below highest-volume level
-    "liquidity_sweep_score",     # recency of last stop-hunt: 1=today, decays to 0 over 10 days
-    # Volume Flow (Vertus-inspired): MFI + buying pressure proxy
-    "mfi_14",                    # Money Flow Index 14d — <30 oversold, >70 overbought
-    "volume_up_pct_20d",         # fraction of total volume that occurred on up-days (20d) — institutional pressure proxy
-    # ── Entry zone / regime ───────────────────────────────────────────────────
-    "price_vs_52w_percentile",   # where price sits in the 52-week range: 0.0=at 52w low, 1.0=at 52w high
-    "yield_10y_change_5d",       # 5-day change in 10-year Treasury yield (macro regime signal)
-    # ── Dip maturity features ─────────────────────────────────────────────────
-    # Distinguish "first day of decline" (premature entry) from "washed-out dip"
-    # (holders exhausted, better risk/reward). NVO Feb vs NVO Mar/Apr pattern.
-    "days_below_ma200",          # consecutive trading days below 200d MA — 0=just crossed, 90+=washed out
-    "decline_deceleration",      # return_1m / avg_monthly_3m: <1=slowing, >1=accelerating, <0=recovering
-    # New features (tasks 3-6)
-    "days_to_next_earnings",     # calendar days to next scheduled earnings; cap 90; DIP only
-    "pe_vs_sector_median",       # forward PE / sector median forward PE; 1.0=at sector median; Core only
-    "dividend_growth_3y",        # 3-year dividend CAGR; 0.0 for non-payers; Core only
-    "sector_momentum_3m",        # sector ETF 3m return (%); Momentum only
 ]
-# PR #28 (Phase A): drop 14 dead features after IC profiling on full parquet:
-#   • 9 CONSTANTS (std=0, IC undefined — _FALLBACK on every row):
-#       gross_margin, de_ratio, pe_vs_fair, analyst_upside, quality_score,
-#       atr_ratio, volume_spike, pe_attractive, peg_ratio (now promoted to FEATURE_COLUMNS)
-#     Reason: original bootstrap had no point-in-time sources for these
-#     features → all 36929 rows carried the same _FALLBACK.
-#     Live inference (build_features in position_monitor) still computes
-#     them correctly — _FALLBACK below kept for backward compatibility.
-#   • 5 NOISE (|IC| < 0.01 with alpha_60d on full parquet):
-#       days_since_52w_high (+0.007), sector_drawdown_5d (-0.007),
-#       macro_score (+0.005), spy_drawdown_5d (+0.003), relative_drop (+0.000)
-#     Reason: these features VARY per row but don't correlate with the target
-#     → waste model capacity.
-# Net: 34 → 20 features. Smoke test: IC single best 0.1744 → 0.1946 (+11%).
-# Additionally: month_of_year is fixed in load_base_dataset (was constant 5.0
-# in parquet due to bootstrap bug; now derived from alert_date.dt.month).
-# See PR #25 for earlier removal (7 noisy features added in PR #23).
+# Dead features REMOVED 2026-05-30 (were computed but no model trained on them;
+# the audit at the top of FEATURE_SETS explains the rationale):
+#   return_6m_pre, beta_90d, vol_of_vol, up_days_pct_20d, short_interest_pct,
+#   vix_sector_signal, days_to_next_earnings, sector_momentum_3m,
+#   pe_vs_sector_median, dividend_growth_3y, volume_up_pct_20d
+#   (the last 3 are still used by Core / Momentum trainers via their own lists;
+#    they aren't DIP features so they don't belong in FEATURE_COLUMNS).
 
 N_FEATURES = len(FEATURE_COLUMNS)
 
@@ -256,85 +236,46 @@ def assert_feature_completeness(row: dict, context: str = "") -> None:
 
 
 FEATURE_SETS: dict[str, list[str]] = {
-    "dip_us": [
-        # Drop / timing
-        "vix", "drop_pct_today", "drawdown_52w", "rsi_14", "bb_width",
-        "rsi_oversold_strength", "vix_regime", "drop_x_drawdown", "vol_x_drop",
-        # Pre-drop trend context (distinguishes clean reversal from deteriorating trend)
-        "return_1m", "return_3m_pre", "sector_relative",
-        # Volume / structure (capitulation + stop-hunt signals)
-        "volume_zscore_20d", "close_in_range_20d", "true_range_pct_20d",
-        "vwap_from_high_ratio", "volume_poc_ratio", "liquidity_sweep_score",
-        "mfi_14",
-        # Sector-relative oversold
-        "rsi_sector_adjusted", "drawdown_sector_normalized",
-        # Entry zone / valuation
-        "consecutive_red_days", "ma_200d_ratio", "price_vs_52w_percentile",
-        "peg_ratio",
-        # Insider activity — both sides, both presence-flag and amount-score.
-        # A CEO buying after a dip and a CEO dumping after a rally are very
-        # different signals; separating buys / sells lets the model price both.
+    # DIP — single source of truth: matches FEATURE_COLUMNS above verbatim.
+    # If you add a feature here, add it to FEATURE_COLUMNS too (and vice versa).
+    # The two-list redundancy is intentional: FEATURE_COLUMNS is the runtime
+    # schema (used by row_base init / inference init / assert_feature_completeness);
+    # FEATURE_SETS["dip_us"] is what get_feature_columns() returns to the trainer.
+    "dip_us": list(FEATURE_COLUMNS),
+    # CORE — mirrors scripts/train_core_model.CORE_FEATURE_COLS verbatim.
+    # The Core trainer doesn't read this; this exists for /admin_features and
+    # any external introspection. Keep in sync with the trainer.
+    "core_us": [
+        # Price / MA signals
+        "price_vs_ma200w", "ma200d_trend_60d", "return_20d", "return_5d",
+        "dd_from_52w_high", "rsi_14",
+        # Volume / institutional flow
+        "obv_trend_20d", "up_down_vol_ratio_20d",
+        "high_vol_up_days_20d", "vol_spike_5d_vs_60d",
+        # Sector context
+        "sector_etf_vs_ma200w", "stock_vs_sector_spread", "sector_return_20d",
+        # User signal
+        "annual_yield_pct",
+        # Fundamentals (PIT via SEC EDGAR XBRL)
+        "revenue_growth", "gross_margin", "roe", "fcf_yield_fund",
+        # Relative valuation + dividend quality
+        "pe_vs_sector_median", "dividend_growth_3y",
+    ],
+    # The momentum model uses its own trainer at momentum_radar/trainer.FEATURE_COLS.
+    # This entry mirrors that list verbatim so /admin_features and any external
+    # introspection match what's actually trained.
+    "momentum_us": [
+        # Momentum trend
+        "return_20d", "return_5d", "return_60d_pre",
+        "volume_ratio_20d", "rsi_14",
+        "pct_from_52w_high", "atr_pct", "close_in_range_20d",
+        # Market structure
+        "vwap_from_low_ratio", "volume_poc_ratio",
+        # Volume flow
+        "mfi_14", "volume_up_pct_20d",
+        # Insider activity (Form 4, PIT)
         "insider_buy_recent", "insider_buy_amount_score",
         "insider_sell_recent", "insider_sell_amount_score",
-        "recent_8k_score",
-        # Earnings quality + sell-side view (now PIT via yfinance.earnings_dates +
-        # .recommendations history, sliced at alert_date in
-        # fundamental_history._yf_pit_earnings_signals).
-        "earnings_beat_rate", "analyst_rating",
-        # Dip maturity — distinguishes premature from washed-out entries
-        "days_below_ma200", "decline_deceleration",
-        # Macro / regime
-        "vix_percentile_1y", "spy_rsi_14", "yield_10y_change_5d",
-        # Calendar / sector pressure
-        "month_of_year", "sector_alert_count_7d",
-        # ── Removed 2026-05-28 ──
-        # Two features dropped because they CANNOT be PIT-computed for historical
-        # rows without introducing look-ahead bias:
-        #   short_interest_pct    → yfinance returns CURRENT value; no PIT source.
-        #   days_to_next_earnings → CURRENT calendar (or alert proximity to
-        #                           next-earnings-from-today); both leak the future.
-        # The other 7 that were briefly dropped are back — root causes fixed in
-        # the build pipeline (sec_guard yfinance code recognition + ordering
-        # of PIT fundamentals before add_derived_features + post-hoc
-        # sector_alert_count_7d window aggregation).
-    ],
-    "core_us": [
-        # Fundamental quality — primary signals for Core
-        "earnings_beat_rate", "analyst_rating",
-        "earnings_call_tone", "recent_8k_score",
-        "insider_buy_recent", "insider_buy_amount_score",
-        "peg_ratio",            # growth-adjusted valuation: low PEG + good fundamentals = Core entry
-        "pe_vs_sector_median",  # stock fwd PE / sector median fwd PE: <1 = structural discount
-        "dividend_growth_3y",   # 3y CAGR: growing dividend = management conviction in earnings durability
-        # Structural entry (historical discount zone)
-        "ma_200d_ratio", "rsi_14", "drawdown_52w", "price_vs_52w_percentile",
-        "rsi_sector_adjusted", "drawdown_sector_normalized",
-        # Dip maturity — quality compounders reward patience (NVO/ADBE pattern)
-        "days_below_ma200",
-        # Macro environment
-        "vix", "vix_regime", "vix_percentile_1y",
-        "spy_rsi_14", "yield_10y_change_5d", "vix_sector_signal",
-        # Calendar
-        "return_1m",  # minimal trend context only; return_3m/6m excluded (see model philosophy)
-        "month_of_year", "sector_alert_count_7d",
-    ],
-    "momentum_us": [
-        # Trend signals
-        "return_1m", "return_3m_pre", "return_6m_pre",
-        "sector_relative", "sector_momentum_3m",  # absolute sector trend context
-        "beta_90d", "vol_of_vol",
-        # Volume flow (directional institutional pressure)
-        "volume_zscore_20d", "up_days_pct_20d",
-        "volume_up_pct_20d", "mfi_14",
-        "vwap_from_high_ratio", "volume_poc_ratio",
-        # Short / squeeze potential + valuation check
-        "short_interest_pct",
-        "peg_ratio",  # high PEG = momentum may be priced in; signals when trend is expensive
-        # Macro / regime
-        "vix", "vix_percentile_1y", "spy_rsi_14", "yield_10y_change_5d",
-        "vix_sector_signal",
-        # Calendar
-        "month_of_year", "sector_alert_count_7d",
     ],
 }
 

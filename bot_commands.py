@@ -4180,6 +4180,160 @@ def _handle_sell(parts: list[str]) -> None:
     )
 
 
+# ── /conviction handler ──────────────────────────────────────────────────────────
+#
+# Parallel tracker for positions opened by personal conviction (outside the bot's
+# alert flow). Uses the same DIP/Momentum/Core analysis engine but writes to
+# personal_positions.json + conviction_outcomes.json — files NEVER touched by
+# any ML training script. See conviction_radar.py for the isolation contract.
+
+def _handle_conviction(parts: list[str]) -> None:
+    sub = parts[1].lower() if len(parts) > 1 else "help"
+
+    try:
+        import conviction_radar as cr
+    except Exception as e:
+        _reply(f"❌ Módulo conviction não disponível: `{e}`")
+        return
+
+    if sub == "help" or sub in ("?", "-h", "--help"):
+        _reply(
+            "🧠 *Convicção — radar paralelo*\n"
+            "_Trackeia posições abertas por convicção pessoal usando o mesmo motor "
+            "do DipRadar mas sem contaminar o ML._\n\n"
+            "*Comandos:*\n"
+            "  `/conviction add TICKER PREÇO SHARES TIPO [PICO]`\n"
+            "    Tipos: `DIP`, `MOMENTUM`, `CORE`. PICO opcional (anchor para trailing stop).\n"
+            "  `/conviction list` — todas as posições activas + P&L\n"
+            "  `/conviction TICKER` — deep-dive condensado (sinais hold/close)\n"
+            "  `/conviction close TICKER PREÇO [motivo]` — fechar e gravar outcome\n"
+            "  `/conviction transition TICKER TIPO` — mudar tipo (ex: DIP→MOMENTUM)\n"
+            "  `/conviction outcomes` — histórico de saídas\n\n"
+            "_Exemplo:_\n"
+            "  `/conviction add LIF 48.41 100 MOMENTUM 61.50`\n"
+            "  `/conviction LIF`"
+        )
+        return
+
+    if sub == "add":
+        # /conviction add TICKER PRICE SHARES TYPE [TRAILING_HIGH]
+        if len(parts) < 6:
+            _reply("⚠️ Uso: `/conviction add TICKER PREÇO SHARES TIPO [PICO]`\n"
+                   "_Tipos: DIP, MOMENTUM, CORE_")
+            return
+        ticker = parts[2].upper().strip()
+        try:
+            price  = float(parts[3])
+            shares = float(parts[4])
+        except ValueError:
+            _reply("⚠️ Preço e shares têm de ser números.")
+            return
+        ptype = parts[5].upper().strip()
+        if ptype not in cr.VALID_TYPES:
+            _reply(f"⚠️ Tipo inválido `{ptype}`. Usa: {', '.join(cr.VALID_TYPES)}")
+            return
+        trailing_high = None
+        if len(parts) >= 7:
+            try:
+                trailing_high = float(parts[6])
+            except ValueError:
+                _reply("⚠️ PICO tem de ser um número.")
+                return
+        try:
+            pos = cr.add_conviction(ticker, price, shares, ptype, trailing_high=trailing_high)
+        except ValueError as e:
+            _reply(f"⚠️ {e}")
+            return
+        except Exception as e:
+            _reply(f"❌ Erro ao adicionar: `{e}`")
+            return
+        snap_bits = []
+        if pos.entry_score is not None:
+            snap_bits.append(f"Score actual: {pos.entry_score:.0f}/100")
+        if pos.entry_win_prob is not None:
+            snap_bits.append(f"Win-prob: {pos.entry_win_prob*100:.0f}%")
+        if pos.initial_pred_alpha is not None:
+            snap_bits.append(f"Alpha previsto: {pos.initial_pred_alpha*100:+.1f}pp")
+        snap_line = ("\n   _" + " | ".join(snap_bits) + "_") if snap_bits else ""
+        trail_str = f" | pico anchor ${pos.trailing_high:.2f}" if ptype == "MOMENTUM" else ""
+        _reply(
+            f"✅ *Convicção aberta — {ticker}*\n\n"
+            f"  💰 {shares:g}x @ ${price:.2f} ({ptype}){trail_str}"
+            f"{snap_line}\n\n"
+            f"_Vigilância diária activada. `/conviction {ticker}` para deep-dive._"
+        )
+        return
+
+    if sub == "list":
+        _reply(cr.render_list())
+        return
+
+    if sub == "outcomes":
+        _reply(cr.render_outcomes())
+        return
+
+    if sub == "close":
+        # /conviction close TICKER PRICE [reason]
+        if len(parts) < 4:
+            _reply("⚠️ Uso: `/conviction close TICKER PREÇO [motivo]`")
+            return
+        ticker = parts[2].upper().strip()
+        try:
+            price = float(parts[3])
+        except ValueError:
+            _reply("⚠️ Preço tem de ser um número.")
+            return
+        reason = " ".join(parts[4:]).strip() if len(parts) >= 5 else "manual"
+        try:
+            outcome = cr.close_conviction(ticker, price, reason=reason)
+        except Exception as e:
+            _reply(f"❌ Erro ao fechar: `{e}`")
+            return
+        if not outcome:
+            _reply(f"⚠️ Convicção *{ticker}* não encontrada.")
+            return
+        pnl_emo = "🟢" if outcome["pnl_pct"] >= 0 else "🔴"
+        _reply(
+            f"{pnl_emo} *Convicção fechada — {ticker}*\n\n"
+            f"  💰 {outcome['shares']:g}x @ ${outcome['exit_price']:.2f}\n"
+            f"  📊 P&L: *${outcome['pnl_abs']:+.2f}* ({outcome['pnl_pct']:+.1f}%) em {outcome['days_held']}d\n"
+            f"  🏷️ Motivo: _{outcome['reason']}_\n\n"
+            f"_Gravado em `conviction_outcomes.json` (não entra em ML)._"
+        )
+        return
+
+    if sub == "transition":
+        # /conviction transition TICKER TYPE
+        if len(parts) < 4:
+            _reply("⚠️ Uso: `/conviction transition TICKER TIPO`")
+            return
+        ticker = parts[2].upper().strip()
+        new_type = parts[3].upper().strip()
+        if new_type not in cr.VALID_TYPES:
+            _reply(f"⚠️ Tipo inválido `{new_type}`. Usa: {', '.join(cr.VALID_TYPES)}")
+            return
+        try:
+            pos = cr.transition_type(ticker, new_type)
+        except Exception as e:
+            _reply(f"❌ Erro: `{e}`")
+            return
+        if not pos:
+            _reply(f"⚠️ Convicção *{ticker}* não encontrada.")
+            return
+        if new_type == "MOMENTUM":
+            _reply(f"🔄 *{ticker}* → {new_type}\n_Trailing high ancorado a ${pos.trailing_high:.2f}._")
+        else:
+            _reply(f"🔄 *{ticker}* → {new_type}")
+        return
+
+    # Default: treat first arg as TICKER → deep-dive
+    ticker = parts[1].upper().strip()
+    try:
+        _reply(cr.render_deep_dive(ticker))
+    except Exception as e:
+        _reply(f"❌ Erro no deep-dive de {ticker}: `{e}`")
+
+
 # ── /liquidez handler ─────────────────────────────────────────────────────────────
 
 def _handle_liquidez(parts: list[str]) -> None:
@@ -4917,6 +5071,10 @@ def _handle_command(text: str) -> None:
     elif cmd == "/sell":
         if not _check_rate(cmd_key): return
         _handle_sell(parts)
+
+    elif cmd == "/conviction":
+        if not _check_rate(cmd_key): return
+        _handle_conviction(parts)
 
     elif cmd == "/liquidez":
         if not _check_rate(cmd_key): return
