@@ -66,6 +66,33 @@ _QUALITY_DROP_TRIGGER = float(os.getenv("CONVICTION_QUALITY_DROP_TRIGGER", "0.15
 
 VALID_TYPES = ("DIP", "MOMENTUM", "CORE")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Trigger taxonomy
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE triggers reflect short-term price/momentum behaviour. They are
+# meaningful for active trades (DIP/MOMENTUM rotation) but should not force a
+# sell on a long-term compounder just because volatility ticked up.
+# STRUCTURAL triggers reflect breakdown of the *thesis* itself — quality drop,
+# margin erosion, multi-criteria deterioration. These ALWAYS issue a full SELL
+# recommendation regardless of never_sell, because a CORE that's no longer a
+# "great company" must be flagged.
+PHASE_TRIGGERS = {
+    "TRAIL_STOP_CONFIRMED",
+    "TRAIL_STOP_PENDING",
+    "EARLY_ALPHA",
+    "DETERIORATION",
+    "TIME_DECAY",
+    "EDGE_GONE",
+    "SUGGEST_TRANSITION",
+}
+STRUCTURAL_TRIGGERS = {
+    "QUALITY_DECLINE",          # quality_score dropped ≥ 20pp
+    "CORE_QUALITY_WARNING",     # quality_score dropped 10-20pp (med severity)
+    "CORE_QUALITY_DECLINE",     # quality_score dropped ≥ 20pp on CORE
+    "STRUCTURAL_DECLINE",       # multi-criteria thesis breakdown
+    "FUNDAMENTAL_BREAKDOWN",    # revenue + margin + debt deterioration
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data model
@@ -82,8 +109,20 @@ class ConvictionPosition:
     entry_price:          float
     shares:               float
     entry_date:           str               # ISO YYYY-MM-DD
-    position_type:        str               # DIP | MOMENTUM | CORE
+    position_type:        str               # DIP | MOMENTUM | CORE — current phase
     source:               str = "conviction"
+
+    # Identity (set at first add, NEVER changes after that).
+    # original_type drives never_sell default and shapes the verdict for
+    # transitions (e.g., a CORE that drifted into MOMENTUM rally is still
+    # fundamentally a CORE — phase triggers should never auto-recommend sell).
+    original_type:        Optional[str] = None
+    # never_sell suppresses *phase* triggers from issuing a 🔴 FECHAR verdict
+    # (capped at 🟡 alerta). STRUCTURAL triggers (quality deterioration,
+    # multi-criteria thesis breakdown) ALWAYS bypass never_sell — that's
+    # the whole point: "a great company that stops being a great company
+    # must trigger a sell alert regardless of the never_sell flag".
+    never_sell:           bool = False
 
     # MOMENTUM trailing-stop state
     trailing_high:        float = 0.0
@@ -95,6 +134,10 @@ class ConvictionPosition:
     initial_pred_alpha:   Optional[float] = None  # alpha_90d at entry (DIP only)
     entry_score:          Optional[float] = None  # DIP score at entry (0..100)
     entry_sector:         Optional[str] = None
+
+    # Snapshot of fundamentals at entry for structural-decline detection.
+    # Keys: revenue_growth, gross_margin, debt_equity, roe, fcf_yield.
+    entry_fundamentals:   Optional[dict] = None
 
     # Mutable state
     last_check_date:      Optional[str] = None
@@ -187,26 +230,45 @@ def add_conviction(
     # Capture entry-day snapshot for later delta comparisons
     snap = _entry_snapshot(ticker, entry_price)
 
+    # never_sell defaults: CORE=True (long-term holds), DIP/MOMENTUM=False (sellable)
+    default_never_sell = (pt == "CORE")
+
     pos = ConvictionPosition(
         ticker             = ticker,
         entry_price        = float(entry_price),
         shares             = float(shares),
         entry_date         = _today_iso(),
         position_type      = pt,
+        original_type      = pt,           # locked at creation
+        never_sell         = default_never_sell,
         trailing_high      = float(trailing_high) if trailing_high else float(entry_price),
         entry_quality_score = snap.get("quality_score"),
         entry_win_prob     = snap.get("win_prob"),
         initial_pred_alpha = snap.get("pred_alpha"),
         entry_score        = snap.get("dip_score"),
         entry_sector       = snap.get("sector"),
+        entry_fundamentals = snap.get("fundamentals"),
         note               = note,
     )
 
     all_positions = load_convictions()
     all_positions.append(pos)
     save_convictions(all_positions)
-    logger.info(f"[conviction] added {ticker} ({pt}) @ ${entry_price:.2f}")
+    logger.info(f"[conviction] added {ticker} ({pt}, never_sell={default_never_sell}) @ ${entry_price:.2f}")
     return pos
+
+
+def set_never_sell(ticker: str, value: bool) -> Optional[ConvictionPosition]:
+    """Toggle never_sell flag for a position. Use lock=True / unlock=False."""
+    ticker = ticker.upper().strip()
+    positions = load_convictions()
+    for p in positions:
+        if p.ticker == ticker:
+            p.never_sell = bool(value)
+            save_convictions(positions)
+            logger.info(f"[conviction] {ticker}: never_sell={value}")
+            return p
+    return None
 
 
 def close_conviction(ticker: str, exit_price: float, reason: str = "manual") -> Optional[dict]:
@@ -273,12 +335,20 @@ def transition_type(ticker: str, new_type: str) -> Optional[ConvictionPosition]:
         if p.ticker == ticker.upper().strip():
             old = p.position_type
             p.position_type = new_type
+            # never_sell auto-rules on transition:
+            #   → CORE: auto-set never_sell=True (long-term hold semantics)
+            #   away from CORE: only auto-unset never_sell if original was NOT CORE
+            #     (a CORE that's currently in MOMENTUM rally stays never_sell=True)
+            if new_type == "CORE":
+                p.never_sell = True
+            elif p.original_type != "CORE":
+                p.never_sell = False
             if new_type == "MOMENTUM":
                 # Anchor trailing_high to current high if not set
                 cur = _fetch_price(p.ticker, fallback=p.entry_price)
                 p.trailing_high = max(p.trailing_high or 0.0, cur, p.entry_price)
             save_convictions(positions)
-            logger.info(f"[conviction] {ticker}: {old} → {new_type}")
+            logger.info(f"[conviction] {ticker}: {old} → {new_type} (never_sell={p.never_sell})")
             return p
     return None
 
@@ -339,13 +409,25 @@ def _rsi(closes: pd.Series, period: int = 14) -> float:
 
 
 def _entry_snapshot(ticker: str, entry_price: float) -> dict:
-    """Capture quality/ML/DIP-score snapshot at entry. Best-effort; all fields optional."""
+    """Capture quality/ML/DIP-score snapshot at entry. Best-effort; all fields optional.
+
+    Now also captures `fundamentals` dict (revenue_growth, gross_margin,
+    debt_equity, roe, fcf_yield) for later structural-decline detection.
+    """
     snap: dict = {}
     try:
         from market_client import get_fundamentals
         fund = get_fundamentals(ticker, min_market_cap=0)
         if fund and not fund.get("skip"):
             snap["sector"] = fund.get("sector")
+            # Persist fundamentals for structural decline detector
+            snap["fundamentals"] = {
+                "revenue_growth": fund.get("revenue_growth"),
+                "gross_margin":   fund.get("gross_margin"),
+                "debt_equity":    fund.get("debt_equity"),
+                "roe":            fund.get("roe"),
+                "fcf_yield":      fund.get("fcf_yield"),
+            }
             try:
                 from score import score_from_fundamentals
                 sf = score_from_fundamentals(fund)
@@ -370,6 +452,122 @@ def _entry_snapshot(ticker: str, entry_price: float) -> dict:
     except Exception as e:
         logger.debug(f"[conviction] snapshot {ticker}: {e}")
     return snap
+
+
+def _detect_fundamental_breakdown(pos: ConvictionPosition, current_fund: dict) -> tuple[bool, list[str]]:
+    """Multi-criteria structural decline detector.
+
+    Returns (is_breakdown, reason_list). Triggers when ≥ 2 of:
+      - Revenue growth turned negative AND dropped ≥ 15pp vs entry
+      - Gross margin eroded ≥ 5pp vs entry
+      - Debt/equity ratio more than doubled vs entry
+      - ROE collapsed ≥ 30pp (e.g., 25% → -5%)
+
+    Used for CORE positions: a "great company" failing on multiple
+    fundamental axes simultaneously stops being a great company. This
+    overrides never_sell — the whole point of the flag is to ignore noise,
+    not to ignore real decline.
+    """
+    if not pos.entry_fundamentals or not current_fund:
+        return False, []
+    reasons: list[str] = []
+
+    def _f(d: dict, k: str) -> Optional[float]:
+        v = d.get(k)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    # 1. Revenue growth collapse
+    rg_then = _f(pos.entry_fundamentals, "revenue_growth")
+    rg_now  = _f(current_fund, "revenue_growth")
+    if rg_then is not None and rg_now is not None:
+        if rg_now < 0 and (rg_then - rg_now) >= 0.15:
+            reasons.append(f"Revenue growth: {rg_then*100:+.0f}% → {rg_now*100:+.0f}% (queda ≥15pp + negativo)")
+
+    # 2. Gross margin erosion
+    gm_then = _f(pos.entry_fundamentals, "gross_margin")
+    gm_now  = _f(current_fund, "gross_margin")
+    if gm_then is not None and gm_now is not None:
+        if (gm_then - gm_now) >= 0.05:
+            reasons.append(f"Gross margin erodiu {(gm_then-gm_now)*100:.0f}pp ({gm_then*100:.0f}% → {gm_now*100:.0f}%)")
+
+    # 3. Debt/equity doubled
+    de_then = _f(pos.entry_fundamentals, "debt_equity")
+    de_now  = _f(current_fund, "debt_equity")
+    if de_then is not None and de_now is not None:
+        if de_then > 0 and de_now >= 2.0 * de_then and de_now >= 1.0:
+            reasons.append(f"Debt/equity duplicou ({de_then:.2f} → {de_now:.2f})")
+
+    # 4. ROE collapse
+    roe_then = _f(pos.entry_fundamentals, "roe")
+    roe_now  = _f(current_fund, "roe")
+    if roe_then is not None and roe_now is not None:
+        if (roe_then - roe_now) >= 0.30:
+            reasons.append(f"ROE colapsou {(roe_then-roe_now)*100:.0f}pp ({roe_then*100:+.0f}% → {roe_now*100:+.0f}%)")
+
+    return (len(reasons) >= 2, reasons)
+
+
+def _detect_event_driven_signals(ticker: str) -> tuple[list[dict], list[str]]:
+    """Real-time event-driven structural signals.
+
+    Uses fundamental_signals.classify_recent_8k (item-code based scoring of
+    last 30d of 8-K filings) and earnings_call_tone (keyword-based sentiment
+    of last 90d of earnings calls). These are event-driven, time-sensitive
+    signals — a 4.02 restatement or 2.04 covenant default 8-K filing is
+    immediately actionable for a CORE position. Always bypasses never_sell.
+
+    Returns (triggers_to_emit, raw_signal_notes).
+    """
+    triggers: list[dict] = []
+    notes: list[str] = []
+    try:
+        from fundamental_signals import classify_recent_8k, earnings_call_tone
+    except Exception:
+        return triggers, notes
+
+    # 8-K material adverse event detector
+    try:
+        score_8k = classify_recent_8k(ticker, lookback_days=30)
+        if score_8k is not None and not (isinstance(score_8k, float) and score_8k != score_8k):
+            notes.append(f"8-K(30d) score: {score_8k:+.2f}")
+            if score_8k <= -0.5:
+                triggers.append({
+                    "kind": "STRUCTURAL_DECLINE",
+                    "severity": "high",
+                    "message": (f"8-K adverso material nos últimos 30 dias "
+                                f"(score {score_8k:+.2f}). Possível restatement, "
+                                f"covenant default, ou evento operacional grave.")
+                })
+            elif score_8k <= -0.2:
+                triggers.append({
+                    "kind": "CORE_QUALITY_WARNING",
+                    "severity": "med",
+                    "message": (f"8-K negativo nos últimos 30 dias (score {score_8k:+.2f}). "
+                                f"Verifica natureza do filing antes de decidir.")
+                })
+    except Exception as e:
+        logger.debug(f"[conviction] 8-K signal {ticker}: {e}")
+
+    # Earnings call tone
+    try:
+        tone = earnings_call_tone(ticker, lookback_days=90)
+        if tone is not None and not (isinstance(tone, float) and tone != tone):
+            notes.append(f"Earnings tone(90d): {tone:+.2f}")
+            if tone <= -0.5:
+                triggers.append({
+                    "kind": "STRUCTURAL_DECLINE",
+                    "severity": "high",
+                    "message": (f"Earnings call tone muito negativo nos últimos 90d "
+                                f"({tone:+.2f}). Guidance cut, deterioração operacional, "
+                                f"ou linguagem defensiva da gestão.")
+                })
+    except Exception as e:
+        logger.debug(f"[conviction] earnings tone {ticker}: {e}")
+
+    return triggers, notes
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -560,16 +758,53 @@ def evaluate_conviction(pos: ConvictionPosition) -> dict:
             })
 
     elif pos.position_type == "CORE":
-        # Long-term tracker: only flag quality deterioration. No daily exit signal.
+        # Long-term tracker: NO phase triggers (no trailing stop, no time decay).
+        # ONLY structural triggers — and those CAN escalate to FECHAR even with
+        # never_sell because a great company that stops being great must alert.
         if pos.entry_quality_score is not None and quality_score is not None:
             qdrop = pos.entry_quality_score - quality_score
-            if qdrop >= _QUALITY_DROP_TRIGGER:
+            if qdrop >= 0.20:
                 out["triggers"].append({
                     "kind": "CORE_QUALITY_DECLINE",
-                    "severity": "med",
-                    "message": (f"Qualidade fundamental caiu {qdrop*100:.0f}pp desde entrada. "
-                                f"Reavalia a tese de longo prazo (sem stop automático no CORE).")
+                    "severity": "high",
+                    "message": (f"🚨 Qualidade fundamental caiu {qdrop*100:.0f}pp desde entrada "
+                                f"({pos.entry_quality_score*100:.0f}% → {quality_score*100:.0f}%). "
+                                f"Tese de 'grande empresa' invalidada — considera fechar.")
                 })
+            elif qdrop >= 0.10:
+                out["triggers"].append({
+                    "kind": "CORE_QUALITY_WARNING",
+                    "severity": "med",
+                    "message": (f"Qualidade caiu {qdrop*100:.0f}pp desde entrada "
+                                f"({pos.entry_quality_score*100:.0f}% → {quality_score*100:.0f}%). "
+                                f"Vigia próximos earnings.")
+                })
+
+        # Multi-criteria fundamental breakdown (revenue + margin + debt + ROE)
+        current_fund_dict = {
+            "revenue_growth": fund.get("revenue_growth") if 'fund' in locals() else None,
+            "gross_margin":   fund.get("gross_margin")   if 'fund' in locals() else None,
+            "debt_equity":    fund.get("debt_equity")    if 'fund' in locals() else None,
+            "roe":            fund.get("roe")            if 'fund' in locals() else None,
+            "fcf_yield":      fund.get("fcf_yield")      if 'fund' in locals() else None,
+        }
+        is_breakdown, breakdown_reasons = _detect_fundamental_breakdown(pos, current_fund_dict)
+        if is_breakdown:
+            out["triggers"].append({
+                "kind": "FUNDAMENTAL_BREAKDOWN",
+                "severity": "high",
+                "message": (f"🚨 Quebra fundamental multi-critério: "
+                            f"{' | '.join(breakdown_reasons)}.")
+            })
+
+    # ── Event-driven structural signals (applies to ALL types) ────────────
+    # 8-K material adverse events + earnings call tone. These OVERRIDE
+    # never_sell — a restatement filing or covenant default for MSFT must
+    # trigger a SELL alert even though MSFT is a "never_sell CORE".
+    event_triggers, event_notes = _detect_event_driven_signals(pos.ticker)
+    out["triggers"].extend(event_triggers)
+    if event_notes:
+        out["event_signals"] = event_notes
 
     return out
 
@@ -582,21 +817,53 @@ def _trigger_emoji(severity: str) -> str:
     return {"high": "🚨", "med": "⚠️", "low": "💡"}.get(severity, "•")
 
 
-def _hold_close_verdict(ev: dict) -> str:
-    """One-line recommendation derived from triggers."""
+def _hold_close_verdict(ev: dict, pos: Optional[ConvictionPosition] = None) -> str:
+    """One-line recommendation derived from triggers.
+
+    never_sell semantics:
+      - Phase triggers (TRAIL_STOP, EARLY_ALPHA, DETERIORATION, EDGE_GONE,
+        TIME_DECAY) are SUPPRESSED to 🟡 alerta when never_sell=True.
+      - Structural triggers (QUALITY_DECLINE, CORE_QUALITY_DECLINE,
+        STRUCTURAL_DECLINE, FUNDAMENTAL_BREAKDOWN, event-driven 8-K) ALWAYS
+        produce 🔴 FECHAR regardless of never_sell — the whole point of
+        never_sell is to ignore noise, not to ignore real thesis breakdown.
+    """
     triggers = ev.get("triggers") or []
     highs = [t for t in triggers if t.get("severity") == "high"]
     meds  = [t for t in triggers if t.get("severity") == "med"]
-    if any(t["kind"] in ("TRAIL_STOP_CONFIRMED", "EDGE_GONE") for t in highs):
-        return "🔴 *FECHAR* — trigger forte accionado."
-    if any(t["kind"] in ("DETERIORATION", "QUALITY_DECLINE", "CORE_QUALITY_DECLINE") for t in highs):
-        return "🟠 *FECHAR PARCIAL* — tese a enfraquecer; corta 30-50%."
+    never_sell = bool(pos.never_sell) if pos else False
+
+    structural_high = [t for t in highs if t["kind"] in STRUCTURAL_TRIGGERS]
+    phase_high      = [t for t in highs if t["kind"] in PHASE_TRIGGERS]
+
+    # 1. STRUCTURAL high — always overrides never_sell. Most severe outcome.
+    if structural_high:
+        return ("🔴 *FECHAR — DETERIORAÇÃO ESTRUTURAL*\n"
+                f"_Trigger estrutural activo: {structural_high[0]['kind']}. "
+                f"Tese de qualidade invalidada — não suprimível por never_sell._")
+
+    # 2. PHASE high — suppressed to 🟡 if never_sell, else 🔴.
+    if phase_high:
+        if never_sell:
+            return ("🟡 *ALERTA — trigger de fase activo (never_sell suprime fecho total)*\n"
+                    f"_Considera **reduzir parcial** para travar lucro. "
+                    f"`/conviction unlock {ev.get('ticker','')}` se quiseres permitir fecho total._")
+        # Original behaviour (no never_sell)
+        if any(t["kind"] in ("TRAIL_STOP_CONFIRMED", "EDGE_GONE") for t in phase_high):
+            return "🔴 *FECHAR* — trigger forte accionado."
+        if any(t["kind"] == "DETERIORATION" for t in phase_high):
+            return "🟠 *FECHAR PARCIAL* — tese a enfraquecer; corta 30-50%."
+
+    # 3. MED triggers
+    if any(t["kind"] in ("CORE_QUALITY_WARNING",) for t in meds):
+        return "🟡 *VIGIAR FUNDAMENTAIS* — qualidade a derivar negativamente; vigia próximos earnings."
     if any(t["kind"] == "EARLY_ALPHA" for t in meds):
         return "🟡 *REALIZAR PARCIAL* — alpha quase todo capturado; trava 50%."
     if any(t["kind"] == "TRAIL_STOP_PENDING" for t in meds):
         return "🟡 *VIGIAR* — stop tocado sem confirmação. Pronto a fechar amanhã se RSI/MA20 confirmar."
     if any(t["kind"] == "TIME_DECAY" for t in meds):
         return "🟡 *REVER PRAZO* — tese de recuperação a expirar."
+
     return "🟢 *MANTER* — sem triggers de saída."
 
 
@@ -619,8 +886,14 @@ def render_deep_dive(ticker: str) -> str:
     pnl_sign = "+" if ev["pnl_pct"] >= 0 else ""
     pnl_emo  = "📈" if ev["pnl_pct"] >= 0 else "📉"
 
+    # Header includes original_type + lock badge if relevant
+    type_badge = pos.position_type
+    if pos.original_type and pos.original_type != pos.position_type:
+        type_badge = f"{pos.position_type} (era {pos.original_type})"
+    lock_badge = " 🔒" if pos.never_sell else ""
+
     lines = [
-        f"🧠 *Convicção {pos.ticker}* — {pos.position_type} | Dia {ev['days_held']}",
+        f"🧠 *Convicção {pos.ticker}* — {type_badge}{lock_badge} | Dia {ev['days_held']}",
         "",
         f"💰 *Posição:* {pos.shares:g}x @ ${pos.entry_price:.2f} → ${ev['current_price']:.2f}",
         f"   {pnl_emo} P&L: *${ev['pnl_abs']:+.2f}* ({pnl_sign}{ev['pnl_pct']:.2f}%)",
@@ -672,6 +945,11 @@ def render_deep_dive(ticker: str) -> str:
             lines.append(f"   Qualidade: {pos.entry_quality_score*100:.0f}% → {q*100:.0f}% ({arrow}{abs(d):.0f}pp)")
         lines.append(f"   _CORE: sem stop automático. Reavalia mensalmente._")
 
+    # Event-driven signals (informational, even if no trigger fired)
+    event_notes = ev.get("event_signals") or []
+    if event_notes:
+        lines += ["", f"📰 *Sinais event-driven:* { ' | '.join(event_notes) }"]
+
     # Triggers
     triggers = ev.get("triggers") or []
     if triggers:
@@ -681,7 +959,8 @@ def render_deep_dive(ticker: str) -> str:
     else:
         lines += ["", "✅ _Sem triggers de saída._"]
 
-    lines += ["", _hold_close_verdict(ev)]
+    # Pass pos to verdict so it can respect never_sell
+    lines += ["", _hold_close_verdict(ev, pos)]
 
     if pos.note:
         lines += ["", f"_Nota original: {pos.note}_"]
@@ -721,6 +1000,180 @@ def render_outcomes(limit: int = 15) -> str:
             f"{sign}{pnl:.1f}% ({entry['days_held']}d) | {entry['reason']}"
         )
     return "\n".join(out)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Auto-classifier + auto-sync from portfolio
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Tickers that should never be auto-tracked as convictions: passive ETFs,
+# foreign-listed instruments, non-equity holdings. Extensible via env var
+# CONVICTION_DENY_TICKERS="A,B,C".
+_AUTO_TRACK_DENY_BASE = {
+    # US benchmarks
+    "SPY", "QQQ", "IVV", "VTI", "VOO",
+    # US sector ETFs
+    "XLK", "XLV", "XLF", "XLE", "XLI", "XLY", "XLP", "XLU", "XLRE", "XLC", "XLB",
+    # Foreign-listed ETFs commonly held by EU/UK investors
+    "EUNL", "EUNL.DE", "IS3N", "IEMA", "ALV",
+    # Portuguese non-stock instruments
+    "PPR",
+}
+
+
+def _get_deny_list() -> set[str]:
+    extras = os.getenv("CONVICTION_DENY_TICKERS", "")
+    extra_set = {t.strip().upper() for t in extras.split(",") if t.strip()}
+    return _AUTO_TRACK_DENY_BASE | extra_set
+
+
+def _classify_type_from_signals(ticker: str, current_price: float, hist) -> str:
+    """Auto-pick MOMENTUM or DIP based on ML signals + technicals.
+
+    NEVER returns CORE — CORE is always user-explicit. Auto-sync of a new
+    holding should err on the side of armed monitoring (MOMENTUM with
+    trailing stop) rather than passive long-term assumption.
+
+    Priority:
+      1. Momentum ML model signal (high score → MOMENTUM)
+      2. DIP ML model alpha forecast (high alpha → DIP)
+      3. Technical fallback (RSI + price vs MA20 + trend direction)
+      4. Default MOMENTUM with current price as trailing_high (preserve gains)
+    """
+    # 1. Try momentum signal
+    try:
+        from momentum_radar.scanner import score_momentum_for_ticker
+        m_score = score_momentum_for_ticker(ticker)
+        if m_score is not None and float(m_score) >= 60:
+            logger.debug(f"[conviction] auto-classify {ticker}: MOMENTUM (momentum score={m_score:.0f})")
+            return "MOMENTUM"
+    except Exception as e:
+        logger.debug(f"[conviction] momentum signal {ticker}: {e}")
+
+    # 2. Try DIP model
+    try:
+        from market_client import get_fundamentals
+        from ml_features import build_features
+        from ml_engine import load_predictor, predict_dip
+        load_predictor()
+        fund = get_fundamentals(ticker, min_market_cap=0)
+        if fund and not fund.get("skip"):
+            feat = build_features(ticker, fund, price_history=hist,
+                                   sector=fund.get("sector") or "Unknown")
+            pred = predict_dip(feature_row=feat, current_price=current_price, ticker=ticker)
+            if pred and pred.model_ready:
+                alpha = float(getattr(pred, "pred_up", 0.0) or 0.0)
+                if alpha >= 0.05:
+                    logger.debug(f"[conviction] auto-classify {ticker}: DIP (alpha={alpha:.3f})")
+                    return "DIP"
+    except Exception as e:
+        logger.debug(f"[conviction] DIP signal {ticker}: {e}")
+
+    # 3. Technical fallback
+    if hist is not None and len(hist) >= 20:
+        try:
+            closes = hist["Close"]
+            ma20   = float(closes.rolling(20).mean().iloc[-1])
+            rsi    = _rsi(closes)
+            # Recent trend: last 20d return
+            recent_ret = float(closes.iloc[-1] / closes.iloc[-20] - 1) if len(closes) >= 20 else 0.0
+            if rsi >= 55 and current_price > ma20 and recent_ret > 0.0:
+                logger.debug(f"[conviction] auto-classify {ticker}: MOMENTUM (RSI {rsi:.0f}, +{recent_ret*100:.0f}% 20d)")
+                return "MOMENTUM"
+            if rsi < 40 and current_price < ma20:
+                logger.debug(f"[conviction] auto-classify {ticker}: DIP (RSI {rsi:.0f}, below MA20)")
+                return "DIP"
+        except Exception:
+            pass
+
+    # 4. Default
+    logger.debug(f"[conviction] auto-classify {ticker}: MOMENTUM (fallback)")
+    return "MOMENTUM"
+
+
+def auto_sync_from_portfolio(send_telegram: Optional[Callable[[str], None]] = None) -> dict:
+    """Create conviction records for portfolio holdings not yet tracked.
+
+    Skips:
+      - Tickers in _AUTO_TRACK_DENY (ETFs, non-equity)
+      - Foreign-listed tickers (any with a dot — .DE, .L, .PA, etc.)
+      - Tickers already in personal_positions.json
+
+    Type is auto-classified via ML signals + technicals.
+    Never auto-classifies as CORE (CORE is always user-explicit).
+
+    Returns: {"added": N, "skipped": M, "items": [(ticker, type, reason)...]}
+    """
+    try:
+        from portfolio import get_positions
+    except Exception as e:
+        logger.warning(f"[conviction] portfolio import failed: {e}")
+        return {"added": 0, "skipped": 0, "items": []}
+
+    try:
+        portfolio_positions = get_positions()
+    except Exception as e:
+        logger.warning(f"[conviction] get_positions failed: {e}")
+        return {"added": 0, "skipped": 0, "items": []}
+
+    deny = _get_deny_list()
+    existing = {p.ticker for p in load_convictions()}
+    added: list[tuple[str, str]] = []
+    skipped: list[tuple[str, str]] = []
+
+    for sym, info in portfolio_positions.items():
+        ticker = sym.upper().strip()
+        if ticker in existing:
+            continue
+        if ticker in deny:
+            skipped.append((ticker, "deny-list (ETF/non-equity)"))
+            continue
+        if "." in ticker:
+            skipped.append((ticker, "foreign-listed"))
+            continue
+
+        try:
+            entry_price = float(info.get("avg_price", 0) or 0)
+            shares      = float(info.get("shares", 0) or 0)
+        except (TypeError, ValueError):
+            skipped.append((ticker, "missing entry data"))
+            continue
+        if entry_price <= 0 or shares <= 0:
+            skipped.append((ticker, "zero shares/price"))
+            continue
+
+        # Auto-classify
+        current = _fetch_price(ticker, fallback=entry_price)
+        hist    = _fetch_price_history(ticker, period="6mo")
+        ptype   = _classify_type_from_signals(ticker, current, hist)
+
+        try:
+            add_conviction(
+                ticker, entry_price, shares, ptype,
+                trailing_high = current if ptype == "MOMENTUM" else None,
+                note          = "auto-sync from portfolio",
+            )
+            added.append((ticker, ptype))
+        except Exception as e:
+            logger.warning(f"[conviction] auto-sync {ticker} failed: {e}")
+            skipped.append((ticker, f"error: {e}"))
+
+    if added and send_telegram:
+        lines = ["🔄 *Auto-sync convicção ↔ carteira*", ""]
+        for t, p in added:
+            lines.append(f"  ✅ {t} → {p} (auto-classificado)")
+        if skipped:
+            lines += ["", "_Saltadas:_"]
+            for t, r in skipped:
+                lines.append(f"  ⏭️ {t} _({r})_")
+        lines += ["", "_Para upgrade a CORE: `/conviction transition TICKER CORE`_"]
+        try:
+            send_telegram("\n".join(lines))
+        except Exception as e:
+            logger.warning(f"[conviction] auto-sync telegram failed: {e}")
+
+    return {"added": len(added), "skipped": len(skipped),
+            "items": [(t, p, "added") for t, p in added] + [(t, "-", r) for t, r in skipped]}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

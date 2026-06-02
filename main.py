@@ -2692,6 +2692,23 @@ def main() -> None:
         id="conviction_monitor", name="Conviction Monitor 22h05",
     )
 
+    # ── Conviction auto-sync: 06:00 Lisboa, mon-sun ───────────────────────────
+    # Walks portfolio.get_positions() and creates conviction records for any
+    # holding not yet tracked AND not in deny-list (ETFs, foreign-listed, PPR).
+    # Type is auto-classified via ML signals + technicals. Never auto-creates
+    # CORE — CORE is always user-explicit upgrade.
+    def _run_conviction_auto_sync():
+        try:
+            import conviction_radar
+            conviction_radar.auto_sync_from_portfolio(send_telegram)
+        except Exception as e:
+            logging.error(f"[conviction] auto-sync failed: {e}", exc_info=True)
+    scheduler.add_job(
+        _run_conviction_auto_sync,
+        CronTrigger(hour=6, minute=0, timezone=LISBON_TZ),
+        id="conviction_auto_sync", name="Conviction Auto-Sync 06h00",
+    )
+
     # ── Saturday Weekly Report: sábado 10:00 Lisboa ───────────────────────────
     scheduler.add_job(
         send_saturday_report,

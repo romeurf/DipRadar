@@ -4107,8 +4107,10 @@ def _handle_buy(parts: list[str]) -> None:
     liq        = result["liquidity"]
     liq_warn   = "\n⚠️ _Liquidez ficou negativa — faz `/liquidez +VALOR` para corrigir._" if result["liq_warning"] else ""
 
-    # If a conviction already exists for this ticker, flag it so the user
-    # decides if they want to re-anchor the thesis to the new average price.
+    # Auto-create conviction if not already tracked AND not in deny-list.
+    # Rationale: "if you /buy, you have a thesis — let the radar watch it".
+    # Skips ETFs/foreign-listed/PPR via _AUTO_TRACK_DENY.
+    # If conviction already exists, surface the DCA hint instead of duplicating.
     conviction_tail = ""
     try:
         import conviction_radar as cr
@@ -4117,13 +4119,41 @@ def _handle_buy(parts: list[str]) -> None:
             conviction_tail = (
                 f"\n\n🧠 _Convicção {symbol} já activa "
                 f"({existing_conv.position_type} @ ${existing_conv.entry_price:.2f}). "
-                f"Preço médio mudou para ${pos['avg_price']:.2f} — se quiseres reflectir "
-                f"o DCA na tese, fecha e reabre:_\n"
+                f"Preço médio mudou para ${pos['avg_price']:.2f} — se quiseres "
+                f"re-ancorar a tese ao novo preço médio:_\n"
                 f"  `/conviction close {symbol} {price:.2f} dca`\n"
                 f"  `/conviction add {symbol} {pos['avg_price']:.2f} {pos['shares']} {existing_conv.position_type}`"
             )
+        else:
+            deny = cr._get_deny_list()
+            if symbol in deny or "." in symbol:
+                conviction_tail = (
+                    f"\n\n🧠 _Carteira actualizada. {symbol} é ETF/foreign-listed — "
+                    f"não auto-criada como convicção (deny-list)._"
+                )
+            else:
+                # Auto-classify and create
+                try:
+                    current = cr._fetch_price(symbol, fallback=price)
+                    hist    = cr._fetch_price_history(symbol, period="6mo")
+                    auto_type = cr._classify_type_from_signals(symbol, current, hist)
+                    cr.add_conviction(
+                        symbol, pos["avg_price"], pos["shares"], auto_type,
+                        trailing_high=current if auto_type == "MOMENTUM" else None,
+                        note="auto-created from /buy",
+                    )
+                    conviction_tail = (
+                        f"\n\n🧠 _Convicção {symbol} criada auto como **{auto_type}** "
+                        f"(classificação por ML + technicals). "
+                        f"`/conviction transition {symbol} CORE` se queres long-term hold._"
+                    )
+                except Exception as e:
+                    conviction_tail = (
+                        f"\n\n🧠 _Convicção {symbol} não criada (auto-classifier falhou: {e}). "
+                        f"Faz `/conviction add {symbol} {pos['avg_price']:.2f} {pos['shares']} TIPO` manual._"
+                    )
     except Exception as e:
-        logging.debug(f"[buy→conviction hint] {symbol}: {e}")
+        logging.debug(f"[buy→conviction auto-create] {symbol}: {e}")
 
     _reply(
         f"✅ {action_str} — *{symbol}*\n\n"
@@ -4243,20 +4273,21 @@ def _handle_conviction(parts: list[str]) -> None:
     if sub == "help" or sub in ("?", "-h", "--help"):
         _reply(
             "🧠 *Convicção — radar paralelo*\n"
-            "_Trackeia posições abertas por convicção pessoal usando o mesmo motor "
-            "do DipRadar mas sem contaminar o ML._\n\n"
+            "_Trackeia posições com o motor do DipRadar mas sem contaminar o ML._\n\n"
             "*Comandos:*\n"
             "  `/conviction add TICKER PREÇO SHARES TIPO [PICO]`\n"
-            "    Tipos: `DIP`, `MOMENTUM`, `CORE`. PICO opcional (anchor para trailing stop).\n"
-            "  `/conviction list` — todas as posições activas + P&L\n"
+            "    Tipos: `DIP`, `MOMENTUM`, `CORE`. CORE → never_sell automático.\n"
+            "    Auto-faz `/buy` se o ticker não está na carteira.\n"
+            "  `/conviction list` — todas as activas + P&L (🔒 = never_sell)\n"
             "  `/conviction TICKER` — deep-dive condensado (sinais hold/close)\n"
-            "  `/conviction close TICKER PREÇO [motivo]` — fechar e gravar outcome\n"
-            "  `/conviction delete TICKER` — remover sem gravar outcome (para corrigir enganos)\n"
-            "  `/conviction transition TICKER TIPO` — mudar tipo (ex: DIP→MOMENTUM)\n"
+            "  `/conviction close TICKER PREÇO [motivo]` — fechar + gravar outcome\n"
+            "  `/conviction delete TICKER` — remover sem outcome (corrigir enganos)\n"
+            "  `/conviction transition TICKER TIPO` — mudar tipo (DIP→MOMENTUM etc.)\n"
+            "  `/conviction lock TICKER` — never_sell=True (triggers de fase só alertam)\n"
+            "  `/conviction unlock TICKER` — never_sell=False (stop ATR pode fechar)\n"
+            "  `/conviction sync` — varrer carteira e criar convicções em falta\n"
             "  `/conviction outcomes` — histórico de saídas\n\n"
-            "_Exemplo:_\n"
-            "  `/conviction add LIF 48.41 100 MOMENTUM 61.50`\n"
-            "  `/conviction LIF`"
+            "_Auto-sync diário às 06:00 Lisboa. ETFs/PPR/foreign-listed saltados._"
         )
         return
 
@@ -4292,17 +4323,34 @@ def _handle_conviction(parts: list[str]) -> None:
         except Exception as e:
             _reply(f"❌ Erro ao adicionar: `{e}`")
             return
+
+        # Auto-sync to portfolio: "if you added with price+shares, you bought it".
+        # Only auto-buy if ticker not already in portfolio (avoids accidental DCA).
+        buy_tail = ""
+        try:
+            from portfolio import get_position, buy as portfolio_buy
+            if get_position(ticker) is None:
+                _br = portfolio_buy(ticker, price, shares)
+                buy_tail = (
+                    f"\n\n💼 _Também adicionado à carteira: "
+                    f"{shares:g}x @ ${price:.2f} (liquidez: €{_br.get('liquidity', 0):.2f})_"
+                )
+            else:
+                buy_tail = (
+                    f"\n\n💼 _{ticker} já na carteira — não duplicado. "
+                    f"Se queres fazer DCA usa `/buy {ticker} PREÇO SHARES`._"
+                )
+        except Exception as e:
+            buy_tail = f"\n\n⚠️ _Auto-/buy falhou: {e}. Faz `/buy {ticker} {price} {shares}` manual se quiseres._"
+
         # Show the full deep-dive immediately — much more informative than
-        # a one-line score snapshot, and tailored to the position type
-        # (MOMENTUM gets trailing stop + RSI + MA20; DIP gets win-prob delta;
-        # CORE gets quality-score block). User sees triggers + verdict in
-        # the same reply that confirmed the add.
+        # a one-line score snapshot, and tailored to the position type.
         try:
             dive = cr.render_deep_dive(ticker)
-            _reply(f"✅ *Convicção aberta — {ticker}*\n\n{dive}")
+            _reply(f"✅ *Convicção aberta — {ticker}*{buy_tail}\n\n{dive}")
         except Exception as e:
             _reply(
-                f"✅ *Convicção aberta — {ticker}* ({ptype})\n"
+                f"✅ *Convicção aberta — {ticker}* ({ptype}){buy_tail}\n"
                 f"_(deep-dive falhou: {e}. Tenta `/conviction {ticker}`.)_"
             )
         return
@@ -4335,6 +4383,53 @@ def _handle_conviction(parts: list[str]) -> None:
             f"🗑️ *{ticker} removida* (sem outcome gravado).\n"
             f"_Podes voltar a `/conviction add {ticker} …` com os valores correctos._"
         )
+        return
+
+    if sub in ("lock", "unlock"):
+        # /conviction lock TICKER       → never_sell = True  (phase triggers suprimidos)
+        # /conviction unlock TICKER     → never_sell = False (phase triggers podem fechar)
+        if len(parts) < 3:
+            _reply(f"⚠️ Uso: `/conviction {sub} TICKER`")
+            return
+        ticker = parts[2].upper().strip()
+        new_val = (sub == "lock")
+        try:
+            updated = cr.set_never_sell(ticker, new_val)
+        except Exception as e:
+            _reply(f"❌ Erro: `{e}`")
+            return
+        if not updated:
+            _reply(f"⚠️ Convicção *{ticker}* não encontrada.")
+            return
+        if new_val:
+            _reply(
+                f"🔒 *{ticker} bloqueada — never_sell = TRUE*\n"
+                f"_Triggers de fase (trailing stop, momentum cooling) viram alertas 🟡 — "
+                f"não recomendam fechar. Triggers estruturais (deterioração de tese, 8-K "
+                f"adverso, queda de qualidade) **continuam** a recomendar fechar._"
+            )
+        else:
+            _reply(
+                f"🔓 *{ticker} desbloqueada — never_sell = FALSE*\n"
+                f"_Triggers de fase podem recomendar fechar. Stop ATR activo._"
+            )
+        return
+
+    if sub == "sync":
+        # /conviction sync — manually trigger auto-sync from portfolio (debug aid)
+        try:
+            result = cr.auto_sync_from_portfolio(send_telegram=None)
+        except Exception as e:
+            _reply(f"❌ Erro no auto-sync: `{e}`")
+            return
+        lines = [f"🔄 *Auto-sync resultado:* {result['added']} adicionadas, {result['skipped']} saltadas"]
+        for item in result.get("items", []):
+            t, p, r = item
+            if r == "added":
+                lines.append(f"  ✅ {t} → {p}")
+            else:
+                lines.append(f"  ⏭️ {t} ({r})")
+        _reply("\n".join(lines))
         return
 
     if sub == "close":
