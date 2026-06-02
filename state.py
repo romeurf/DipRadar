@@ -159,6 +159,54 @@ def reset_today_flip_spent() -> None:
     _save_json("daily_flip_spent.json", data)
 
 
+# ── Scan heartbeat ────────────────────────────────────────────────────────
+# Persistent telemetry of every DIP scan run. The point is to make silence
+# legible: when a week passes with 0 alerts, the heartbeats let us tell
+# "the scanner ran 5 times, screened 80 tickers each, top score was 48
+# (threshold 50)" from "the scanner is broken — 0 tickers screened, all
+# features NaN". One is healthy patience; the other is a real problem.
+#
+# Stored as a rolling list. Pruned to last 60 days on each write so the
+# JSON stays small.
+
+def append_scan_heartbeat(entry: dict) -> None:
+    """Append one heartbeat record.
+
+    Caller provides at minimum:
+      - timestamp (ISO datetime string)
+      - n_screened (raw universe size that entered the loop)
+      - n_scored (how many got a valid score)
+      - n_alerted (how many passed the score threshold)
+      - top_score (max score in the scan, or None if none scored)
+      - threshold (effective MIN_DIP_SCORE used)
+    Extra keys are stored verbatim.
+    """
+    if not isinstance(entry, dict):
+        return
+    data = _load_json("scan_heartbeat.json", default=[]) or []
+    if not isinstance(data, list):
+        data = []
+    data.append(entry)
+    # Prune to last 60 days
+    cutoff_iso = (date.today() - timedelta(days=60)).isoformat()
+    pruned = []
+    for h in data:
+        ts = str(h.get("timestamp") or "")
+        if ts[:10] >= cutoff_iso:
+            pruned.append(h)
+    _save_json("scan_heartbeat.json", pruned)
+
+
+def load_scan_heartbeats(days: int = 7) -> list:
+    """Return heartbeats from the last `days` days (most recent first)."""
+    data = _load_json("scan_heartbeat.json", default=[]) or []
+    if not isinstance(data, list):
+        return []
+    cutoff_iso = (date.today() - timedelta(days=days)).isoformat()
+    out = [h for h in data if str(h.get("timestamp") or "")[:10] >= cutoff_iso]
+    return sorted(out, key=lambda h: h.get("timestamp", ""), reverse=True)
+
+
 # ── Weekly log ────────────────────────────────────────────────────────────
 
 def load_weekly_log() -> list:

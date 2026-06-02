@@ -809,6 +809,62 @@ def send_saturday_report() -> None:
             lines.append(f"  {i}. *{e['symbol']}* — Score {e['score']:.0f}/100 | {e['verdict']} | {e['date']}")
         lines.append("")
 
+    # ── Scan heartbeat — make silence legible ─────────────────────────────
+    # Aggregates per-scan diagnostics from state.scan_heartbeat for the last
+    # 7 days. A week with 0 alerts is informative IF the scanner ran and
+    # found scores near the threshold; suspicious if the scanner didn't run
+    # or scored everything to zero. The historical baseline (alerts/month
+    # over the 12 weeks of heartbeat history) tells the user whether silence
+    # is normal or a regime change.
+    try:
+        from state import load_scan_heartbeats
+        hbs = load_scan_heartbeats(days=7)
+        hbs_hist = load_scan_heartbeats(days=84)  # ~12 weeks for baseline
+        if hbs:
+            n_runs = len(hbs)
+            tot_screened = sum(int(h.get("n_screened", 0)) for h in hbs)
+            tot_scored   = sum(int(h.get("n_scored", 0))   for h in hbs)
+            tot_alerted  = sum(int(h.get("n_alerted", 0))  for h in hbs)
+            tops   = [h["top_score"] for h in hbs if h.get("top_score") is not None]
+            top_overall = max(tops) if tops else None
+            thresh = next((h.get("threshold") for h in hbs if h.get("threshold") is not None), None)
+
+            # Historical alert rate: alerts per scan-day over the rolling window
+            hist_days = max(1, len({str(h.get("timestamp"))[:10] for h in hbs_hist}))
+            hist_alerted = sum(int(h.get("n_alerted", 0)) for h in hbs_hist)
+            alerts_per_day = hist_alerted / hist_days if hist_days else 0.0
+            alerts_per_week = alerts_per_day * 5  # trading days
+
+            lines += [
+                "─" * 30, "",
+                "*📡 Scan health (heartbeat):*",
+                f"  Esta semana: *{n_runs}* scans corridos | "
+                f"*{tot_screened}* tickers triados | "
+                f"*{tot_scored}* pontuados",
+                f"  Total alertas semana: *{tot_alerted}* | "
+                f"Threshold: {thresh:.0f}" if thresh is not None else f"  Total alertas semana: *{tot_alerted}*",
+            ]
+            if top_overall is not None:
+                gap = (top_overall - thresh) if thresh is not None else None
+                gap_str = f" (gap {gap:+.0f} vs threshold)" if gap is not None else ""
+                lines.append(f"  Top score atingido: *{top_overall:.0f}*/100{gap_str}")
+            # Baseline rate — calmer reading when alerts are absent
+            if hist_days >= 5:
+                lines.append(
+                    f"  Baseline {len({str(h.get('timestamp'))[:10] for h in hbs_hist})}d: "
+                    f"≈*{alerts_per_week:.1f}* alertas/semana esperados "
+                    f"(_{hist_alerted} sobre {hist_days} dias de scan_)"
+                )
+            lines.append("")
+        else:
+            lines += [
+                "─" * 30, "",
+                "*📡 Scan health (heartbeat):*  _Sem registos esta semana — verificar se o scheduler está activo._",
+                "",
+            ]
+    except Exception as e:
+        logging.warning(f"Heartbeat block: {e}")
+
     try:
         bt_block = build_backtest_summary()
         lines += ["─" * 30, "", bt_block, ""]
@@ -1555,6 +1611,16 @@ def run_scan() -> None:
     _scan_running = True
     # ── Feature 8: conjunto de symbols que passaram score >= MIN_DIP_SCORE ──
     _scan_syms_scored: set[str] = set()
+    # Heartbeat counters — written to state.scan_heartbeat at end of scan so
+    # the weekly report can tell "scanner is healthy but silent" from "scanner
+    # is broken". Updated inline as the scan progresses.
+    _hb_scores: list[float] = []
+    _hb_n_alerted = 0
+    _hb_n_rejected = 0
+    _hb_threshold = float(MIN_DIP_SCORE)
+    _hb_n_screened = 0
+    _hb_started = datetime.now(LISBON_TZ).isoformat(timespec="seconds")
+
     try:
         if not is_market_open():
             logging.info("Mercado fechado, scan ignorado.")
@@ -1563,6 +1629,7 @@ def run_scan() -> None:
         logging.info("A iniciar scan de dips...")
         spy_change = get_spy_change()
         stocks     = screen_global_dips(DROP_THRESHOLD, MIN_MARKET_CAP)
+        _hb_n_screened = len(stocks) if stocks else 0
         if not stocks:
             logging.info("Sem stocks na triagem.")
             return
@@ -1581,6 +1648,7 @@ def run_scan() -> None:
                 )
         except Exception:
             effective_min_score = float(MIN_DIP_SCORE)
+        _hb_threshold = float(effective_min_score)
 
         ranked_entries = []
         comprar_syms   = set()
@@ -1618,7 +1686,16 @@ def run_scan() -> None:
                 except Exception:
                     pass
 
+                # Record this score in the heartbeat — keeps the full distribution,
+                # not just alerts, so a "0 alerts" week can still report top score
+                # and median.
+                try:
+                    _hb_scores.append(float(score))
+                except Exception:
+                    pass
+
                 if score < effective_min_score:
+                    _hb_n_rejected += 1
                     append_rejected_log({
                         "symbol": sym, "change": stock["change_pct"],
                         "reason": f"score baixo ({score:.0f} < {effective_min_score:.0f})",
@@ -1626,6 +1703,7 @@ def run_scan() -> None:
                         "radar": "DIP", "price": fund.get("price"),
                     })
                     continue
+                _hb_n_alerted += 1
 
                 if score >= 75:
                     verdict, emoji_str, tier = "COMPRAR", "🟢", 1
@@ -1911,6 +1989,29 @@ def run_scan() -> None:
     finally:
         expire_missing_streaks(_scan_syms_scored)
         _scan_running = False
+        # ── Scan heartbeat: telemetry that makes silence legible ────────
+        # Even a "0 alerts" scan now leaves a row showing universe size,
+        # score distribution and threshold. The weekly report aggregates
+        # these so a quiet week can be classified as "scanner healthy,
+        # market boring" vs "scanner broken".
+        try:
+            import state as _st_hb
+            _top = max(_hb_scores) if _hb_scores else None
+            _med = (
+                sorted(_hb_scores)[len(_hb_scores) // 2] if _hb_scores else None
+            )
+            _st_hb.append_scan_heartbeat({
+                "timestamp":   _hb_started,
+                "n_screened":  int(_hb_n_screened),
+                "n_scored":    len(_hb_scores),
+                "n_alerted":   int(_hb_n_alerted),
+                "n_rejected":  int(_hb_n_rejected),
+                "top_score":   round(_top, 1) if _top is not None else None,
+                "median_score": round(_med, 1) if _med is not None else None,
+                "threshold":   round(_hb_threshold, 1),
+            })
+        except Exception as _hb_err:
+            logging.debug(f"[scan_heartbeat] failed: {_hb_err}")
         logging.info("Scan concluído.")
 
 
@@ -2679,11 +2780,13 @@ def main() -> None:
             from momentum_radar.trainer import run_momentum_training
 
             # Fase 1: dataset incremental — build_dataset.py auto-detecta a
-            # ultima data do parquet e so processa dados novos (220d lookback)
+            # ultima data do parquet e so processa dados novos (220d lookback).
+            # 12h timeout — momentum dataset now queries EDGAR per episode for
+            # the 4 insider features, which made the 2h timeout too tight.
             script = _Path(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py"
             proc = _sp.run(
                 [_sys.executable, str(script)],
-                capture_output=True, text=True, timeout=7200
+                capture_output=True, text=True, timeout=12 * 3600
             )
             if proc.returncode != 0:
                 stderr_tail = (proc.stderr or "")[-300:]

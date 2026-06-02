@@ -525,6 +525,10 @@ def get_earnings_days(symbol: str) -> int | None:
         if earnings_raw is None:
             return None
         if isinstance(earnings_raw, list):
+            if not earnings_raw:
+                # Empty list — yfinance returned the key but with no scheduled
+                # earnings (recent IPO, special situation). Treat as "unknown".
+                return None
             earnings_raw = earnings_raw[0]
         if isinstance(earnings_raw, (int, float)):
             dt = datetime.fromtimestamp(earnings_raw, tz=timezone.utc)

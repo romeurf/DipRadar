@@ -1969,11 +1969,14 @@ def _handle_admin_momentum_retrain(parts: list[str]) -> None:
             bundle_path = data_dir / "momentum_model.pkl"
             report_path = data_dir / "momentum_report.json"
 
-            # Passo 1: actualizar dataset (só últimos 35 dias — incremental)
+            # Passo 1: actualizar dataset (só últimos 35 dias — incremental).
+            # 12h timeout — momentum dataset now queries EDGAR per episode for
+            # the 4 insider features (commit 0c4703c), which dramatically
+            # slowed the bulk build. Incremental updates are still fast.
             script = Path(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py"
             result = subprocess.run(
                 [sys.executable, str(script), "--out", str(ds_path)],
-                capture_output=True, text=True, timeout=7200
+                capture_output=True, text=True, timeout=12 * 3600
             )
             if result.returncode != 0:
                 _reply(f"⚠️ Dataset update falhou:\n`{(result.stderr or '')[-300:]}`\n_A tentar treinar com dados existentes..._")
@@ -4996,7 +4999,9 @@ def _handle_command(text: str) -> None:
                 _reply("⏰ Bootstrap excedeu 6h.")
             except Exception as e:
                 _reply(f"❌ Erro: `{e}`")
-        import threading
+        # `threading` is already imported at module top; importing it inside
+        # _handle_command would shadow it as a local variable and break the
+        # other elif branches that use threading.Thread() above this line.
         threading.Thread(target=_run_bootstrap, daemon=True, name="bootstrap").start()
 
     elif cmd == "/admin_bootstrap_status":
@@ -5063,7 +5068,6 @@ def _handle_command(text: str) -> None:
                 _reply("⏰ Bootstrap momentum excedeu 4h.")
             except Exception as e:
                 _reply(f"❌ Erro: `{e}`")
-        import threading
         threading.Thread(target=_run_mom_bootstrap, daemon=True, name="momentum-bootstrap").start()
 
     elif cmd == "/admin_momentum_dataset":
@@ -5380,7 +5384,6 @@ def _handle_command(text: str) -> None:
                     )
             except Exception as e:
                 _reply(f"Error publishing: {e}")
-        import threading
         threading.Thread(target=_run_publish, daemon=True, name="publish-charts").start()
 
     elif cmd == "/admin_set_floor":
