@@ -5886,6 +5886,82 @@ def _handle_command(text: str) -> None:
     elif cmd in ("/admin_check_config", "/check_config"):
         _handle_admin_check_config()
 
+    elif cmd in ("/admin_portfolio_diag", "/admin_carteira_diag"):
+        # Diagnostic: dump exact contents of _cache["positions"] + computed values
+        try:
+            from portfolio import get_positions, get_holdings_tuples, _cache
+            from market_client import get_usdeur, get_portfolio_snapshot
+            from state import get_etfs, get_ppr
+            import json, yfinance as _yf
+
+            raw_positions = get_positions()
+            holdings_tuples = get_holdings_tuples()
+            usd_eur = get_usdeur()
+            etfs = get_etfs()
+            ppr  = get_ppr()
+
+            lines = ["🔍 *Portfolio Diagnostic*\n"]
+            lines.append(f"USD/EUR: `{usd_eur:.6f}`\n")
+            lines.append(f"_cache[positions] has *{len(raw_positions)}* entries:\n")
+            for sym, pos in raw_positions.items():
+                _shares = pos.get("shares", "MISSING")
+                _avg    = pos.get("avg_price", "MISSING")
+                _cost   = pos.get("total_cost", "MISSING")
+                lines.append(
+                    f"  *{sym}*: shares=`{_shares}` avg_price=`{_avg}` "
+                    f"total_cost=`{_cost}`"
+                )
+            lines.append("")
+            lines.append(f"get_holdings_tuples() returns *{len(holdings_tuples)}* tuples:")
+            for t in holdings_tuples:
+                lines.append(f"  `{t}`")
+            lines.append("")
+            lines.append(f"Live prices + value_eur (what snapshot computes):")
+            for sym, shares, avg in holdings_tuples:
+                try:
+                    _info = _yf.Ticker(sym).fast_info
+                    _now = float(getattr(_info, "last_price", 0) or 0)
+                    _fx = usd_eur  # all stocks USD
+                    _value = shares * _now * _fx
+                    lines.append(
+                        f"  *{sym}*: {shares:g} × ${_now:.2f} × {_fx:.4f} = "
+                        f"*€{_value:,.2f}*"
+                    )
+                except Exception as _e:
+                    lines.append(f"  *{sym}*: live price failed ({_e})")
+            lines.append("")
+            lines.append(f"PPR state: shares=`{ppr.get('shares')}` avg=`{ppr.get('avg_cost')}` nav=`{ppr.get('current_nav')}`")
+            lines.append(f"ETFs ({len(etfs)}): `{list(etfs.keys())}`")
+            for etf, p in etfs.items():
+                lines.append(f"  {etf}: shares=`{p.get('shares')}` avg=`{p.get('avg_cost')}`")
+
+            # Run actual snapshot to compare
+            lines.append("")
+            lines.append(f"get_portfolio_snapshot() returns:")
+            _snap = get_portfolio_snapshot(
+                holdings_tuples,
+                float(ppr.get("shares") or 0),
+                float(ppr.get("avg_cost") or 0),
+                usd_eur,
+                etfs=etfs,
+                ppr_current_nav=ppr.get("current_nav"),
+            )
+            lines.append(f"  total_eur: *€{_snap.get('total_eur'):,.2f}*")
+            lines.append(f"  total_cost: *€{_snap.get('total_cost'):,.2f}*")
+            lines.append(f"  ppr_value: *€{_snap.get('ppr_value'):,.2f}*")
+            lines.append(f"  etf_total: *€{_snap.get('etf_total', 0):,.2f}*")
+            lines.append(f"  positions ({len(_snap.get('positions', []))}):")
+            for pos in _snap.get("positions", []):
+                lines.append(
+                    f"    {pos.get('symbol')}: "
+                    f"shares={pos.get('shares')} "
+                    f"value=€{pos.get('value_eur'):,.2f} "
+                    f"pnl_d={pos.get('pnl_day')}"
+                )
+            _reply("\n".join(lines))
+        except Exception as e:
+            _reply(f"❌ Diag falhou: `{e}`")
+
     elif cmd == "/admin_features":
         _handle_admin_features(parts)
 
