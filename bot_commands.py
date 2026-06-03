@@ -2703,24 +2703,37 @@ def _handle_admin_full_pipeline(parts: list[str]) -> None:
 # ── /admin_overnight ──────────────────────────────────────────────────────────
 
 def _handle_admin_overnight(parts: list[str]) -> None:
-    """/admin_overnight [--no-purge] [--dip-only] [--core-only] [--momentum-only]
+    """/admin_overnight [flags]
 
     Full sequential rebuild of all 3 models — designed to run overnight.
 
-    Steps (in order):
-      1. Purge disk (price_cache + training parquets + snapshot) — keeps alert_db + pickles
-      2. DIP dataset build  (scripts/build_dip_dataset.py --force-rebuild)
-      3. DIP model retrain  (monthly_retrain.run_monthly_retrain)
-      4. Core dataset build (scripts/build_core_dataset.py --force-rebuild)
-      5. Core model train   (scripts/train_core_model.py)
-      6. Momentum dataset   (momentum_radar/scripts/build_dataset.py)
-      7. Momentum retrain   (momentum_radar.trainer.run_momentum_training)
+    Steps:
+      0. Purge — CONSERVATIVE by default: only deletes parquets (which
+         will be rebuilt anyway). Preserves price_cache, EDGAR cache,
+         and pickle files so:
+         - yfinance doesn't re-download 30+ years × 1500 tickers (saves 4-6h)
+         - EDGAR cache stays warm (saves significant per-episode time)
+         - Existing pickles stay loaded if retrain fails (no model loss)
+      1. DIP dataset build  (scripts/build_dip_dataset.py --force-rebuild)
+      2. DIP model retrain  (monthly_retrain.run_monthly_retrain)
+      3. Core dataset build (scripts/build_core_dataset.py --force-rebuild)
+      4. Core model train   (scripts/train_core_model.py)
+      5. Momentum dataset   (momentum_radar/scripts/build_dataset.py)
+      6. Momentum retrain   (momentum_radar.trainer.run_momentum_training)
 
     Flags:
-      --no-purge      Skip the disk purge step (if you already freed space)
-      --dip-only      Only steps 2-3
-      --core-only     Only steps 4-5
-      --momentum-only Only steps 6-7
+      --no-purge       Skip the disk purge step entirely
+      --purge-cache    ALSO wipe price_cache (forces full yfinance re-download)
+                       Use when you suspect cache corruption or want hard reset.
+      --purge-models   ALSO wipe .pkl files (forces fallback if retrain fails)
+                       DANGEROUS — bot loses ML models if pipeline doesn't
+                       complete. Only use if you have a backup or are willing
+                       to drop back to rule-based.
+      --purge-all      Equivalent to --purge-cache --purge-models (legacy
+                       behaviour of older /admin_overnight runs).
+      --dip-only       Only DIP build + retrain
+      --core-only      Only Core build + retrain
+      --momentum-only  Only Momentum build + retrain
 
     The bot stays fully responsive throughout. Use /admin_pipeline_status to monitor.
     Each step sends a Telegram update on start and completion.
@@ -2730,10 +2743,12 @@ def _handle_admin_overnight(parts: list[str]) -> None:
         _reply("⚠️ Pipeline already running. Wait for it to finish.")
         return
 
-    no_purge      = "--no-purge"      in parts
-    dip_only      = "--dip-only"      in parts
-    core_only     = "--core-only"     in parts
-    momentum_only = "--momentum-only" in parts
+    no_purge       = "--no-purge"       in parts
+    purge_cache    = "--purge-cache"    in parts or "--purge-all" in parts
+    purge_models   = "--purge-models"   in parts or "--purge-all" in parts
+    dip_only       = "--dip-only"       in parts
+    core_only      = "--core-only"      in parts
+    momentum_only  = "--momentum-only"  in parts
 
     run_dip      = not core_only and not momentum_only
     run_core     = not dip_only  and not momentum_only
@@ -2745,12 +2760,21 @@ def _handle_admin_overnight(parts: list[str]) -> None:
     if run_momentum: scope_parts.append("Momentum")
     scope = " + ".join(scope_parts)
 
+    _purge_summary = (
+        "Skipping purge (--no-purge)"
+        if no_purge
+        else (
+            f"Purge: parquets always; "
+            f"cache={'WIPE' if purge_cache else 'KEEP'}; "
+            f"models={'WIPE' if purge_models else 'KEEP'}"
+        )
+    )
     _reply(
         f"<b>Overnight Pipeline — {scope}</b>\n"
-        f"{'Step 0: disk purge\n' if not no_purge else 'Skipping disk purge (--no-purge)\n'}"
+        f"{_purge_summary}\n"
         f"Steps: dataset build → retrain for each model, sequentially.\n"
         f"Bot stays active. Use <code>/admin_pipeline_status</code> to monitor.\n"
-        f"<i>Estimated total time: 6–12 hours</i>"
+        f"<i>Estimated total time: 4–8 hours with warm caches, 6–12 hours cold</i>"
     )
 
     def _run():
@@ -2779,27 +2803,66 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                 return False, str(e)
 
         try:
-            # ── Step 0: Purge disk ────────────────────────────────────────────
+            # ── Step 0: Purge disk (CONSERVATIVE by default) ──────────────────
+            # Default: only delete parquets (they get rebuilt anyway).
+            # --purge-cache: also wipe price_cache (forces yfinance re-download).
+            # --purge-models: also wipe .pkl files (DANGEROUS).
             if not no_purge:
                 _pipeline_phase = "Step 0 — purging disk"
-                _plog("Step 0: purging disk...")
-                price_cache = data_dir / "price_cache"
+                _plog(
+                    f"Step 0: purging disk... "
+                    f"(cache: {'YES' if purge_cache else 'preserved'}, "
+                    f"models: {'YES' if purge_models else 'preserved'})"
+                )
                 freed = 0
-                if price_cache.exists():
-                    freed += sum(f.stat().st_size for f in price_cache.rglob("*") if f.is_file())
-                    shutil.rmtree(str(price_cache), ignore_errors=True)
-                for name in ("ml_training_base.parquet", "core_training_base.parquet",
-                             "momentum_training.parquet", "ml_momentum_training.parquet",
-                             "ml_training_input.parquet",
-                             "dip_models.pkl", "core_us_model.pkl", "momentum_model.pkl",
-                             "momentum_report.json", "ml_report.json"):
+                items_removed: list[str] = []
+
+                # Always: training parquets + intermediate JSON reports
+                always_purge = (
+                    "ml_training_base.parquet", "core_training_base.parquet",
+                    "momentum_training.parquet", "ml_momentum_training.parquet",
+                    "ml_training_input.parquet",
+                    "momentum_report.json", "ml_report.json",
+                    # Old checkpoint files from interrupted runs
+                    "ml_training_base.checkpoint.parquet",
+                    "core_training_base.checkpoint.parquet",
+                    "momentum_training.checkpoint.parquet",
+                )
+                for name in always_purge:
                     p = data_dir / name
                     if p.exists():
                         freed += p.stat().st_size
                         p.unlink()
+                        items_removed.append(name)
+
+                # Opt-in: price cache (yfinance OHLCV cache, expensive to rebuild)
+                if purge_cache:
+                    price_cache_dir = data_dir / "price_cache"
+                    if price_cache_dir.exists():
+                        freed += sum(
+                            f.stat().st_size for f in price_cache_dir.rglob("*") if f.is_file()
+                        )
+                        shutil.rmtree(str(price_cache_dir), ignore_errors=True)
+                        items_removed.append("price_cache/")
+
+                # Opt-in: model pickles (loses ML on retrain failure!)
+                if purge_models:
+                    for name in ("dip_models.pkl", "core_us_model.pkl", "momentum_model.pkl"):
+                        p = data_dir / name
+                        if p.exists():
+                            freed += p.stat().st_size
+                            p.unlink()
+                            items_removed.append(name)
+
                 mb = freed / 1024 / 1024
-                _plog(f"Step 0: purge done — freed {mb:.0f} MB")
-                _reply(f"✅ <b>Step 0 — Disk purged</b>: freed <b>{mb:.0f} MB</b>\nStarting dataset builds...")
+                _plog(f"Step 0: purge done — freed {mb:.0f} MB ({len(items_removed)} items)")
+                _reply(
+                    f"✅ <b>Step 0 — Disk purged</b>: freed <b>{mb:.0f} MB</b>\n"
+                    f"<i>Removed: {len(items_removed)} items. "
+                    f"{'price_cache preserved' if not purge_cache else 'price_cache WIPED'}, "
+                    f"{'models preserved' if not purge_models else 'models WIPED'}.</i>\n"
+                    f"Starting dataset builds..."
+                )
 
             # ── Step 1+2: DIP ─────────────────────────────────────────────────
             if run_dip:
