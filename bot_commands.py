@@ -5886,6 +5886,38 @@ def _handle_command(text: str) -> None:
     elif cmd in ("/admin_check_config", "/check_config"):
         _handle_admin_check_config()
 
+    elif cmd in ("/admin_portfolio_clear", "/admin_carteira_clear"):
+        # Wipe corrupted portfolio cache + persisted JSON. For recovering from
+        # the Google Sheets locale bug (values inflated 10^N×). After running,
+        # use /sync_portfolio to re-import positions with correct values.
+        # Requires explicit --yes to prevent accidental wipe.
+        if "--yes" not in parts:
+            _reply(
+                "⚠️ *Confirmação obrigatória*\n\n"
+                "Este comando vai APAGAR todas as posições da carteira "
+                "(cache em memória + ficheiro `_dipr_portfolio.json`).\n\n"
+                "_PPR, ETFs e convicções não são tocados._\n\n"
+                "Para confirmar:\n"
+                "  `/admin_portfolio_clear --yes`\n\n"
+                "_Depois usa `/sync_portfolio` para re-importar._"
+            )
+        else:
+            try:
+                from portfolio import _cache, _PORTFOLIO_FILE
+                _cache["positions"] = {}
+                # _cache["liquidity"] preserved — that's a separate concern
+                if _PORTFOLIO_FILE.exists():
+                    _PORTFOLIO_FILE.unlink()
+                _reply(
+                    "✅ *Carteira limpa*\n\n"
+                    "  Cache: zerada (positions={})\n"
+                    "  Ficheiro: `_dipr_portfolio.json` removido\n\n"
+                    "Para re-importar com valores corrigidos:\n"
+                    "`/sync_portfolio NVO:159.59197811:50.56 ADBE:16.27745882:268.6 …`"
+                )
+            except Exception as e:
+                _reply(f"❌ Erro a limpar: `{e}`")
+
     elif cmd in ("/admin_portfolio_diag", "/admin_carteira_diag"):
         # Diagnostic: dump exact contents of _cache["positions"] + computed values
         try:

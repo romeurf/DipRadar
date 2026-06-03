@@ -207,7 +207,12 @@ PPR_SHARES, PPR_AVG_COST = _get_ppr_values()
 
 _GS_CREDENTIALS = os.getenv("GOOGLE_SHEETS_CREDENTIALS", "")
 _GS_SHEET_ID    = os.getenv("GOOGLE_SHEET_ID", "")
-_USE_GS         = bool(_GS_CREDENTIALS and _GS_SHEET_ID)
+# Google Sheets backend DISABLED — its locale-aware number parsing inflated
+# values by 10^N (e.g., "159.591978" stored as 159591978 in pt-PT locale,
+# treating the dot as thousand-separator). Caused the €19B Carteira total
+# bug. JSON local file is now the only backend — safer + no API quota.
+# Env vars GOOGLE_SHEETS_CREDENTIALS / GOOGLE_SHEET_ID are now ignored.
+_USE_GS         = False
 
 # Cache em memória
 _cache: dict = {"liquidity": None, "positions": None}  # None = não carregado ainda
