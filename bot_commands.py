@@ -2789,6 +2789,36 @@ def _handle_admin_overnight(parts: list[str]) -> None:
         data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
         scripts  = Path(__file__).parent / "scripts"
 
+        # Track each step's outcome for the final summary.
+        # Format: {step_name: ("OK"|"FAIL"|"SKIP"|"PARTIAL", detail_str)}
+        step_results: dict[str, tuple[str, str]] = {}
+
+        def _try_promote_checkpoint(parquet_path: Path, label: str) -> bool:
+            """If a *.checkpoint.parquet exists for this dataset, promote it to
+            the full parquet path so the retrain can proceed with partial data.
+            Returns True if promoted, False otherwise.
+
+            Rationale: 678/1526 tickers' worth of episodes is still much better
+            than zero data. The retrain can run on partial — it just won't
+            generalize as broadly. Operator can re-run later for full rebuild.
+            """
+            ckpt = parquet_path.with_name(parquet_path.stem + ".checkpoint.parquet")
+            if not ckpt.exists():
+                return False
+            try:
+                import pandas as pd
+                _df = pd.read_parquet(ckpt)
+                _rows = len(_df)
+                shutil.copy2(str(ckpt), str(parquet_path))
+                _plog(
+                    f"  [{label}] checkpoint recovered: {_rows:,} rows from "
+                    f"{ckpt.name} → {parquet_path.name}"
+                )
+                return True
+            except Exception as e:
+                _plog(f"  [{label}] checkpoint recovery failed: {e}")
+                return False
+
         def _sub(cmd: list[str], phase: str, timeout_h: float) -> tuple[bool, str]:
             """Run subprocess, set pipeline phase, return (ok, tail_output)."""
             global _pipeline_phase
@@ -2885,12 +2915,36 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                         tickers = df["ticker"].nunique() if "ticker" in df.columns else "?"
                         _plog(f"Step 1: DIP dataset OK — {rows:,} rows, {tickers} tickers, {elapsed:.0f}m")
                         _reply(f"✅ <b>Step 1/6 — DIP dataset done</b> ({elapsed:.0f} min)\n{rows:,} rows | {tickers} tickers")
+                        step_results["DIP dataset"] = ("OK", f"{rows:,} rows, {tickers} tickers, {elapsed:.0f}m")
                     except Exception:
                         _plog(f"Step 1: DIP dataset OK ({elapsed:.0f}m) — stats unavailable")
                         _reply(f"✅ <b>Step 1/6 — DIP dataset done</b> ({elapsed:.0f} min)")
+                        step_results["DIP dataset"] = ("OK", f"{elapsed:.0f}m (stats unavailable)")
                 else:
                     _plog(f"Step 1: DIP dataset FAILED — {tail[-200:]}")
-                    _reply(f"❌ <b>Step 1/6 — DIP dataset FAILED</b>\n<code>{tail[-400:]}</code>\n\n<i>Continuing with Core...</i>")
+                    # Try to recover checkpoint as partial dataset
+                    _ckpt_ok = _try_promote_checkpoint(out_dip, "Step 1/DIP")
+                    if _ckpt_ok:
+                        ok = True  # let retrain proceed with partial data
+                        try:
+                            import pandas as pd
+                            df = pd.read_parquet(out_dip)
+                            rows = len(df)
+                            tickers = df["ticker"].nunique() if "ticker" in df.columns else "?"
+                            _reply(
+                                f"⚠️ <b>Step 1/6 — DIP dataset PARTIAL</b>\n"
+                                f"Build failed but checkpoint recovered: {rows:,} rows | {tickers} tickers\n"
+                                f"<i>Retrain will run on partial dataset. Re-run later for full rebuild.</i>"
+                            )
+                            step_results["DIP dataset"] = ("PARTIAL", f"{rows:,} rows (from checkpoint)")
+                        except Exception:
+                            step_results["DIP dataset"] = ("PARTIAL", "checkpoint recovered (stats unavailable)")
+                    else:
+                        _reply(
+                            f"❌ <b>Step 1/6 — DIP dataset FAILED</b>\n<code>{tail[-400:]}</code>\n\n"
+                            f"<i>No checkpoint to recover. Skipping DIP retrain, continuing with Core...</i>"
+                        )
+                        step_results["DIP dataset"] = ("FAIL", tail[-200:])
 
                 if ok:
                     _pipeline_phase = "Step 2/6 — DIP retrain"
@@ -2907,9 +2961,16 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                         rho_s  = f" | ρ={rho:.4f}" if isinstance(rho, float) else ""
                         _plog(f"Step 2: DIP retrain {dec} ({elapsed:.0f}m){rho_s}")
                         _reply(f"{icon} <b>Step 2/6 — DIP retrain: {dec}</b> ({elapsed:.0f} min){rho_s}")
+                        step_results["DIP retrain"] = (
+                            "OK" if dec == "PROMOTED" else ("PARTIAL" if dec == "KEPT" else "FAIL"),
+                            f"{dec}{rho_s} ({elapsed:.0f}m)"
+                        )
                     except Exception as e:
                         _plog(f"Step 2: DIP retrain exception — {e}")
                         _reply(f"❌ <b>Step 2/6 — DIP retrain FAILED</b>\n<code>{e}</code>")
+                        step_results["DIP retrain"] = ("FAIL", str(e))
+                else:
+                    step_results["DIP retrain"] = ("SKIP", "dataset failed")
 
             # ── Step 3+4: Core ────────────────────────────────────────────────
             if run_core:
@@ -2932,12 +2993,15 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                         tickers = df["ticker"].nunique() if "ticker" in df.columns else "?"
                         _plog(f"Step 3: Core dataset OK — {rows:,} rows, {tickers} tickers, {elapsed:.0f}m")
                         _reply(f"✅ <b>Step 3/6 — Core dataset done</b> ({elapsed:.0f} min)\n{rows:,} rows | {tickers} tickers")
+                        step_results["Core dataset"] = ("OK", f"{rows:,} rows, {tickers} tickers, {elapsed:.0f}m")
                     except Exception:
                         _plog(f"Step 3: Core dataset OK ({elapsed:.0f}m) — stats unavailable")
                         _reply(f"✅ <b>Step 3/6 — Core dataset done</b> ({elapsed:.0f} min)")
+                        step_results["Core dataset"] = ("OK", f"{elapsed:.0f}m")
                 else:
                     _plog(f"Step 3: Core dataset FAILED — {tail[-200:]}")
                     _reply(f"❌ <b>Step 3/6 — Core dataset FAILED</b>\n<code>{tail[-400:]}</code>\n\n<i>Continuing with Momentum...</i>")
+                    step_results["Core dataset"] = ("FAIL", tail[-200:])
 
                 if ok:
                     _plog("Step 4: Core model train started...")
@@ -2961,9 +3025,13 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                         except Exception:
                             pass
                         _reply(f"✅ <b>Step 4/6 — Core model trained</b> ({elapsed:.0f} min)\nML scoring active.")
+                        step_results["Core retrain"] = ("OK", f"{elapsed:.0f}m")
                     else:
                         _plog(f"Step 4: Core model FAILED — {tail4[-200:]}")
                         _reply(f"❌ <b>Step 4/6 — Core model FAILED</b>\n<code>{tail4[-400:]}</code>")
+                        step_results["Core retrain"] = ("FAIL", tail4[-200:])
+                else:
+                    step_results["Core retrain"] = ("SKIP", "dataset failed")
 
             # ── Step 5+6: Momentum ────────────────────────────────────────────
             if run_momentum:
@@ -2985,12 +3053,15 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                         rows = len(df)
                         _plog(f"Step 5: Momentum dataset OK — {rows:,} rows, {elapsed:.0f}m")
                         _reply(f"✅ <b>Step 5/6 — Momentum dataset done</b> ({elapsed:.0f} min)\n{rows:,} rows")
+                        step_results["Momentum dataset"] = ("OK", f"{rows:,} rows, {elapsed:.0f}m")
                     except Exception:
                         _plog(f"Step 5: Momentum dataset OK ({elapsed:.0f}m)")
                         _reply(f"✅ <b>Step 5/6 — Momentum dataset done</b> ({elapsed:.0f} min)")
+                        step_results["Momentum dataset"] = ("OK", f"{elapsed:.0f}m")
                 else:
                     _plog(f"Step 5: Momentum dataset FAILED — {tail[-200:]}")
                     _reply(f"❌ <b>Step 5/6 — Momentum dataset FAILED</b>\n<code>{tail[-400:]}</code>")
+                    step_results["Momentum dataset"] = ("FAIL", tail[-200:])
 
                 if ok:
                     _pipeline_phase = "Step 6/6 — Momentum retrain"
@@ -3011,16 +3082,46 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                         ic_s = f" | IC={ic:.4f}" if isinstance(ic, float) else ""
                         _plog(f"Step 6: Momentum retrain {dec} ({elapsed:.0f}m){ic_s}")
                         _reply(f"{icon} <b>Step 6/6 — Momentum retrain: {dec}</b> ({elapsed:.0f} min){ic_s}")
+                        step_results["Momentum retrain"] = (
+                            "OK" if dec == "PROMOTED" else ("PARTIAL" if dec == "KEPT" else "FAIL"),
+                            f"{dec}{ic_s} ({elapsed:.0f}m)"
+                        )
                     except Exception as e:
                         _plog(f"Step 6: Momentum retrain exception — {e}")
                         _reply(f"❌ <b>Step 6/6 — Momentum retrain FAILED</b>\n<code>{e}</code>")
+                        step_results["Momentum retrain"] = ("FAIL", str(e))
+                else:
+                    step_results["Momentum retrain"] = ("SKIP", "dataset failed")
 
+            # ── Final summary: honest about what worked vs failed ────────────
             _plog("Overnight pipeline complete")
-            _reply(
-                "<b>Overnight pipeline complete!</b>\n"
-                "All models rebuilt from scratch.\n"
-                "Use <code>/admin_check_config</code> to verify model status."
+            _summary_lines = ["<b>Overnight pipeline complete</b>", ""]
+            _ok_count   = sum(1 for s, _ in step_results.values() if s == "OK")
+            _part_count = sum(1 for s, _ in step_results.values() if s == "PARTIAL")
+            _fail_count = sum(1 for s, _ in step_results.values() if s == "FAIL")
+            _skip_count = sum(1 for s, _ in step_results.values() if s == "SKIP")
+            _total      = len(step_results)
+            _summary_lines.append(
+                f"<b>{_ok_count}/{_total} OK</b> | {_part_count} partial | "
+                f"{_fail_count} failed | {_skip_count} skipped"
             )
+            _summary_lines.append("")
+            _emoji = {"OK": "✅", "PARTIAL": "⚠️", "FAIL": "❌", "SKIP": "⏭️"}
+            for _step_name, (_status, _detail) in step_results.items():
+                _summary_lines.append(f"{_emoji.get(_status, '?')} <b>{_step_name}</b>: {_detail}")
+            _summary_lines += [
+                "",
+                "<i>Verifica com:</i>",
+                "<code>/admin_check_config</code> — estado dos 3 modelos",
+                "<code>/admin_features dip|core|momentum</code> — qualidade dos features",
+            ]
+            if _fail_count > 0 or _part_count > 0:
+                _summary_lines += [
+                    "",
+                    "<i>Para retentar só os que falharam (mantém caches/modelos):</i>",
+                    "<code>/admin_overnight --no-purge --dip-only</code> (ou --core-only / --momentum-only)",
+                ]
+            _reply("\n".join(_summary_lines))
 
         except Exception as e:
             logging.error(f"[overnight] unexpected: {e}", exc_info=True)
