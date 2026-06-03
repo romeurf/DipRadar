@@ -174,6 +174,18 @@ def _find_dip_episodes(hist: pd.DataFrame) -> list[pd.Timestamp]:
 # Build dataset
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _format_eta(seconds: float) -> str:
+    """Format seconds → '2h 13m' or '47m 12s' or '8s'."""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        m, s = divmod(int(seconds), 60)
+        return f"{m}m {s}s"
+    h, rem = divmod(int(seconds), 3600)
+    m, _ = divmod(rem, 60)
+    return f"{h}h {m}m"
+
+
 def build_dip_dataset(
     tickers: list[str],
     price_cache: dict[str, pd.DataFrame],
@@ -182,8 +194,17 @@ def build_dip_dataset(
     cache_dir: Path,
     add_fundamentals: bool = True,
     add_fase5: bool = True,
+    checkpoint_path: Optional[Path] = None,
+    checkpoint_every: int = 100,
 ) -> pd.DataFrame:
-    """Build DipRadar training dataset by scanning historical price data."""
+    """Build DipRadar training dataset by scanning historical price data.
+
+    checkpoint_path: if set, writes a partial parquet at this path every
+                     `checkpoint_every` tickers. On crash/timeout, the
+                     partial file survives so the operator can inspect or
+                     re-resume from there.
+    checkpoint_every: write cadence in tickers (default 100).
+    """
     from ml_features import (
         FEATURE_COLUMNS, _FALLBACK, add_derived_features,
         add_momentum_features, add_raw_ohlcv_features,
@@ -196,6 +217,7 @@ def build_dip_dataset(
     spy_hist = macro_cache.get("SPY")
     rows: list[dict] = []
     n_tickers = len(tickers)
+    _start_time = time.time()
 
     for i, ticker in enumerate(tickers):
         hist = price_cache.get(ticker)
@@ -399,8 +421,35 @@ def build_dip_dataset(
 
             rows.append(row_base)
 
+        # Progress log with ETA — every 50 tickers (or final)
         if (i + 1) % 50 == 0 or (i + 1) == n_tickers:
-            log.info(f"  [{i+1}/{n_tickers}] {ticker} | {len(rows)} dip episodes so far")
+            elapsed = time.time() - _start_time
+            avg_per_ticker = elapsed / (i + 1)
+            remaining = n_tickers - (i + 1)
+            eta_seconds = avg_per_ticker * remaining
+            pct = (i + 1) / n_tickers * 100
+            log.info(
+                f"  [{i+1}/{n_tickers} {pct:.1f}%] {ticker} | "
+                f"{len(rows)} rows | elapsed {_format_eta(elapsed)} | "
+                f"ETA {_format_eta(eta_seconds)}"
+            )
+
+        # Checkpoint write every N tickers (defensive against timeouts)
+        if (
+            checkpoint_path is not None
+            and (i + 1) % checkpoint_every == 0
+            and rows
+        ):
+            try:
+                _partial = pd.DataFrame(rows)
+                checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                _partial.to_parquet(checkpoint_path, index=False)
+                log.info(
+                    f"  💾 checkpoint: {len(_partial)} rows → "
+                    f"{checkpoint_path.name} ({_partial.memory_usage(deep=True).sum() / 1024 / 1024:.1f} MB)"
+                )
+            except Exception as _ckpt_err:
+                log.warning(f"  checkpoint write failed: {_ckpt_err} — continuing in-memory")
 
     return pd.DataFrame(rows)
 
@@ -510,6 +559,10 @@ def main() -> int:
         f"A construir dataset de dips desde {start} "
         f"(entry<{_EPISODE_ENTRY:.0%}, exit>{_EPISODE_EXIT:.0%})..."
     )
+    # Checkpoint goes to "<out>.checkpoint.parquet" so the operator can
+    # inspect partial work after a crash/timeout without overwriting the
+    # last good full dataset.
+    _checkpoint_path = out_path.with_name(out_path.stem + ".checkpoint.parquet")
     new_df = build_dip_dataset(
         tickers=list(price_cache.keys()),
         price_cache=price_cache,
@@ -518,6 +571,8 @@ def main() -> int:
         cache_dir=cache_dir,
         add_fundamentals=not args.no_fundamentals,
         add_fase5=not args.no_fase5,
+        checkpoint_path=_checkpoint_path,
+        checkpoint_every=100,
     )
 
     if new_df.empty:
