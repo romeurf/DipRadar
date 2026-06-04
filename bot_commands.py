@@ -2904,7 +2904,11 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                     [sys.executable, str(scripts / "build_dip_dataset.py"),
                      "--start", "1993-01-01", "--out", str(out_dip), "--force-rebuild"],
                     phase="Step 1/6 — DIP dataset build",
-                    timeout_h=12,
+                    # 12h was hitting timeout with ~98% coverage (207k/211k rows).
+                    # 18h gives margin for full 100% rebuild + slow EDGAR/Tiingo
+                    # episodes. Checkpoint recovery (commit c76157c) ensures a
+                    # timed-out build at 18h still produces usable data.
+                    timeout_h=18,
                 )
                 elapsed = (_t.time() - t0) / 60
                 if ok:
@@ -3043,7 +3047,11 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                 ok, tail = _sub(
                     [sys.executable, str(mom_script), "--out", str(out_mom)],
                     phase="Step 5/6 — Momentum dataset build",
-                    timeout_h=8,
+                    # 8h → 12h: momentum builds 3 horizons (30d/90d/180d alpha)
+                    # with EDGAR per episode for insider/8-K features. With 1500
+                    # tickers × ~40 episodes/ticker × EDGAR-heavy work, the old
+                    # 8h was getting tight. 12h gives comfortable margin.
+                    timeout_h=12,
                 )
                 elapsed = (_t.time() - t0) / 60
                 if ok:
