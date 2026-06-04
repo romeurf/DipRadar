@@ -6357,6 +6357,46 @@ def _handle_command(text: str) -> None:
         except Exception as e:
             _reply(f"❌ Erro: `{e}`")
 
+    elif cmd in ("/admin_edgar_coverage", "/admin_edgar_history"):
+        # Verify EDGAR's submissions index for a ticker now reaches back
+        # historically (after the chunk-merge fix). Use this to confirm
+        # the chunk fetch works before running a full backfill on 1495
+        # tickers. Usage: /admin_edgar_coverage AAPL
+        if len(parts) < 2:
+            _reply("Uso: `/admin_edgar_coverage TICKER` (ex: `/admin_edgar_coverage AAPL`)")
+            return
+        ticker = parts[1].upper().strip()
+        try:
+            from fundamental_signals import _edgar_submissions
+            data = _edgar_submissions(ticker)
+            recent = (data.get("filings") or {}).get("recent") or {}
+            forms       = recent.get("form", []) or []
+            dates_filed = recent.get("filingDate", []) or []
+            n_total     = len(forms)
+            n_form4     = sum(1 for f in forms if f in ("4", "4/A"))
+            n_8k        = sum(1 for f in forms if f.startswith("8-K"))
+            n_10k       = sum(1 for f in forms if f.startswith("10-K"))
+            n_10q       = sum(1 for f in forms if f.startswith("10-Q"))
+            earliest    = dates_filed[-1] if dates_filed else "n/a"
+            latest      = dates_filed[0] if dates_filed else "n/a"
+            chunks_files = (data.get("filings") or {}).get("files", []) or []
+            n_chunks    = len(chunks_files)
+            merged      = bool(data.get("_chunks_merged"))
+            _reply(
+                f"📚 *EDGAR coverage — {ticker}*\n"
+                f"• Total filings: `{n_total:,}`\n"
+                f"• Form 4 (insider): `{n_form4:,}`\n"
+                f"• 8-K (material events): `{n_8k:,}`\n"
+                f"• 10-K (annual): `{n_10k:,}`\n"
+                f"• 10-Q (quarterly): `{n_10q:,}`\n"
+                f"• Date range: `{earliest}` → `{latest}`\n"
+                f"• Historical chunks: `{n_chunks}` "
+                f"({'✅ merged' if merged else '⚠️ not merged yet'})\n\n"
+                f"_Se earliest é ≤2009 e chunks≥1, PIT funciona para training_."
+            )
+        except Exception as e:
+            _reply(f"❌ Erro a buscar EDGAR para `{ticker}`: `{e}`")
+
     elif cmd in ("/admin_form4_cache_status", "/admin_form4_cache"):
         # Inspect (and optionally purge) the Form 4 disk cache. Before the
         # caching fix, transient EDGAR rate-limit failures were cached as

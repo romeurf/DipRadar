@@ -190,6 +190,82 @@ _EDGAR_DISK_CACHE_DIR = (
 )
 _EDGAR_DISK_TTL_SECONDS = 7 * 24 * 3600   # 7 days
 
+# Historical chunks of the submissions index are IMMUTABLE — once SEC closes
+# a chunk (1000 filings), it never changes. Cache them forever in a separate
+# directory so that even a 7-day TTL refresh on the main JSON doesn't trigger
+# re-downloads of historical data.
+_EDGAR_CHUNK_CACHE_DIR = (
+    _DiskPath("/data/edgar_submissions_chunks") if _DiskPath("/data").exists()
+    else _DiskPath("/tmp/edgar_submissions_chunks")
+)
+
+
+def _fetch_edgar_chunk(name: str) -> dict:
+    """Fetch one historical submissions chunk and cache permanently.
+
+    Chunks are immutable — older filings are never amended in the index —
+    so once cached, the file is authoritative forever. This is the same
+    pattern used for Form 4 XML.
+    """
+    import requests
+    import json as _json
+    import time as _t
+
+    if not name:
+        return {}
+    _EDGAR_CHUNK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = _EDGAR_CHUNK_CACHE_DIR / name
+    if cache_path.exists():
+        try:
+            return _json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            # Corrupt — unlink and refetch
+            try:
+                cache_path.unlink()
+            except Exception:
+                pass
+
+    # Respect SEC's 10 req/s limit (~100ms spacing) for chunk pulls
+    _t.sleep(0.12)
+    try:
+        r = requests.get(
+            f"https://data.sec.gov/submissions/{name}",
+            headers=_EDGAR_HEADERS, timeout=15,
+        )
+        if r.status_code != 200:
+            # Don't cache failures — chunks should always exist; transient
+            # errors retry next time.
+            return {}
+        data = r.json()
+    except Exception:
+        return {}
+
+    try:
+        tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        tmp.write_text(_json.dumps(data), encoding="utf-8")
+        tmp.replace(cache_path)
+    except Exception:
+        pass
+    return data
+
+
+def _merge_chunk_into_recent(recent: dict, chunk: dict) -> None:
+    """Append a chunk's parallel arrays onto the recent dict in-place.
+
+    Chunks have flat schema: {"form": [...], "filingDate": [...], ...}
+    (no "recent" wrapper). We append after the recent arrays so that the
+    overall list stays most-recent-first.
+    """
+    if not chunk:
+        return
+    for key, val in chunk.items():
+        if not isinstance(val, list):
+            continue
+        if key in recent and isinstance(recent[key], list):
+            recent[key] = list(recent[key]) + list(val)
+        else:
+            recent[key] = list(val)
+
 
 def _edgar_submissions(ticker: str) -> dict:
     """Return the EDGAR submissions JSON for a US ticker. Raises on failure.
@@ -220,8 +296,18 @@ def _edgar_submissions(ticker: str) -> dict:
             if age < _EDGAR_DISK_TTL_SECONDS:
                 try:
                     data = _json.loads(disk_path.read_text(encoding="utf-8"))
-                    _edgar_submissions_cache[base] = data
-                    return data
+                    # Pre-chunk-merge caches lack the `_chunks_merged`
+                    # sentinel. If absent AND the JSON has historical
+                    # `files` to merge, treat as stale and refetch so
+                    # the new historical-chunk logic kicks in.
+                    needs_upgrade = (
+                        not data.get("_chunks_merged")
+                        and bool((data.get("filings") or {}).get("files"))
+                    )
+                    if not needs_upgrade:
+                        _edgar_submissions_cache[base] = data
+                        return data
+                    # else: fall through to HTTP refetch + merge
                 except Exception:
                     # Corrupt file — fall through and refetch
                     pass
@@ -242,6 +328,42 @@ def _edgar_submissions(ticker: str) -> dict:
         raise ValueError(f"{base} not covered by EDGAR (404)")
     r.raise_for_status()
     data = r.json()
+
+    # Extend with historical chunks. EDGAR's submissions JSON has two parts:
+    #   - "recent": last ~1000 filings (all types combined)
+    #   - "files": array of chunk pointers for older filings
+    # An active filer like AAPL has 30 years of filings split across multiple
+    # chunks; without merging them, any PIT lookup for old alert_dates would
+    # miss the relevant Form 4 / 8-K / earnings filings and silently return
+    # 0.0 ("EDGAR confirmed no activity") when in reality we just hadn't
+    # fetched the historical data. _edgar_recent_covers_pit() catches this
+    # symptom, but the proper fix is to actually fetch the history.
+    files_meta = data.get("filings", {}).get("files", []) or []
+    if files_meta:
+        recent = data.get("filings", {}).get("recent", {}) or {}
+        n_chunks = 0
+        for fm in files_meta:
+            chunk_name = (fm or {}).get("name", "")
+            if not chunk_name:
+                continue
+            chunk = _fetch_edgar_chunk(chunk_name)
+            if chunk:
+                _merge_chunk_into_recent(recent, chunk)
+                n_chunks += 1
+        data.setdefault("filings", {})["recent"] = recent
+        if n_chunks:
+            try:
+                _earliest = recent.get("filingDate", [""])[-1]
+                log.info(
+                    f"[edgar] {base}: merged {n_chunks} historical chunks "
+                    f"(earliest filing now {_earliest})"
+                )
+            except Exception:
+                pass
+
+    # Sentinel so the disk-cache tier knows this entry already includes
+    # historical chunks (or had none to fetch — either way, fully merged).
+    data["_chunks_merged"] = True
 
     # Promote to disk cache (best-effort)
     try:
