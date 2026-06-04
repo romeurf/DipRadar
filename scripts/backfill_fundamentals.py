@@ -201,6 +201,11 @@ def backfill(
 
     log.info(f"  Processing: {len(process_idx):,} rows")
 
+    # NaN counts BEFORE backfill (for verification report at the end)
+    nan_before: dict[str, int] = {}
+    for col in _ALL_COLS_TO_REFRESH:
+        nan_before[col] = int(df[col].isna().sum())
+
     t0 = time.time()
     rows_processed = 0
     rows_updated = 0
@@ -247,19 +252,42 @@ def backfill(
     log.info(f"  Atomic rename: {tmp_path.name} → {parquet_path.name}")
     tmp_path.replace(parquet_path)
 
+    # NaN counts AFTER backfill, computed on the saved dataframe
     log.info(f"✅ Backfill complete in {(time.time() - t0)/60:.1f} min")
     log.info(f"   Rows updated: {rows_updated:,}/{rows_processed:,}")
-    log.info(f"   Field population (rows with new values):")
+    log.info("")
+    log.info("   NaN coverage report (BEFORE → AFTER, delta):")
+    log.info("   " + "─" * 75)
+    nan_after: dict[str, int] = {}
     for col in _ALL_COLS_TO_REFRESH:
-        cnt = field_counts[col]
-        if cnt > 0:
-            pct = cnt / rows_processed * 100
-            log.info(f"     {col}: {cnt:,} ({pct:.1f}%)")
+        nan_after[col] = int(df[col].isna().sum())
+        before = nan_before[col]
+        after  = nan_after[col]
+        delta  = before - after
+        pct_real_before = (1 - before / n_total) * 100
+        pct_real_after  = (1 - after  / n_total) * 100
+        # Visual: ✅ if real coverage improved meaningfully, ➖ if unchanged,
+        # ⚠️ if got worse (which would indicate a bug — shouldn't happen
+        # because we only OVERWRITE NaN, never overwrite real with NaN)
+        if delta > 0:
+            icon = "✅"
+        elif delta == 0:
+            icon = "➖"
+        else:
+            icon = "⚠️"
+        log.info(
+            f"   {icon} {col:35s}  "
+            f"NaN: {before:>7,} → {after:>7,}  ({delta:+,})  "
+            f"real: {pct_real_before:5.1f}% → {pct_real_after:5.1f}%"
+        )
+    log.info("   " + "─" * 75)
 
     return {
         "rows_processed":  rows_processed,
         "rows_updated":    rows_updated,
         "fields_updated":  dict(field_counts),
+        "nan_before":      nan_before,
+        "nan_after":       nan_after,
         "elapsed_minutes": round((time.time() - t0) / 60, 1),
     }
 

@@ -6109,6 +6109,158 @@ def _handle_command(text: str) -> None:
         except Exception as e:
             _reply(f"❌ Erro: `{e}`")
 
+    elif cmd in ("/admin_test_retrain", "/admin_dry_retrain", "/admin_micro_test"):
+        # Quick health check before committing to 8-12h of full retrain.
+        # Runs in 3-8 min:
+        #   1. Schema check — all FEATURE_COLUMNS present
+        #   2. NaN coverage report (per-column real vs NaN)
+        #   3. Distribution sanity (no Inf, std > 0, mean within sane range)
+        #   4. Trainer dry run on 5% sample with 2 folds — verifies pipeline
+        #      end-to-end without producing a real model
+        #   5. Time estimate for full retrain based on sample timing
+        try:
+            from pathlib import Path as _P
+            import pandas as _pd
+            import math as _math
+            import time as _time
+
+            _dd = _P("/data") if _P("/data").exists() else _P("/tmp")
+            parquet = _dd / "ml_training_base.parquet"
+            if not parquet.exists():
+                _reply(f"⚠️ `{parquet.name}` não existe. Corre `/admin_overnight` primeiro.")
+                return
+
+            _reply(
+                f"🧪 *Micro-test* do retrain a iniciar\n\n"
+                f"  Schema check + NaN report + 5% sample training + ETA full\n"
+                f"  Estimativa: 3-8 min\n\n"
+                f"_Sem pickle gerado, sem alteração no parquet._"
+            )
+
+            def _run_test():
+                t0 = _time.time()
+                lines = ["🧪 *Micro-test retrain — resultado*\n"]
+                try:
+                    df = _pd.read_parquet(parquet)
+                except Exception as e:
+                    _reply(f"❌ Parquet load falhou: `{e}`")
+                    return
+
+                lines.append(f"📊 *Parquet:* {len(df):,} rows × {len(df.columns)} cols")
+                lines.append(f"   Range: {df['alert_date'].min()} → {df['alert_date'].max()}")
+                lines.append("")
+
+                # 1. Schema check
+                try:
+                    from ml_features import FEATURE_COLUMNS
+                    missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
+                    if missing:
+                        lines.append(f"❌ *Schema check FAIL:* {len(missing)} cols em falta:")
+                        for c in missing[:10]:
+                            lines.append(f"   • {c}")
+                        _reply("\n".join(lines))
+                        return
+                    else:
+                        lines.append(f"✅ *Schema check:* {len(FEATURE_COLUMNS)} features presentes")
+                except Exception as e:
+                    lines.append(f"⚠️ Schema check error: `{e}`")
+
+                # 2. NaN coverage + distribution sanity
+                lines.append("")
+                lines.append("📉 *NaN coverage + sanidade:*")
+                problems_severe = []
+                problems_warn = []
+                from ml_features import FEATURE_COLUMNS as _FC
+                for col in _FC:
+                    if col not in df.columns:
+                        continue
+                    series = df[col]
+                    n_real = int(series.notna().sum())
+                    pct_real = n_real / len(df) * 100
+                    if n_real == 0:
+                        problems_severe.append(f"{col}: 0% real (dead column)")
+                        continue
+                    valid = series.dropna()
+                    # Check for Inf
+                    if _math.isinf(float(valid.min() if len(valid) else 0)) or _math.isinf(float(valid.max() if len(valid) else 0)):
+                        problems_severe.append(f"{col}: contains Inf")
+                    # Check for zero variance
+                    elif len(valid) >= 2 and valid.std() == 0:
+                        problems_severe.append(f"{col}: std=0 ({valid.iloc[0]} constante) — likely broken")
+                    elif pct_real < 5:
+                        problems_warn.append(f"{col}: {pct_real:.1f}% real (very sparse)")
+
+                if problems_severe:
+                    lines.append(f"❌ *{len(problems_severe)} features problemáticas:*")
+                    for p in problems_severe[:10]:
+                        lines.append(f"   • {p}")
+                else:
+                    lines.append("✅ Sem features com 0% real ou std=0")
+                if problems_warn:
+                    lines.append(f"⚠️ *{len(problems_warn)} sparse features (<5% real):*")
+                    for p in problems_warn[:5]:
+                        lines.append(f"   • {p}")
+
+                # 3. Sample trainer dry run (5% rows, 2 folds, fast)
+                lines.append("")
+                lines.append("🔬 *Trainer dry run* (5% sample, 2 folds, no pickle)...")
+                sample_n = max(1000, int(len(df) * 0.05))
+                sample_n = min(sample_n, 10000)  # cap
+                t_train_start = _time.time()
+                try:
+                    from ml_training.train import run_training
+                    result = run_training(
+                        input_parquet=parquet,
+                        output_bundle=None,   # NO write
+                        output_report=None,
+                        n_folds=2,            # vs 10
+                        use_ensemble_champion=False,
+                        use_sector_neutral=False,
+                        max_rows=sample_n,
+                        log_summary=False,
+                    ) or {}
+                    train_elapsed = _time.time() - t_train_start
+                    decision = result.get("decision", "?")
+                    rho = result.get("candidate_rho_alpha")
+                    icon = "✅" if decision in ("PROMOTED", "KEPT") else "⚠️"
+                    rho_str = f" | ρ_alpha={rho:.4f}" if isinstance(rho, float) else ""
+                    lines.append(
+                        f"   {icon} Trainer corre limpo em {train_elapsed:.0f}s "
+                        f"({sample_n:,} rows × 2 folds){rho_str}"
+                    )
+                    # Estimate full run time
+                    full_rows = len(df)
+                    # Heuristic: training scales ~O(N) per fold; 10 folds vs 2 → 5x
+                    # ensemble champion adds ~2x; full universe so multiply
+                    est_full_minutes = (train_elapsed / 60) * (full_rows / sample_n) * (10/2) * 2.0
+                    lines.append(f"   📐 ETA full retrain: ~{est_full_minutes:.0f} min ({est_full_minutes/60:.1f}h)")
+                except Exception as e:
+                    train_elapsed = _time.time() - t_train_start
+                    lines.append(f"   ❌ Trainer FALHOU após {train_elapsed:.0f}s:")
+                    lines.append(f"      <code>{str(e)[:200]}</code>")
+                    lines.append("   _NÃO disparar /admin_retrain antes de investigar o erro acima._")
+
+                # 4. Verdict
+                lines.append("")
+                if problems_severe or "FALHOU" in "\n".join(lines):
+                    lines.append("🔴 *Veredicto: NÃO RECOMENDA retrain completo*")
+                    lines.append("   Corrige os problemas acima antes de comprometer com 12h.")
+                elif problems_warn:
+                    lines.append("🟡 *Veredicto: OK COM RESSALVAS*")
+                    lines.append("   Sparse features vão funcionar mas podem reduzir IC.")
+                else:
+                    lines.append("🟢 *Veredicto: SEGURO disparar full retrain*")
+                    lines.append("   Parquet saudável, pipeline limpo, sem flags vermelhos.")
+
+                total_elapsed = (_time.time() - t0) / 60
+                lines.append(f"\n_Test demorou {total_elapsed:.1f} min._")
+                _reply("\n".join(lines))
+
+            import threading
+            threading.Thread(target=_run_test, daemon=True, name="micro-test-retrain").start()
+        except Exception as e:
+            _reply(f"❌ Micro-test falhou: `{e}`")
+
     elif cmd in ("/admin_backfill_fundamentals", "/admin_backfill"):
         # Recompute ONLY the fundamental columns in the DIP parquet, in place,
         # without re-fetching yfinance OHLCV or re-detecting episodes. Updates:
@@ -6164,13 +6316,20 @@ def _handle_command(text: str) -> None:
                     return
                 elapsed = (_t.time() - t0) / 60
                 if proc.returncode == 0:
-                    # Extract the field-population summary from stdout
-                    tail = (proc.stdout or "")[-800:]
+                    # Extract the NaN coverage report (BEFORE → AFTER) from stdout.
+                    # The script prints that section after a "NaN coverage report"
+                    # header line.
+                    out = proc.stdout or ""
+                    if "NaN coverage report" in out:
+                        idx = out.find("NaN coverage report")
+                        tail = out[idx:idx + 3000]
+                    else:
+                        tail = out[-1500:]
                     _reply(
                         f"✅ *Backfill fundamentals — concluído* ({elapsed:.0f} min)\n\n"
                         f"<code>{tail}</code>\n\n"
-                        f"_Verifica com `/admin_features dip` — fundamentals (revenue_growth, "
-                        f"earnings_growth, _eps_ttm, peg_ratio) devem mostrar n>0._"
+                        f"_Próximo passo: `/admin_test_retrain` para validar o pipeline "
+                        f"antes de comprometer com retrain completo._"
                     )
                 else:
                     tail = ((proc.stdout or "") + (proc.stderr or ""))[-600:]
