@@ -423,6 +423,12 @@ def insider_buy_recent(ticker: str, lookback_days: int = 30, as_of_date: "date |
         dates_filed = recent.get("filingDate", [])
         as_of  = as_of_date or date.today()
         cutoff = as_of - timedelta(days=lookback_days)
+        # PIT-data-gap guard: if EDGAR's recent list starts after `as_of`,
+        # we have no data covering this PIT date. Returning 0.0 would be
+        # fake confirmation of "no insider activity" when in reality we
+        # have no idea what happened back then.
+        if not _edgar_recent_covers_pit(dates_filed, as_of):
+            return NaN
         for form, filed_str in zip(forms, dates_filed):
             if form not in ("4", "4/A"):
                 continue
@@ -464,6 +470,10 @@ def insider_buy_amount_score(ticker: str, lookback_days: int = 60, as_of_date: "
         primary_docs    = recent.get("primaryDocument", [""] * len(forms))  # nome real do ficheiro
         as_of  = as_of_date or date.today()
         cutoff = as_of - timedelta(days=lookback_days)
+        # PIT-data-gap guard: EDGAR's recent list only reaches ~2 years
+        # back. For older alert_dates we have no data to verify.
+        if not _edgar_recent_covers_pit(dates_filed, as_of):
+            return NaN, 0.0
 
         total_purchase = 0.0
         top_name  = ""
@@ -515,12 +525,41 @@ def insider_buy_amount_score(ticker: str, lookback_days: int = 60, as_of_date: "
         return NaN, 0.0
 
 
+def _edgar_recent_covers_pit(dates_filed: list, as_of: "date") -> bool:
+    """Return True iff EDGAR's `recent` filings extend back at least to `as_of`.
+
+    EDGAR's submissions JSON only returns ~last 1000 filings in `recent`.
+    For a US ticker like AAPL with thousands of filings, this means the
+    `recent` list typically starts ~2 years ago. Queries for old PIT dates
+    (e.g. 2020 alert_date) get a `recent` array dated entirely AFTER the
+    PIT window — there are no filings to check against, so any "no
+    activity in window" answer would be a fake confirmation.
+
+    Returns False if no filings fit, or if the earliest filing in `recent`
+    is more recent than `as_of` (meaning the PIT date is before our data
+    window). True means we can at least see filings on/before `as_of`.
+    """
+    earliest = None
+    for d in dates_filed:
+        try:
+            fd = date.fromisoformat(str(d)[:10])
+        except (ValueError, TypeError):
+            continue
+        if earliest is None or fd < earliest:
+            earliest = fd
+    if earliest is None:
+        return False
+    return earliest <= as_of
+
+
 def insider_sell_recent(ticker: str, lookback_days: int = 30, as_of_date: "date | None" = None) -> float:
     """1.0 if any insider sale (Form 4 code D) in the last `lookback_days`, else 0.0.
 
-    NaN if the ticker has no EDGAR coverage (non-US), or if there ARE Form 4
-    filings in the window but every XML fetch failed (rate-limit / network).
-    0.0 means EDGAR confirmed Form 4 activity and none was a sale.
+    NaN if the ticker has no EDGAR coverage (non-US), if EDGAR's recent
+    filings don't extend back to the PIT date (data gap, not confirmed
+    silence), or if there ARE Form 4 filings in the window but every XML
+    fetch failed. 0.0 means EDGAR data covers the PIT date and confirms
+    no sale activity.
     """
     try:
         data   = _edgar_submissions(ticker)
@@ -535,6 +574,11 @@ def insider_sell_recent(ticker: str, lookback_days: int = 30, as_of_date: "date 
         primary_docs = recent.get("primaryDocument", [""] * len(forms))
         as_of  = as_of_date or date.today()
         cutoff = as_of - timedelta(days=lookback_days)
+        # EDGAR's recent list only goes back ~1000 filings (~2 years for
+        # an active filer). If our PIT date precedes the earliest filing
+        # in `recent`, we have no data to check — return NaN, not 0.0.
+        if not _edgar_recent_covers_pit(dates_filed, as_of):
+            return NaN
         n_in_window = 0
         n_parsed_ok = 0
         n_sales     = 0
@@ -587,6 +631,8 @@ def insider_sell_amount_score(ticker: str, lookback_days: int = 60, as_of_date: 
         primary_docs = recent.get("primaryDocument", [""] * len(forms))
         as_of  = as_of_date or date.today()
         cutoff = as_of - timedelta(days=lookback_days)
+        if not _edgar_recent_covers_pit(dates_filed, as_of):
+            return NaN, 0.0
 
         total_sale = 0.0
         top_name   = ""

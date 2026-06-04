@@ -141,10 +141,19 @@ def _process_row(row: pd.Series, cache_dir: Path) -> dict:
     exchange = ""
     try:
         if has_sec_filings(str(row["ticker"]), country, exchange):
-            fase5 = _compute_fase5_row(pd.Series(merged), None) or {}
+            # price_cache MUST be a dict-like object — _compute_fase5_row
+            # does `price_cache.get(ticker)` on line 554. Passing None
+            # raises AttributeError immediately, killing Phase 5 silently
+            # (the outer try/except just logs at DEBUG and returns nothing
+            # new — merged keeps row's old values, including any fake 0.0
+            # from prior buggy runs). Empty dict {} is safe: price-based
+            # signals (consecutive_red_days, ma_200d_ratio) stay NaN
+            # because there's no history, but EDGAR signals (Form 4
+            # insider, 8-K) still run.
+            fase5 = _compute_fase5_row(pd.Series(merged), {}) or {}
             merged.update(fase5)
     except Exception as e:
-        log.debug(f"[backfill] Phase 5 failed for {row.get('ticker', '?')}: {e}")
+        log.warning(f"[backfill] Phase 5 failed for {row.get('ticker', '?')}: {e}")
 
     # Derived: peg_ratio etc.
     try:
