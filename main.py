@@ -2146,6 +2146,30 @@ def run_monthly_retrain() -> None:
 
     def _run_retrain():
         try:
+            # Fase 0: refresh INCREMENTAL do parquet base — adiciona episódios
+            # do último mês ao ml_training_base.parquet sem rebuild completo.
+            # Sem --force-rebuild, o builder detecta o parquet existente e só
+            # processa datas novas (lookback 200d).
+            try:
+                import subprocess as _sp, sys as _sys
+                from pathlib import Path as _P
+                _data_dir = _P("/data") if _P("/data").exists() else _P("/tmp")
+                _build_script = _P(__file__).parent / "scripts" / "build_dip_dataset.py"
+                _bproc = _sp.run(
+                    [_sys.executable, str(_build_script),
+                     "--out", str(_data_dir / "ml_training_base.parquet")],
+                    capture_output=True, text=True, timeout=2 * 3600
+                )
+                if _bproc.returncode == 0:
+                    logging.info("[monthly_retrain] DIP dataset refresh incremental OK")
+                else:
+                    logging.warning(
+                        f"[monthly_retrain] DIP incremental build exit "
+                        f"{_bproc.returncode} — train continua com parquet antigo"
+                    )
+            except Exception as _be:
+                logging.warning(f"[monthly_retrain] DIP incremental skipped: {_be}")
+
             from monthly_retrain import run_monthly_retrain
             _result_holder[0] = run_monthly_retrain()
         except Exception as e:
@@ -2945,6 +2969,79 @@ def main() -> None:
         _run_momentum_monthly,
         CronTrigger(day=1, hour=8, minute=0, timezone=LISBON_TZ),
         id="momentum_retrain", name="Monthly Retrain (MomentumRadar)",
+    )
+
+    # ── CoreRadar Retrain — dia 1, 07h00 Lisboa (entre DIP e Momentum) ────────
+    # Previously missing! Core stayed with whatever model was trained manually
+    # via /admin_overnight, drifting further from market reality every month.
+    # Same pattern as momentum: incremental dataset build + train + reload.
+    def _run_core_monthly():
+        import subprocess as _sp, sys as _sys
+        from pathlib import Path as _Path
+        t0_core = time.time()
+        now_str_core = datetime.now(LISBON_TZ).strftime("%d/%m/%Y %H:%M")
+        send_telegram(
+            f"Retreino Core iniciado ({now_str_core}).\n"
+            f"Fase 1: dataset incremental (eventos do ultimo mes).\n"
+            f"Fase 2: treino. Notificacao quando terminar."
+        )
+        data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
+        try:
+            # Fase 1: dataset incremental — sem --force-rebuild, só adiciona
+            # episódios novos ao parquet existente (lookback de 200d).
+            build_script = _Path(__file__).parent / "scripts" / "build_core_dataset.py"
+            build_proc = _sp.run(
+                [_sys.executable, str(build_script),
+                 "--out", str(data_dir / "core_training_base.parquet")],
+                capture_output=True, text=True, timeout=4 * 3600
+            )
+            if build_proc.returncode != 0:
+                stderr_tail = (build_proc.stderr or "")[-300:]
+                logging.warning(f"[core_retrain] build_dataset exit {build_proc.returncode}")
+                send_telegram(
+                    f"⚠️ Core dataset incremental falhou (exit {build_proc.returncode}) — "
+                    f"a treinar no dataset anterior.\n`{stderr_tail}`"
+                )
+            else:
+                logging.info("[core_retrain] Dataset Core actualizado")
+
+            # Fase 2: train
+            train_script = _Path(__file__).parent / "scripts" / "train_core_model.py"
+            train_proc = _sp.run(
+                [_sys.executable, str(train_script),
+                 "--parquet", str(data_dir / "core_training_base.parquet")],
+                capture_output=True, text=True, timeout=1 * 3600
+            )
+            elapsed = time.time() - t0_core
+            if train_proc.returncode == 0:
+                # Reload in-process so the new model is active immediately
+                try:
+                    import core_radar as _cr
+                    _cr._core_model_checked = False
+                    _cr._core_model_bundle  = None
+                    _cr._load_core_model()
+                except Exception as _re:
+                    logging.warning(f"[core_retrain] model reload: {_re}")
+                send_telegram(
+                    f"✅ *CoreRadar Retrain — OK*\n"
+                    f"_{now_str_core} ({elapsed:.0f}s)_\n"
+                    f"ML scoring active. /admin_check_config para CV_IC."
+                )
+            else:
+                stderr_tail = (train_proc.stderr or "")[-300:]
+                logging.error(f"[core_retrain] train exit {train_proc.returncode}: {stderr_tail}")
+                send_telegram(
+                    f"❌ Core train falhou (exit {train_proc.returncode}).\n"
+                    f"`{stderr_tail}`"
+                )
+        except Exception as e:
+            logging.error(f"[core_retrain] {e}", exc_info=True)
+            send_telegram(f"❌ Core retrain falhou: {e}")
+
+    scheduler.add_job(
+        _run_core_monthly,
+        CronTrigger(day=1, hour=7, minute=0, timezone=LISBON_TZ),
+        id="core_retrain", name="Monthly Retrain (CoreRadar)",
     )
 
     # ── Paper Trading: update diário de posições abertas (22:50 Lisboa) ───────

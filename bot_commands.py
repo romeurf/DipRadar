@@ -2731,6 +2731,12 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                        to drop back to rule-based.
       --purge-all      Equivalent to --purge-cache --purge-models (legacy
                        behaviour of older /admin_overnight runs).
+      --incremental    Use INCREMENTAL builds — don't pass --force-rebuild to
+                       dataset builders, so they only process new dates since
+                       the last record in the parquet. 10× faster than full
+                       rebuild. Implies --no-purge automatically. RECOMMENDED
+                       FOR MONTHLY RETRAIN. Use when you have a healthy
+                       parquet and just want to add new month's data.
       --dip-only       Only DIP build + retrain
       --core-only      Only Core build + retrain
       --momentum-only  Only Momentum build + retrain
@@ -2749,6 +2755,13 @@ def _handle_admin_overnight(parts: list[str]) -> None:
     dip_only       = "--dip-only"       in parts
     core_only      = "--core-only"      in parts
     momentum_only  = "--momentum-only"  in parts
+    # --incremental: pass NO --force-rebuild to dataset builders, so they
+    # detect existing parquet and only process new dates since last record.
+    # 10× faster than full rebuild. Perfect for monthly retrain cadence.
+    # Implies --no-purge automatically (can't keep parquets if purge wipes them).
+    incremental    = "--incremental"    in parts
+    if incremental:
+        no_purge = True  # forced
 
     run_dip      = not core_only and not momentum_only
     run_core     = not dip_only  and not momentum_only
@@ -2900,15 +2913,15 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                 _reply("⏳ <b>Step 1/6 — DIP dataset</b> building (4-6h)...")
                 t0 = _t.time()
                 out_dip = data_dir / "ml_training_base.parquet"
+                _dip_cmd = [sys.executable, str(scripts / "build_dip_dataset.py"),
+                            "--start", "1993-01-01", "--out", str(out_dip)]
+                if not incremental:
+                    _dip_cmd.append("--force-rebuild")
                 ok, tail = _sub(
-                    [sys.executable, str(scripts / "build_dip_dataset.py"),
-                     "--start", "1993-01-01", "--out", str(out_dip), "--force-rebuild"],
-                    phase="Step 1/6 — DIP dataset build",
-                    # 12h was hitting timeout with ~98% coverage (207k/211k rows).
-                    # 18h gives margin for full 100% rebuild + slow EDGAR/Tiingo
-                    # episodes. Checkpoint recovery (commit c76157c) ensures a
-                    # timed-out build at 18h still produces usable data.
-                    timeout_h=18,
+                    _dip_cmd,
+                    phase="Step 1/6 — DIP dataset build" + (" (incremental)" if incremental else ""),
+                    # Incremental builds finish in 10-30 min; full rebuild in 4-18h.
+                    timeout_h=2 if incremental else 18,
                 )
                 elapsed = (_t.time() - t0) / 60
                 if ok:
@@ -2982,11 +2995,14 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                 _reply("⏳ <b>Step 3/6 — Core dataset</b> building (1-2h)...")
                 t0 = _t.time()
                 out_core = data_dir / "core_training_base.parquet"
+                _core_cmd = [sys.executable, str(scripts / "build_core_dataset.py"),
+                             "--out", str(out_core), "--start", "1993-01-01"]
+                if not incremental:
+                    _core_cmd.append("--force-rebuild")
                 ok, tail = _sub(
-                    [sys.executable, str(scripts / "build_core_dataset.py"),
-                     "--out", str(out_core), "--start", "1993-01-01", "--force-rebuild"],
-                    phase="Step 3/6 — Core dataset build",
-                    timeout_h=10,
+                    _core_cmd,
+                    phase="Step 3/6 — Core dataset build" + (" (incremental)" if incremental else ""),
+                    timeout_h=1 if incremental else 10,
                 )
                 elapsed = (_t.time() - t0) / 60
                 if ok:
@@ -3044,14 +3060,14 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                 t0 = _t.time()
                 out_mom = data_dir / "momentum_training.parquet"
                 mom_script = Path(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py"
+                _mom_cmd = [sys.executable, str(mom_script), "--out", str(out_mom)]
+                if not incremental:
+                    _mom_cmd.append("--force-rebuild")
                 ok, tail = _sub(
-                    [sys.executable, str(mom_script), "--out", str(out_mom)],
-                    phase="Step 5/6 — Momentum dataset build",
-                    # 8h → 12h: momentum builds 3 horizons (30d/90d/180d alpha)
-                    # with EDGAR per episode for insider/8-K features. With 1500
-                    # tickers × ~40 episodes/ticker × EDGAR-heavy work, the old
-                    # 8h was getting tight. 12h gives comfortable margin.
-                    timeout_h=12,
+                    _mom_cmd,
+                    phase="Step 5/6 — Momentum dataset build" + (" (incremental)" if incremental else ""),
+                    # Incremental: ~30-90 min. Full rebuild: 6-12h.
+                    timeout_h=2 if incremental else 12,
                 )
                 elapsed = (_t.time() - t0) / 60
                 if ok:
