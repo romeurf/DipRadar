@@ -6109,6 +6109,78 @@ def _handle_command(text: str) -> None:
         except Exception as e:
             _reply(f"❌ Erro: `{e}`")
 
+    elif cmd in ("/admin_backfill_fundamentals", "/admin_backfill"):
+        # Recompute ONLY the fundamental columns in the DIP parquet, in place,
+        # without re-fetching yfinance OHLCV or re-detecting episodes. Updates:
+        # gross_margin, de_ratio, roe, revenue_growth, earnings_growth,
+        # _eps_ttm, trailing_pe, peg_ratio, earnings_beat_rate, analyst_rating,
+        # fcf_yield, quality_score. Everything else (RSI, drawdown, vix,
+        # alpha_90d targets, etc.) is preserved untouched.
+        try:
+            from pathlib import Path as _P
+            _dd = _P("/data") if _P("/data").exists() else _P("/tmp")
+            parquet = _dd / "ml_training_base.parquet"
+            if not parquet.exists():
+                _reply(f"⚠️ `{parquet.name}` não existe — corre `/admin_overnight` primeiro.")
+                return
+
+            # Optional filters
+            since_arg = None
+            tickers_arg = None
+            for token in parts[1:]:
+                if token.startswith("--since="):
+                    since_arg = token.split("=", 1)[1]
+                elif token.startswith("--tickers="):
+                    tickers_arg = token.split("=", 1)[1]
+
+            _reply(
+                f"🔄 *Backfill fundamentals* a iniciar\n\n"
+                f"  Parquet: `{parquet.name}` ({parquet.stat().st_size//1024//1024} MB)\n"
+                f"  EDGAR PIT TTM + YoY para `revenue_growth`, `earnings_growth`, `_eps_ttm`\n"
+                f"  yfinance para `earnings_beat_rate`, `analyst_rating`\n"
+                f"  Derivado: `peg_ratio`, `trailing_pe`\n\n"
+                f"⏳ Estimativa: 45-90 min para 211k rows\n"
+                f"_Preserva intacto: RSI, drawdown_52w, alpha_90d, targets, e tudo o resto._\n"
+                f"_Atomic write: parquet original safe até ao fim._"
+            )
+
+            def _run_backfill():
+                import subprocess as _sp, sys as _sys
+                import time as _t
+                t0 = _t.time()
+                script = _P(__file__).parent / "scripts" / "backfill_fundamentals.py"
+                cmd = [_sys.executable, str(script), "--parquet", str(parquet)]
+                if since_arg:
+                    cmd += ["--since", since_arg]
+                if tickers_arg:
+                    cmd += ["--tickers", tickers_arg]
+                try:
+                    proc = _sp.run(cmd, capture_output=True, text=True, timeout=4 * 3600)
+                except _sp.TimeoutExpired:
+                    _reply("❌ Backfill timed out após 4h. Inspeciona Railway logs.")
+                    return
+                except Exception as e:
+                    _reply(f"❌ Backfill falhou: `{e}`")
+                    return
+                elapsed = (_t.time() - t0) / 60
+                if proc.returncode == 0:
+                    # Extract the field-population summary from stdout
+                    tail = (proc.stdout or "")[-800:]
+                    _reply(
+                        f"✅ *Backfill fundamentals — concluído* ({elapsed:.0f} min)\n\n"
+                        f"<code>{tail}</code>\n\n"
+                        f"_Verifica com `/admin_features dip` — fundamentals (revenue_growth, "
+                        f"earnings_growth, _eps_ttm, peg_ratio) devem mostrar n>0._"
+                    )
+                else:
+                    tail = ((proc.stdout or "") + (proc.stderr or ""))[-600:]
+                    _reply(f"❌ Backfill exit {proc.returncode}:\n<code>{tail}</code>")
+
+            import threading
+            threading.Thread(target=_run_backfill, daemon=True, name="dip-backfill-fundamentals").start()
+        except Exception as e:
+            _reply(f"❌ Erro: `{e}`")
+
     elif cmd in ("/admin_diag_yf", "/admin_yf_test"):
         # Diagnose what yfinance actually returns for a ticker, so we can see
         # if peg_ratio/earnings_beat_rate/analyst_rating are 100% NaN due to:
