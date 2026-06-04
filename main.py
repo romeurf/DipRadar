@@ -1302,7 +1302,10 @@ def build_alert(
     )
     if no_liquidity:
         body += "\n⚠️ _Sem liquidez disponível — alerta para referência e monitorização. Sem compra executada._"
-    elif sizing_str:
+    elif sizing_str and verdict not in ("EVITAR", "REJEITAR"):
+        # Suppress sizing when the verdict is reject — showing "💶 Sizing: €20"
+        # right after "Rejeitado: sem suporte técnico" is contradictory and
+        # confused users into thinking the bot was recommending a buy.
         body += f"\n💶 *Sizing:* {sizing_str}"
     return body
 

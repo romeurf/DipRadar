@@ -589,7 +589,13 @@ _8K_ITEMS: dict[str, tuple[float, str]] = {
     "4.01": (-0.5, "Changes in Registrant's Certifying Accountant — mudança de auditor (sinal de problemas)"),
     "4.02": (-0.9, "Non-Reliance on Previously Issued Financial Statements — restatement de resultados anteriores"),
     "5.01": (+0.1, "Changes in Control of Registrant — mudança de controlo"),
-    "5.02": (-0.3, "Departure of Directors or Certain Officers — saída de executivo ou director"),
+    # Item 5.02 recalibrated -0.3 → -0.1: executive/director departures are
+    # extremely common (board rotations, retirements, new appointments file
+    # under the same code). At -0.3 it was triggering CORE_QUALITY_WARNING on
+    # routine large-cap convictions (NOW, UBER, MSFT all hit it simultaneously).
+    # CEO-departure-as-crisis is rare enough to deserve a manual check; the
+    # generic 5.02 filing is more like 5.03 (bylaw amendment) — corporate noise.
+    "5.02": (-0.1, "Departure of Directors or Certain Officers — saída de executivo ou director"),
     "5.03": (-0.1, "Amendments to AoI or Bylaws — alteração de estatutos"),
     "7.01": ( 0.0, "Regulation FD Disclosure — divulgação ao abrigo do Regulamento FD"),
     "8.01": ( 0.0, "Other Events — outros eventos"),
