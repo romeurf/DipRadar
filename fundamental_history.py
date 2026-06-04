@@ -477,6 +477,12 @@ def _edgar_get(ticker: str, alert_date: date, cache_dir: Path) -> dict:
         if ttm_ni > 0:
             result["_eps_ttm"] = round(ttm_ni / shares, 4)
 
+    # Expose shares outstanding so callers can compute PIT market cap
+    # (shares × alert_date_price) for fcf_yield, ev_multiples, etc. — those
+    # calculations need a price the EDGAR facts file doesn't carry.
+    if shares is not None and shares > 0:
+        result["_shares_outstanding"] = float(shares)
+
     # Filtrar campos None → não retornar dict vazio
     valid = {k: v for k, v in result.items() if v is not None}
     return valid if len(valid) >= 2 else {}

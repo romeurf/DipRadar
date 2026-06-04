@@ -505,9 +505,23 @@ def _process_one_ticker(
                     cache_dir / "fundamental_cache",
                 )
                 if fund_raw:
+                    # fcf_yield = FCF / market_cap_PIT.
+                    # market_cap_PIT = alert_date_price × shares_outstanding.
+                    # fundamental_history._edgar_get now exposes
+                    # _shares_outstanding so this is fully PIT (no leak from
+                    # current yfinance market cap). Previous code had a
+                    # circular `fcf_yield_v = None` that never populated it.
                     fcf_yield_v = fund_raw.get("fcf_yield")
-                    if fcf_yield_v is None and fund_raw.get("_fcf_raw") and price > 0:
-                        fcf_yield_v = None
+                    if fcf_yield_v is None:
+                        _fcf_raw = fund_raw.get("_fcf_raw")
+                        _shares  = fund_raw.get("_shares_outstanding")
+                        if _fcf_raw is not None and _shares and price > 0:
+                            try:
+                                mcap = float(price) * float(_shares)
+                                if mcap > 0:
+                                    fcf_yield_v = round(float(_fcf_raw) / mcap, 4)
+                            except (TypeError, ValueError):
+                                pass
 
                     fund = {
                         "revenue_growth":  fund_raw.get("revenue_growth"),
@@ -515,7 +529,12 @@ def _process_one_ticker(
                         "roe":             fund_raw.get("roe"),
                         "fcf_yield_fund":  fcf_yield_v,
                         "analyst_upside":  fund_raw.get("analyst_upside"),
-                        "earnings_growth": fund_raw.get("revenue_growth"),  # proxy
+                        # earnings_growth: use the real EDGAR-computed value
+                        # (TTM YoY net income). Previously fell back to
+                        # revenue_growth as a proxy because earnings_growth
+                        # wasn't being populated. After the fundamental_history
+                        # fixes it now is — use it.
+                        "earnings_growth": fund_raw.get("earnings_growth"),
                     }
             except Exception as _fe:
                 log.debug(f"[core_fund] {ticker}@{alert_date.date()}: {_fe}")

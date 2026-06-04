@@ -416,46 +416,81 @@ def _compute_pit_fundamentals_row(
     # ones stay NaN through to the parquet and the trainer handles them per
     # model type (LGBM native; Ridge col-mean impute via _prepare_X).
     _NAN = float("nan")
+    # Initialise ALL refresh columns to NaN so the backfill writes "missing"
+    # honestly when a source has no data. FUNDAMENTAL_COLS is the legacy
+    # 5-column set; the extras (roe, _eps_ttm, etc.) are added below from
+    # whichever source has them. Without explicit NaN init, the backfill's
+    # `for col in _ALL_COLS_TO_REFRESH` would either skip the col (no key)
+    # or get the row's old value (silent no-op).
+    _EXTRA_COLS = (
+        "roe", "_eps_ttm", "earnings_growth", "trailing_pe",
+        "earnings_beat_rate", "analyst_rating", "fcf_yield",
+    )
     result: dict = {col: _NAN for col in FUNDAMENTAL_COLS}
+    for col in _EXTRA_COLS:
+        result[col] = _NAN
+
     if "earnings_beat_rate" in earn_signals:
         result["earnings_beat_rate"] = earn_signals["earnings_beat_rate"]
     if "analyst_rating" in earn_signals:
         result["analyst_rating"] = earn_signals["analyst_rating"]
 
     if fund:
-        for col in ("gross_margin", "de_ratio", "revenue_growth", "quality_score"):
+        # Direct propagation: any EDGAR-computed value that's already a
+        # ratio/score is propagated as-is. roe is added here (previously
+        # missing — _edgar_get computes it but _compute_pit_fundamentals_row
+        # never propagated, leaving the col 100% NaN in the parquet).
+        for col in ("gross_margin", "de_ratio", "roe", "revenue_growth", "quality_score"):
             if col in fund and fund[col] is not None:
-                result[col] = float(fund[col])
+                try:
+                    result[col] = float(fund[col])
+                except (TypeError, ValueError):
+                    pass
 
-        # Optional PIT extras used downstream by add_derived_features.
-        # earnings_growth + trailing_pe let peg_ratio compute properly instead
-        # of staying at _FALLBACK (2.0). _yf_quarterly returns _eps_ttm (PIT
-        # TTM EPS); we combine it with the row's entry price here to produce
-        # trailing_pe — keeping the PE PIT-correct (uses the price at the
-        # alert date, not yfinance's current price).
+        # PIT extras used downstream by add_derived_features.
+        # earnings_growth + trailing_pe let peg_ratio compute properly.
         if "earnings_growth" in fund and fund["earnings_growth"] is not None:
             try:
                 result["earnings_growth"] = float(fund["earnings_growth"])
             except (TypeError, ValueError):
                 pass
+
+        # _eps_ttm: previously used only internally to compute trailing_pe;
+        # now also exposed as its own column so the model can learn from it
+        # directly (high signal for value strategies). EDGAR XBRL provides
+        # TTM net income; shares outstanding lets us derive EPS.
         _eps_ttm = fund.get("_eps_ttm")
-        if _eps_ttm is not None and price > 0:
+        if _eps_ttm is not None:
             try:
                 eps = float(_eps_ttm)
-                if eps > 0:
+                result["_eps_ttm"] = eps
+                if price > 0 and eps > 0:
                     result["trailing_pe"] = round(price / eps, 4)
             except (TypeError, ValueError):
                 pass
 
-        # fcf_yield precisa do preço de mercado (fcf / market_cap)
+        # fcf_yield = FCF / market_cap_PIT.
+        # market_cap_PIT = alert_date_price × shares_outstanding_at_alert_date.
+        # _edgar_get now exposes _shares_outstanding; combined with the row's
+        # entry price this is fully PIT (no leakage from current market data).
         fcf_raw = fund.get("_fcf_raw") or fund.get("fcf_raw")
-        if fcf_raw is not None and price > 0:
-            # Estimativa grosseira: market_cap = preço × shares (não temos shares)
-            # Usamos o fcf_yield directamente se disponível do Tiingo
-            if "fcf_yield" in fund and fund["fcf_yield"] is not None:
+        if "fcf_yield" in fund and fund["fcf_yield"] is not None:
+            # Tiingo or another source already provided a yield — use directly
+            try:
                 result["fcf_yield"] = float(fund["fcf_yield"])
-            # EDGAR/yfinance: não temos shares outstanding, guardamos fcf_raw
-            # para diagnóstico mas não calculamos yield sem market cap real
+            except (TypeError, ValueError):
+                pass
+        elif fcf_raw is not None and price > 0:
+            shares = fund.get("_shares_outstanding")
+            try:
+                shares_f = float(shares) if shares is not None else None
+                fcf_f    = float(fcf_raw)
+                if shares_f and shares_f > 0:
+                    market_cap = price * shares_f
+                    if market_cap > 0:
+                        result["fcf_yield"] = round(fcf_f / market_cap, 4)
+            except (TypeError, ValueError):
+                pass
 
     return result
 
