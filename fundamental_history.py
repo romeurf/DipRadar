@@ -581,13 +581,24 @@ def _yf_pit_earnings_signals(
                     # strongBuy/buy/hold/sell/strongSell columns).
                     cols = {c.lower(): c for c in rdf.columns}
                     if {"strongbuy", "buy", "hold", "sell", "strongsell"} <= set(cols):
-                        # Monthly bucket form — synthesize a numeric mean (1..5)
+                        # Monthly bucket form — period is RELATIVE: "0m"=current,
+                        # "1m"=1 month ago, etc. (NOT an ISO date). yfinance only
+                        # returns last 4 months. Convert to absolute date so the
+                        # PIT filter below can compare against alert_date.
+                        from datetime import date as _d
+                        from datetime import timedelta as _td
+                        _today = _d.today()
                         for _, row in rdf.iterrows():
                             try:
-                                d = str(row.get(cols.get("period", ""), ""))[:10] if "period" in cols else None
-                                if not d:
-                                    # fall back to index if not in the row
-                                    pass
+                                # period: "0m", "1m", "2m", "3m"
+                                period_str = str(row.get(cols.get("period", ""), "0m")).strip()
+                                if period_str.endswith("m") and period_str[:-1].lstrip("-").isdigit():
+                                    months_ago = int(period_str[:-1])
+                                    # ~30 days per month approximation
+                                    abs_date = _today - _td(days=months_ago * 30)
+                                    d = abs_date.isoformat()
+                                else:
+                                    d = str(period_str)[:10]
                                 sb = float(row[cols["strongbuy"]] or 0)
                                 b  = float(row[cols["buy"]] or 0)
                                 h  = float(row[cols["hold"]] or 0)
