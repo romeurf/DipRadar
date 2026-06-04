@@ -774,30 +774,20 @@ def get_pit_fundamentals(
         except Exception as e:
             log.debug(f"[fund_hist] EDGAR falhou {ticker}: {e}")
 
-    # Tier 3: yfinance quarterly (fills _eps_ttm + earnings_growth gaps)
+    # Tier 3: yfinance quarterly (fills _eps_ttm + earnings_growth gaps,
+    # PIT-correct from quarterly filings)
     try:
         _merge_in(_yf_quarterly(ticker, alert_date, cache_dir))
     except Exception as e:
         log.debug(f"[fund_hist] yfinance quarterly falhou {ticker}: {e}")
 
-    # Tier 4: yfinance.info — last-resort fallback for revenue_growth.
-    # NOT PIT (it's current state) but for recent rows it's a useful proxy
-    # when neither EDGAR nor quarterly_financials has YoY data. Skip if key
-    # already populated by a PIT source.
-    if "revenue_growth" not in merged or merged.get("revenue_growth") is None:
-        try:
-            import yfinance as yf
-            info = yf.Ticker(ticker).info or {}
-            rg = info.get("revenueGrowth")
-            if rg is not None:
-                merged["revenue_growth"] = round(float(rg), 4)
-            # Also try earnings_growth from .info (epsGrowth field) — same caveats
-            if "earnings_growth" not in merged or merged.get("earnings_growth") is None:
-                eg = info.get("earningsGrowth") or info.get("epsGrowth")
-                if eg is not None:
-                    merged["earnings_growth"] = round(float(eg), 4)
-        except Exception as e:
-            log.debug(f"[fund_hist] yf.info fallback {ticker}: {e}")
+    # NO yfinance.info fallback — it returns CURRENT state, not PIT. Applying
+    # today's revenueGrowth to a 2020 alert_date would leak forward-looking
+    # information into training. NaN is the honest value when no PIT source
+    # has the data. Tree models handle NaN natively; the linear model uses
+    # column mean of NON-NULL rows (no zero inflation). The bot's live
+    # /analisar flow uses a separate code path with yfinance.info because
+    # there "current = PIT" for today's alert.
 
     return merged
 
