@@ -310,10 +310,20 @@ def _parse_form4_xml(accession_no: str, cik: str, primary_doc: str = "") -> dict
     _cache_dir.mkdir(parents=True, exist_ok=True)
     _cache_file = _cache_dir / f"{cik_int}_{acc_clean}.json"
     if _cache_file.exists():
-        # No TTL — Form 4 filings are immutable. If the cache file exists,
-        # it's authoritative forever.
+        # No TTL — Form 4 filings are IMMUTABLE post-submission. But a cached
+        # empty dict {} is a legacy "fetch failed" marker from before this
+        # fix — treat as cache-miss so we retry. Successful parses always
+        # have non-empty content (at minimum name/title/code).
         try:
-            return _json.loads(_cache_file.read_text(encoding="utf-8"))
+            cached = _json.loads(_cache_file.read_text(encoding="utf-8"))
+            if cached:  # non-empty → real parse, use forever
+                return cached
+            # Empty dict → legacy failure cache. Delete it so we retry now
+            # and don't read it again next iteration.
+            try:
+                _cache_file.unlink()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -322,24 +332,27 @@ def _parse_form4_xml(accession_no: str, cik: str, primary_doc: str = "") -> dict
     try:
         r = requests.get(doc_url, headers=_EDGAR_HEADERS, timeout=10)
         if r.status_code != 200:
-            # Cache the failure too (with shorter TTL via empty dict marker)
-            # so we don't hammer the same broken URL on every build.
-            empty: dict = {}
-            try:
-                _cache_file.write_text(_json.dumps(empty), encoding="utf-8")
-            except Exception:
-                pass
-            return empty
+            # DO NOT cache failures. Rate limits + transient network errors
+            # are not authoritative answers — caching {} would lie to
+            # insider_*_recent / *_amount_score on the next backfill,
+            # producing fake zeros. Returning empty without persisting
+            # gives the caller a chance to detect "fetch failed" and
+            # emit NaN.
+            return {}
         text  = r.text
         start = text.find("<ownershipDocument>")
         end   = text.find("</ownershipDocument>")
         if start == -1 or end == -1:
-            empty = {}
+            # Truly malformed filing (not a transient failure). This is
+            # rare and likely permanent — cache so we don't keep retrying.
+            # Sentinel field distinguishes "parsed, no ownership data" from
+            # legacy empty-dict failure markers.
+            permanent_empty = {"_no_ownership_doc": True}
             try:
-                _cache_file.write_text(_json.dumps(empty), encoding="utf-8")
+                _cache_file.write_text(_json.dumps(permanent_empty), encoding="utf-8")
             except Exception:
                 pass
-            return empty
+            return permanent_empty
         root = ET.fromstring(text[start:end + len("</ownershipDocument>")])
     except Exception:
         return {}
@@ -456,6 +469,8 @@ def insider_buy_amount_score(ticker: str, lookback_days: int = 60, as_of_date: "
         top_name  = ""
         top_title = ""
         top_amount = 0.0
+        n_in_window = 0
+        n_parsed_ok = 0
 
         for form, filed_str, acc, pdoc in zip(forms, dates_filed, accessions, primary_docs):
             if form not in ("4", "4/A"):
@@ -466,7 +481,11 @@ def insider_buy_amount_score(ticker: str, lookback_days: int = 60, as_of_date: "
                     continue
             except ValueError:
                 continue
+            n_in_window += 1
             parsed = _parse_form4_xml(acc, cik_str, primary_doc=str(pdoc or ""))
+            if not parsed:
+                continue
+            n_parsed_ok += 1
             if parsed.get("is_purchase"):
                 amt = parsed.get("amount_usd", 0)
                 total_purchase += amt
@@ -476,6 +495,9 @@ def insider_buy_amount_score(ticker: str, lookback_days: int = 60, as_of_date: "
                     top_name   = parsed.get("name", "")
                     top_title  = parsed.get("title", "")
 
+        # Form 4s existed but every XML fetch failed → NaN (we don't know)
+        if n_in_window > 0 and n_parsed_ok == 0:
+            return NaN, 0.0
         if total_purchase <= 0:
             return 0.0, 0.0
 
@@ -496,8 +518,9 @@ def insider_buy_amount_score(ticker: str, lookback_days: int = 60, as_of_date: "
 def insider_sell_recent(ticker: str, lookback_days: int = 30, as_of_date: "date | None" = None) -> float:
     """1.0 if any insider sale (Form 4 code D) in the last `lookback_days`, else 0.0.
 
-    NaN if the ticker has no EDGAR coverage (non-US). 0.0 means EDGAR confirmed
-    no sales in the window — semantically very different from NaN.
+    NaN if the ticker has no EDGAR coverage (non-US), or if there ARE Form 4
+    filings in the window but every XML fetch failed (rate-limit / network).
+    0.0 means EDGAR confirmed Form 4 activity and none was a sale.
     """
     try:
         data   = _edgar_submissions(ticker)
@@ -512,6 +535,9 @@ def insider_sell_recent(ticker: str, lookback_days: int = 30, as_of_date: "date 
         primary_docs = recent.get("primaryDocument", [""] * len(forms))
         as_of  = as_of_date or date.today()
         cutoff = as_of - timedelta(days=lookback_days)
+        n_in_window = 0
+        n_parsed_ok = 0
+        n_sales     = 0
         for form, filed_str, acc, pdoc in zip(forms, dates_filed, accessions, primary_docs):
             if form not in ("4", "4/A"):
                 continue
@@ -521,10 +547,17 @@ def insider_sell_recent(ticker: str, lookback_days: int = 30, as_of_date: "date 
                     continue
             except ValueError:
                 continue
+            n_in_window += 1
             parsed = _parse_form4_xml(acc, cik_str, primary_doc=str(pdoc or ""))
+            if not parsed:
+                continue  # transient fetch failure — don't count as confirmed-no-sale
+            n_parsed_ok += 1
             if parsed.get("is_sale"):
-                return 1.0
-        return 0.0
+                n_sales += 1
+        # Form 4s existed but we couldn't parse any → NaN (honest unknown)
+        if n_in_window > 0 and n_parsed_ok == 0:
+            return NaN
+        return 1.0 if n_sales > 0 else 0.0
     except Exception:
         return NaN
 
@@ -559,6 +592,8 @@ def insider_sell_amount_score(ticker: str, lookback_days: int = 60, as_of_date: 
         top_name   = ""
         top_title  = ""
         top_amount = 0.0
+        n_in_window = 0
+        n_parsed_ok = 0
 
         for form, filed_str, acc, pdoc in zip(forms, dates_filed, accessions, primary_docs):
             if form not in ("4", "4/A"):
@@ -569,7 +604,11 @@ def insider_sell_amount_score(ticker: str, lookback_days: int = 60, as_of_date: 
                     continue
             except ValueError:
                 continue
+            n_in_window += 1
             parsed = _parse_form4_xml(acc, cik_str, primary_doc=str(pdoc or ""))
+            if not parsed:
+                continue
+            n_parsed_ok += 1
             if parsed.get("is_sale"):
                 amt = parsed.get("sale_amount_usd", 0)
                 total_sale += amt
@@ -578,6 +617,8 @@ def insider_sell_amount_score(ticker: str, lookback_days: int = 60, as_of_date: 
                     top_name   = parsed.get("name", "")
                     top_title  = parsed.get("title", "")
 
+        if n_in_window > 0 and n_parsed_ok == 0:
+            return NaN, 0.0
         if total_sale <= 0:
             return 0.0, 0.0
 

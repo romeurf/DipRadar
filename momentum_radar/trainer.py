@@ -140,7 +140,7 @@ def _walk_forward_ic(df: pd.DataFrame, feats: list[str], target: str) -> tuple[f
 
         m = _make_momentum_model()
 
-        col_means = _compute_col_means(tr, feats)
+        col_means = _compute_col_means(tr, feats, m)
         X_tr = _prepare_X(tr, feats, col_means, m)
         X_te = _prepare_X(te, feats, col_means, m)
         y_tr = tr[target].values.astype(float)
@@ -173,7 +173,7 @@ def _train_final_model(df: pd.DataFrame, feats: list[str], target: str):
     df = df.dropna(subset=[target]).reset_index(drop=True)
     m = _make_momentum_model()
 
-    col_means = _compute_col_means(df, feats)
+    col_means = _compute_col_means(df, feats, m)
     X = _prepare_X(df, feats, col_means, m)
     y = df[target].values.astype(float)
     sw = np.ones(len(X), dtype=np.float32)
@@ -333,7 +333,7 @@ def run_momentum_training(
                 if len(grp) < 100:
                     continue
                 sm = ScaledRidge(alpha=10.0)
-                col_means = _compute_col_means(grp, FEATURE_COLS)
+                col_means = _compute_col_means(grp, FEATURE_COLS, sm)
                 Xs = _prepare_X(grp, FEATURE_COLS, col_means, sm)
                 ys = grp["alpha_90d"].values.astype(float)
                 sm.fit(Xs, ys)

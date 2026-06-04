@@ -87,21 +87,47 @@ def _prepare_X(df: pd.DataFrame, feats: list[str], col_means: dict[str, float], 
     return result.values.astype(np.float32)
 
 
-def _compute_col_means(df: pd.DataFrame, feats: list[str]) -> dict[str, float]:
-    """Médias calculadas APENAS das linhas com dados reais (sem inventar nada)."""
+def _compute_col_means(df: pd.DataFrame, feats: list[str], model=None) -> dict[str, float]:
+    """Médias calculadas APENAS das linhas com dados reais (sem inventar nada).
+
+    Diagnóstico de cobertura:
+    - Para tree models (XGB/LGBM/RF), o ``means`` dict NÃO é consumido — o
+      ``_prepare_X`` passa NaN diretamente ao algoritmo, que aprende rotas
+      'missing' sem fallback. O warning aqui é só diagnóstico de qualidade
+      do dataset; o modelo NÃO está a ver zeros.
+    - Para linear models (Ridge), o ``means[col]`` é injetado como fillna
+      quando ``_prepare_X`` é chamado. Aí sim há fallback efetivo.
+
+    A flag ``model`` afina apenas o texto do warning para refletir o que
+    realmente acontece a jusante.
+    """
     means = {}
+    is_tree = (model is not None) and _is_tree_model(model)
     for col in feats:
         if col not in df.columns:
             means[col] = 0.0
             continue
         valid = df[col].dropna()
         if len(valid) == 0:
-            log.warning(f"[impute] '{col}': sem dados reais — fallback 0.0")
+            if is_tree:
+                log.warning(
+                    f"[coverage] '{col}': 0%% cobertura no dataset — "
+                    f"tree model trata como NaN nativo (split missing branch)"
+                )
+            else:
+                log.warning(
+                    f"[impute] '{col}': sem dados reais — linear model "
+                    f"recebe 0.0 (coluna efetivamente constante)"
+                )
             means[col] = 0.0
         else:
             pct = len(valid) / len(df) * 100
             if pct < 20:
-                log.info(f"[impute] '{col}': {pct:.0f}% cobertura ({len(valid)} linhas)")
+                kind = "tree NaN-native" if is_tree else "linear mean-impute"
+                log.info(
+                    f"[coverage] '{col}': {pct:.0f}%% cobertura "
+                    f"({len(valid)} linhas) — {kind}"
+                )
             means[col] = float(valid.mean())
     return means
 
@@ -238,8 +264,8 @@ def run_walk_forward_cv(
 
         for name, cfg in model_configs.items():
             feats    = [f for f in cfg["feats"] if f in df_tr.columns]
-            _means   = _compute_col_means(df_tr, feats)   # médias só do training fold
             _probe   = cfg["factory"]()                    # instância para detectar tipo
+            _means   = _compute_col_means(df_tr, feats, _probe)  # médias só do training fold
             X_tr     = _prepare_X(df_tr, feats, _means, _probe)
             X_te     = _prepare_X(df_te, feats, _means, _probe)   # mesmas médias — sem leakage
 
@@ -547,7 +573,7 @@ def train_full_champion(
             f"Regenera o parquet via /admin_regen_parquet."
         )
     _champ_probe  = champion_cfg["factory"]()
-    _means_full   = _compute_col_means(df_v31, feats)
+    _means_full   = _compute_col_means(df_v31, feats, _champ_probe)
     X_full        = _prepare_X(df_v31, feats, _means_full, _champ_probe)
     y_alpha_full  = winsorize(df_v31[train_target].values.astype(float))
     y_down_full   = winsorize(df_v31["max_drawdown_60d"].values)
@@ -612,7 +638,7 @@ def train_full_ensemble(
         )
     # Ensemble: factory cria várias instâncias — detectar tipo pelo primeiro
     _ens_probe    = next(iter(model_configs.values()))["factory"]() if model_configs else None
-    _means_ens    = _compute_col_means(df_v31, feats)
+    _means_ens    = _compute_col_means(df_v31, feats, _ens_probe)
     X_full        = _prepare_X(df_v31, feats, _means_ens, _ens_probe)
     y_alpha_full  = winsorize(df_v31[train_target].values.astype(float))
     y_down_full   = winsorize(df_v31["max_drawdown_60d"].values)
@@ -1099,7 +1125,7 @@ def run_training(
         _df_val    = _df_sec.iloc[_split:]
 
         _sec_probe    = _scfg["factory"]()
-        _sec_means_tr = _compute_col_means(_df_tr, feats_used)
+        _sec_means_tr = _compute_col_means(_df_tr, feats_used, _sec_probe)
 
         _ic_holdout: float = float("nan")
         if len(_df_val) >= _MIN_SECTOR_VAL:
@@ -1124,7 +1150,7 @@ def run_training(
                 continue
 
         # Retrain no dataset completo para produção
-        _sec_means_full = _compute_col_means(_df_sec, feats_used)
+        _sec_means_full = _compute_col_means(_df_sec, feats_used, _sec_probe)
         _X_full = _prepare_X(_df_sec, feats_used, _sec_means_full, _sec_probe)
         _y_full = winsorize(_df_sec[_active_target].values.astype(float))
         _sw_full = _weights_with_boost(

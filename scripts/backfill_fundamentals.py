@@ -152,15 +152,20 @@ def _process_row(row: pd.Series, cache_dir: Path) -> dict:
     except Exception as e:
         log.debug(f"[backfill] add_derived_features failed for {row.get('ticker', '?')}: {e}")
 
-    # Return only the columns we want to refresh, with their new values.
-    # Skip NaN (don't overwrite an existing value with NaN).
+    # Return ALL refresh columns including NaN. The previous version skipped
+    # NaN writes to "preserve existing real data", but that logic preserved
+    # FAKE zeros — insider_*_amount_score had 0.0 written by an earlier
+    # buggy backfill when EDGAR rate-limited (function used to return 0.0
+    # on parse failure; now correctly returns NaN). Skipping NaN now would
+    # cement those false zeros forever.
+    #
+    # The fix: trust the source function. It returns NaN only when it
+    # genuinely doesn't know; otherwise a real value (including 0.0 for
+    # "confirmed no insider activity"). Always write what the function says.
     out = {}
     for col in _ALL_COLS_TO_REFRESH:
         if col in merged:
-            v = merged[col]
-            if v is None or (isinstance(v, float) and np.isnan(v)):
-                continue
-            out[col] = v
+            out[col] = merged[col]  # may be NaN — that's now honest
     return out
 
 
@@ -266,15 +271,21 @@ def backfill(
         delta  = before - after
         pct_real_before = (1 - before / n_total) * 100
         pct_real_after  = (1 - after  / n_total) * 100
-        # Visual: ✅ if real coverage improved meaningfully, ➖ if unchanged,
-        # ⚠️ if got worse (which would indicate a bug — shouldn't happen
-        # because we only OVERWRITE NaN, never overwrite real with NaN)
+        # Visual:
+        #   ✅ real coverage improved (NaN→value)
+        #   ➖ unchanged
+        #   🔄 NaN count increased — backfill OVERWROTE previous "real"
+        #      values with NaN. This is EXPECTED for insider_*_amount_score
+        #      after the parse-failure fix (those zeros were fake; we're
+        #      converting them back to honest NaN). For other columns, a
+        #      negative delta means the source function couldn't recompute
+        #      a value it previously had — investigate.
         if delta > 0:
             icon = "✅"
         elif delta == 0:
             icon = "➖"
         else:
-            icon = "⚠️"
+            icon = "🔄"
         log.info(
             f"   {icon} {col:35s}  "
             f"NaN: {before:>7,} → {after:>7,}  ({delta:+,})  "

@@ -114,7 +114,24 @@
       "Bash(python -m unittest tests.test_allocation_engine.test_etf_core_priority -v)",
       "Bash(MONTHLY_BUDGET_EUR=1050 FLIP_FUND_EUR=105 python -c ' *)",
       "Bash(MONTHLY_BUDGET_EUR=1050 FLIP_FUND_EUR=105 SECTOR_CONCENTRATION_CAP=0.35 python -c ' *)",
-      "Bash(python -c 'import ast; src = open\\('\\\\''ml_features.py'\\\\'', encoding='\\\\''utf-8'\\\\''\\).read\\(\\); tree = ast.parse\\(src\\); fc = [] *)"
+      "Bash(python -c 'import ast; src = open\\('\\\\''ml_features.py'\\\\'', encoding='\\\\''utf-8'\\\\''\\).read\\(\\); tree = ast.parse\\(src\\); fc = [] *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('conviction_radar.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(git checkout *)",
+      "WebFetch(domain:www.morningstar.pt)",
+      "WebFetch(domain:www.optimize.pt)",
+      "WebFetch(domain:global.morningstar.com)",
+      "WebFetch(domain:optimize.pt)",
+      "WebFetch(domain:www.apfipp.pt)",
+      "WebFetch(domain:pt.investing.com)",
+      "WebFetch(domain:www.bancoinvest.pt)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('ppr_scraper.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -m pip install pypdf --quiet)",
+      "Bash(git pull *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('monthly_retrain.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(git stash *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('ml_training/train.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(git revert *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/backfill_fundamentals.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ],
     "additionalDirectories": [
       "c:\\Users\\Romeu\\OneDrive\\Documentos\\GitHub\\DipRadar"

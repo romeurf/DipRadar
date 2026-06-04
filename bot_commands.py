@@ -6316,15 +6316,16 @@ def _handle_command(text: str) -> None:
                     return
                 elapsed = (_t.time() - t0) / 60
                 if proc.returncode == 0:
-                    # Extract the NaN coverage report (BEFORE → AFTER) from stdout.
-                    # The script prints that section after a "NaN coverage report"
-                    # header line.
-                    out = proc.stdout or ""
-                    if "NaN coverage report" in out:
-                        idx = out.find("NaN coverage report")
-                        tail = out[idx:idx + 3000]
+                    # Extract the NaN coverage report (BEFORE → AFTER). The
+                    # backfill script uses Python logging which writes to
+                    # stderr by default — the report appears in proc.stderr,
+                    # not stdout. Search both to be robust.
+                    combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+                    if "NaN coverage report" in combined:
+                        idx = combined.find("NaN coverage report")
+                        tail = combined[idx:idx + 3000]
                     else:
-                        tail = out[-1500:]
+                        tail = combined[-1500:]
                     _reply(
                         f"✅ *Backfill fundamentals — concluído* ({elapsed:.0f} min)\n\n"
                         f"<code>{tail}</code>\n\n"
@@ -6337,6 +6338,81 @@ def _handle_command(text: str) -> None:
 
             import threading
             threading.Thread(target=_run_backfill, daemon=True, name="dip-backfill-fundamentals").start()
+        except Exception as e:
+            _reply(f"❌ Erro: `{e}`")
+
+    elif cmd in ("/admin_form4_cache_status", "/admin_form4_cache"):
+        # Inspect (and optionally purge) the Form 4 disk cache. Before the
+        # caching fix, transient EDGAR rate-limit failures were cached as
+        # empty {} dicts and read forever as "no insider activity", producing
+        # fake zeros in insider_*_amount_score columns. The current code
+        # auto-purges {} on read, but a bulk purge is useful before kicking
+        # off a fresh backfill.
+        # Usage:
+        #   /admin_form4_cache_status         → counts only
+        #   /admin_form4_cache_status purge   → delete all empty {} entries
+        try:
+            from pathlib import Path as _P
+            import json as _json
+
+            _dd       = _P("/data") if _P("/data").exists() else _P("/tmp")
+            _cache_d  = _dd / "form4_cache"
+            if not _cache_d.exists():
+                _reply(f"ℹ️ `{_cache_d}` não existe ainda.")
+                return
+
+            files     = list(_cache_d.glob("*.json"))
+            n_total   = len(files)
+            n_empty   = 0
+            n_good    = 0
+            n_bad     = 0
+            for fp in files:
+                try:
+                    txt = fp.read_text(encoding="utf-8")
+                    obj = _json.loads(txt) if txt else None
+                    if not obj:
+                        n_empty += 1
+                    else:
+                        n_good += 1
+                except Exception:
+                    n_bad += 1
+
+            do_purge = len(parts) >= 2 and parts[1].lower() == "purge"
+            if do_purge:
+                n_purged = 0
+                for fp in files:
+                    try:
+                        txt = fp.read_text(encoding="utf-8")
+                        obj = _json.loads(txt) if txt else None
+                        if not obj:
+                            fp.unlink()
+                            n_purged += 1
+                    except Exception:
+                        try:
+                            fp.unlink()
+                            n_purged += 1
+                        except Exception:
+                            pass
+                _reply(
+                    f"🧹 *Form 4 cache — purge concluído*\n"
+                    f"Path: `{_cache_d}`\n"
+                    f"• Antes: `{n_total}` ficheiros (`{n_good}` reais, `{n_empty}` vazios, `{n_bad}` corruptos)\n"
+                    f"• Eliminados: `{n_purged}`\n"
+                    f"• Restantes: `{n_total - n_purged}` (parses reais — permanente)\n\n"
+                    f"_Próximo passo: `/admin_backfill_fundamentals` para refetch das filings._"
+                )
+            else:
+                _reply(
+                    f"📦 *Form 4 cache — status*\n"
+                    f"Path: `{_cache_d}`\n"
+                    f"• Total: `{n_total}` ficheiros\n"
+                    f"• Parses reais: `{n_good}` (permanente)\n"
+                    f"• Vazios `{{}}` (legacy failure cache): `{n_empty}`\n"
+                    f"• Corruptos: `{n_bad}`\n\n"
+                    f"Vazios são lidos como 'sem atividade' pelas funções insider "
+                    f"e produzem zeros falsos. Para limpar:\n"
+                    f"`/admin_form4_cache_status purge`"
+                )
         except Exception as e:
             _reply(f"❌ Erro: `{e}`")
 
