@@ -5910,6 +5910,131 @@ def _handle_command(text: str) -> None:
     elif cmd in ("/admin_check_config", "/check_config"):
         _handle_admin_check_config()
 
+    elif cmd in ("/admin_missed_alpha", "/admin_missed_dips"):
+        # Surface dip episodes that the bot DID NOT alert on but recovered
+        # strongly (alpha_90d ≥ threshold). These are "money left on table"
+        # — patterns the current alert filter is over-restrictive on.
+        #
+        # Usage:
+        #   /admin_missed_alpha                  → last 180 days, alpha ≥ 0.15
+        #   /admin_missed_alpha 365              → last year, default 15%
+        #   /admin_missed_alpha 180 25           → 25%+ alpha threshold
+        try:
+            lookback_days = int(parts[1]) if len(parts) > 1 else 180
+        except ValueError:
+            lookback_days = 180
+        try:
+            min_alpha_pct = float(parts[2]) if len(parts) > 2 else 15.0
+        except ValueError:
+            min_alpha_pct = 15.0
+        min_alpha = min_alpha_pct / 100.0
+
+        try:
+            from pathlib import Path as _P
+            import pandas as _pd
+            from datetime import date as _date, timedelta as _td
+
+            _dd = _P("/data") if _P("/data").exists() else _P("/tmp")
+            parquet = _dd / "ml_training_base.parquet"
+            if not parquet.exists():
+                _reply(f"⚠️ Parquet `{parquet.name}` não existe — corre `/admin_overnight` primeiro.")
+                return
+
+            df = _pd.read_parquet(parquet)
+            n_total = len(df)
+            if "alpha_90d" not in df.columns:
+                _reply("⚠️ Parquet sem coluna `alpha_90d` — formato antigo. Re-builds via `/admin_overnight`.")
+                return
+
+            cutoff = _date.today() - _td(days=lookback_days)
+            df["_alert_date"] = _pd.to_datetime(df["alert_date"]).dt.date
+            recent = df[df["_alert_date"] >= cutoff].copy()
+
+            # Episodes the bot DIDN'T alert on (source=simulated) AND had high alpha
+            if "source" in recent.columns:
+                missed = recent[(recent["source"] == "simulated") & (recent["alpha_90d"] >= min_alpha)]
+                # "Caught" = real alerts (bot fired on it)
+                caught = recent[(recent["source"] == "real")]
+            else:
+                # Older parquet without source column — assume all are simulated
+                missed = recent[recent["alpha_90d"] >= min_alpha]
+                caught = _pd.DataFrame()
+
+            if missed.empty:
+                _reply(
+                    f"✅ *Missed Alpha Report* — {lookback_days}d\n\n"
+                    f"Nenhum dip não-alertado com alpha ≥ {min_alpha_pct:.0f}% nos últimos {lookback_days} dias.\n"
+                    f"_Parquet: {n_total:,} rows_"
+                )
+                return
+
+            # Aggregate
+            missed = missed.sort_values("alpha_90d", ascending=False)
+            n_missed = len(missed)
+            total_alpha = missed["alpha_90d"].sum() * 100
+            avg_alpha = missed["alpha_90d"].mean() * 100
+            n_caught = len(caught)
+            catch_rate = n_caught / (n_caught + n_missed) if (n_caught + n_missed) > 0 else 0
+
+            lines = [
+                f"🔍 *Missed Alpha Report* ({lookback_days}d, alpha ≥ {min_alpha_pct:.0f}%)\n",
+                f"📊 *Bot performance:*",
+                f"  ✅ Caught (alertou): *{n_caught}* episódios",
+                f"  ❌ Missed (não alertou): *{n_missed}* episódios",
+                f"  🎯 Catch rate: *{catch_rate*100:.1f}%*\n",
+                f"📈 *Money left on table:*",
+                f"  Total alpha somado: *{total_alpha:+.0f}%*",
+                f"  Avg alpha por miss: *{avg_alpha:+.1f}%*\n",
+                f"🥇 *Top 15 misses (alpha desc):*",
+            ]
+            for _, row in missed.head(15).iterrows():
+                tkr = row.get("ticker", "?")
+                dt  = row["_alert_date"]
+                alpha = row.get("alpha_90d", 0) * 100
+                drop = (row.get("drop_pct_today") or 0)
+                rsi  = (row.get("rsi_14") or 0)
+                sec  = (row.get("sector") or "?")[:12]
+                lines.append(
+                    f"  📈 *{tkr}* {dt} | drop {drop:+.1f}% | alpha *{alpha:+.0f}%* "
+                    f"| RSI {rsi:.0f} | _{sec}_"
+                )
+
+            # Sector breakdown
+            if "sector" in missed.columns:
+                sec_counts = missed["sector"].value_counts().head(5)
+                lines += [
+                    "",
+                    "🏭 *Por sector (top 5):*",
+                ]
+                for s, c in sec_counts.items():
+                    pct = c / n_missed * 100
+                    lines.append(f"  • {s}: *{c}* ({pct:.0f}%)")
+
+            # Month breakdown
+            try:
+                missed["_month"] = _pd.to_datetime(missed["_alert_date"]).dt.to_period("M").astype(str)
+                month_counts = missed["_month"].value_counts().sort_index(ascending=False).head(6)
+                lines += [
+                    "",
+                    "📅 *Por mês (últimos 6):*",
+                ]
+                for m, c in month_counts.items():
+                    lines.append(f"  • {m}: *{c}* misses")
+            except Exception:
+                pass
+
+            lines += [
+                "",
+                "_💡 Como reagir:_",
+                "  • Sectores recorrentes → revê filtros sectoriais",
+                "  • RSI baixo recorrente → considera baixar threshold de RSI",
+                "  • Drops moderados recorrentes → relaxa o threshold de drop_pct_today",
+                "  • Para forçar o modelo a aprender estes padrões, ver _Phase B_ na roadmap",
+            ]
+            _reply("\n".join(lines))
+        except Exception as e:
+            _reply(f"❌ Missed alpha report falhou: `{e}`")
+
     elif cmd in ("/admin_portfolio_clear", "/admin_carteira_clear"):
         # Wipe corrupted portfolio cache + persisted JSON. For recovering from
         # the Google Sheets locale bug (values inflated 10^N×). After running,
