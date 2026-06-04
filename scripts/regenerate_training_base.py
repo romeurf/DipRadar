@@ -326,9 +326,13 @@ def _compute_row_features(
             add_momentum_features(fv, hist, sec_slice, spy_slice)
         except Exception as e:
             log.debug(f"  momentum failed {ticker}@{alert_date.date()}: {e}")
-    # Fallbacks para keys ausentes
+    # NaN policy: if computation didn't populate a key, it stays NaN — that's
+    # honest "we couldn't compute it" instead of a misleading fallback value.
+    # Tree models handle NaN natively; linear models use column-mean imputation
+    # from rows where the value IS real.
+    _NAN_LOCAL = float("nan")
     for k in ("return_6m_pre", "return_12m_pre", "sector_relative_6m", "vol_of_vol", "bb_width"):
-        fv.setdefault(k, _FALLBACK.get(k, 0.0))
+        fv.setdefault(k, _NAN_LOCAL)
 
     # Regime
     try:
@@ -336,7 +340,7 @@ def _compute_row_features(
     except Exception as e:
         log.debug(f"  regime failed {ticker}@{alert_date.date()}: {e}")
     for k in ("vix_percentile_1y", "spy_rsi_14", "yield_10y_change_5d"):
-        fv.setdefault(k, _FALLBACK.get(k, 0.0))
+        fv.setdefault(k, _NAN_LOCAL)
 
     # Raw OHLCV (PR #30) — usa o mesmo slice já fetchado, sem custo extra
     if hist is not None:
@@ -345,7 +349,7 @@ def _compute_row_features(
         except Exception as e:
             log.debug(f"  raw_ohlcv failed {ticker}@{alert_date.date()}: {e}")
     for k in ("volume_zscore_20d", "close_in_range_20d", "up_days_pct_20d", "true_range_pct_20d"):
-        fv.setdefault(k, _FALLBACK.get(k, 0.0))
+        fv.setdefault(k, _NAN_LOCAL)
 
     # Market Structure (v4.3) — Anchored VWAP + Volume POC + Liquidity Sweep
     if hist is not None:
@@ -354,7 +358,7 @@ def _compute_row_features(
         except Exception as e:
             log.debug(f"  market_structure failed {ticker}@{alert_date.date()}: {e}")
     for k in ("vwap_from_high_ratio", "volume_poc_ratio", "liquidity_sweep_score"):
-        fv.setdefault(k, _FALLBACK.get(k, 0.0))
+        fv.setdefault(k, _NAN_LOCAL)
 
     # Volume Flow — MFI 14d + buying pressure ratio 20d
     if hist is not None:
@@ -364,7 +368,7 @@ def _compute_row_features(
         except Exception as e:
             log.debug(f"  volume_flow failed {ticker}@{alert_date.date()}: {e}")
     for k in ("mfi_14", "volume_up_pct_20d"):
-        fv.setdefault(k, _FALLBACK.get(k, 0.0))
+        fv.setdefault(k, _NAN_LOCAL)
 
     # Dividends — 3-year CAGR (Core model)
     if hist is not None:
@@ -372,10 +376,10 @@ def _compute_row_features(
             add_dividend_features(fv, hist, alert_date)
         except Exception as e:
             log.debug(f"  dividend_features failed {ticker}@{alert_date.date()}: {e}")
-    fv.setdefault("dividend_growth_3y", _FALLBACK.get("dividend_growth_3y", 0.0))
+    fv.setdefault("dividend_growth_3y", _NAN_LOCAL)
 
-    # Devolver só as colunas de interesse
-    return {k: float(fv.get(k, _FALLBACK.get(k, 0.0))) for k in NEW_FEATURE_COLS}
+    # Devolver só as colunas de interesse — NaN se ausente, sem fallback
+    return {k: float(fv.get(k, _NAN_LOCAL)) for k in NEW_FEATURE_COLS}
 
 
 def _compute_pit_fundamentals_row(
@@ -552,15 +556,13 @@ def _compute_fase5_row(
     # baseline; EDGAR-dependent ones start at NaN so missing data propagates
     # as "missing", not as a constant the model interprets as signal.
     _NAN = float("nan")
-    _EDGAR_ONLY = {
-        "insider_buy_recent", "insider_buy_amount_score",
-        "insider_sell_recent", "insider_sell_amount_score",
-        "recent_8k_score", "earnings_call_tone",
-    }
-    fv: dict[str, float] = {
-        k: (_NAN if k in _EDGAR_ONLY else _FALLBACK.get(k, 0.0))
-        for k in FASE5_COLS
-    }
+    # Initialize ALL features as NaN. Computation downstream overwrites with
+    # real values where possible; whatever stays NaN at write-time becomes
+    # "we don't know this for this row" — the model learns to ignore via
+    # native NaN handling (tree models) or mean-imputation from non-NaN rows
+    # (linear models). Replaces the older mixed init (EDGAR=NaN, others=_FALLBACK)
+    # which silently hid compute failures with neutral-looking numbers.
+    fv: dict[str, float] = {k: _NAN for k in FASE5_COLS}
 
     # Price-based signals (PIT — always computed regardless of SEC eligibility)
     if hist is not None and len(hist) >= 2:

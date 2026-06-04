@@ -253,21 +253,29 @@ def build_dip_dataset(
                 continue
             entry_price = float(pit_hist["Close"].iloc[-1])
 
-            # Step 1: initialize features.
-            # Technical / macro features get _FALLBACK (always computable from
-            # price history + macro feeds).
-            # EDGAR / yfinance-historical features get NaN so that companies
-            # without coverage (mostly pre-2009 dates and non-SEC tickers)
-            # propagate "missing" through to training instead of being silently
-            # coerced to a constant the model interprets as signal.
-            # Tree models (LightGBM / XGBoost) handle NaN natively; linear
-            # models (Ridge) get column-mean imputation in _prepare_X. Either
-            # way the row contributes nothing to those columns' learning.
+            # Step 1: initialize features as NaN.
+            #
+            # User policy (2026-06-04): "não queria valores para fallback,
+            # queria que o modelo aprendesse um 'ignorar porque nestes não
+            # conseguimos essa informação adicional'."
+            #
+            # All features start as NaN. Downstream steps overwrite with real
+            # values when computation succeeds. Whatever remains NaN at end-of-
+            # build represents "we couldn't compute this for this row" — and
+            # the model learns from that signal explicitly:
+            #   - Tree models (LightGBM/XGBoost): native NaN split branches,
+            #     can route missing values to a learned best-fit child
+            #   - Linear models (Ridge): column-mean imputation on the NON-NaN
+            #     rows of the training set (no zero inflation, no fallback
+            #     contamination)
+            #
+            # The old behavior — initializing technicals with _FALLBACK values
+            # like vix=20, rsi_14=40, drop_pct_today=-8 — silently hid compute
+            # failures: a row where price_history fetch failed would have
+            # rsi_14=40 (looks real, indistinguishable from a real 40-RSI
+            # row). NaN makes the failure explicit and learnable.
             _NAN = float("nan")
-            row_base: dict = {
-                col: (_NAN if col in _EDGAR_DEPENDENT_FEATURES else _FALLBACK[col])
-                for col in FEATURE_COLUMNS
-            }
+            row_base: dict = {col: _NAN for col in FEATURE_COLUMNS}
             row_base.update({
                 "ticker":     ticker,
                 "alert_date": alert_date,
@@ -362,13 +370,27 @@ def build_dip_dataset(
                 rsi_thr  = _RSI_OVERSOLD_THRESHOLD.get(sec_type, 32.0)
                 _VIX_F   = {"growth": -1.0, "cyclical": -0.5, "commodity": 0.0, "defensive": +0.5}
                 _DD_TYP  = {"growth": -25.0, "cyclical": -30.0, "commodity": -40.0, "defensive": -20.0}
-                _rsi     = float(row_base.get("rsi_14", _FALLBACK["rsi_14"]))
-                _vix     = float(row_base.get("vix",    _FALLBACK["vix"]))
-                _dd52    = float(row_base.get("drawdown_52w", _FALLBACK["drawdown_52w"]))
-                row_base["rsi_sector_adjusted"]        = round(max(0.0, rsi_thr - _rsi), 4)
-                row_base["vix_sector_signal"]          = round(_vix * _VIX_F.get(sec_type, -0.5) / 40.0, 4)
-                dd_norm = _dd52 / abs(_DD_TYP.get(sec_type, -30.0))
-                row_base["drawdown_sector_normalized"] = round(float(max(-3.0, min(0.0, dd_norm))), 4)
+                # NaN propagation: sector features are NaN when their base
+                # inputs are NaN. Avoid the silent max(0.0, NaN)=0.0 trap that
+                # CPython 3.x produces — that would inject a fake 0 into the
+                # training set when really we just couldn't compute the input.
+                _rsi  = row_base.get("rsi_14")
+                _vix  = row_base.get("vix")
+                _dd52 = row_base.get("drawdown_52w")
+                _nan = float("nan")
+                if _rsi is None or (isinstance(_rsi, float) and math.isnan(_rsi)):
+                    row_base["rsi_sector_adjusted"] = _nan
+                else:
+                    row_base["rsi_sector_adjusted"] = round(max(0.0, rsi_thr - float(_rsi)), 4)
+                if _vix is None or (isinstance(_vix, float) and math.isnan(_vix)):
+                    row_base["vix_sector_signal"] = _nan
+                else:
+                    row_base["vix_sector_signal"] = round(float(_vix) * _VIX_F.get(sec_type, -0.5) / 40.0, 4)
+                if _dd52 is None or (isinstance(_dd52, float) and math.isnan(_dd52)):
+                    row_base["drawdown_sector_normalized"] = _nan
+                else:
+                    dd_norm = float(_dd52) / abs(_DD_TYP.get(sec_type, -30.0))
+                    row_base["drawdown_sector_normalized"] = round(float(max(-3.0, min(0.0, dd_norm))), 4)
             except Exception as e:
                 log.debug(f"  sector_features failed {ticker}@{alert_date.date()}: {e}")
 

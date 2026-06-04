@@ -273,17 +273,18 @@ def _filing_primary_url(cik_int: int, acc_clean: str, primary_doc: str = "") -> 
     return f"{base}/{acc_clean}.txt"
 
 
-_FORM4_PARSE_CACHE_TTL = 30 * 86400  # 30 days — Form 4 content is immutable post-filing
-
-
 def _parse_form4_xml(accession_no: str, cik: str, primary_doc: str = "") -> dict:
     """Parse a Form 4 XML and return both purchase AND sale info.
 
-    CACHED on disk: Form 4 filings are immutable once filed, so we cache
-    parsed results indefinitely (30-day TTL to be safe). Before this cache,
-    a full DIP parquet build hit EDGAR ~millions of times for Form 4 XMLs,
-    triggering rate limits → many filings returned non-200 → is_sale=False
-    → insider_sell_recent appeared 100% zero in the parquet (false negative).
+    CACHED on disk PERMANENTLY: Form 4 filings are IMMUTABLE post-submission
+    — the SEC stores them once and never updates. No TTL check, ever. Once
+    cached, the parsed result is used forever (until the user explicitly
+    purges the cache dir).
+
+    Before this cache, a full DIP parquet build hit EDGAR ~millions of times
+    for Form 4 XMLs, triggering rate limits → many filings returned non-200
+    → is_sale=False → insider_sell_recent appeared 100% zero in the parquet
+    (false negative).
 
     Returns a dict with:
       - amount_usd       : total purchase value (shares × price)         [legacy alias for buy]
@@ -309,10 +310,10 @@ def _parse_form4_xml(accession_no: str, cik: str, primary_doc: str = "") -> dict
     _cache_dir.mkdir(parents=True, exist_ok=True)
     _cache_file = _cache_dir / f"{cik_int}_{acc_clean}.json"
     if _cache_file.exists():
+        # No TTL — Form 4 filings are immutable. If the cache file exists,
+        # it's authoritative forever.
         try:
-            stat = _cache_file.stat()
-            if _t.time() - stat.st_mtime < _FORM4_PARSE_CACHE_TTL:
-                return _json.loads(_cache_file.read_text(encoding="utf-8"))
+            return _json.loads(_cache_file.read_text(encoding="utf-8"))
         except Exception:
             pass
 
