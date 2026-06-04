@@ -404,20 +404,45 @@ def _yf_quarterly(ticker: str, alert_date: date, cache_dir: Path) -> dict:
     cf  = _pit_period(raw.get("cf",  {})) or {}
 
     def _get(d: dict, *keys) -> Optional[float]:
+        """Lookup by exact match first, then case-insensitive substring.
+
+        yfinance has renamed financial line items multiple times — modern
+        versions use long descriptive names like "Net Income From Continuing
+        Operation Net Minority Interest" instead of the old "Net Income".
+        Substring match handles that without us having to enumerate every
+        variant. Order matters: exact match wins (more specific).
+        """
+        # Pass 1: exact match (fast path, also avoids ambiguity)
         for k in keys:
             v = d.get(k)
             if v is not None:
                 f = _sf(v)
                 if f is not None:
                     return f
+        # Pass 2: case-insensitive substring match (handles renamed cols)
+        d_lower = {str(k).lower(): k for k in d.keys()}
+        for k in keys:
+            k_low = k.lower()
+            # Look for keys containing all words of the search term in order
+            target_words = k_low.split()
+            for key_lower, original_key in d_lower.items():
+                # Match if all target words appear in the key, in any positions
+                if all(w in key_lower for w in target_words):
+                    v = d.get(original_key)
+                    if v is not None:
+                        f = _sf(v)
+                        if f is not None:
+                            return f
+                    break  # found a partial match, don't try other variants
         return None
 
     revenue      = _get(fin, "Total Revenue", "Revenue")
     gross_profit = _get(fin, "Gross Profit")
-    op_cf        = _get(cf,  "Total Cash From Operations", "Operating Cash Flow")
-    capex        = _get(cf,  "Capital Expenditures")
-    total_debt   = _get(bs,  "Long Term Debt", "Long-term Debt")
-    equity       = _get(bs,  "Total Stockholder Equity", "Stockholders Equity")
+    op_cf        = _get(cf,  "Total Cash From Operations", "Operating Cash Flow", "Operating Cash Flow")
+    capex        = _get(cf,  "Capital Expenditures", "Capital Expenditure")
+    total_debt   = _get(bs,  "Long Term Debt", "Long-term Debt", "Total Debt")
+    equity       = _get(bs,  "Total Stockholder Equity", "Stockholders Equity",
+                              "Common Stock Equity")
 
     result: dict = {}
 
@@ -459,7 +484,14 @@ def _yf_quarterly(ticker: str, alert_date: date, cache_dir: Path) -> dict:
             ttm_ni = 0.0
             ok = True
             for _, key in ttm_window:
-                ni_q = _get(raw["fin"][key], "Net Income", "Net Income From Continuing Operations")
+                ni_q = _get(
+                    raw["fin"][key],
+                    # Most specific first (current yfinance schema):
+                    "Net Income From Continuing Operation Net Minority Interest",
+                    "Net Income Common Stockholders",
+                    "Net Income From Continuing Operations",
+                    "Net Income",
+                )
                 if ni_q is None:
                     ok = False
                     break
@@ -470,7 +502,14 @@ def _yf_quarterly(ticker: str, alert_date: date, cache_dir: Path) -> dict:
                 py_ni = 0.0
                 py_ok = True
                 for _, key in py_window:
-                    ni_q = _get(raw["fin"][key], "Net Income", "Net Income From Continuing Operations")
+                    ni_q = _get(
+                    raw["fin"][key],
+                    # Most specific first (current yfinance schema):
+                    "Net Income From Continuing Operation Net Minority Interest",
+                    "Net Income Common Stockholders",
+                    "Net Income From Continuing Operations",
+                    "Net Income",
+                )
                     if ni_q is None:
                         py_ok = False
                         break
@@ -481,8 +520,15 @@ def _yf_quarterly(ticker: str, alert_date: date, cache_dir: Path) -> dict:
             # trailing_pe = price / EPS_ttm; needs entry price (from caller) AND
             # shares outstanding. We pass eps_ttm separately so the caller can
             # finish the PE calc with the row's actual entry price.
-            shares = _get(bs, "Common Stock Shares Outstanding",
-                          "Shares Outstanding", "Ordinary Shares Number")
+            shares = _get(
+                bs,
+                # Most specific first (current yfinance schema variants):
+                "Common Stock Shares Outstanding",
+                "Ordinary Shares Number",
+                "Share Issued",
+                "Shares Outstanding",
+                "Common Stock",  # fallback (substring match will hit any "Common Stock*")
+            )
             if ok and shares and shares > 0 and ttm_ni > 0:
                 result["_eps_ttm"] = ttm_ni / shares
     except Exception as _e:
