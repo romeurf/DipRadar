@@ -5911,94 +5911,177 @@ def _handle_command(text: str) -> None:
         _handle_admin_check_config()
 
     elif cmd in ("/admin_dip_fill_missing", "/admin_fill_missing"):
-        # Process the tickers that are in the universe but NOT yet in
-        # ml_training_base.parquet. After the previous /admin_overnight
-        # timed out at 12h with ~98% coverage (207k/211k rows, 1495/1526
-        # tickers), this command targets the remaining ~31 tickers.
-        # Runs in background; reports progress + final merge stats.
-        try:
-            from pathlib import Path as _P
-            import pandas as _pd
-            from universe import get_ml_universe as _gmu
+        # Generic fill-missing: applies to DIP, Core, or Momentum parquets.
+        # Identifies tickers in the universe but NOT yet in the parquet, then
+        # processes only those with full history. Final merge is concat +
+        # dedup, preferring source="real" over "simulated" on conflicts.
+        # Usage:
+        #   /admin_fill_missing dip       (or /admin_dip_fill_missing — back-compat)
+        #   /admin_fill_missing core
+        #   /admin_fill_missing momentum
 
+        # Determine which model
+        if cmd == "/admin_dip_fill_missing":
+            model = "dip"
+        elif len(parts) > 1:
+            model = parts[1].lower().strip()
+        else:
+            _reply(
+                "🔍 *Fill missing tickers*\n\n"
+                "Uso: `/admin_fill_missing <model>`\n"
+                "  • `dip`      — completa `ml_training_base.parquet`\n"
+                "  • `core`     — completa `core_training_base.parquet`\n"
+                "  • `momentum` — completa `momentum_training.parquet`\n\n"
+                "_Útil quando um `/admin_overnight` parou a meio e quer-se acabar "
+                "só o que falta, sem refazer tudo._"
+            )
+            return
+
+        if model not in ("dip", "core", "momentum"):
+            _reply(f"⚠️ Modelo inválido `{model}`. Usa: `dip`, `core`, `momentum`.")
+            return
+
+        # Per-model configuration
+        def _load_universe_for(m: str) -> set[str]:
+            if m in ("dip", "momentum"):
+                from universe import get_ml_universe
+                return set(get_ml_universe())
+            elif m == "core":
+                # Read core_universe.json directly (avoids subprocess hop)
+                import json as _json
+                from pathlib import Path as _P
+                _uni_file = _P(__file__).parent / "core_universe.json"
+                if not _uni_file.exists():
+                    return set()
+                try:
+                    data = _json.loads(_uni_file.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        # may be {"tickers": [...]} or {ticker: {...}}
+                        if "tickers" in data and isinstance(data["tickers"], list):
+                            return {str(t).upper() for t in data["tickers"]}
+                        return {str(t).upper() for t in data.keys()}
+                    if isinstance(data, list):
+                        return {str(t).upper() for t in data}
+                except Exception:
+                    return set()
+            return set()
+
+        from pathlib import Path as _P
+        configs = {
+            "dip": {
+                "parquet_name": "ml_training_base.parquet",
+                "script":       _P(__file__).parent / "scripts" / "build_dip_dataset.py",
+                "extra_args":   ["--start", "1993-01-01"],
+                "dedup_keys":   ["ticker", "alert_date"],
+                "date_col":     "alert_date",
+                "retrain_hint": "/admin_retrain",
+            },
+            "core": {
+                "parquet_name": "core_training_base.parquet",
+                "script":       _P(__file__).parent / "scripts" / "build_core_dataset.py",
+                "extra_args":   ["--start", "1993-01-01"],
+                "dedup_keys":   ["ticker", "date"],
+                "date_col":     "date",
+                "retrain_hint": "/admin_overnight --no-purge --core-only",
+            },
+            "momentum": {
+                "parquet_name": "momentum_training.parquet",
+                "script":       _P(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py",
+                "extra_args":   [],
+                "dedup_keys":   ["ticker", "date"],
+                "date_col":     "date",
+                "retrain_hint": "/admin_overnight --no-purge --momentum-only",
+            },
+        }
+        cfg = configs[model]
+
+        try:
+            import pandas as _pd
             _dd = _P("/data") if _P("/data").exists() else _P("/tmp")
-            parquet = _dd / "ml_training_base.parquet"
+            parquet = _dd / cfg["parquet_name"]
             if not parquet.exists():
-                _reply(f"⚠️ `{parquet.name}` não existe. Corre `/admin_overnight` primeiro para a base.")
+                _reply(
+                    f"⚠️ `{parquet.name}` não existe. Corre `/admin_overnight --{model}-only` "
+                    f"primeiro para criar a base."
+                )
                 return
 
             _df = _pd.read_parquet(parquet)
             existing_tickers = set(_df["ticker"].unique()) if "ticker" in _df.columns else set()
-            universe = set(_gmu())
+            universe = _load_universe_for(model)
+            if not universe:
+                _reply(f"⚠️ Universo {model} vazio — impossível determinar missing.")
+                return
             missing = sorted(universe - existing_tickers)
 
             if not missing:
                 _reply(
-                    f"✅ Parquet DIP já está completo.\n"
+                    f"✅ Parquet *{model.upper()}* já está completo.\n"
                     f"  Tickers no parquet: *{len(existing_tickers)}*\n"
-                    f"  Tickers do universo: *{len(universe)}*\n"
-                    f"  Em falta: *0*"
+                    f"  Universo: *{len(universe)}*"
                 )
                 return
 
             _reply(
-                f"🔍 *Fill missing DIP tickers*\n\n"
+                f"🔍 *Fill missing — {model.upper()}*\n\n"
                 f"  No parquet: *{len(existing_tickers)}* tickers ({len(_df):,} rows)\n"
-                f"  No universo: *{len(universe)}* tickers\n"
+                f"  Universo: *{len(universe)}* tickers\n"
                 f"  *{len(missing)} em falta* — vou processar agora.\n\n"
                 f"_Tickers: {', '.join(missing[:20])}{'...' if len(missing) > 20 else ''}_\n\n"
-                f"⏳ Estimativa: ~{max(5, len(missing)*2)} min. "
-                f"Notificação quando terminar."
+                f"⏳ Estimativa: ~{max(5, len(missing)*2)} min. Notificação quando terminar."
             )
 
             def _run_fill():
                 import subprocess as _sp, sys as _sys
                 import time as _t
                 t0 = _t.time()
-                tmp_out = _dd / "ml_training_base.fill.parquet"
-                build_script = _P(__file__).parent / "scripts" / "build_dip_dataset.py"
-                # Process missing tickers ONLY, full history from --start
+                tmp_out = _dd / f"{cfg['parquet_name'].rsplit('.', 1)[0]}.fill.parquet"
                 cmd = [
-                    _sys.executable, str(build_script),
+                    _sys.executable, str(cfg["script"]),
                     "--tickers", ",".join(missing),
                     "--out", str(tmp_out),
-                    "--start", "1993-01-01",
+                    *cfg["extra_args"],
                 ]
                 try:
                     proc = _sp.run(cmd, capture_output=True, text=True, timeout=4 * 3600)
                 except _sp.TimeoutExpired:
-                    _reply(f"❌ Fill timed out após 4h. Logs no Railway para detalhes.")
+                    _reply(f"❌ Fill {model} timed out após 4h. Logs no Railway.")
                     return
                 except Exception as e:
-                    _reply(f"❌ Fill falhou: `{e}`")
+                    _reply(f"❌ Fill {model} falhou: `{e}`")
                     return
 
                 if proc.returncode != 0:
                     tail = ((proc.stdout or "") + (proc.stderr or ""))[-400:]
-                    _reply(f"❌ Build dos missing falhou (exit {proc.returncode}):\n<code>{tail}</code>")
+                    _reply(f"❌ Build {model} dos missing falhou (exit {proc.returncode}):\n<code>{tail}</code>")
                     return
 
                 if not tmp_out.exists():
-                    _reply(f"⚠️ Build OK mas `{tmp_out.name}` não foi escrito. Sem dados novos para merge.")
+                    _reply(f"⚠️ Build {model} OK mas `{tmp_out.name}` não foi escrito. Sem dados novos para merge.")
                     return
 
-                # Merge — concat + dedup, preferir source="real" se houver conflito
                 try:
                     new_df = _pd.read_parquet(tmp_out)
                     existing_df = _pd.read_parquet(parquet)
 
-                    # Ensure source column exists for safe dedup
+                    # source column: ensure it exists, default existing=real, new=simulated
                     if "source" not in existing_df.columns:
                         existing_df["source"] = "real"
                     if "source" not in new_df.columns:
                         new_df["source"] = "simulated"
 
                     combined = _pd.concat([existing_df, new_df], ignore_index=True)
-                    # Sort by source ("real" > "simulated") so dedup keeps the real one
                     combined["_sort"] = (combined["source"] == "real").astype(int)
                     combined = combined.sort_values("_sort", ascending=False).drop(columns=["_sort"])
-                    combined = combined.drop_duplicates(subset=["ticker", "alert_date"], keep="first")
-                    combined = combined.sort_values("alert_date").reset_index(drop=True)
+
+                    # Dedup keys differ per model (DIP=alert_date, others=date)
+                    dedup_keys = [k for k in cfg["dedup_keys"] if k in combined.columns]
+                    if not dedup_keys:
+                        dedup_keys = ["ticker"]
+                    combined = combined.drop_duplicates(subset=dedup_keys, keep="first")
+
+                    sort_col = cfg["date_col"] if cfg["date_col"] in combined.columns else dedup_keys[0]
+                    combined = combined.sort_values(sort_col).reset_index(drop=True)
 
                     n_before = len(existing_df)
                     n_after  = len(combined)
@@ -6006,23 +6089,23 @@ def _handle_command(text: str) -> None:
                     new_tickers_actual = set(new_df["ticker"].unique()) - existing_tickers
 
                     combined.to_parquet(parquet, index=False)
-                    tmp_out.unlink()  # cleanup temp file
+                    tmp_out.unlink()
 
                     elapsed = (_t.time() - t0) / 60
                     _reply(
-                        f"✅ *Fill missing DIP — concluído* ({elapsed:.0f} min)\n\n"
+                        f"✅ *Fill missing — {model.upper()} concluído* ({elapsed:.0f} min)\n\n"
                         f"  Rows antes: *{n_before:,}*\n"
                         f"  Rows depois: *{n_after:,}*\n"
                         f"  Novos: *+{n_new:,}*\n"
                         f"  Tickers novos: *{len(new_tickers_actual)}/{len(missing)}*\n"
                         f"  ({len(missing) - len(new_tickers_actual)} sem dados — provavelmente delisted)\n\n"
-                        f"_Próximo passo: `/admin_retrain` para treinar o DIP no parquet completo._"
+                        f"_Próximo passo: `{cfg['retrain_hint']}` para treinar o modelo no parquet completo._"
                     )
                 except Exception as e:
-                    _reply(f"❌ Merge falhou: `{e}`")
+                    _reply(f"❌ Merge {model} falhou: `{e}`")
 
             import threading
-            threading.Thread(target=_run_fill, daemon=True, name="dip-fill-missing").start()
+            threading.Thread(target=_run_fill, daemon=True, name=f"{model}-fill-missing").start()
         except Exception as e:
             _reply(f"❌ Erro: `{e}`")
 
