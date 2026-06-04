@@ -25,6 +25,7 @@ import pandas as pd
 
 from ml_training.config import HORIZON_DAYS, N_FOLDS, PURGE_DAYS
 from ml_training.cv import (
+    apply_missed_alpha_boost,
     build_walk_forward_folds,
     fold_metric_record,
     spearman_safe,
@@ -34,6 +35,24 @@ from ml_training.cv import (
 )
 
 log = logging.getLogger(__name__)
+
+# Missed-alpha boost configuration. Multiplies sample weight for rows where
+# the bot DIDN'T alert (source="simulated") but alpha_90d ≥ threshold.
+# Env vars:
+#   MISSED_ALPHA_BOOST_FACTOR (default 2.0; 1.0 = disabled)
+#   MISSED_ALPHA_THRESHOLD    (default 0.15 = 15%)
+import os as _os_for_boost
+_MISSED_BOOST_FACTOR    = float(_os_for_boost.getenv("MISSED_ALPHA_BOOST_FACTOR", "2.0"))
+_MISSED_ALPHA_THRESHOLD = float(_os_for_boost.getenv("MISSED_ALPHA_THRESHOLD", "0.15"))
+
+
+def _weights_with_boost(base_w, df_subset):
+    """Apply missed-alpha boost on top of temporal_weights output."""
+    return apply_missed_alpha_boost(
+        base_w, df_subset,
+        boost_factor=_MISSED_BOOST_FACTOR,
+        alpha_threshold=_MISSED_ALPHA_THRESHOLD,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -212,7 +231,10 @@ def run_walk_forward_cv(
         # Usar train_end (não max_date do dataset global) para que o sample mais
         # recente do fold tenha peso 1.0. max_date global punha amostras de folds
         # antigos com pesos demasiado baixos (look-ahead sobre a extensão temporal).
-        sw_tr = temporal_weights(df_tr["alert_date"], pd.Timestamp(train_end))
+        sw_tr = _weights_with_boost(
+            temporal_weights(df_tr["alert_date"], pd.Timestamp(train_end)),
+            df_tr,
+        )
 
         for name, cfg in model_configs.items():
             feats    = [f for f in cfg["feats"] if f in df_tr.columns]
@@ -529,7 +551,10 @@ def train_full_champion(
     X_full        = _prepare_X(df_v31, feats, _means_full, _champ_probe)
     y_alpha_full  = winsorize(df_v31[train_target].values.astype(float))
     y_down_full   = winsorize(df_v31["max_drawdown_60d"].values)
-    sw_full       = temporal_weights(df_v31["alert_date"], max_date)
+    sw_full       = _weights_with_boost(
+        temporal_weights(df_v31["alert_date"], max_date),
+        df_v31,
+    )
 
     X_t, y_t_a, sw_t, X_v, y_v_a = _split_val(X_full, y_alpha_full, sw_full, val_frac=0.07)
     _, y_t_d, _, _, y_v_d         = _split_val(X_full, y_down_full,  sw_full, val_frac=0.07)
@@ -591,7 +616,10 @@ def train_full_ensemble(
     X_full        = _prepare_X(df_v31, feats, _means_ens, _ens_probe)
     y_alpha_full  = winsorize(df_v31[train_target].values.astype(float))
     y_down_full   = winsorize(df_v31["max_drawdown_60d"].values)
-    sw_full       = temporal_weights(df_v31["alert_date"], max_date)
+    sw_full       = _weights_with_boost(
+        temporal_weights(df_v31["alert_date"], max_date),
+        df_v31,
+    )
 
     X_t, y_t_a, sw_t, X_v, y_v_a = _split_val(X_full, y_alpha_full, sw_full, val_frac=0.07)
     _, y_t_d, _, _, y_v_d         = _split_val(X_full, y_down_full,  sw_full, val_frac=0.07)
@@ -1077,7 +1105,10 @@ def run_training(
         if len(_df_val) >= _MIN_SECTOR_VAL:
             _X_tr  = _prepare_X(_df_tr, feats_used, _sec_means_tr, _sec_probe)
             _y_tr  = winsorize(_df_tr[_active_target].values.astype(float))
-            _sw_tr = temporal_weights(_df_tr["alert_date"], _df_tr["alert_date"].max())
+            _sw_tr = _weights_with_boost(
+                temporal_weights(_df_tr["alert_date"], _df_tr["alert_date"].max()),
+                _df_tr,
+            )
             _m_val = _scfg["factory"]()
             _m_val.fit(_X_tr, _y_tr, sample_weight=_sw_tr)
 
@@ -1096,7 +1127,10 @@ def run_training(
         _sec_means_full = _compute_col_means(_df_sec, feats_used)
         _X_full = _prepare_X(_df_sec, feats_used, _sec_means_full, _sec_probe)
         _y_full = winsorize(_df_sec[_active_target].values.astype(float))
-        _sw_full = temporal_weights(_df_sec["alert_date"], _df_sec["alert_date"].max())
+        _sw_full = _weights_with_boost(
+            temporal_weights(_df_sec["alert_date"], _df_sec["alert_date"].max()),
+            _df_sec,
+        )
         _m_prod = _scfg["factory"]()
         _m_prod.fit(_X_full, _y_full, sample_weight=_sw_full)
 

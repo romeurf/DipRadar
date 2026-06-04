@@ -132,6 +132,69 @@ def temporal_weights(
     return np.exp(-np.log(2) * days / half_life_days)
 
 
+def apply_missed_alpha_boost(
+    base_weights: np.ndarray,
+    df: pd.DataFrame,
+    boost_factor: float = 2.0,
+    alpha_threshold: float = 0.15,
+) -> np.ndarray:
+    """Boost training weights for "missed alpha" rows — episodes the bot DID
+    NOT alert on (source="simulated") but that recovered strongly
+    (alpha_90d ≥ alpha_threshold).
+
+    Rationale: the universe-wide builder captures every dip, but the bot's
+    alert filter is what decides whether to fire. Boosting these rows during
+    training pushes the model to learn the patterns that the filter has been
+    over-restrictive on, so future scans recognize them.
+
+    Parameters
+    ----------
+    base_weights : np.ndarray
+        Output of temporal_weights or similar; gets multiplied in-place.
+    df : pd.DataFrame
+        Same row indexing as base_weights. Must contain `source` and
+        `alpha_90d` columns. Missing columns → returns base_weights unchanged
+        (graceful degradation for old parquets).
+    boost_factor : float
+        Multiplicative boost for missed-alpha rows. Default 2.0.
+        - 1.0 = no boost (disable)
+        - 2.0 = double weight on missed (recommended starting point)
+        - 5.0 = aggressive, risk of overfitting / precision loss
+    alpha_threshold : float
+        Minimum alpha_90d to qualify as "high alpha missed". Default 0.15 (15%).
+
+    Returns
+    -------
+    np.ndarray with same shape as base_weights, modified copy.
+    """
+    if base_weights is None or len(base_weights) == 0:
+        return base_weights
+    if "source" not in df.columns or "alpha_90d" not in df.columns:
+        return base_weights
+    if boost_factor == 1.0:
+        return base_weights
+
+    weights = np.asarray(base_weights, dtype=float).copy()
+    if len(weights) != len(df):
+        # Length mismatch — usually means the caller passed a different df
+        # than the one weights were computed from. Skip boost to be safe.
+        return weights
+
+    try:
+        is_missed = (
+            (df["source"].astype(str) == "simulated") &
+            (pd.to_numeric(df["alpha_90d"], errors="coerce") >= alpha_threshold)
+        ).values
+        n_boosted = int(is_missed.sum())
+        if n_boosted > 0:
+            weights[is_missed] *= float(boost_factor)
+    except Exception:
+        # Any failure: silently return original weights (don't break training)
+        return base_weights
+
+    return weights
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Combinador de métricas por fold (mantém compat com o notebook)
 # ─────────────────────────────────────────────────────────────────────────────

@@ -2648,6 +2648,27 @@ def main() -> None:
         id="scan_intraday", name="Scan US Intraday 17h45",
     )
 
+    # ── Hourly intraday scans: 15h, 16h, 18h, 19h, 20h Lisboa, seg-sex ───────
+    # Why hourly: a dip happens at 10:30 ET; by the 21:15 Lisboa EOD scan,
+    # the stock may have already recovered 5%+. Volatile names move too fast
+    # to wait for end-of-day. Hourly granularity catches fresh dips while
+    # they're still cheap.
+    # Why these specific hours: US market is 14:30-21:00 Lisboa (summer/DST).
+    # 15h-20h covers the bulk of the trading day. 17:00 + 21:00 omitted
+    # because the existing 17:45 and 21:15 scans cover those windows already
+    # (with extra checks like thesis_degradation, recovery_alerts, watchlist).
+    # Each hourly scan respects the _alerted_today dedup, so a stock alerted
+    # at 15h won't re-alert at 16h. No spam.
+    scheduler.add_job(
+        lambda: (
+            run_scan(),
+            check_thesis_degradation(),
+            check_recovery_alerts(),
+        ),
+        CronTrigger(day_of_week="mon-fri", hour="15,16,18,19,20", minute=0, timezone=LISBON_TZ),
+        id="scan_hourly_intraday", name="Scan Hourly Intraday (15h,16h,18h,19h,20h)",
+    )
+
     # ── Scan US EOD: 21:15 Lisboa, seg-sex ───────────────────────────────────
     scheduler.add_job(
         lambda: (
