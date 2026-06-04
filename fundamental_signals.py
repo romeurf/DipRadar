@@ -145,10 +145,20 @@ _CIK_LOADED = False
 
 
 def _ensure_cik_map() -> None:
+    """Load the SEC ticker→CIK map on first use.
+
+    Earlier version flipped `_CIK_LOADED = True` BEFORE the HTTP attempt
+    (to avoid retry storms), but that meant a single transient failure
+    (timeout / 503 / DNS blip on Railway boot) permanently left the bot
+    with an empty CIK map for the whole session — every insider /
+    EDGAR lookup returning "not in CIK map" forever. Now we only mark
+    loaded on success. On failure, the next call retries; retry storms
+    are bounded by the 20s timeout per attempt + however quickly the
+    caller loops.
+    """
     global _CIK_MAP, _CIK_LOADED
     if _CIK_LOADED:
         return
-    _CIK_LOADED = True  # marcar antes de tentar — evita retry storms
     try:
         import requests
         r = requests.get(
@@ -161,13 +171,14 @@ def _ensure_cik_map() -> None:
             for v in r.json().values()
             if "ticker" in v and "cik_str" in v
         }
+        _CIK_LOADED = True
         log.info(f"[insider] CIK map carregado: {len(_CIK_MAP)} tickers SEC")
     except Exception as e:
         log.error(
             f"[insider] Falha a carregar CIK map do SEC EDGAR: {e}. "
-            f"insider_buy_recent retornará NaN para esta sessão."
+            f"Próxima chamada vai tentar de novo."
         )
-        _CIK_MAP = {}  # vazio — insider_buy_recent retorna NaN para todos
+        # Deliberately leave _CIK_LOADED = False so next call retries
 
 
 _edgar_submissions_cache: dict[str, dict] = {}  # cache em memória por sessão
