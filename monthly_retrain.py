@@ -1023,19 +1023,41 @@ def run_monthly_retrain(
     elapsed = time.time() - t0
     log.info(f"[retrain] CONCLUÍDO em {elapsed:.0f}s — decision={gate['decision']}")
 
-    # Auto-publish charts to GitHub after retrain
-    try:
-        from chart_generator import generate_all_charts
-        from github_publisher import push_all_charts
-        generate_all_charts()
-        results = push_all_charts()
-        published = [k for k, v in results.items() if v and not str(v).startswith("ERROR")]
-        if published:
-            log.info(f"[retrain] Charts published to GitHub: {published}")
-        else:
-            log.debug("[retrain] No charts published (no data or GITHUB_TOKEN not set).")
-    except Exception as _chart_err:
-        log.warning(f"[retrain] Chart publish failed (non-blocking): {_chart_err}")
+    # Auto-publish charts to GitHub after retrain — DISABLED BY DEFAULT.
+    #
+    # Why this is opt-in now: when GITHUB_CHARTS_REPO points to the bot's
+    # OWN deployment repo (instead of a separate public charts repo), the
+    # auto-commit triggers Railway's auto-deploy → container restart →
+    # whatever pipeline step was running is killed.
+    #
+    # User's 2026-06-04 incident: DIP retrain finished cleanly at 05:35
+    # with IC=0.0419 SR=7.29 (usable!). push_all_charts() fired, committed
+    # "Update drip_ledger.md [DipRadar auto]" (c9de650) to the deployment
+    # repo, Railway redeployed, container died at 05:37 — killing Step 3
+    # (Core dataset) mid-build.
+    #
+    # Set ENABLE_AUTO_CHARTS_PUBLISH=1 explicitly only if your
+    # GITHUB_CHARTS_REPO points to a SEPARATE public charts repo that
+    # doesn't trigger your deployment. Otherwise, run /admin_publish_charts
+    # manually after pipeline completes.
+    if os.getenv("ENABLE_AUTO_CHARTS_PUBLISH", "").strip().lower() in ("1", "true", "yes"):
+        try:
+            from chart_generator import generate_all_charts
+            from github_publisher import push_all_charts
+            generate_all_charts()
+            results = push_all_charts()
+            published = [k for k, v in results.items() if v and not str(v).startswith("ERROR")]
+            if published:
+                log.info(f"[retrain] Charts published to GitHub: {published}")
+            else:
+                log.debug("[retrain] No charts published (no data or GITHUB_TOKEN not set).")
+        except Exception as _chart_err:
+            log.warning(f"[retrain] Chart publish failed (non-blocking): {_chart_err}")
+    else:
+        log.info(
+            "[retrain] Auto-charts-publish skipped (set ENABLE_AUTO_CHARTS_PUBLISH=1 "
+            "to enable; only safe if GITHUB_CHARTS_REPO ≠ deployment repo)."
+        )
 
     return {
         **gate,
