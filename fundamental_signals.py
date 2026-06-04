@@ -273,37 +273,72 @@ def _filing_primary_url(cik_int: int, acc_clean: str, primary_doc: str = "") -> 
     return f"{base}/{acc_clean}.txt"
 
 
+_FORM4_PARSE_CACHE_TTL = 30 * 86400  # 30 days — Form 4 content is immutable post-filing
+
+
 def _parse_form4_xml(accession_no: str, cik: str, primary_doc: str = "") -> dict:
     """Parse a Form 4 XML and return both purchase AND sale info.
+
+    CACHED on disk: Form 4 filings are immutable once filed, so we cache
+    parsed results indefinitely (30-day TTL to be safe). Before this cache,
+    a full DIP parquet build hit EDGAR ~millions of times for Form 4 XMLs,
+    triggering rate limits → many filings returned non-200 → is_sale=False
+    → insider_sell_recent appeared 100% zero in the parquet (false negative).
 
     Returns a dict with:
       - amount_usd       : total purchase value (shares × price)         [legacy alias for buy]
       - is_purchase      : True if any acquisition (code A)              [legacy alias]
-      - sale_amount_usd  : total sale value (shares × price)             [NEW]
-      - is_sale          : True if any disposition (code D)              [NEW]
+      - sale_amount_usd  : total sale value (shares × price)
+      - is_sale          : True if any disposition (code D)
       - name             : insider name
       - title            : role (e.g. "Chief Executive Officer", "Director")
-
-    Both sides are returned from the same filing so callers can score buys
-    and sells independently — a CEO disposing of shares carries a very
-    different signal from a CEO buying them, and many filings have both.
     """
     import requests
     import xml.etree.ElementTree as ET
+    import json as _json
+    from pathlib import Path as _P
+    import time as _t
 
     acc_clean = accession_no.replace("-", "")
     cik_int   = int(cik)
-    doc_url   = _filing_primary_url(cik_int, acc_clean, primary_doc)
+
+    # Disk cache. Key includes ticker-agnostic identifiers — cik + accession
+    # uniquely identify a filing regardless of which ticker requested it.
+    _data_dir = _P("/data") if _P("/data").exists() else _P("/tmp")
+    _cache_dir = _data_dir / "form4_cache"
+    _cache_dir.mkdir(parents=True, exist_ok=True)
+    _cache_file = _cache_dir / f"{cik_int}_{acc_clean}.json"
+    if _cache_file.exists():
+        try:
+            stat = _cache_file.stat()
+            if _t.time() - stat.st_mtime < _FORM4_PARSE_CACHE_TTL:
+                return _json.loads(_cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    doc_url = _filing_primary_url(cik_int, acc_clean, primary_doc)
 
     try:
         r = requests.get(doc_url, headers=_EDGAR_HEADERS, timeout=10)
         if r.status_code != 200:
-            return {}
+            # Cache the failure too (with shorter TTL via empty dict marker)
+            # so we don't hammer the same broken URL on every build.
+            empty: dict = {}
+            try:
+                _cache_file.write_text(_json.dumps(empty), encoding="utf-8")
+            except Exception:
+                pass
+            return empty
         text  = r.text
         start = text.find("<ownershipDocument>")
         end   = text.find("</ownershipDocument>")
         if start == -1 or end == -1:
-            return {}
+            empty = {}
+            try:
+                _cache_file.write_text(_json.dumps(empty), encoding="utf-8")
+            except Exception:
+                pass
+            return empty
         root = ET.fromstring(text[start:end + len("</ownershipDocument>")])
     except Exception:
         return {}
@@ -339,17 +374,25 @@ def _parse_form4_xml(accession_no: str, cik: str, primary_doc: str = "") -> dict
             has_sell = True
             sell_amount += amt
 
-    return {
+    result = {
         # Buy side (legacy key names preserved)
         "amount_usd":      buy_amount,
         "is_purchase":     has_buy,
-        # Sell side (new)
+        # Sell side
         "sale_amount_usd": sell_amount,
         "is_sale":         has_sell,
         # Identity
         "name":            name,
         "title":           title,
     }
+
+    # Cache the parsed result on disk so subsequent builds skip the HTTP fetch
+    try:
+        _cache_file.write_text(_json.dumps(result), encoding="utf-8")
+    except Exception:
+        pass
+
+    return result
 
 
 def insider_buy_recent(ticker: str, lookback_days: int = 30, as_of_date: "date | None" = None) -> float:

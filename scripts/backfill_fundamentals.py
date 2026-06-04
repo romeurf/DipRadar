@@ -67,7 +67,11 @@ logging.basicConfig(
 
 
 # Columns the script will recompute. Everything else in the parquet is preserved.
-_FUNDAMENTAL_COLS_TO_REFRESH = [
+#
+# Order matters: tier 1 (fundamentals) runs first, tier 2 (Phase 5 EDGAR
+# Form 4 / 8-K / earnings call) runs second, then derived features (peg_ratio)
+# get computed last from the combined inputs.
+_TIER1_FUNDAMENTAL_COLS = [
     # From _compute_pit_fundamentals_row (EDGAR + yfinance.quarterly tier merge)
     "gross_margin",
     "de_ratio",
@@ -80,45 +84,82 @@ _FUNDAMENTAL_COLS_TO_REFRESH = [
     "trailing_pe",
     "earnings_beat_rate",
     "analyst_rating",
-    # Computed by add_derived_features from the above + alert_date
+]
+
+_TIER2_PHASE5_COLS = [
+    # From _compute_fase5_row (EDGAR Form 4 / 8-K / earnings calls)
+    "insider_buy_recent",
+    "insider_sell_recent",
+    "insider_buy_amount_score",
+    "insider_sell_amount_score",
+    "recent_8k_score",
+    "earnings_call_tone",
+]
+
+_DERIVED_COLS = [
+    # Computed by add_derived_features from tier 1+2 + alert_date
     "peg_ratio",
 ]
 
+_ALL_COLS_TO_REFRESH = _TIER1_FUNDAMENTAL_COLS + _TIER2_PHASE5_COLS + _DERIVED_COLS
+
 
 def _process_row(row: pd.Series, cache_dir: Path) -> dict:
-    """Compute updated fundamentals for one row. Returns dict of (col → new value).
+    """Compute updated fundamentals + Phase 5 features for one row.
+
+    Two-tier recompute:
+      Tier 1: _compute_pit_fundamentals_row → EDGAR TTM YoY (revenue_growth,
+              earnings_growth, _eps_ttm), gross_margin, de_ratio, roe,
+              earnings_beat_rate, analyst_rating
+      Tier 2: _compute_fase5_row → EDGAR Form 4 insider activity (buys/sells/
+              amounts), 8-K material event score, earnings call tone
+
+    Then add_derived_features computes peg_ratio from the combined tier 1 inputs.
 
     Only returns columns where we got a fresh value; NaN/missing stays missing.
-    Calls the (now-fixed) PIT pipeline that uses EDGAR XBRL TTM YoY for
-    revenue_growth/earnings_growth/_eps_ttm.
     """
-    from scripts.regenerate_training_base import _compute_pit_fundamentals_row
+    from scripts.regenerate_training_base import (
+        _compute_pit_fundamentals_row,
+        _compute_fase5_row,
+        has_sec_filings,
+    )
     from ml_features import add_derived_features
 
+    # Tier 1: PIT fundamentals
+    fund: dict = {}
     try:
         fund = _compute_pit_fundamentals_row(row, cache_dir) or {}
     except Exception as e:
         log.debug(f"[backfill] PIT fundamentals failed for {row.get('ticker', '?')}@{row.get('alert_date', '?')}: {e}")
-        return {}
 
-    # Carry over original row's other fields so add_derived_features has everything
     merged = dict(row)
     merged.update(fund)
 
-    # Recompute derived features (peg_ratio etc.) on the merged dict
+    # Tier 2: Phase 5 EDGAR signals — but only for tickers with SEC coverage
+    sector = str(row.get("sector", ""))
+    country = ""  # not in parquet but has_sec_filings tolerates empty country for US tickers
+    exchange = ""
+    try:
+        if has_sec_filings(str(row["ticker"]), country, exchange):
+            fase5 = _compute_fase5_row(pd.Series(merged), None) or {}
+            merged.update(fase5)
+    except Exception as e:
+        log.debug(f"[backfill] Phase 5 failed for {row.get('ticker', '?')}: {e}")
+
+    # Derived: peg_ratio etc.
     try:
         add_derived_features(merged, alert_date=pd.Timestamp(row["alert_date"]))
     except Exception as e:
         log.debug(f"[backfill] add_derived_features failed for {row.get('ticker', '?')}: {e}")
 
-    # Return only the columns we want to refresh, with their new values
+    # Return only the columns we want to refresh, with their new values.
+    # Skip NaN (don't overwrite an existing value with NaN).
     out = {}
-    for col in _FUNDAMENTAL_COLS_TO_REFRESH:
+    for col in _ALL_COLS_TO_REFRESH:
         if col in merged:
             v = merged[col]
-            # Convert numpy/pandas types to plain Python for parquet stability
             if v is None or (isinstance(v, float) and np.isnan(v)):
-                continue  # don't overwrite existing values with NaN
+                continue
             out[col] = v
     return out
 
@@ -140,7 +181,7 @@ def backfill(
     log.info(f"  Total rows: {n_total:,}")
 
     # Ensure all target columns exist (in case of older parquet without them)
-    for col in _FUNDAMENTAL_COLS_TO_REFRESH:
+    for col in _ALL_COLS_TO_REFRESH:
         if col not in df.columns:
             df[col] = np.nan
 
@@ -163,7 +204,7 @@ def backfill(
     t0 = time.time()
     rows_processed = 0
     rows_updated = 0
-    field_counts: dict[str, int] = {c: 0 for c in _FUNDAMENTAL_COLS_TO_REFRESH}
+    field_counts: dict[str, int] = {c: 0 for c in _ALL_COLS_TO_REFRESH}
 
     for i, idx in enumerate(process_idx):
         row = df.loc[idx]
@@ -209,7 +250,7 @@ def backfill(
     log.info(f"✅ Backfill complete in {(time.time() - t0)/60:.1f} min")
     log.info(f"   Rows updated: {rows_updated:,}/{rows_processed:,}")
     log.info(f"   Field population (rows with new values):")
-    for col in _FUNDAMENTAL_COLS_TO_REFRESH:
+    for col in _ALL_COLS_TO_REFRESH:
         cnt = field_counts[col]
         if cnt > 0:
             pct = cnt / rows_processed * 100
