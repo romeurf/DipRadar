@@ -121,8 +121,8 @@ def _process_row(row: pd.Series, cache_dir: Path) -> dict:
     from scripts.regenerate_training_base import (
         _compute_pit_fundamentals_row,
         _compute_fase5_row,
-        has_sec_filings,
     )
+    from sec_guard import has_sec_filings
     from ml_features import add_derived_features
 
     # Tier 1: PIT fundamentals
