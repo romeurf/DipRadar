@@ -6316,16 +6316,32 @@ def _handle_command(text: str) -> None:
                     return
                 elapsed = (_t.time() - t0) / 60
                 if proc.returncode == 0:
-                    # Extract the NaN coverage report (BEFORE → AFTER). The
-                    # backfill script uses Python logging which writes to
-                    # stderr by default — the report appears in proc.stderr,
-                    # not stdout. Search both to be robust.
+                    # Extract the FULL backfill log — covers everything from
+                    # "Loading parquet" through "Total rows" / "Ticker filter"
+                    # / "Processing: N rows" / per-1000-row progress / final
+                    # NaN coverage report. Python logging writes to stderr by
+                    # default so the bulk is in proc.stderr. Searching both is
+                    # robust to any log redirect.
                     combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
-                    if "NaN coverage report" in combined:
+                    if "Loading parquet" in combined:
+                        idx = combined.find("Loading parquet")
+                        tail = combined[idx:]
+                    elif "NaN coverage report" in combined:
                         idx = combined.find("NaN coverage report")
-                        tail = combined[idx:idx + 3000]
+                        tail = combined[idx:]
                     else:
-                        tail = combined[-1500:]
+                        tail = combined[-3000:]
+                    # Telegram code blocks ≤ ~4000 chars. If too long, keep
+                    # the head (filter / processing summary) AND tail (NaN
+                    # report) — the per-1000-row progress lines in the
+                    # middle are skippable.
+                    if len(tail) > 3500:
+                        head = tail[:1500]
+                        rep_idx = tail.find("NaN coverage report")
+                        if rep_idx >= 0:
+                            tail = head + "\n... [progress lines truncated] ...\n" + tail[rep_idx:rep_idx + 2000]
+                        else:
+                            tail = head + "\n... [truncated] ...\n" + tail[-1500:]
                     _reply(
                         f"✅ *Backfill fundamentals — concluído* ({elapsed:.0f} min)\n\n"
                         f"<code>{tail}</code>\n\n"

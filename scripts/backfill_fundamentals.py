@@ -216,9 +216,39 @@ def backfill(
     rows_updated = 0
     field_counts: dict[str, int] = {c: 0 for c in _ALL_COLS_TO_REFRESH}
 
+    # First-row diagnostic — confirms pipeline actually executes the work
+    # we expect. Without this, a silent no-op (e.g. has_sec_filings
+    # rejecting every ticker, or _compute_pit_fundamentals_row swallowing
+    # an exception) is invisible from the final NaN report alone.
+    _diag_emitted = False
+
     for i, idx in enumerate(process_idx):
         row = df.loc[idx]
-        new_values = _process_row(row, cache_dir)
+        if not _diag_emitted:
+            try:
+                from sec_guard import has_sec_filings as _has_sec
+                _hs = _has_sec(str(row["ticker"]), "", "")
+            except Exception as _e:
+                _hs = f"ERR({type(_e).__name__})"
+            new_values = _process_row(row, cache_dir)
+            _real_keys = [k for k, v in new_values.items()
+                          if v is not None and not (isinstance(v, float) and np.isnan(v))]
+            _nan_keys  = [k for k, v in new_values.items()
+                          if v is None or (isinstance(v, float) and np.isnan(v))]
+            log.info(
+                f"  [diag] first row: ticker={row.get('ticker', '?')} "
+                f"alert_date={row.get('alert_date', '?')} "
+                f"has_sec_filings={_hs} "
+                f"new_values_returned={len(new_values)} "
+                f"real={len(_real_keys)} nan={len(_nan_keys)}"
+            )
+            if _real_keys:
+                log.info(f"  [diag]   real keys: {_real_keys}")
+            if _nan_keys[:8]:
+                log.info(f"  [diag]   nan keys (first 8): {_nan_keys[:8]}")
+            _diag_emitted = True
+        else:
+            new_values = _process_row(row, cache_dir)
         if new_values:
             rows_updated += 1
             for col, val in new_values.items():
