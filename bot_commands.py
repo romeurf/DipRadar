@@ -5910,6 +5910,122 @@ def _handle_command(text: str) -> None:
     elif cmd in ("/admin_check_config", "/check_config"):
         _handle_admin_check_config()
 
+    elif cmd in ("/admin_dip_fill_missing", "/admin_fill_missing"):
+        # Process the tickers that are in the universe but NOT yet in
+        # ml_training_base.parquet. After the previous /admin_overnight
+        # timed out at 12h with ~98% coverage (207k/211k rows, 1495/1526
+        # tickers), this command targets the remaining ~31 tickers.
+        # Runs in background; reports progress + final merge stats.
+        try:
+            from pathlib import Path as _P
+            import pandas as _pd
+            from universe import get_ml_universe as _gmu
+
+            _dd = _P("/data") if _P("/data").exists() else _P("/tmp")
+            parquet = _dd / "ml_training_base.parquet"
+            if not parquet.exists():
+                _reply(f"⚠️ `{parquet.name}` não existe. Corre `/admin_overnight` primeiro para a base.")
+                return
+
+            _df = _pd.read_parquet(parquet)
+            existing_tickers = set(_df["ticker"].unique()) if "ticker" in _df.columns else set()
+            universe = set(_gmu())
+            missing = sorted(universe - existing_tickers)
+
+            if not missing:
+                _reply(
+                    f"✅ Parquet DIP já está completo.\n"
+                    f"  Tickers no parquet: *{len(existing_tickers)}*\n"
+                    f"  Tickers do universo: *{len(universe)}*\n"
+                    f"  Em falta: *0*"
+                )
+                return
+
+            _reply(
+                f"🔍 *Fill missing DIP tickers*\n\n"
+                f"  No parquet: *{len(existing_tickers)}* tickers ({len(_df):,} rows)\n"
+                f"  No universo: *{len(universe)}* tickers\n"
+                f"  *{len(missing)} em falta* — vou processar agora.\n\n"
+                f"_Tickers: {', '.join(missing[:20])}{'...' if len(missing) > 20 else ''}_\n\n"
+                f"⏳ Estimativa: ~{max(5, len(missing)*2)} min. "
+                f"Notificação quando terminar."
+            )
+
+            def _run_fill():
+                import subprocess as _sp, sys as _sys
+                import time as _t
+                t0 = _t.time()
+                tmp_out = _dd / "ml_training_base.fill.parquet"
+                build_script = _P(__file__).parent / "scripts" / "build_dip_dataset.py"
+                # Process missing tickers ONLY, full history from --start
+                cmd = [
+                    _sys.executable, str(build_script),
+                    "--tickers", ",".join(missing),
+                    "--out", str(tmp_out),
+                    "--start", "1993-01-01",
+                ]
+                try:
+                    proc = _sp.run(cmd, capture_output=True, text=True, timeout=4 * 3600)
+                except _sp.TimeoutExpired:
+                    _reply(f"❌ Fill timed out após 4h. Logs no Railway para detalhes.")
+                    return
+                except Exception as e:
+                    _reply(f"❌ Fill falhou: `{e}`")
+                    return
+
+                if proc.returncode != 0:
+                    tail = ((proc.stdout or "") + (proc.stderr or ""))[-400:]
+                    _reply(f"❌ Build dos missing falhou (exit {proc.returncode}):\n<code>{tail}</code>")
+                    return
+
+                if not tmp_out.exists():
+                    _reply(f"⚠️ Build OK mas `{tmp_out.name}` não foi escrito. Sem dados novos para merge.")
+                    return
+
+                # Merge — concat + dedup, preferir source="real" se houver conflito
+                try:
+                    new_df = _pd.read_parquet(tmp_out)
+                    existing_df = _pd.read_parquet(parquet)
+
+                    # Ensure source column exists for safe dedup
+                    if "source" not in existing_df.columns:
+                        existing_df["source"] = "real"
+                    if "source" not in new_df.columns:
+                        new_df["source"] = "simulated"
+
+                    combined = _pd.concat([existing_df, new_df], ignore_index=True)
+                    # Sort by source ("real" > "simulated") so dedup keeps the real one
+                    combined["_sort"] = (combined["source"] == "real").astype(int)
+                    combined = combined.sort_values("_sort", ascending=False).drop(columns=["_sort"])
+                    combined = combined.drop_duplicates(subset=["ticker", "alert_date"], keep="first")
+                    combined = combined.sort_values("alert_date").reset_index(drop=True)
+
+                    n_before = len(existing_df)
+                    n_after  = len(combined)
+                    n_new    = n_after - n_before
+                    new_tickers_actual = set(new_df["ticker"].unique()) - existing_tickers
+
+                    combined.to_parquet(parquet, index=False)
+                    tmp_out.unlink()  # cleanup temp file
+
+                    elapsed = (_t.time() - t0) / 60
+                    _reply(
+                        f"✅ *Fill missing DIP — concluído* ({elapsed:.0f} min)\n\n"
+                        f"  Rows antes: *{n_before:,}*\n"
+                        f"  Rows depois: *{n_after:,}*\n"
+                        f"  Novos: *+{n_new:,}*\n"
+                        f"  Tickers novos: *{len(new_tickers_actual)}/{len(missing)}*\n"
+                        f"  ({len(missing) - len(new_tickers_actual)} sem dados — provavelmente delisted)\n\n"
+                        f"_Próximo passo: `/admin_retrain` para treinar o DIP no parquet completo._"
+                    )
+                except Exception as e:
+                    _reply(f"❌ Merge falhou: `{e}`")
+
+            import threading
+            threading.Thread(target=_run_fill, daemon=True, name="dip-fill-missing").start()
+        except Exception as e:
+            _reply(f"❌ Erro: `{e}`")
+
     elif cmd in ("/admin_missed_alpha", "/admin_missed_dips"):
         # Surface dip episodes that the bot DID NOT alert on but recovered
         # strongly (alpha_90d ≥ threshold). These are "money left on table"
