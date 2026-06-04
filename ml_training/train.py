@@ -65,6 +65,62 @@ def _is_tree_model(model) -> bool:
     return any(x in name for x in ("xgb", "lgbm", "lightgbm", "forest", "tree", "dart"))
 
 
+def _filter_dead_features(
+    df: pd.DataFrame,
+    feats: list[str],
+    nan_threshold: float = 1.0,
+    log_partial_threshold: float = 0.95,
+) -> tuple[list[str], list[str], list[tuple[str, float]]]:
+    """Identify and remove features that are useless because they're (nearly) all NaN.
+
+    NaN ≠ 0. A feature with 100% NaN provides ZERO information to the model:
+      - Tree models: can't split on it (NaN propagates to a single child)
+      - Linear models: column mean falls back to 0.0 → constant column → 0 coef
+    Either way: dead weight that wastes training cycles and confuses the user.
+
+    Strategy:
+      - 100% NaN (or above `nan_threshold`): DROP completely from training
+      - Above `log_partial_threshold` (e.g. 95% NaN): WARN but keep (sparse)
+      - Below: silent, normal
+
+    Returns
+    -------
+    (alive_feats, dropped_feats, partial_feats) — three lists:
+      alive_feats:    features to actually train on
+      dropped_feats:  list[str] dropped entirely (100% NaN globally)
+      partial_feats:  list[(name, nan_pct)] kept but sparsely populated
+    """
+    if not feats:
+        return [], [], []
+    alive: list[str] = []
+    dropped: list[str] = []
+    partial: list[tuple[str, float]] = []
+    n_rows = len(df)
+    for col in feats:
+        if col not in df.columns:
+            dropped.append(col)
+            continue
+        n_nan = int(df[col].isna().sum())
+        nan_pct = n_nan / n_rows if n_rows > 0 else 1.0
+        if nan_pct >= nan_threshold:
+            dropped.append(col)
+        else:
+            alive.append(col)
+            if nan_pct >= log_partial_threshold:
+                partial.append((col, nan_pct))
+    if dropped:
+        log.warning(
+            f"[features] {len(dropped)} dead features removed (100% NaN): "
+            f"{dropped}"
+        )
+    if partial:
+        log.warning(
+            f"[features] {len(partial)} sparse features (>95% NaN, kept): "
+            f"{[(c, f'{p*100:.1f}%') for c, p in partial]}"
+        )
+    return alive, dropped, partial
+
+
 def _prepare_X(df: pd.DataFrame, feats: list[str], col_means: dict[str, float], model=None) -> np.ndarray:
     """Prepara a matriz X com tratamento de NaN honesto.
 
@@ -842,6 +898,19 @@ def run_training(
         raise ValueError(
             f"FEATURE_COLUMNS em falta no parquet: {missing}. "
             f"Regenera o parquet via /admin_regen_parquet."
+        )
+
+    # Drop features that are 100% NaN — they contribute zero signal and the
+    # old 0.0-fallback was misleading (NaN ≠ 0). Tree models can't split on
+    # all-NaN; linear models get a constant 0 column → 0 coefficient. Either
+    # way: dead weight. User feedback (2026-06-04): "NA and 0 are two
+    # diferent things". Implemented via _filter_dead_features.
+    feats_full, dead_full, partial_full = _filter_dead_features(df, feats_full)
+    feats_baseline, dead_base, _ = _filter_dead_features(df, feats_baseline)
+    if dead_full or dead_base:
+        log.info(
+            f"[run_training] Training with {len(feats_full)} effective "
+            f"features (dropped {len(set(dead_full + dead_base))} dead)."
         )
 
     # Walk-forward CV
