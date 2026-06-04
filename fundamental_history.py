@@ -249,6 +249,112 @@ def _edgar_pit_value(
     return None
 
 
+def _edgar_quarterly_values(
+    facts: dict,
+    alert_date: date,
+    concept_names: list[str],
+    taxonomy: str = "us-gaap",
+    unit: str = "USD",
+) -> list[tuple[date, float]]:
+    """Quarterly values for a concept, filtered to entries filed at-or-before alert_date.
+
+    Returns list of (period_end, value) tuples sorted by period_end descending.
+    Filters out annual / YTD entries (only quarter-duration entries kept, ~90 days).
+
+    First concept in concept_names that has data wins — alternatives are
+    only tried if the primary concept returns nothing.
+    """
+    gaap = facts.get("facts", {}).get(taxonomy, {})
+    for concept in concept_names:
+        entries = gaap.get(concept, {}).get("units", {}).get(unit, [])
+        if not entries:
+            continue
+        seen_ends: set[date] = set()
+        out: list[tuple[date, float]] = []
+        for e in entries:
+            form = e.get("form", "")
+            if form not in ("10-Q", "10-K", "10-Q/A", "10-K/A"):
+                continue
+            try:
+                filed = date.fromisoformat(str(e.get("filed", ""))[:10])
+                end_d = date.fromisoformat(str(e.get("end", ""))[:10])
+            except (ValueError, KeyError):
+                continue
+            if filed > alert_date:
+                continue
+            # Filter to quarterly entries: duration 60-100 days (covers 3-month
+            # quarters with some variation for fiscal calendar quirks). Excludes
+            # YTD (180/270/365-day entries) and instant balance-sheet entries.
+            start_str = e.get("start")
+            if not start_str:
+                continue
+            try:
+                start_d = date.fromisoformat(str(start_str)[:10])
+            except ValueError:
+                continue
+            duration_days = (end_d - start_d).days
+            if not (60 <= duration_days <= 100):
+                continue
+            if end_d in seen_ends:
+                continue
+            val = _sf(e.get("val"))
+            if val is None:
+                continue
+            seen_ends.add(end_d)
+            out.append((end_d, val))
+        if out:
+            out.sort(key=lambda x: x[0], reverse=True)
+            return out
+    return []
+
+
+def _edgar_ttm(
+    facts: dict,
+    alert_date: date,
+    concept_names: list[str],
+    taxonomy: str = "us-gaap",
+    unit: str = "USD",
+) -> Optional[tuple[float, date]]:
+    """TTM = sum of 4 most recent quarterly values filed at-or-before alert_date.
+
+    Returns (ttm_value, end_date_of_most_recent_quarter) or None if <4 quarters.
+    PIT-correct: only uses data that was publicly available at alert_date.
+    """
+    quarters = _edgar_quarterly_values(facts, alert_date, concept_names, taxonomy, unit)
+    if len(quarters) < 4:
+        return None
+    ttm = sum(v for _, v in quarters[:4])
+    return ttm, quarters[0][0]
+
+
+def _edgar_yoy_growth(
+    facts: dict,
+    alert_date: date,
+    concept_names: list[str],
+    taxonomy: str = "us-gaap",
+    unit: str = "USD",
+) -> Optional[float]:
+    """YoY TTM growth: (TTM_now - TTM_yoy) / abs(TTM_yoy). NaN-safe.
+
+    Returns None if either TTM (current) or TTM (1 year prior) can't be
+    computed. Returns the growth as a decimal (e.g., 0.08 = 8% YoY).
+    """
+    now = _edgar_ttm(facts, alert_date, concept_names, taxonomy, unit)
+    if now is None:
+        return None
+    ttm_now, end_now = now
+    # Use the period_end of the current TTM minus ~1 year to find prior TTM.
+    # 370 days buffer accounts for filing delay variability.
+    prior_cutoff = end_now - timedelta(days=370)
+    prev = _edgar_ttm(facts, prior_cutoff, concept_names, taxonomy, unit)
+    if prev is None:
+        return None
+    ttm_prev, _ = prev
+    if abs(ttm_prev) < 1.0:  # avoid division by ~0
+        return None
+    return (ttm_now - ttm_prev) / abs(ttm_prev)
+
+
 def _edgar_get(ticker: str, alert_date: date, cache_dir: Path) -> dict:
     """Fundamentais PIT via SEC EDGAR para um ticker US."""
     cik = _get_cik(ticker, cache_dir)
@@ -335,6 +441,41 @@ def _edgar_get(ticker: str, alert_date: date, cache_dir: Path) -> dict:
     if result["roe"] is not None and result["roe"] > 0.10:
         score += 0.25
     result["quality_score"] = round(score, 3)
+
+    # ── PIT-correct revenue_growth via EDGAR XBRL TTM YoY ──
+    # Uses _edgar_yoy_growth: sums last 4 quarterly filings → TTM_now,
+    # finds 4 quarters one year prior → TTM_prev, growth = delta / |prev|.
+    # Free, PIT-correct, covers US tickers post-~2009 (XBRL mandate).
+    rev_concepts = [
+        "Revenues",
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "SalesRevenueNet",
+        "RevenueFromContractWithCustomer",
+    ]
+    rg = _edgar_yoy_growth(facts, alert_date, rev_concepts)
+    if rg is not None:
+        result["revenue_growth"] = round(rg, 4)
+
+    # ── PIT-correct earnings_growth (TTM Net Income YoY) ──
+    ni_concepts = ["NetIncomeLoss", "ProfitLoss"]
+    eg = _edgar_yoy_growth(facts, alert_date, ni_concepts)
+    if eg is not None:
+        result["earnings_growth"] = round(eg, 4)
+
+    # ── _eps_ttm = TTM Net Income / shares outstanding ──
+    # Used downstream by regenerate_training_base to compute trailing_pe
+    # with the row's entry price (PIT). peg_ratio then computes correctly.
+    ni_ttm = _edgar_ttm(facts, alert_date, ni_concepts)
+    shares = _edgar_pit_value(
+        facts, alert_date,
+        ["CommonStockSharesOutstanding"],
+        unit="shares",
+        form_filter=("10-Q", "10-K", "10-Q/A", "10-K/A"),
+    )
+    if ni_ttm is not None and shares is not None and shares > 0:
+        ttm_ni, _end = ni_ttm
+        if ttm_ni > 0:
+            result["_eps_ttm"] = round(ttm_ni / shares, 4)
 
     # Filtrar campos None → não retornar dict vazio
     valid = {k: v for k, v in result.items() if v is not None}
