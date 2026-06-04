@@ -740,30 +740,66 @@ def get_pit_fundamentals(
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Tier 1: Tiingo
-    if has_tiingo_access():
-        result = _tiingo_get(ticker, alert_date)
-        if result:
-            return result
+    # MERGE strategy (not "first wins"): each tier has different strengths.
+    # EDGAR is PIT-correct for US tickers and has gross_margin/de_ratio/roe.
+    # yfinance fills gaps for _eps_ttm + earnings_growth (needs 8 quarters).
+    # Tiingo (if user has access) has the deepest history.
+    #
+    # Priority order on key conflicts (most-correct → least):
+    #   Tiingo > EDGAR > yfinance quarterly > yfinance.info
+    # When tier N has a key, tier N+1's value for that key is IGNORED.
+    merged: dict = {}
 
-    # Tier 2: SEC EDGAR (US tickers)
+    def _merge_in(source: dict):
+        """Add keys from source where not already present in merged."""
+        if not source:
+            return
+        for k, v in source.items():
+            if v is None:
+                continue
+            if k not in merged or merged[k] is None:
+                merged[k] = v
+
+    # Tier 1: Tiingo (highest priority)
+    if has_tiingo_access():
+        try:
+            _merge_in(_tiingo_get(ticker, alert_date))
+        except Exception as e:
+            log.debug(f"[fund_hist] Tiingo falhou {ticker}: {e}")
+
+    # Tier 2: SEC EDGAR (US tickers, gross_margin/de_ratio/roe/quality_score)
     if _is_us_ticker(ticker):
         try:
-            result = _edgar_get(ticker, alert_date, cache_dir)
-            if result:
-                return result
+            _merge_in(_edgar_get(ticker, alert_date, cache_dir))
         except Exception as e:
             log.debug(f"[fund_hist] EDGAR falhou {ticker}: {e}")
 
-    # Tier 3: yfinance quarterly (todos os tickers)
+    # Tier 3: yfinance quarterly (fills _eps_ttm + earnings_growth gaps)
     try:
-        result = _yf_quarterly(ticker, alert_date, cache_dir)
-        if result:
-            return result
+        _merge_in(_yf_quarterly(ticker, alert_date, cache_dir))
     except Exception as e:
         log.debug(f"[fund_hist] yfinance quarterly falhou {ticker}: {e}")
 
-    return {}
+    # Tier 4: yfinance.info — last-resort fallback for revenue_growth.
+    # NOT PIT (it's current state) but for recent rows it's a useful proxy
+    # when neither EDGAR nor quarterly_financials has YoY data. Skip if key
+    # already populated by a PIT source.
+    if "revenue_growth" not in merged or merged.get("revenue_growth") is None:
+        try:
+            import yfinance as yf
+            info = yf.Ticker(ticker).info or {}
+            rg = info.get("revenueGrowth")
+            if rg is not None:
+                merged["revenue_growth"] = round(float(rg), 4)
+            # Also try earnings_growth from .info (epsGrowth field) — same caveats
+            if "earnings_growth" not in merged or merged.get("earnings_growth") is None:
+                eg = info.get("earningsGrowth") or info.get("epsGrowth")
+                if eg is not None:
+                    merged["earnings_growth"] = round(float(eg), 4)
+        except Exception as e:
+            log.debug(f"[fund_hist] yf.info fallback {ticker}: {e}")
+
+    return merged
 
 
 def prefetch_fundamentals(
