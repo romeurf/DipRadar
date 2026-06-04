@@ -6109,6 +6109,92 @@ def _handle_command(text: str) -> None:
         except Exception as e:
             _reply(f"❌ Erro: `{e}`")
 
+    elif cmd in ("/admin_diag_yf", "/admin_yf_test"):
+        # Diagnose what yfinance actually returns for a ticker, so we can see
+        # if peg_ratio/earnings_beat_rate/analyst_rating are 100% NaN due to:
+        #   (a) yfinance returning empty (data limit, real)
+        #   (b) yfinance returning data with renamed columns (parsing bug)
+        if len(parts) < 2:
+            _reply("Uso: `/admin_diag_yf TICKER` (ex: `/admin_diag_yf AAPL`)")
+            return
+        ticker = parts[2].upper().strip() if len(parts) > 2 else parts[1].upper().strip()
+        try:
+            import yfinance as _yf
+            import pandas as _pd
+            tk = _yf.Ticker(ticker)
+
+            lines = [f"🔬 *yfinance diagnostic — {ticker}*\n"]
+
+            # 1. earnings_dates
+            lines.append("📅 *earnings_dates:*")
+            try:
+                edf = tk.earnings_dates
+                if edf is None or edf.empty:
+                    lines.append("  ❌ Empty/None")
+                else:
+                    lines.append(f"  ✅ {len(edf)} rows | cols: `{list(edf.columns)}`")
+                    # Show first row to see actual data
+                    first = edf.iloc[0]
+                    lines.append(f"  First row: {dict(first.head(5).items())}")
+            except Exception as e:
+                lines.append(f"  ❌ Exception: `{e}`")
+
+            # 2. recommendations
+            lines.append("\n👨‍💼 *recommendations:*")
+            try:
+                rdf = tk.recommendations
+                if rdf is None or rdf.empty:
+                    lines.append("  ❌ Empty/None")
+                else:
+                    lines.append(f"  ✅ {len(rdf)} rows | cols: `{list(rdf.columns)}`")
+                    first = rdf.iloc[0]
+                    lines.append(f"  First row: {dict(first.head(6).items())}")
+            except Exception as e:
+                lines.append(f"  ❌ Exception: `{e}`")
+
+            # 3. quarterly_financials
+            lines.append("\n💰 *quarterly_financials:*")
+            try:
+                qf = tk.quarterly_financials
+                if qf is None or qf.empty:
+                    lines.append("  ❌ Empty/None")
+                else:
+                    lines.append(f"  ✅ {qf.shape[0]} rows × {qf.shape[1]} cols")
+                    lines.append(f"  Index sample: {list(qf.index[:5])}")
+                    lines.append(f"  Cols (dates): {[str(c)[:10] for c in qf.columns[:4]]}")
+            except Exception as e:
+                lines.append(f"  ❌ Exception: `{e}`")
+
+            # 4. Run actual pipeline functions
+            lines.append("\n🔧 *Pipeline functions:*")
+            try:
+                from pathlib import Path as _P
+                from datetime import date as _date
+                from fundamental_history import _yf_pit_earnings_signals, get_pit_fundamentals
+                _dd = _P("/data") if _P("/data").exists() else _P("/tmp")
+                cache = _dd / "fundamentals_cache"
+                cache.mkdir(parents=True, exist_ok=True)
+
+                # Force fresh (delete cache file if exists)
+                cache_path = cache / f"yf_pit_earnings_{ticker.replace('.', '_')}.json"
+                if cache_path.exists():
+                    cache_path.unlink()
+
+                earn = _yf_pit_earnings_signals(ticker, _date.today(), cache)
+                lines.append(f"  `_yf_pit_earnings_signals`: `{earn}`")
+
+                fund = get_pit_fundamentals(ticker, _date.today(), cache)
+                # Show only key fields
+                key_fund = {k: fund.get(k) for k in ("revenue_growth", "gross_margin", "earnings_growth", "_eps_ttm", "fcf_yield") if k in fund}
+                lines.append(f"  `get_pit_fundamentals` (key fields): `{key_fund}`")
+            except Exception as e:
+                lines.append(f"  ❌ Exception: `{e}`")
+
+            lines.append("\n_Esta info diz se yfinance funciona vs se o nosso parser está partido._")
+            _reply("\n".join(lines))
+        except Exception as e:
+            _reply(f"❌ Diag falhou: `{e}`")
+
     elif cmd in ("/admin_missed_alpha", "/admin_missed_dips"):
         # Surface dip episodes that the bot DID NOT alert on but recovered
         # strongly (alpha_90d ≥ threshold). These are "money left on table"
