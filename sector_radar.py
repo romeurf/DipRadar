@@ -55,6 +55,7 @@ class TickerSignals:
     ma200_ratio: float          # price / MA200 (1.0 = at MA)
     ma50_ratio: float           # price / MA50
     return_30d: float
+    return_30d_vs_spy: float    # relative strength 30d (this - SPY)
     return_ytd: float
     return_ytd_vs_spy: float    # excess return YTD vs SPY
     days_below_ma200: int       # consecutive days price < MA200
@@ -210,39 +211,60 @@ def _compute_momentum_score(
     ma200_ratio: float,
     ma50_ratio: float,
     return_30d: float,
+    return_30d_vs_spy: float,
 ) -> float:
-    """0-100 momentum opportunity score.
+    """0-100 momentum opportunity score — RELATIVE strength required.
 
-    For sectors trending UP sustainably. Avoid late-stage parabolic
-    (RSI > 80 capped). A healthy momentum candidate sits above MA50 and
-    MA200, has RSI 50-75, and positive but not extreme 30d return.
+    A "momentum buy" only fires when the ticker is OUTPERFORMING the
+    broader market. Just trending up alongside SPY is beta participation,
+    not actionable signal — every sector grinds higher in a bull market
+    but only some are leadership candidates.
+
+    Gates (return 0 if any fails):
+      - return_30d_vs_spy must be ≥ 2pp (true relative strength)
+      - ma50_ratio must be ≥ 1.0 (trend confirmed)
+
+    Score (after gates pass):
+      - Relative strength magnitude  (40 max)
+      - RSI in healthy range          (20 max)
+      - Established trend             (20 max)
+      - 30d return tier               (20 max)
+
+    Penalties:
+      - Parabolic exhaustion (RSI > 78 or return_30d > 20%): -25
     """
+    # Hard gates — no momentum without these
+    if return_30d_vs_spy < 0.02:
+        return 0.0  # not outperforming
+    if ma50_ratio < 1.0:
+        return 0.0  # below MA50, no trend
+
     score = 0.0
 
-    # Above MA200 with cushion — weight 25
-    if ma200_ratio > 1.03:
-        score += 25.0
-    elif ma200_ratio > 1.0:
-        score += 15.0
+    # Relative strength magnitude — saturate at +10pp
+    score += 40.0 * min(1.0, return_30d_vs_spy / 0.10)
 
-    # Above MA50 (recent trend confirmed) — weight 20
-    if ma50_ratio > 1.0:
-        score += 20.0
-
-    # RSI in healthy range — weight 25 (50-70 is sweet spot)
+    # RSI healthy (50-70 ideal)
     if 50 <= rsi_14 <= 70:
-        score += 25.0
-    elif 45 <= rsi_14 < 50 or 70 < rsi_14 <= 78:
-        score += 15.0
+        score += 20.0
+    elif 45 <= rsi_14 < 50 or 70 < rsi_14 <= 75:
+        score += 12.0
 
-    # 30d return positive but not parabolic — weight 30
-    if 0.02 <= return_30d <= 0.10:
-        score += 30.0
-    elif return_30d > 0.10:
-        # parabolic, ride is late
-        score += 15.0
-    elif 0 < return_30d < 0.02:
+    # Established trend (above MA200 by ≥5%)
+    if ma200_ratio > 1.05:
+        score += 20.0
+    elif ma200_ratio > 1.0:
         score += 10.0
+
+    # Absolute return reasonable
+    if 0.03 <= return_30d <= 0.12:
+        score += 20.0
+    elif return_30d > 0.12:
+        score += 8.0
+
+    # Parabolic exhaustion penalty — heavily penalize blowoff tops
+    if rsi_14 > 78 or return_30d > 0.20:
+        score -= 25.0
 
     return max(0.0, min(100.0, score))
 
@@ -451,7 +473,9 @@ def compute_signals(
     # Returns
     return_30d = current / float(closes.iloc[-30]) - 1.0 if len(closes) >= 30 else 0.0
 
-    # YTD return
+    # SPY 30d return + YTD for relative strength calcs
+    spy_return_30d = 0.0
+    return_30d_vs_spy = 0.0
     return_ytd = 0.0
     return_ytd_vs_spy = 0.0
     try:
@@ -462,12 +486,21 @@ def compute_signals(
             return_ytd = float(ytd_slice.iloc[-1] / ytd_slice.iloc[0] - 1.0)
         if spy_hist is not None and not spy_hist.empty:
             spy_closes = spy_hist["Close"].astype(float)
+            # SPY 30d return (matches ticker's 30d window)
+            if len(spy_closes) >= 30:
+                spy_return_30d = float(spy_closes.iloc[-1] / spy_closes.iloc[-30] - 1.0)
+                return_30d_vs_spy = return_30d - spy_return_30d
+            # SPY YTD
             spy_ytd = spy_closes[spy_closes.index >= ytd_start]
             if len(spy_ytd) >= 2:
-                spy_ret = float(spy_ytd.iloc[-1] / spy_ytd.iloc[0] - 1.0)
-                return_ytd_vs_spy = return_ytd - spy_ret
+                spy_ret_ytd = float(spy_ytd.iloc[-1] / spy_ytd.iloc[0] - 1.0)
+                return_ytd_vs_spy = return_ytd - spy_ret_ytd
     except Exception as e:
-        logger.debug(f"[sector_radar] YTD calc failed for {ticker}: {e}")
+        logger.debug(f"[sector_radar] returns calc failed for {ticker}: {e}")
+
+    # For SPY itself, "vs SPY" is identically 0 — that's correct, and the
+    # momentum gate naturally rejects SPY as a momentum candidate. Dip
+    # score still works for SPY (it's a sector-like for the radar purposes).
 
     # Duration metrics
     days_below_ma200 = _consecutive_days_below(closes, ma200)
@@ -478,7 +511,7 @@ def compute_signals(
         drawdown_52w, rsi_14, ma200_ratio, return_ytd_vs_spy, return_30d
     )
     momentum_score = _compute_momentum_score(
-        rsi_14, ma200_ratio, ma50_ratio, return_30d
+        rsi_14, ma200_ratio, ma50_ratio, return_30d, return_30d_vs_spy
     )
     secular_risk = _compute_secular_risk(closes, drawdown_52w, ma200)
     exit_strength = _compute_exit_strength(
@@ -506,6 +539,7 @@ def compute_signals(
         ma200_ratio=round(ma200_ratio, 4),
         ma50_ratio=round(ma50_ratio, 4),
         return_30d=round(return_30d, 4),
+        return_30d_vs_spy=round(return_30d_vs_spy, 4),
         return_ytd=round(return_ytd, 4),
         return_ytd_vs_spy=round(return_ytd_vs_spy, 4),
         days_below_ma200=int(days_below_ma200),
