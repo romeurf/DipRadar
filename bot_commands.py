@@ -6477,6 +6477,190 @@ def _handle_command(text: str) -> None:
         except Exception as e:
             _reply(f"❌ Erro: `{e}`")
 
+    elif cmd in ("/admin_threshold_analysis", "/admin_threshold", "/admin_thresh"):
+        # Find the threshold that maximises Sharpe-of-selected-trades.
+        # Preferentially uses honest out-of-fold predictions persisted
+        # during /admin_retrain. Falls back to in-sample predictions
+        # (with a loud warning) when OOF file doesn't exist yet.
+        #
+        # OOF semantics: for each row, the prediction comes from a fold
+        # where THAT row was in the test set — the model never saw it.
+        # This eliminates the in-sample bias that would otherwise inflate
+        # Sharpe estimates by ~30-50%.
+        #
+        # Read-only — does NOT change any production constants. Output is
+        # a recommendation; set _SCORE_HIGH / _SCORE_MED / _SCORE_FLOOR
+        # in ml_predictor.py based on what the table shows.
+        try:
+            from pathlib import Path as _P
+            import pandas as _pd
+            import numpy as _np
+            import joblib as _jl
+
+            _dd = _P("/data") if _P("/data").exists() else _P("/tmp")
+            parquet_p = _dd / "ml_training_base.parquet"
+            oof_p     = _dd / "dip_oof_predictions.parquet"
+            bundle_candidates = [
+                _dd / "dip_models.pkl",
+                _P(__file__).parent / "ml_training" / "dip_models.pkl",
+            ]
+            bundle_p = next((p for p in bundle_candidates if p.exists()), None)
+
+            # Path A: prefer OOF predictions file (rigorous, no bias)
+            df = None
+            source_tag = ""
+            bias_warning = ""
+            if oof_p.exists():
+                oof_df = _pd.read_parquet(oof_p)
+                if "oof_pred" in oof_df.columns and "actual" in oof_df.columns:
+                    df = oof_df.rename(columns={"oof_pred": "_pred", "actual": "_actual"})
+                    n_total = len(df)
+                    source_tag = "OOF (walk-forward, sem bias)"
+                    _PT = "oof"  # display only
+                else:
+                    _reply("⚠️ `dip_oof_predictions.parquet` corrupto. Re-corre `/admin_retrain`.")
+                    return
+            else:
+                # Path B: fallback to in-sample. Loud warning.
+                if not parquet_p.exists():
+                    _reply(f"⚠️ Nem OOF nem parquet existem. Corre `/admin_overnight` + `/admin_retrain`.")
+                    return
+                if bundle_p is None:
+                    _reply(
+                        "⚠️ OOF file ausente E bundle ausente. Corre `/admin_retrain` — "
+                        "vai gerar ambos (modelo + dip_oof_predictions.parquet)."
+                    )
+                    return
+
+                try:
+                    from ml_training.config import PRIMARY_TARGET as _PT
+                except Exception:
+                    _PT = "alpha_90d"
+                df_raw = _pd.read_parquet(parquet_p)
+                if _PT not in df_raw.columns:
+                    _reply(
+                        f"⚠️ Coluna `{_PT}` ausente no parquet. "
+                        f"Se mudaste DIP_PRIMARY_TARGET, corre `/admin_overnight`."
+                    )
+                    return
+                df_raw = df_raw[df_raw[_PT].notna()].reset_index(drop=True)
+                if len(df_raw) < 200:
+                    _reply(f"⚠️ Apenas `{len(df_raw)}` rows com `{_PT}` resolvido — análise pouco fiável.")
+                    return
+
+                bundle = _jl.load(bundle_p)
+                feature_cols = list(getattr(bundle, "feature_cols", []))
+                if not feature_cols:
+                    _reply("⚠️ Bundle sem `feature_cols`. Retrain necessário.")
+                    return
+                missing_in_parquet = [c for c in feature_cols if c not in df_raw.columns]
+                if missing_in_parquet:
+                    _reply(
+                        f"⚠️ Bundle pede `{len(missing_in_parquet)}` features ausentes: "
+                        f"`{missing_in_parquet[:5]}`. Regenera parquet."
+                    )
+                    return
+
+                X = df_raw[feature_cols].values.astype("float32")
+                try:
+                    preds = bundle.model_up.predict(X)
+                except Exception as e:
+                    _reply(f"❌ Falha a predizer: `{e}`")
+                    return
+                df = _pd.DataFrame({
+                    "_pred":   preds,
+                    "_actual": df_raw[_PT].values.astype("float64"),
+                })
+                n_total = len(df)
+                source_tag = "IN-SAMPLE (biased ↑ ~30-50%)"
+                bias_warning = (
+                    "\n\n⚠️ *AVISO*: Predictions in-sample (modelo viu estes dados no treino). "
+                    "Sharpe inflacionado. Corre `/admin_retrain` para gerar OOF correto, "
+                    "depois re-corre este comando."
+                )
+
+            # Common analysis (whatever path produced df)
+            actual = df["_actual"].values
+            preds  = df["_pred"].values
+
+            # Pick threshold ladder spanning typical alpha range
+            thresholds = [0.005, 0.010, 0.015, 0.020, 0.030, 0.040,
+                          0.050, 0.060, 0.080, 0.100, 0.150]
+
+            rows_table = []
+            for thr in thresholds:
+                sel = df[df["_pred"] >= thr]
+                n_sel = len(sel)
+                if n_sel == 0:
+                    rows_table.append({"thr": thr, "n": 0})
+                    continue
+                a   = sel["_actual"].values
+                mu  = float(_np.mean(a))
+                sd  = float(_np.std(a))
+                hit = float((a > 0).sum()) / n_sel
+                sharpe = mu / sd if sd > 1e-6 else 0.0
+                rows_table.append({
+                    "thr":    thr,
+                    "n":      n_sel,
+                    "mean":   mu,
+                    "hit":    hit,
+                    "sharpe": sharpe,
+                })
+
+            # Baseline: ALL rows (no threshold filter)
+            base_mean = float(actual.mean())
+            base_hit  = float((actual > 0).sum()) / n_total
+            base_sd   = float(actual.std())
+            base_sharpe = base_mean / base_sd if base_sd > 1e-6 else 0.0
+
+            # Recommend by Sharpe among thresholds with ≥30 selections
+            viable = [r for r in rows_table if r.get("n", 0) >= 30 and "sharpe" in r]
+            best = max(viable, key=lambda r: r["sharpe"]) if viable else None
+
+            lines = [
+                f"📊 *Threshold Analysis — DIP*",
+                f"Source: `{source_tag}`",
+                f"Target: `{_PT}`",
+                f"Base: `{n_total:,}` rows, μ={base_mean*100:+.2f}%, "
+                f"hit={base_hit*100:.0f}%, Sharpe={base_sharpe:+.2f}",
+                "",
+                "```",
+                f"{'Thr':>6} {'N':>6} {'μ-α':>7} {'Hit%':>5} {'Sharpe':>7}",
+                "─" * 38,
+            ]
+            for r in rows_table:
+                if r.get("n", 0) == 0:
+                    lines.append(f"{r['thr']:>6.3f} {0:>6}     --     --      --")
+                    continue
+                marker = " ←" if best and abs(r["thr"] - best["thr"]) < 1e-9 else ""
+                lines.append(
+                    f"{r['thr']:>6.3f} {r['n']:>6,} "
+                    f"{r['mean']*100:>+6.2f}% {r['hit']*100:>4.0f}% "
+                    f"{r['sharpe']:>+7.2f}{marker}"
+                )
+            lines.append("```")
+            lines.append("")
+            if best:
+                lines.append(
+                    f"*Recomendação*: threshold ≈ `{best['thr']:.3f}` "
+                    f"(Sharpe {best['sharpe']:+.2f}, "
+                    f"{best['n']:,} alertas, μ-α {best['mean']*100:+.2f}%)"
+                )
+                # Suggest mapping to existing constants
+                if best["thr"] <= 0.02:
+                    lines.append(f"_Sugestão: `_SCORE_FLOOR = {best['thr']:.3f}` em `ml_predictor.py`._")
+                elif best["thr"] <= 0.04:
+                    lines.append(f"_Sugestão: `_SCORE_MED = {best['thr']:.3f}` em `ml_predictor.py`._")
+                else:
+                    lines.append(f"_Sugestão: `_SCORE_HIGH = {best['thr']:.3f}` em `ml_predictor.py`._")
+            else:
+                lines.append("⚠️ Nenhum threshold com ≥30 alertas selecionados — modelo pouco discriminante.")
+            if bias_warning:
+                lines.append(bias_warning)
+            _reply("\n".join(lines))
+        except Exception as e:
+            _reply(f"❌ Threshold analysis falhou: `{e}`")
+
     elif cmd in ("/admin_purge_sec_caches", "/admin_purge_sec"):
         # Reclaim disk by removing the three SEC Filings cache directories
         # that supported the now-removed Form 4 / 8-K / earnings call

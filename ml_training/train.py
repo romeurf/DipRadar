@@ -1031,6 +1031,36 @@ def run_training(
         champion_oof_pred = oof_pred[single_champion_name]
     log.info(f"[run_training] Champion final: {champion_kind}={champion_name}")
 
+    # Persist OOF predictions of the champion for downstream threshold
+    # analysis (admin command /admin_threshold_analysis). These are
+    # honest out-of-fold predictions — the model never saw these rows
+    # during training. Far more reliable than in-sample predictions for
+    # picking _SCORE_HIGH / _SCORE_MED / _SCORE_FLOOR. Drop NaN rows
+    # (folds with insufficient train/test left some rows unpredicted).
+    try:
+        _oof_path = input_parquet.parent / "dip_oof_predictions.parquet"
+        _oof_arr  = np.asarray(champion_oof_pred, dtype=float)
+        _oof_df = pd.DataFrame({
+            "alert_date": pd.to_datetime(df["alert_date"]).values,
+            "ticker":     df["ticker"].astype(str).values,
+            "sector":     df.get("sector", pd.Series([""] * len(df))).astype(str).values,
+            "actual":     df[_active_target].astype(float).values,
+            "oof_pred":   _oof_arr,
+        })
+        _oof_df = _oof_df[
+            _oof_df["oof_pred"].notna() & _oof_df["actual"].notna()
+        ].reset_index(drop=True)
+        # Embed metadata so the consumer knows which target was used.
+        _oof_df.attrs["target_col"]    = _active_target
+        _oof_df.attrs["champion_name"] = champion_name
+        _oof_df.to_parquet(_oof_path, index=False)
+        log.info(
+            f"[run_training] OOF predictions persistidas: {_oof_path.name} "
+            f"({len(_oof_df):,} rows, target={_active_target})"
+        )
+    except Exception as _oof_e:
+        log.warning(f"[run_training] Falha a persistir OOF predictions: {_oof_e}")
+
     # Isotonic calibrator OOF (usa champion_oof_pred, seja single ou ensemble)
     from ml_training.config import CALIBRATOR_THRESHOLD
     iso, brier, n_oof = fit_isotonic_calibrator(
