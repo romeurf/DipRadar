@@ -117,6 +117,11 @@ def _process_row(row: pd.Series, cache_dir: Path) -> dict:
     Then add_derived_features computes peg_ratio from the combined tier 1 inputs.
 
     Only returns columns where we got a fresh value; NaN/missing stays missing.
+
+    Early-skip optimisation: alert_dates before 2003 have no realistic chance
+    of EDGAR fundamentals (XBRL mandate is 2009) or Form 4 (electronic filing
+    pre-2003 was inconsistent). Skipping these rows instantly avoids ~20k
+    pointless HTTP attempts on the full parquet — net savings of hours.
     """
     from scripts.regenerate_training_base import (
         _compute_pit_fundamentals_row,
@@ -124,6 +129,17 @@ def _process_row(row: pd.Series, cache_dir: Path) -> dict:
     )
     from sec_guard import has_sec_filings
     from ml_features import add_derived_features
+
+    # Fast path: pre-2003 rows have no fundamentals or Form 4 to fetch.
+    # Return NaN for all refresh cols (honest: we know we won't find data)
+    # so the backfill writes NaN deliberately instead of trying every source
+    # and timing out.
+    try:
+        _yr = pd.Timestamp(row["alert_date"]).year
+    except Exception:
+        _yr = 1900
+    if _yr < 2003:
+        return {c: float("nan") for c in _ALL_COLS_TO_REFRESH}
 
     # Tier 1: PIT fundamentals
     fund: dict = {}
@@ -184,6 +200,7 @@ def backfill(
     ticker_filter: Optional[set[str]] = None,
     since_date: Optional[pd.Timestamp] = None,
     log_every: int = 1000,
+    max_rows: Optional[int] = None,
 ) -> dict:
     """Walk the parquet row-by-row, recompute fundamentals, atomic write.
 
@@ -212,6 +229,20 @@ def backfill(
     if not process_idx:
         log.warning("Nothing to process after filters.")
         return {"rows_processed": 0, "rows_updated": 0}
+
+    # Incremental session cap. The Form 4 XML cache is permanent so a
+    # partial run still warms it for subsequent sessions. Selecting from
+    # the front of process_idx (chronologically earliest after sort) gives
+    # deterministic resume behaviour: the next session's --max-rows starts
+    # where this one left off only if combined with `--since` shift, but
+    # critically the cache is what matters most — XMLs once fetched don't
+    # need to be fetched again.
+    if max_rows is not None and max_rows > 0 and len(process_idx) > max_rows:
+        log.info(
+            f"  Max-rows cap: {max_rows:,} of {len(process_idx):,} rows "
+            f"(remaining will need additional session)"
+        )
+        process_idx = process_idx[:max_rows]
 
     log.info(f"  Processing: {len(process_idx):,} rows")
 
@@ -351,6 +382,10 @@ def main() -> int:
     p.add_argument("--tickers", help="Comma-separated ticker subset (default: all)")
     p.add_argument("--since", help="Only process rows with alert_date >= YYYY-MM-DD")
     p.add_argument("--log-every", type=int, default=1000)
+    p.add_argument("--max-rows", type=int, default=None,
+                   help="Cap rows processed this session (incremental backfill). "
+                        "Form 4 XML cache is permanent so partial runs warm it for "
+                        "subsequent sessions.")
     args = p.parse_args()
 
     data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
@@ -380,6 +415,7 @@ def main() -> int:
         ticker_filter=ticker_filter,
         since_date=since_date,
         log_every=args.log_every,
+        max_rows=args.max_rows,
     )
     return 0
 

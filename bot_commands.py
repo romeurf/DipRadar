@@ -6279,11 +6279,14 @@ def _handle_command(text: str) -> None:
             # Optional filters
             since_arg = None
             tickers_arg = None
+            max_rows_arg = None
             for token in parts[1:]:
                 if token.startswith("--since="):
                     since_arg = token.split("=", 1)[1]
                 elif token.startswith("--tickers="):
                     tickers_arg = token.split("=", 1)[1]
+                elif token.startswith("--max-rows="):
+                    max_rows_arg = token.split("=", 1)[1]
 
             _reply(
                 f"🔄 *Backfill fundamentals* a iniciar\n\n"
@@ -6306,10 +6309,35 @@ def _handle_command(text: str) -> None:
                     cmd += ["--since", since_arg]
                 if tickers_arg:
                     cmd += ["--tickers", tickers_arg]
+                if max_rows_arg:
+                    cmd += ["--max-rows", max_rows_arg]
+                # Timeout: first full run fetches Form 4 XMLs for the entire
+                # parquet (potentially 17-30h). Set to 48h so the user can
+                # genuinely "let it finish". The early-skip in _process_row
+                # eliminates ~20k pre-2003 rows that have no fetchable data;
+                # the remaining work is bounded by EDGAR rate limit and the
+                # permanent Form 4 cache (second run is sub-minute).
+                _BACKFILL_TIMEOUT = 48 * 3600
                 try:
-                    proc = _sp.run(cmd, capture_output=True, text=True, timeout=4 * 3600)
-                except _sp.TimeoutExpired:
-                    _reply("❌ Backfill timed out após 4h. Inspeciona Railway logs.")
+                    proc = _sp.run(cmd, capture_output=True, text=True,
+                                   timeout=_BACKFILL_TIMEOUT)
+                except _sp.TimeoutExpired as _te:
+                    # Capture whatever the subprocess managed to write before
+                    # being killed. Without this, the user has no idea how
+                    # far the run got. Railway logs don't show subprocess
+                    # output (it's captured silently), so this is the only
+                    # window into what happened.
+                    _so = (getattr(_te, "stdout", "") or "")
+                    _se = (getattr(_te, "stderr", "") or "")
+                    _combined = (_so + "\n" + _se).strip()
+                    _tail = _combined[-2500:] if _combined else "(sem output capturado)"
+                    _reply(
+                        f"❌ *Backfill timed out após {_BACKFILL_TIMEOUT/3600:.0f}h*\n\n"
+                        f"<code>{_tail}</code>\n\n"
+                        f"_Sugestão: re-corre com `--max-rows=50000` para sessão "
+                        f"incremental (cache Form 4 é permanente, próxima sessão "
+                        f"é mais rápida)._"
+                    )
                     return
                 except Exception as e:
                     _reply(f"❌ Backfill falhou: `{e}`")
@@ -6354,6 +6382,98 @@ def _handle_command(text: str) -> None:
 
             import threading
             threading.Thread(target=_run_backfill, daemon=True, name="dip-backfill-fundamentals").start()
+        except Exception as e:
+            _reply(f"❌ Erro: `{e}`")
+
+    elif cmd in ("/admin_disk_usage", "/admin_disk"):
+        # Quick breakdown of what's eating the 5GB Railway volume.
+        # Useful before launching a multi-hour backfill that will grow
+        # form4_cache / edgar_submissions_chunks significantly.
+        try:
+            from pathlib import Path as _P
+            import shutil as _sh
+
+            _dd = _P("/data") if _P("/data").exists() else _P("/tmp")
+            total, used, free = _sh.disk_usage(str(_dd))
+
+            def _dir_size(path: _P) -> tuple[int, int]:
+                """Return (total_bytes, file_count) for a directory."""
+                if not path.exists():
+                    return 0, 0
+                total_b = 0
+                count = 0
+                try:
+                    for fp in path.rglob("*"):
+                        if fp.is_file():
+                            try:
+                                total_b += fp.stat().st_size
+                                count += 1
+                            except OSError:
+                                pass
+                except OSError:
+                    pass
+                return total_b, count
+
+            def _fmt(b: int) -> str:
+                if b >= 1024**3:
+                    return f"{b/1024**3:.2f} GB"
+                if b >= 1024**2:
+                    return f"{b/1024**2:.1f} MB"
+                if b >= 1024:
+                    return f"{b/1024:.0f} KB"
+                return f"{b} B"
+
+            # Inspect the top consumers — cache dirs + the big parquets
+            candidates = [
+                ("form4_cache",              _dd / "form4_cache"),
+                ("edgar_submissions",        _dd / "edgar_submissions"),
+                ("edgar_submissions_chunks", _dd / "edgar_submissions_chunks"),
+                ("fundamentals_cache",       _dd / "fundamentals_cache"),
+                ("fundamental_cache",        _dd / "fundamental_cache"),
+                ("price_cache",              _dd / "price_cache"),
+                ("yf_cache",                 _dd / "yf_cache"),
+                ("ml_predictions",           _dd / "ml_predictions"),
+                ("backups",                  _dd / "backups"),
+                ("dip_model_stage",          _dd / "dip_model_stage"),
+                ("alert_db",                 _dd / "alert_db"),
+            ]
+            entries = []
+            for name, path in candidates:
+                sz, ct = _dir_size(path)
+                if sz > 0:
+                    entries.append((name, sz, ct))
+
+            # Sort biggest first
+            entries.sort(key=lambda x: -x[1])
+            lines = [f"💾 *Disk usage — `{_dd}`*"]
+            lines.append(
+                f"Volume: `{_fmt(used)}` used / `{_fmt(total)}` total "
+                f"(`{_fmt(free)}` free, {used/total*100:.0f}%)"
+            )
+            lines.append("")
+            lines.append("*Top consumers:*")
+            for name, sz, ct in entries[:12]:
+                lines.append(f"• `{name}`: {_fmt(sz)} ({ct:,} files)")
+
+            # Big parquets
+            lines.append("")
+            lines.append("*Key parquets:*")
+            for name in ("ml_training_base.parquet", "core_dataset.parquet",
+                         "momentum_dataset.parquet"):
+                fp = _dd / name
+                if fp.exists():
+                    lines.append(f"• `{name}`: {_fmt(fp.stat().st_size)}")
+
+            # Warning if free space getting tight
+            if free < 500 * 1024**2:  # <500 MB
+                lines.append("")
+                lines.append(
+                    "⚠️ *Menos de 500 MB livres* — backfill pode falhar a "
+                    "escrever cache ou .tmp parquet. Considera limpar "
+                    "`fundamental_cache` (yfinance, rebuilds-on-demand)."
+                )
+
+            _reply("\n".join(lines))
         except Exception as e:
             _reply(f"❌ Erro: `{e}`")
 
