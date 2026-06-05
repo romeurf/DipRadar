@@ -548,16 +548,41 @@ def compute_signals(
     )
 
 
+def fetch_spy_history(period: str = "3y") -> Optional[pd.DataFrame]:
+    """Fetch SPY OHLCV — needed for relative strength computation.
+
+    Callers computing a single ticker (e.g., `/sectors XLK` deep-dive)
+    should fetch SPY first and pass to `fetch_and_compute`. Otherwise
+    `return_30d_vs_spy` falls back to 0.0, the momentum gate fails for
+    any ticker, and the FSM silently overwrites legitimate BUY_ZONE
+    states with NEUTRAL. The bug manifested as an oscillation loop:
+    snapshot fires BUY alert → deep-dive silently resets to NEUTRAL →
+    next snapshot fires BUY alert again.
+    """
+    try:
+        import yfinance as yf
+        return yf.Ticker("SPY").history(period=period, auto_adjust=True)
+    except Exception as e:
+        logger.warning(f"[sector_radar] SPY fetch failed: {e}")
+        return None
+
+
 def fetch_and_compute(
     ticker: str,
     spy_hist: Optional[pd.DataFrame] = None,
     period: str = "3y",
+    auto_fetch_spy: bool = True,
 ) -> Optional[TickerSignals]:
     """Convenience wrapper: fetch OHLCV via yfinance then compute signals.
 
-    Used by the daily radar sweep. For batch computation across many
-    tickers, fetch SPY once and reuse.
+    For batch computation across many tickers, fetch SPY once and reuse
+    (`rank_universe` does this). For one-off calls (admin commands,
+    diagnostics), leave `auto_fetch_spy=True` so the function fetches
+    SPY itself — otherwise momentum gating fails and FSM state writes
+    are corrupted (see fetch_spy_history docstring).
     """
+    if spy_hist is None and auto_fetch_spy and ticker.upper() != "SPY":
+        spy_hist = fetch_spy_history(period=period)
     try:
         import yfinance as yf
         hist = yf.Ticker(ticker).history(period=period, auto_adjust=True)

@@ -6385,6 +6385,22 @@ def _handle_command(text: str) -> None:
         except Exception as e:
             _reply(f"❌ Erro: `{e}`")
 
+    elif cmd in ("/admin_reset_sector_states", "/admin_reset_sectors"):
+        # Wipe the sector_radar FSM state file. Useful after fixing a
+        # scoring bug — the persisted state may have wrong transitions
+        # baked in, and you want a fresh snapshot to re-classify.
+        try:
+            from pathlib import Path as _P
+            _dd = _P("/data") if _P("/data").exists() else _P("/tmp")
+            f = _dd / "sector_radar_state.json"
+            if f.exists():
+                f.unlink()
+                _reply(f"🧹 `{f.name}` apagado. Próximo `/sectors` arranca limpo.")
+            else:
+                _reply(f"ℹ️ `{f.name}` já não existia.")
+        except Exception as e:
+            _reply(f"❌ Erro: `{e}`")
+
     elif cmd in ("/sectors", "/sector_radar"):
         # Daily sector radar snapshot — ranks all sector ETFs + broad
         # market + thematic by combined buy score. Highlights BUY_ZONE
@@ -6546,7 +6562,7 @@ def _handle_command(text: str) -> None:
         # via their US proxies. Shows exit_strength and entry_strength so
         # you can decide whether to trim / hold / re-enter.
         try:
-            from sector_radar import fetch_and_compute
+            from sector_radar import fetch_and_compute, fetch_spy_history
             from etf_universe import user_holding_proxies, proxy_to_ucits, get_etf
             import state as _st
 
@@ -6555,9 +6571,13 @@ def _handle_command(text: str) -> None:
                 _reply("ℹ️ Nenhuma holding UCITS registada em `etf_universe.py`.")
                 return
 
+            # Fetch SPY once for the loop — otherwise momentum gate fails
+            # for each proxy and the FSM writes corrupt state.
+            spy_hist = fetch_spy_history()
+
             lines = ["💼 *Holdings ETF status*", ""]
             for ucits, us_proxy in proxies.items():
-                sig = fetch_and_compute(us_proxy)
+                sig = fetch_and_compute(us_proxy, spy_hist=spy_hist)
                 if sig is None:
                     lines.append(f"• `{ucits}` ({us_proxy}): ⚠️ sem dados")
                     continue
