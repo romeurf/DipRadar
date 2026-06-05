@@ -84,14 +84,10 @@ FEATURE_COLUMNS: list[str] = [
     "ma_200d_ratio",
     "price_vs_52w_percentile",
     "peg_ratio",
-    # Insider activity (Form 4, PIT)
-    "insider_buy_recent",
-    "insider_buy_amount_score",
-    "insider_sell_recent",
-    "insider_sell_amount_score",
-    # SEC 8-K + earnings call sentiment
-    "recent_8k_score",
-    "earnings_call_tone",
+    # SEC Filings features (Form 4 insider buys/sells/amounts, 8-K material
+    # events, earnings call tone) REMOVED — pipeline produced too many false
+    # zeros and the technical setup is the dominant signal. Columns stay in
+    # the parquet schema for backward compat; trainer ignores them.
     # Earnings quality + sell-side view
     "earnings_beat_rate",
     "analyst_rating",
@@ -193,16 +189,12 @@ _FALLBACK: dict[str, float] = {
     # Fase 5: sinais de qualidade e sentimento
     "consecutive_red_days": 3.0,      # 3 dias consecutivos — neutro
     "ma_200d_ratio": 0.90,            # 10% below MA200 — typical dip
-    "insider_buy_recent": 0.0,         # sem compra insider — caso mais comum
-    "insider_sell_recent": 0.0,        # no insider sale — most common case
+    # SEC Filings fallbacks (insider, 8-K, earnings call tone) REMOVED.
+    # Columns retained in some legacy parquets as NaN; trainer no longer
+    # references them.
     "earnings_beat_rate": 0.50,        # 50% — neutro (random)
     "analyst_rating": 2.5,             # entre Buy e Hold — neutro
     "short_interest_pct": 0.05,        # 5% — typical short interest
-    # Phase 5b: advanced signals
-    "insider_buy_amount_score": 0.0,   # no insider buys — most common case
-    "insider_sell_amount_score": 0.0,  # no insider sales — most common case
-    "recent_8k_score": 0.0,            # no recent 8-K or neutral
-    "earnings_call_tone": float("nan"),  # NaN = call not available; XGBoost learns split direction for missing data
     # Sector-conditioned features (v4.2)
     "rsi_sector_adjusted": 0.0,       # 0 = RSI na norma do sector (sem sinal de oversold)
     "vix_sector_signal": 0.0,         # 0 = VIX neutro ou sector tipo desconhecido
@@ -273,9 +265,7 @@ FEATURE_SETS: dict[str, list[str]] = {
         "vwap_from_low_ratio", "volume_poc_ratio",
         # Volume flow
         "mfi_14", "volume_up_pct_20d",
-        # Insider activity (Form 4, PIT)
-        "insider_buy_recent", "insider_buy_amount_score",
-        "insider_sell_recent", "insider_sell_amount_score",
+        # SEC Filings (insider Form 4) removed — see DIP FEATURE_COLUMNS.
     ],
 }
 

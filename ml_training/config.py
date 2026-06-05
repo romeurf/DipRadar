@@ -10,7 +10,24 @@ from ml_features import get_feature_columns
 HORIZON_DAYS: int = 90                      # janela para close_90d / alpha_90d
 
 # Colunas alvo no parquet — geradas em data.py
-PRIMARY_TARGET: str = "alpha_90d"           # excesso de retorno sobre SPY em 90d
+#
+# Target choice (PRIMARY_TARGET):
+#   - "alpha_90d"           → excess return vs SPY (market-beta target).
+#                             Predicts stock-specific + sector + market
+#                             timing combined. Easier coverage (SPY exists
+#                             for every row) but mixes signals.
+#   - "alpha_vs_sector_90d" → excess return vs the matching sector ETF
+#                             (XLK, XLF, XLV...). Stock-specific target —
+#                             removes sector beta so the model learns
+#                             relative-strength within sector. Cleaner for
+#                             a stock-picking strategy.
+#
+# Switch via env var DIP_PRIMARY_TARGET. Default kept at alpha_90d for
+# backward compatibility with existing trained bundles; flip to
+# alpha_vs_sector_90d after rebuilding the parquet with both targets
+# populated (build_dip_dataset.py writes both since this change).
+import os as _os
+PRIMARY_TARGET: str = _os.getenv("DIP_PRIMARY_TARGET", "alpha_90d")
 RISK_TARGET: str = "max_drawdown_60d"       # drawdown máximo nos primeiros 60d
 
 # Threshold do calibrador: P(alpha_90d > CALIBRATOR_THRESHOLD)

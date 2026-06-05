@@ -88,12 +88,9 @@ _MIN_BARS_AHEAD = 95     # minimum trading days required for 90d target
 #                                post-2002
 _EDGAR_DEPENDENT_FEATURES: frozenset[str] = frozenset({
     "peg_ratio",
-    "insider_buy_recent",
-    "insider_buy_amount_score",
-    "insider_sell_recent",
-    "insider_sell_amount_score",
-    "recent_8k_score",
-    "earnings_call_tone",
+    # insider_buy/sell_*, recent_8k_score, earnings_call_tone REMOVED —
+    # SEC Filings (Form 4 / 8-K) pipeline retired. Columns stay in the
+    # parquet as NaN for schema stability; trainer no longer reads them.
     "earnings_beat_rate",
     "analyst_rating",
 })
@@ -397,10 +394,19 @@ def build_dip_dataset(
             # Step 7: target — alpha_90d
             try:
                 targets = _compute_alpha_targets_row(
-                    pd.Series(row_base), price_cache, spy_hist
+                    pd.Series(row_base),
+                    price_cache,
+                    spy_hist,
+                    sector_etf_cache=sector_etf_cache,
                 )
             except Exception:
-                targets = {"alpha_90d": float("nan"), "close_90d": float("nan"), "spy_close_90d": float("nan")}
+                targets = {
+                    "alpha_90d":            float("nan"),
+                    "alpha_vs_sector_90d":  float("nan"),
+                    "close_90d":            float("nan"),
+                    "spy_close_90d":        float("nan"),
+                    "sector_etf_close_90d": float("nan"),
+                }
             row_base.update(targets)
 
             if not math.isfinite(row_base.get("alpha_90d", float("nan"))):

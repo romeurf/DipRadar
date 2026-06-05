@@ -61,6 +61,11 @@ def load_base_dataset(parquet_path: Path) -> pd.DataFrame:
                  "return_3m", "return_6m", "spy_return_ref", "outcome_label", "price",
                  "market_cap", "market_cap_b", "_source", "source",
                  "alpha_60d", "close_60d", "close_90d", "spy_close_60d", "spy_close_90d",
+                 # Sector-relative alpha target (added when PRIMARY_TARGET =
+                 # "alpha_vs_sector_90d"). Listing in meta_cols ensures it
+                 # isn't accidentally treated as a feature.
+                 "alpha_vs_sector_90d", "sector_etf_close_90d",
+                 "alpha_vs_sector_90d_rank",
                  "max_return_60d", "max_drawdown_60d", "max_drawdown_20d", "max_drawdown_90d",
                  "alpha_60d_rank", "alpha_90d_rank", "label_upside_10_90d",
                  "label_downside_15_20d", "month_of_year"}
@@ -330,5 +335,13 @@ def build_dataset(base_df: pd.DataFrame, price_cache: dict[str, pd.DataFrame], e
         df_out = add_cross_sectional_rank(df_out, target_col="alpha_60d", rank_col="alpha_60d_rank")
         if "alpha_90d" in df_out.columns:
             df_out = add_cross_sectional_rank(df_out, target_col="alpha_90d", rank_col="alpha_90d_rank")
+        # Also rank the sector-relative target if present (build_dip_dataset.py
+        # writes alpha_vs_sector_90d alongside alpha_90d). The rank flavour is
+        # picked up automatically by the trainer when use_rank_target_train=True.
+        if "alpha_vs_sector_90d" in df_out.columns:
+            df_out = add_cross_sectional_rank(
+                df_out, target_col="alpha_vs_sector_90d",
+                rank_col="alpha_vs_sector_90d_rank",
+            )
     log.info(f"[data] dataset: shape={df_out.shape} | skipped={skipped}")
     return df_out, skipped

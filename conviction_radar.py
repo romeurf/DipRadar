@@ -511,63 +511,12 @@ def _detect_fundamental_breakdown(pos: ConvictionPosition, current_fund: dict) -
 
 
 def _detect_event_driven_signals(ticker: str) -> tuple[list[dict], list[str]]:
-    """Real-time event-driven structural signals.
-
-    Uses fundamental_signals.classify_recent_8k (item-code based scoring of
-    last 30d of 8-K filings) and earnings_call_tone (keyword-based sentiment
-    of last 90d of earnings calls). These are event-driven, time-sensitive
-    signals — a 4.02 restatement or 2.04 covenant default 8-K filing is
-    immediately actionable for a CORE position. Always bypasses never_sell.
-
-    Returns (triggers_to_emit, raw_signal_notes).
+    """Stub. SEC Filings event-driven signals (8-K classification, earnings
+    call tone) were removed when the broader SEC pipeline was retired. The
+    function is kept so callers in evaluate_conviction don't need import
+    rewrites; a future from-scratch SEC integration can refill this.
     """
-    triggers: list[dict] = []
-    notes: list[str] = []
-    try:
-        from fundamental_signals import classify_recent_8k, earnings_call_tone
-    except Exception:
-        return triggers, notes
-
-    # 8-K material adverse event detector
-    try:
-        score_8k = classify_recent_8k(ticker, lookback_days=30)
-        if score_8k is not None and not (isinstance(score_8k, float) and score_8k != score_8k):
-            notes.append(f"8-K(30d) score: {score_8k:+.2f}")
-            if score_8k <= -0.5:
-                triggers.append({
-                    "kind": "STRUCTURAL_DECLINE",
-                    "severity": "high",
-                    "message": (f"8-K adverso material nos últimos 30 dias "
-                                f"(score {score_8k:+.2f}). Possível restatement, "
-                                f"covenant default, ou evento operacional grave.")
-                })
-            elif score_8k <= -0.2:
-                triggers.append({
-                    "kind": "CORE_QUALITY_WARNING",
-                    "severity": "med",
-                    "message": (f"8-K negativo nos últimos 30 dias (score {score_8k:+.2f}). "
-                                f"Verifica natureza do filing antes de decidir.")
-                })
-    except Exception as e:
-        logger.debug(f"[conviction] 8-K signal {ticker}: {e}")
-
-    # Earnings call tone
-    try:
-        tone = earnings_call_tone(ticker, lookback_days=90)
-        if tone is not None and not (isinstance(tone, float) and tone != tone):
-            notes.append(f"Earnings tone(90d): {tone:+.2f}")
-            if tone <= -0.5:
-                triggers.append({
-                    "kind": "STRUCTURAL_DECLINE",
-                    "severity": "high",
-                    "message": (f"Earnings call tone muito negativo nos últimos 90d "
-                                f"({tone:+.2f}). Guidance cut, deterioração operacional, "
-                                f"ou linguagem defensiva da gestão.")
-                })
-    except Exception as e:
-        logger.debug(f"[conviction] earnings tone {ticker}: {e}")
-
-    return triggers, notes
+    return [], []
 
 
 # ─────────────────────────────────────────────────────────────────────────────

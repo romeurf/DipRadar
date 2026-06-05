@@ -147,12 +147,11 @@ TARGET_COLS: list[str] = [
 FASE5_COLS: list[str] = [
     "consecutive_red_days",      # PIT via price_cache
     "ma_200d_ratio",             # PIT via price_cache
-    "insider_buy_recent",        # PIT via SEC Form 4 — code A
-    "insider_buy_amount_score",  # PIT via SEC Form 4 — code A magnitude
-    "insider_sell_recent",       # PIT via SEC Form 4 — code D
-    "insider_sell_amount_score", # PIT via SEC Form 4 — code D magnitude
-    "recent_8k_score",           # PIT via SEC 8-K
-    "earnings_call_tone",        # PIT via SEC 8-K text
+    # SEC Filings features (insider_buy/sell, recent_8k_score, earnings_call_tone)
+    # were REMOVED — the EDGAR Form 4 pipeline produced too many false zeros
+    # (PIT data gap before chunk merge, parse failures cached as empty). User
+    # decision: ignore insider/8-K activity. The columns remain in the parquet
+    # written as NaN to preserve schema; trainer ignores them.
 ]
 
 # Features yfinance — valores actuais por ticker (não PIT, mas melhor que fallback 0)
@@ -500,18 +499,31 @@ def _compute_alpha_targets_row(
     price_cache: dict[str, pd.DataFrame],
     spy_hist: Optional[pd.DataFrame],
     horizon_days: int = 90,
+    sector_etf_cache: Optional[dict[str, pd.DataFrame]] = None,
 ) -> dict:
-    """Computa alpha_90d para uma linha do parquet.
+    """Computa alpha_90d (vs SPY) e alpha_vs_sector_90d (vs sector ETF).
 
-    alpha_90d = log1p(stock_return_90d) - log1p(spy_return_90d)
-    onde os retornos são calculados a partir do preço de entrada até T+90d.
+    Two targets so trainers can choose:
+      - alpha_90d: stock excess return vs SPY. The market-beta target.
+        Predicting it means predicting any combination of (stock-specific +
+        sector + market timing) signals.
+      - alpha_vs_sector_90d: stock excess return vs the matching sector ETF
+        (XLK, XLF, etc.). The stock-specific target. Removes sector beta so
+        the model learns "PDD vs other Consumer Cyclicals" rather than "PDD
+        vs total market". For a stock-picking strategy this is the cleaner
+        signal — sector rotations dominate raw returns and obscure the
+        per-name alpha the model should be learning.
+
+    Both are log-return differentials so they compose additively.
     """
     import math
 
     result = {
-        "alpha_90d":    float("nan"),
-        "close_90d":    float("nan"),
-        "spy_close_90d": float("nan"),
+        "alpha_90d":           float("nan"),
+        "alpha_vs_sector_90d": float("nan"),
+        "close_90d":           float("nan"),
+        "spy_close_90d":       float("nan"),
+        "sector_etf_close_90d": float("nan"),
     }
 
     ticker     = str(row["ticker"])
@@ -544,7 +556,9 @@ def _compute_alpha_targets_row(
     if not math.isfinite(stock_ret) or stock_ret <= -1.0 or abs(stock_ret) > 2.0:
         return result
 
-    # SPY no mesmo período
+    result["close_90d"] = round(stock_ret, 6)
+
+    # SPY no mesmo período → alpha_90d (market-beta target)
     if spy_hist is not None and not spy_hist.empty:
         spy_entry_slice = spy_hist[spy_hist.index <= alert_date]
         spy_exit_slice  = spy_hist[(spy_hist.index > alert_date) & (spy_hist.index <= exit_date)]
@@ -555,13 +569,27 @@ def _compute_alpha_targets_row(
                 spy_ret = spy_close / spy_price - 1.0
                 if math.isfinite(spy_ret) and -1.0 < spy_ret <= 1.0:
                     result["alpha_90d"]     = round(math.log1p(stock_ret) - math.log1p(spy_ret), 6)
-                    result["close_90d"]     = round(stock_ret, 6)
                     result["spy_close_90d"] = round(spy_ret, 6)
-                    return result
 
-    # Sem SPY: guarda só o retorno absoluto (alpha vs SPY não disponível)
-    if math.isfinite(stock_ret):
-        result["close_90d"] = round(stock_ret, 6)
+    # Sector ETF no mesmo período → alpha_vs_sector_90d (stock-specific target)
+    sector = str(row.get("sector", "") or "")
+    sec_etf = SECTOR_ETF.get(sector)
+    if sec_etf and sector_etf_cache and sec_etf in sector_etf_cache:
+        sec_hist = sector_etf_cache.get(sec_etf)
+        if sec_hist is not None and not sec_hist.empty:
+            sec_entry_slice = sec_hist[sec_hist.index <= alert_date]
+            sec_exit_slice  = sec_hist[(sec_hist.index > alert_date) & (sec_hist.index <= exit_date)]
+            if not sec_entry_slice.empty and not sec_exit_slice.empty:
+                sec_price = float(sec_entry_slice["Close"].iloc[-1])
+                sec_close = float(sec_exit_slice["Close"].iloc[-1])
+                if sec_price > 0:
+                    sec_ret = sec_close / sec_price - 1.0
+                    if math.isfinite(sec_ret) and -1.0 < sec_ret <= 1.0:
+                        result["alpha_vs_sector_90d"] = round(
+                            math.log1p(stock_ret) - math.log1p(sec_ret), 6
+                        )
+                        result["sector_etf_close_90d"] = round(sec_ret, 6)
+
     return result
 
 
@@ -628,61 +656,13 @@ def _compute_fase5_row(
     # "no 8-K events".
     _ticker_exchange = str(row.get("exchange", "") or "")
     _ticker_country  = str(row.get("country", "") or "")
+    # SEC Filings features (Form 4 insider, 8-K material events, earnings
+    # call tone) were removed from FASE5_COLS. Phase 5 now only emits the
+    # price-based signals computed above (consecutive_red_days, ma_200d_ratio).
+    # has_sec_filings gating is preserved so a future SEC integration can
+    # plug back in here without re-discovering the eligibility logic.
     if not _has_sec(ticker, _ticker_country, _ticker_exchange):
         return fv
-
-    try:
-        from fundamental_signals import (
-            insider_buy_recent,
-            insider_buy_amount_score,
-            insider_sell_recent,
-            insider_sell_amount_score,
-            classify_recent_8k,
-            earnings_call_tone as _earnings_tone,
-        )
-        # Form 4 insider buying. NaN stays if function returns None
-        # (lookup failed / no submissions cache); 0.0 is a REAL signal of
-        # "EDGAR responded with no Form 4 in window" — those are different.
-        try:
-            v = insider_buy_recent(ticker, lookback_days=30, as_of_date=alert_dt)
-            if v is not None and _math.isfinite(float(v)):
-                fv["insider_buy_recent"] = float(v)
-        except Exception:
-            pass
-        try:
-            score, _amt = insider_buy_amount_score(ticker, lookback_days=30, as_of_date=alert_dt)
-            if score is not None and _math.isfinite(float(score)):
-                fv["insider_buy_amount_score"] = float(score)
-        except Exception:
-            pass
-        # Sell side — parallel to buys. EDGAR-confirmed "no sales in window" =
-        # 0.0 (real signal). NaN = no coverage / fetch failed.
-        try:
-            v = insider_sell_recent(ticker, lookback_days=30, as_of_date=alert_dt)
-            if v is not None and _math.isfinite(float(v)):
-                fv["insider_sell_recent"] = float(v)
-        except Exception:
-            pass
-        try:
-            s_score, _s_amt = insider_sell_amount_score(ticker, lookback_days=30, as_of_date=alert_dt)
-            if s_score is not None and _math.isfinite(float(s_score)):
-                fv["insider_sell_amount_score"] = float(s_score)
-        except Exception:
-            pass
-        try:
-            score_8k = classify_recent_8k(ticker, lookback_days=60, as_of_date=alert_dt)
-            if score_8k is not None and _math.isfinite(float(score_8k)):
-                fv["recent_8k_score"] = float(score_8k)
-        except Exception:
-            pass
-        try:
-            tone = _earnings_tone(ticker, lookback_days=90, as_of_date=alert_dt)
-            if tone is not None and _math.isfinite(float(tone)):
-                fv["earnings_call_tone"] = float(tone)
-        except Exception:
-            pass
-    except ImportError as e:
-        log.debug(f"  fase5 EDGAR {ticker}: fundamental_signals not available ({e})")
 
     return fv
 

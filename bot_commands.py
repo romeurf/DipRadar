@@ -6477,118 +6477,57 @@ def _handle_command(text: str) -> None:
         except Exception as e:
             _reply(f"❌ Erro: `{e}`")
 
-    elif cmd in ("/admin_edgar_coverage", "/admin_edgar_history"):
-        # Verify EDGAR's submissions index for a ticker now reaches back
-        # historically (after the chunk-merge fix). Use this to confirm
-        # the chunk fetch works before running a full backfill on 1495
-        # tickers. Usage: /admin_edgar_coverage AAPL
-        if len(parts) < 2:
-            _reply("Uso: `/admin_edgar_coverage TICKER` (ex: `/admin_edgar_coverage AAPL`)")
-            return
-        ticker = parts[1].upper().strip()
-        try:
-            from fundamental_signals import _edgar_submissions
-            data = _edgar_submissions(ticker)
-            recent = (data.get("filings") or {}).get("recent") or {}
-            forms       = recent.get("form", []) or []
-            dates_filed = recent.get("filingDate", []) or []
-            n_total     = len(forms)
-            n_form4     = sum(1 for f in forms if f in ("4", "4/A"))
-            n_8k        = sum(1 for f in forms if f.startswith("8-K"))
-            n_10k       = sum(1 for f in forms if f.startswith("10-K"))
-            n_10q       = sum(1 for f in forms if f.startswith("10-Q"))
-            earliest    = dates_filed[-1] if dates_filed else "n/a"
-            latest      = dates_filed[0] if dates_filed else "n/a"
-            chunks_files = (data.get("filings") or {}).get("files", []) or []
-            n_chunks    = len(chunks_files)
-            merged      = bool(data.get("_chunks_merged"))
-            _reply(
-                f"📚 *EDGAR coverage — {ticker}*\n"
-                f"• Total filings: `{n_total:,}`\n"
-                f"• Form 4 (insider): `{n_form4:,}`\n"
-                f"• 8-K (material events): `{n_8k:,}`\n"
-                f"• 10-K (annual): `{n_10k:,}`\n"
-                f"• 10-Q (quarterly): `{n_10q:,}`\n"
-                f"• Date range: `{earliest}` → `{latest}`\n"
-                f"• Historical chunks: `{n_chunks}` "
-                f"({'✅ merged' if merged else '⚠️ not merged yet'})\n\n"
-                f"_Se earliest é ≤2009 e chunks≥1, PIT funciona para training_."
-            )
-        except Exception as e:
-            _reply(f"❌ Erro a buscar EDGAR para `{ticker}`: `{e}`")
-
-    elif cmd in ("/admin_form4_cache_status", "/admin_form4_cache"):
-        # Inspect (and optionally purge) the Form 4 disk cache. Before the
-        # caching fix, transient EDGAR rate-limit failures were cached as
-        # empty {} dicts and read forever as "no insider activity", producing
-        # fake zeros in insider_*_amount_score columns. The current code
-        # auto-purges {} on read, but a bulk purge is useful before kicking
-        # off a fresh backfill.
-        # Usage:
-        #   /admin_form4_cache_status         → counts only
-        #   /admin_form4_cache_status purge   → delete all empty {} entries
+    elif cmd in ("/admin_purge_sec_caches", "/admin_purge_sec"):
+        # Reclaim disk by removing the three SEC Filings cache directories
+        # that supported the now-removed Form 4 / 8-K / earnings call
+        # pipeline. Safe to run anytime — XBRL fundamentals (gross_margin,
+        # roe, etc.) use a different path (fundamentals_cache) which is
+        # NOT touched here.
         try:
             from pathlib import Path as _P
-            import json as _json
+            import shutil as _sh
 
-            _dd       = _P("/data") if _P("/data").exists() else _P("/tmp")
-            _cache_d  = _dd / "form4_cache"
-            if not _cache_d.exists():
-                _reply(f"ℹ️ `{_cache_d}` não existe ainda.")
-                return
-
-            files     = list(_cache_d.glob("*.json"))
-            n_total   = len(files)
-            n_empty   = 0
-            n_good    = 0
-            n_bad     = 0
-            for fp in files:
+            _dd     = _P("/data") if _P("/data").exists() else _P("/tmp")
+            targets = [
+                _dd / "form4_cache",
+                _dd / "edgar_submissions",
+                _dd / "edgar_submissions_chunks",
+            ]
+            lines = ["🧹 *SEC caches purge*"]
+            total_freed = 0
+            for d in targets:
+                if not d.exists():
+                    lines.append(f"• `{d.name}`: (não existe)")
+                    continue
+                # Sum size before delete for the report
+                size = 0
+                n    = 0
                 try:
-                    txt = fp.read_text(encoding="utf-8")
-                    obj = _json.loads(txt) if txt else None
-                    if not obj:
-                        n_empty += 1
+                    for fp in d.rglob("*"):
+                        if fp.is_file():
+                            try:
+                                size += fp.stat().st_size
+                                n    += 1
+                            except OSError:
+                                pass
+                except OSError:
+                    pass
+                try:
+                    _sh.rmtree(d)
+                    total_freed += size
+                    if size >= 1024**2:
+                        lines.append(f"• `{d.name}`: {size/1024**2:.1f} MB, {n:,} files → ✅ deleted")
                     else:
-                        n_good += 1
-                except Exception:
-                    n_bad += 1
+                        lines.append(f"• `{d.name}`: {size/1024:.0f} KB, {n:,} files → ✅ deleted")
+                except OSError as e:
+                    lines.append(f"• `{d.name}`: ⚠️ falha ({e})")
 
-            do_purge = len(parts) >= 2 and parts[1].lower() == "purge"
-            if do_purge:
-                n_purged = 0
-                for fp in files:
-                    try:
-                        txt = fp.read_text(encoding="utf-8")
-                        obj = _json.loads(txt) if txt else None
-                        if not obj:
-                            fp.unlink()
-                            n_purged += 1
-                    except Exception:
-                        try:
-                            fp.unlink()
-                            n_purged += 1
-                        except Exception:
-                            pass
-                _reply(
-                    f"🧹 *Form 4 cache — purge concluído*\n"
-                    f"Path: `{_cache_d}`\n"
-                    f"• Antes: `{n_total}` ficheiros (`{n_good}` reais, `{n_empty}` vazios, `{n_bad}` corruptos)\n"
-                    f"• Eliminados: `{n_purged}`\n"
-                    f"• Restantes: `{n_total - n_purged}` (parses reais — permanente)\n\n"
-                    f"_Próximo passo: `/admin_backfill_fundamentals` para refetch das filings._"
-                )
+            if total_freed >= 1024**2:
+                lines.append(f"\n*Total libertado: {total_freed/1024**2:.1f} MB*")
             else:
-                _reply(
-                    f"📦 *Form 4 cache — status*\n"
-                    f"Path: `{_cache_d}`\n"
-                    f"• Total: `{n_total}` ficheiros\n"
-                    f"• Parses reais: `{n_good}` (permanente)\n"
-                    f"• Vazios `{{}}` (legacy failure cache): `{n_empty}`\n"
-                    f"• Corruptos: `{n_bad}`\n\n"
-                    f"Vazios são lidos como 'sem atividade' pelas funções insider "
-                    f"e produzem zeros falsos. Para limpar:\n"
-                    f"`/admin_form4_cache_status purge`"
-                )
+                lines.append(f"\n*Total libertado: {total_freed/1024:.0f} KB*")
+            lines.append("_XBRL fundamentals (gross_margin, roe, fcf) usam path separado, intacto._")
+            _reply("\n".join(lines))
         except Exception as e:
             _reply(f"❌ Erro: `{e}`")
 

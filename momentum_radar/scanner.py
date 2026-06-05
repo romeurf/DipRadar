@@ -155,53 +155,20 @@ _SECTOR_ETF_CACHE: dict[str, float] = {}
 
 
 def _add_insider_signals_inline(signals: dict, ticker: str) -> None:
-    """Mutate `signals` to include the 4 PIT insider features.
+    """No-op stub. Insider features (Form 4) were removed from the model.
 
-    Used by the live scanner: only the candidates that pass quality/score
-    gates get the (relatively expensive) EDGAR queries. NaN propagation
-    matches the training-time semantics — no SEC coverage / non-US ticker
-    leaves all four insider keys as NaN, and the ml_predictor downstream
-    imputes to _FALLBACK so Ridge models don't NaN-out.
+    The previous implementation hit EDGAR per live candidate to populate
+    insider_buy_recent / insider_sell_recent / *_amount_score. With the
+    features no longer in FEATURE_COLS, the trainer ignores them and the
+    inference path doesn't need them either — but a future scanner that
+    reads signals.get("insider_*") would crash on a KeyError without the
+    setdefault. Keep the NaN-init for that defensive reason.
     """
     _NAN = float("nan")
     signals.setdefault("insider_buy_recent", _NAN)
     signals.setdefault("insider_buy_amount_score", _NAN)
     signals.setdefault("insider_sell_recent", _NAN)
     signals.setdefault("insider_sell_amount_score", _NAN)
-    try:
-        from fundamental_signals import (
-            insider_buy_recent as _ibr,
-            insider_buy_amount_score as _ibas,
-            insider_sell_recent as _isr,
-            insider_sell_amount_score as _isas,
-        )
-        import math as _m
-        try:
-            v = _ibr(ticker, lookback_days=30)
-            if v is not None and _m.isfinite(float(v)):
-                signals["insider_buy_recent"] = float(v)
-        except Exception:
-            pass
-        try:
-            s, _amt = _ibas(ticker, lookback_days=30)
-            if s is not None and _m.isfinite(float(s)):
-                signals["insider_buy_amount_score"] = float(s)
-        except Exception:
-            pass
-        try:
-            v = _isr(ticker, lookback_days=30)
-            if v is not None and _m.isfinite(float(v)):
-                signals["insider_sell_recent"] = float(v)
-        except Exception:
-            pass
-        try:
-            s, _amt = _isas(ticker, lookback_days=30)
-            if s is not None and _m.isfinite(float(s)):
-                signals["insider_sell_amount_score"] = float(s)
-        except Exception:
-            pass
-    except ImportError:
-        pass
 
 
 def _sector_return_20d(sector: str, _cache: dict = _SECTOR_ETF_CACHE) -> float:
