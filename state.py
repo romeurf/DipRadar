@@ -945,3 +945,149 @@ def get_flip_summary() -> dict:
         "n_open":        len(opened),
         "n_closed":      len(closed),
     }
+
+
+# ─── Sector Radar state machine ──────────────────────────────────────────────
+#
+# Each ticker tracks one state. Transitions fire alerts; staying in a state
+# is silent (hysteresis: trigger >70, reset <50). The Telegram alert layer
+# calls sector_state_should_alert() to decide whether to send.
+#
+# Schema per ticker:
+#   {
+#     "state":             "NEUTRAL" | "SELL_ZONE" | "BUY_ZONE",
+#     "last_alert_at":     ISO-8601 timestamp,
+#     "last_alert_state":  the state that triggered the last alert,
+#     "last_combined_buy": float — for diagnostic
+#     "last_exit_strength": float
+#     "updated_at":        ISO-8601 timestamp
+#   }
+#
+# State transitions (with hysteresis, threshold 70 / reset 50):
+#   NEUTRAL → SELL_ZONE  when exit_strength crosses ≥70   — ALERT
+#   NEUTRAL → BUY_ZONE   when combined_buy   crosses ≥70   — ALERT
+#   SELL_ZONE → NEUTRAL  when exit_strength drops <50      — SILENT (reset)
+#   BUY_ZONE  → NEUTRAL  when combined_buy   drops <50     — SILENT (reset)
+#
+# A ticker in NEUTRAL is mentioned in the daily morning report only if a
+# signal recently fired (handled at the report layer, not here).
+
+_SECTOR_STATE_FILE = "sector_radar_state.json"
+
+_BUY_TRIGGER_THRESHOLD  = 70.0
+_BUY_RESET_THRESHOLD    = 50.0
+_SELL_TRIGGER_THRESHOLD = 70.0
+_SELL_RESET_THRESHOLD   = 50.0
+
+
+def load_sector_states() -> dict:
+    """Return the full sector-state dict {ticker: state_record}."""
+    return _read(_SECTOR_STATE_FILE)
+
+
+def save_sector_states(states: dict) -> None:
+    _write(_SECTOR_STATE_FILE, states)
+
+
+def get_sector_state(ticker: str) -> dict:
+    """Return state record for a ticker, or a default NEUTRAL record."""
+    states = load_sector_states()
+    return states.get(ticker.upper(), {
+        "state":              "NEUTRAL",
+        "last_alert_at":      None,
+        "last_alert_state":   None,
+        "last_combined_buy":  0.0,
+        "last_exit_strength": 0.0,
+        "updated_at":         None,
+    })
+
+
+def update_sector_state(
+    ticker: str,
+    *,
+    combined_buy: float,
+    exit_strength: float,
+) -> tuple[str, bool]:
+    """Apply the FSM to the new scores and persist.
+
+    Returns ``(new_state, should_alert)``. The caller is responsible for
+    actually sending the alert when ``should_alert=True``.
+    """
+    states = load_sector_states()
+    t = ticker.upper()
+    record = states.get(t, {
+        "state":              "NEUTRAL",
+        "last_alert_at":      None,
+        "last_alert_state":   None,
+        "last_combined_buy":  0.0,
+        "last_exit_strength": 0.0,
+        "updated_at":         None,
+    })
+
+    prev_state = record.get("state", "NEUTRAL")
+    new_state = prev_state
+    should_alert = False
+
+    # Transition logic — hysteresis built in
+    if prev_state == "NEUTRAL":
+        # SELL takes priority: a holding flagged for exit is more urgent
+        # than another buy opportunity (defensive bias).
+        if exit_strength >= _SELL_TRIGGER_THRESHOLD:
+            new_state = "SELL_ZONE"
+            should_alert = True
+        elif combined_buy >= _BUY_TRIGGER_THRESHOLD:
+            new_state = "BUY_ZONE"
+            should_alert = True
+
+    elif prev_state == "SELL_ZONE":
+        if exit_strength < _SELL_RESET_THRESHOLD:
+            new_state = "NEUTRAL"
+            # Silent — signal faded
+        # else: stay in SELL_ZONE, no new alert
+
+    elif prev_state == "BUY_ZONE":
+        if combined_buy < _BUY_RESET_THRESHOLD:
+            new_state = "NEUTRAL"
+        # else: stay in BUY_ZONE, no new alert
+
+    # Persist
+    now_iso = datetime.utcnow().isoformat()
+    record["state"] = new_state
+    record["last_combined_buy"]  = float(combined_buy)
+    record["last_exit_strength"] = float(exit_strength)
+    record["updated_at"] = now_iso
+    if should_alert:
+        record["last_alert_at"]    = now_iso
+        record["last_alert_state"] = new_state
+
+    states[t] = record
+    save_sector_states(states)
+    return new_state, should_alert
+
+
+def reset_sector_state(ticker: str) -> bool:
+    """Force a ticker back to NEUTRAL (admin use; manually clear stuck state)."""
+    states = load_sector_states()
+    t = ticker.upper()
+    if t not in states:
+        return False
+    states[t]["state"] = "NEUTRAL"
+    states[t]["updated_at"] = datetime.utcnow().isoformat()
+    save_sector_states(states)
+    return True
+
+
+def sector_states_summary() -> dict:
+    """Counts per state across all tracked tickers — for diagnostics."""
+    states = load_sector_states()
+    counts = {"NEUTRAL": 0, "SELL_ZONE": 0, "BUY_ZONE": 0}
+    for record in states.values():
+        s = record.get("state", "NEUTRAL")
+        if s in counts:
+            counts[s] += 1
+    return {
+        "counts":   counts,
+        "n_total":  len(states),
+        "tickers_in_buy_zone":  [t for t, r in states.items() if r.get("state") == "BUY_ZONE"],
+        "tickers_in_sell_zone": [t for t, r in states.items() if r.get("state") == "SELL_ZONE"],
+    }

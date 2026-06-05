@@ -6385,6 +6385,226 @@ def _handle_command(text: str) -> None:
         except Exception as e:
             _reply(f"❌ Erro: `{e}`")
 
+    elif cmd in ("/sectors", "/sector_radar"):
+        # Daily sector radar snapshot — ranks all sector ETFs + broad
+        # market + thematic by combined buy score. Highlights BUY_ZONE
+        # and SELL_ZONE candidates (FSM state from state.py).
+        #
+        # Usage:
+        #   /sectors           → full snapshot (all monitored ETFs)
+        #   /sectors XLK       → deep dive on one ticker
+        #   /sectors holdings  → only the user's current ETF positions
+        try:
+            from sector_radar import rank_universe, fetch_and_compute
+            from etf_universe import (
+                all_monitored_tickers,
+                sector_etf_tickers,
+                broad_etf_tickers,
+                thematic_etf_tickers,
+                user_holding_proxies,
+                proxy_to_ucits,
+                get_etf,
+                display_ticker_pair,
+            )
+            import state as _st
+
+            # Deep-dive on one ticker
+            if len(parts) >= 2 and parts[1].upper() not in ("HOLDINGS",):
+                t = parts[1].upper().strip()
+                sig = fetch_and_compute(t)
+                if sig is None:
+                    _reply(f"⚠️ Sem dados para `{t}` (não está no universe ou yfinance falhou).")
+                    return
+                etf_meta = get_etf(t)
+                meta_line = ""
+                if etf_meta:
+                    if etf_meta.ucits_ticker:
+                        meta_line = (
+                            f"\n_{etf_meta.name}_\n"
+                            f"_UCITS equivalente: `{etf_meta.ucits_ticker}` ({etf_meta.ucits_name})_"
+                        )
+                    else:
+                        meta_line = f"\n_{etf_meta.name}_"
+
+                state_record = _st.get_sector_state(t)
+                fsm_state = state_record.get("state", "NEUTRAL")
+
+                # Apply the FSM (this updates persistent state too)
+                new_state, should_alert = _st.update_sector_state(
+                    t,
+                    combined_buy=sig.combined_buy,
+                    exit_strength=sig.exit_strength,
+                )
+
+                _reply(
+                    f"📊 *Sector Radar — {t}*{meta_line}\n"
+                    f"Preço: `${sig.price:.2f}` | RSI: `{sig.rsi_14:.0f}` | "
+                    f"DD 52w: `{sig.drawdown_52w*100:+.1f}%`\n"
+                    f"MA200 ratio: `{sig.ma200_ratio:.3f}` "
+                    f"({sig.days_below_ma200}d abaixo, {sig.dd_duration_months:.0f}m em DD)\n"
+                    f"Retorno: 30d `{sig.return_30d*100:+.1f}%` | "
+                    f"YTD `{sig.return_ytd*100:+.1f}%` | "
+                    f"vs SPY `{sig.return_ytd_vs_spy*100:+.1f}%`\n\n"
+                    f"*Scores* (0-100):\n"
+                    f"• Dip:           `{sig.dip_score:>5.1f}`\n"
+                    f"• Momentum:      `{sig.momentum_score:>5.1f}`\n"
+                    f"• Secular Risk:  `{sig.secular_risk:>5.1f}` "
+                    f"{'⚠️ value trap?' if sig.secular_risk > 60 else ''}\n"
+                    f"• Combined BUY:  `{sig.combined_buy:>5.1f}` "
+                    f"{'🔥' if sig.combined_buy > 70 else ''}\n"
+                    f"• Exit strength: `{sig.exit_strength:>5.1f}` "
+                    f"{'🛑' if sig.exit_strength > 70 else ''}\n"
+                    f"• Entry strength:`{sig.entry_strength:>5.1f}`\n\n"
+                    f"FSM state: `{fsm_state}` → `{new_state}` "
+                    f"{'(🚨 alert!)' if should_alert else ''}"
+                )
+                return
+
+            # Holdings-only mode
+            holdings_mode = len(parts) >= 2 and parts[1].upper() == "HOLDINGS"
+            if holdings_mode:
+                proxies = user_holding_proxies()
+                tickers = list(proxies.values())
+            else:
+                tickers = all_monitored_tickers()
+
+            results = rank_universe(tickers)
+            if not results:
+                _reply("⚠️ Sem resultados — verifica conectividade yfinance.")
+                return
+
+            # Apply FSM to each + collect transitions
+            transitions: list[str] = []
+            for sig in results:
+                new_state, should_alert = _st.update_sector_state(
+                    sig.ticker,
+                    combined_buy=sig.combined_buy,
+                    exit_strength=sig.exit_strength,
+                )
+                sig.state = new_state
+                if should_alert:
+                    transitions.append(
+                        f"{sig.ticker} → {new_state} "
+                        f"(buy={sig.combined_buy:.0f}, exit={sig.exit_strength:.0f})"
+                    )
+
+            # Build snapshot table
+            header = "📊 *Sector Radar — snapshot*" + (
+                " (holdings only)" if holdings_mode else ""
+            )
+            lines = [header, ""]
+            lines.append("```")
+            lines.append(
+                f"{'Ticker':>7} {'BUY':>5} {'Dip':>5} {'Mom':>5} "
+                f"{'Sec':>5} {'Exit':>5} {'State':>9}"
+            )
+            lines.append("─" * 53)
+            for sig in results[:20]:  # cap at 20 to avoid spam
+                state_marker = ""
+                if sig.state == "BUY_ZONE":
+                    state_marker = "🔥"
+                elif sig.state == "SELL_ZONE":
+                    state_marker = "🛑"
+                ucits = proxy_to_ucits(sig.ticker)
+                ucits_tag = f" ({ucits})" if ucits else ""
+                ticker_disp = sig.ticker + ucits_tag if holdings_mode else sig.ticker
+                lines.append(
+                    f"{ticker_disp:>7} "
+                    f"{sig.combined_buy:>5.0f} "
+                    f"{sig.dip_score:>5.0f} "
+                    f"{sig.momentum_score:>5.0f} "
+                    f"{sig.secular_risk:>5.0f} "
+                    f"{sig.exit_strength:>5.0f} "
+                    f"{state_marker + sig.state:>9}"
+                )
+            lines.append("```")
+
+            # Highlight transitions
+            if transitions:
+                lines.append("")
+                lines.append("*Alertas de transição:*")
+                for tr in transitions:
+                    lines.append(f"• {tr}")
+
+            # Summary footer
+            summary = _st.sector_states_summary()
+            lines.append("")
+            lines.append(
+                f"_Estados activos: BUY={summary['counts']['BUY_ZONE']}, "
+                f"SELL={summary['counts']['SELL_ZONE']}, "
+                f"NEUTRAL={summary['counts']['NEUTRAL']}._"
+            )
+            lines.append("_Detalhe de um ETF: `/sectors XLK`. Holdings: `/sectors holdings`._")
+
+            _reply("\n".join(lines))
+        except Exception as e:
+            _reply(f"❌ Sector radar falhou: `{e}`")
+
+    elif cmd in ("/holdings_etf_status", "/holdings_etf"):
+        # Focused view: just the user's UCITS holdings (SEC0, SXR8, IS3N)
+        # via their US proxies. Shows exit_strength and entry_strength so
+        # you can decide whether to trim / hold / re-enter.
+        try:
+            from sector_radar import fetch_and_compute
+            from etf_universe import user_holding_proxies, proxy_to_ucits, get_etf
+            import state as _st
+
+            proxies = user_holding_proxies()  # {UCITS: US_proxy}
+            if not proxies:
+                _reply("ℹ️ Nenhuma holding UCITS registada em `etf_universe.py`.")
+                return
+
+            lines = ["💼 *Holdings ETF status*", ""]
+            for ucits, us_proxy in proxies.items():
+                sig = fetch_and_compute(us_proxy)
+                if sig is None:
+                    lines.append(f"• `{ucits}` ({us_proxy}): ⚠️ sem dados")
+                    continue
+                state_record = _st.get_sector_state(us_proxy)
+                fsm_state = state_record.get("state", "NEUTRAL")
+
+                # Apply FSM (also persists)
+                new_state, should_alert = _st.update_sector_state(
+                    us_proxy,
+                    combined_buy=sig.combined_buy,
+                    exit_strength=sig.exit_strength,
+                )
+
+                state_emoji = {
+                    "NEUTRAL":   "⚪",
+                    "BUY_ZONE":  "🔥",
+                    "SELL_ZONE": "🛑",
+                }.get(new_state, "⚪")
+
+                action = "MANTER"
+                if new_state == "SELL_ZONE":
+                    action = "VENDER (sinal forte)"
+                elif sig.exit_strength > 50:
+                    action = "VIGIAR (deterioração)"
+                elif new_state == "BUY_ZONE":
+                    action = "REFORÇAR"
+
+                lines.append(
+                    f"*{ucits}* (via `{us_proxy}`) {state_emoji} `{new_state}`"
+                )
+                lines.append(
+                    f"  Preço: `${sig.price:.2f}` | RSI: `{sig.rsi_14:.0f}` | "
+                    f"DD 52w: `{sig.drawdown_52w*100:+.1f}%`"
+                )
+                lines.append(
+                    f"  Exit: `{sig.exit_strength:.0f}` | "
+                    f"Entry: `{sig.entry_strength:.0f}` | "
+                    f"Combined BUY: `{sig.combined_buy:.0f}`"
+                )
+                lines.append(f"  → *{action}*")
+                if should_alert:
+                    lines.append(f"  🚨 *Transição: {fsm_state} → {new_state}*")
+                lines.append("")
+
+            _reply("\n".join(lines).rstrip())
+        except Exception as e:
+            _reply(f"❌ Holdings status falhou: `{e}`")
+
     elif cmd in ("/admin_disk_usage", "/admin_disk"):
         # Quick breakdown of what's eating the 5GB Railway volume.
         # Useful before launching a multi-hour backfill that will grow
