@@ -48,16 +48,20 @@ class TickerSignals:
     secular_risk: float
     exit_strength: float
     entry_strength: float
+    caution_score: float       # early-warning: deterioration starting
 
     # Raw metrics used in scoring (kept for display / debugging)
     drawdown_52w: float        # negative number, e.g. -0.18 = -18%
     rsi_14: float
     ma200_ratio: float          # price / MA200 (1.0 = at MA)
     ma50_ratio: float           # price / MA50
+    return_7d: float
+    return_7d_vs_spy: float     # relative strength 7d (early warning)
     return_30d: float
     return_30d_vs_spy: float    # relative strength 30d (this - SPY)
     return_ytd: float
     return_ytd_vs_spy: float    # excess return YTD vs SPY
+    pullback_from_recent_peak: float  # negative — drop from last 30d high
     days_below_ma200: int       # consecutive days price < MA200
     dd_duration_months: float   # months since last 52w high
 
@@ -366,6 +370,90 @@ def _compute_exit_strength(
     return max(0.0, min(100.0, score))
 
 
+def _compute_caution_score(
+    return_7d: float,
+    return_7d_vs_spy: float,
+    return_30d: float,
+    return_30d_peak_60d: float,
+    return_30d_vs_spy: float,
+    return_30d_vs_spy_peak_60d: float,
+    pullback_from_recent_peak: float,
+    rsi_14: float,
+    rsi_peak_30d: float,
+    rsi_5d_ago: float,
+    price_now: float,
+    price_5d_ago: float,
+) -> float:
+    """0-100 early-warning score. Mix of LEADING and LAGGING signals.
+
+    Reactive caution (price already dropped 7%+) saves you from the next
+    leg down but you've already lost. This version blends:
+
+    LEADING signals — fire BEFORE significant drop:
+      L1. Momentum deceleration: 30d return decayed > 50% from 60d peak
+      L2. Relative strength decay: 30d vs SPY dropped > 50% from peak
+      L3. RSI rollover from recent peak (was >65, now -10pts lower)
+      L4. RSI bearish divergence: price up but RSI down over 5d
+
+    LAGGING signals — confirm an underway pullback:
+      L5. Pullback from recent peak ≥ 4%
+      L6. 7-day return < -2%
+      L7. 7-day relative strength loss > 1pp vs SPY
+
+    Trade-off: leading signals catch tops earlier but have more false
+    positives (sometimes momentum re-accelerates after deceleration). The
+    multi-signal gate (≥2 conditions) reduces noise. Use with scaling
+    exit policy — trim incrementally as caution rises, don't exit all at
+    once on a single trigger.
+    """
+    score = 0.0
+    n_signals = 0
+
+    # ── LEADING signals ──────────────────────────────────────────────
+    # L1. Momentum deceleration — was strong, halved
+    if return_30d_peak_60d > 0.08 and return_30d < return_30d_peak_60d * 0.5:
+        score += 20.0
+        n_signals += 1
+
+    # L2. Relative strength decaying — leadership fading
+    if (return_30d_vs_spy_peak_60d > 0.05
+            and return_30d_vs_spy < return_30d_vs_spy_peak_60d * 0.4):
+        score += 20.0
+        n_signals += 1
+
+    # L3. RSI rollover from recent peak (was hot, cooling)
+    if (rsi_peak_30d - rsi_14) >= 10.0 and rsi_14 < 65 and rsi_peak_30d > 65:
+        score += 15.0
+        n_signals += 1
+
+    # L4. RSI bearish divergence over 5d — price up, RSI down
+    if price_now > price_5d_ago and rsi_14 < rsi_5d_ago - 3:
+        score += 15.0
+        n_signals += 1
+
+    # ── LAGGING signals (confirming) ─────────────────────────────────
+    # L5. Pullback from recent peak ≥ 4% — drop starting in earnest
+    if pullback_from_recent_peak < -0.04:
+        score += 15.0
+        n_signals += 1
+
+    # L6. 7-day return < -2% — short-term weakness
+    if return_7d < -0.02:
+        score += 10.0
+        n_signals += 1
+
+    # L7. 7-day relative strength loss > 1pp — underperforming acutely
+    if return_7d_vs_spy < -0.01:
+        score += 15.0
+        n_signals += 1
+
+    # Multi-signal gate: ≥2 conditions to fire — single signals are noise
+    if n_signals < 2:
+        return 0.0
+
+    return max(0.0, min(100.0, score))
+
+
 def _compute_entry_strength(
     closes: pd.Series,
     rsi_14: float,
@@ -470,12 +558,62 @@ def compute_signals(
     ma200_ratio = current / ma200_last if ma200_last > 0 else 1.0
     ma50_ratio = current / ma50_last if ma50_last > 0 else 1.0
 
-    # Returns
+    # Returns — short and medium term
+    return_7d = current / float(closes.iloc[-7]) - 1.0 if len(closes) >= 7 else 0.0
     return_30d = current / float(closes.iloc[-30]) - 1.0 if len(closes) >= 30 else 0.0
 
-    # SPY 30d return + YTD for relative strength calcs
+    # Pullback from recent peak (last 30d high) — early warning that the
+    # rally is fading, even if the 52w high is far away.
+    if len(closes) >= 30:
+        recent_peak = float(closes.iloc[-30:].max())
+        pullback_from_recent_peak = current / recent_peak - 1.0 if recent_peak > 0 else 0.0
+    else:
+        pullback_from_recent_peak = 0.0
+
+    # RSI and price snapshots — for divergence detection (5d ago)
+    price_5d_ago = float(closes.iloc[-6]) if len(closes) >= 6 else current
+    if len(closes) >= 20:
+        rsi_5d_ago = _rsi(closes.iloc[:-5])
+        if not math.isfinite(rsi_5d_ago):
+            rsi_5d_ago = rsi_14
+    else:
+        rsi_5d_ago = rsi_14
+
+    # Rolling RSI history over last 30 days — for rollover detection
+    rsi_peak_30d = rsi_14
+    if len(closes) >= 45:
+        rsi_history = []
+        for i in range(0, 30):
+            window = closes.iloc[-(i + 14 + 1):len(closes) - i] if i > 0 else closes
+            if len(window) >= 15:
+                rsi_at_i = _rsi(window)
+                if math.isfinite(rsi_at_i):
+                    rsi_history.append(rsi_at_i)
+        if rsi_history:
+            rsi_peak_30d = max(rsi_history)
+
+    # Rolling 30d returns over last 60 days — for momentum-deceleration
+    # detection. The peak shows the strongest 30d window in recent memory;
+    # if current 30d is much lower, momentum is decaying even if still
+    # positive in absolute terms.
+    return_30d_peak_60d = return_30d
+    if len(closes) >= 90:
+        rolling_30d_returns = []
+        for i in range(0, 60):
+            end = len(closes) - i
+            if end >= 30:
+                ret_i = float(closes.iloc[end - 1] / closes.iloc[end - 30] - 1.0)
+                if math.isfinite(ret_i):
+                    rolling_30d_returns.append(ret_i)
+        if rolling_30d_returns:
+            return_30d_peak_60d = max(rolling_30d_returns)
+
+    # SPY-relative returns (7d + 30d + YTD) and peak relative strength
     spy_return_30d = 0.0
+    spy_return_7d = 0.0
+    return_7d_vs_spy = 0.0
     return_30d_vs_spy = 0.0
+    return_30d_vs_spy_peak_60d = 0.0  # populated inside try if SPY available
     return_ytd = 0.0
     return_ytd_vs_spy = 0.0
     try:
@@ -486,7 +624,10 @@ def compute_signals(
             return_ytd = float(ytd_slice.iloc[-1] / ytd_slice.iloc[0] - 1.0)
         if spy_hist is not None and not spy_hist.empty:
             spy_closes = spy_hist["Close"].astype(float)
-            # SPY 30d return (matches ticker's 30d window)
+            # SPY 7d + 30d returns (for relative strength at both horizons)
+            if len(spy_closes) >= 7:
+                spy_return_7d = float(spy_closes.iloc[-1] / spy_closes.iloc[-7] - 1.0)
+                return_7d_vs_spy = return_7d - spy_return_7d
             if len(spy_closes) >= 30:
                 spy_return_30d = float(spy_closes.iloc[-1] / spy_closes.iloc[-30] - 1.0)
                 return_30d_vs_spy = return_30d - spy_return_30d
@@ -495,6 +636,25 @@ def compute_signals(
             if len(spy_ytd) >= 2:
                 spy_ret_ytd = float(spy_ytd.iloc[-1] / spy_ytd.iloc[0] - 1.0)
                 return_ytd_vs_spy = return_ytd - spy_ret_ytd
+            # Peak relative strength over last 60d — for leadership-decay
+            # detection. If we were leading by +8pp and now only +3pp,
+            # leadership is fading even though we're still outperforming.
+            return_30d_vs_spy_peak_60d = return_30d_vs_spy
+            if len(closes) >= 90 and len(spy_closes) >= 90:
+                rs_history = []
+                # Align lengths from the tail
+                n = min(len(closes), len(spy_closes))
+                tk_tail = closes.iloc[-n:].reset_index(drop=True)
+                sp_tail = spy_closes.iloc[-n:].reset_index(drop=True)
+                for i in range(0, 60):
+                    end = n - i
+                    if end >= 30:
+                        tk_ret = float(tk_tail.iloc[end - 1] / tk_tail.iloc[end - 30] - 1.0)
+                        sp_ret = float(sp_tail.iloc[end - 1] / sp_tail.iloc[end - 30] - 1.0)
+                        if math.isfinite(tk_ret) and math.isfinite(sp_ret):
+                            rs_history.append(tk_ret - sp_ret)
+                if rs_history:
+                    return_30d_vs_spy_peak_60d = max(rs_history)
     except Exception as e:
         logger.debug(f"[sector_radar] returns calc failed for {ticker}: {e}")
 
@@ -518,12 +678,31 @@ def compute_signals(
         closes, rsi_14, ma200_ratio, drawdown_52w, ma50, ma200
     )
     entry_strength = _compute_entry_strength(closes, rsi_14, return_30d, ma50, ma200)
+    caution_score = _compute_caution_score(
+        return_7d=return_7d,
+        return_7d_vs_spy=return_7d_vs_spy,
+        return_30d=return_30d,
+        return_30d_peak_60d=return_30d_peak_60d,
+        return_30d_vs_spy=return_30d_vs_spy,
+        return_30d_vs_spy_peak_60d=return_30d_vs_spy_peak_60d,
+        pullback_from_recent_peak=pullback_from_recent_peak,
+        rsi_14=rsi_14,
+        rsi_peak_30d=rsi_peak_30d,
+        rsi_5d_ago=rsi_5d_ago,
+        price_now=current,
+        price_5d_ago=price_5d_ago,
+    )
 
-    # Combined BUY score: stronger of dip/momentum, downweighted by secular risk.
-    # Half-weight on secular ensures that a strong dip in a moderately-risky
-    # sector (e.g., 80 dip + 40 secular = 60) still beats a weak signal in a
-    # clean sector (e.g., 60 dip + 0 secular = 60), with edge to clean.
-    combined_buy = max(dip_score, momentum_score) - 0.5 * secular_risk
+    # Combined BUY score: stronger of dip/momentum, penalised by both
+    # SECULAR risk (might be dying) and CAUTION (actively deteriorating).
+    # The caution penalty ensures a sector in active pullback doesn't get
+    # a "REFORÇAR" recommendation just because its 30d trend is still up —
+    # buying into the drop is exactly what we want to avoid.
+    combined_buy = (
+        max(dip_score, momentum_score)
+        - 0.5 * secular_risk
+        - 0.5 * caution_score
+    )
     combined_buy = max(0.0, min(100.0, combined_buy))
 
     return TickerSignals(
@@ -534,14 +713,18 @@ def compute_signals(
         secular_risk=round(secular_risk, 1),
         exit_strength=round(exit_strength, 1),
         entry_strength=round(entry_strength, 1),
+        caution_score=round(caution_score, 1),
         drawdown_52w=round(drawdown_52w, 4),
         rsi_14=round(rsi_14, 1) if math.isfinite(rsi_14) else float("nan"),
         ma200_ratio=round(ma200_ratio, 4),
         ma50_ratio=round(ma50_ratio, 4),
+        return_7d=round(return_7d, 4),
+        return_7d_vs_spy=round(return_7d_vs_spy, 4),
         return_30d=round(return_30d, 4),
         return_30d_vs_spy=round(return_30d_vs_spy, 4),
         return_ytd=round(return_ytd, 4),
         return_ytd_vs_spy=round(return_ytd_vs_spy, 4),
+        pullback_from_recent_peak=round(pullback_from_recent_peak, 4),
         days_below_ma200=int(days_below_ma200),
         dd_duration_months=round(dd_duration_months, 1),
         combined_buy=round(combined_buy, 1),

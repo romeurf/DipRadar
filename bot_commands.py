@@ -6456,8 +6456,11 @@ def _handle_command(text: str) -> None:
                     f"📊 *Sector Radar — {t}*{meta_line}\n"
                     f"Preço: `${sig.price:.2f}` | RSI: `{sig.rsi_14:.0f}` | "
                     f"DD 52w: `{sig.drawdown_52w*100:+.1f}%`\n"
+                    f"Pullback do peak 30d: `{sig.pullback_from_recent_peak*100:+.1f}%`\n"
                     f"MA200 ratio: `{sig.ma200_ratio:.3f}` "
                     f"({sig.days_below_ma200}d abaixo, {sig.dd_duration_months:.0f}m em DD)\n"
+                    f"Retorno 7d: `{sig.return_7d*100:+.1f}%` "
+                    f"(vs SPY: `{sig.return_7d_vs_spy*100:+.1f}pp`)\n"
                     f"Retorno 30d: `{sig.return_30d*100:+.1f}%` "
                     f"(vs SPY: `{sig.return_30d_vs_spy*100:+.1f}pp`)\n"
                     f"Retorno YTD: `{sig.return_ytd*100:+.1f}%` "
@@ -6467,6 +6470,8 @@ def _handle_command(text: str) -> None:
                     f"• Momentum:      `{sig.momentum_score:>5.1f}`\n"
                     f"• Secular Risk:  `{sig.secular_risk:>5.1f}` "
                     f"{'⚠️ value trap?' if sig.secular_risk > 60 else ''}\n"
+                    f"• Caution:       `{sig.caution_score:>5.1f}` "
+                    f"{'⚠️ deterioração ativa' if sig.caution_score > 50 else ''}\n"
                     f"• Combined BUY:  `{sig.combined_buy:>5.1f}` "
                     f"{'🔥' if sig.combined_buy > 70 else ''}\n"
                     f"• Exit strength: `{sig.exit_strength:>5.1f}` "
@@ -6512,8 +6517,8 @@ def _handle_command(text: str) -> None:
             lines = [header, ""]
             lines.append("```")
             lines.append(
-                f"{'Ticker':>7} {'BUY':>5} {'Dip':>5} {'Mom':>5} "
-                f"{'Sec':>5} {'Exit':>5} {'State':>9}"
+                f"{'Ticker':>7} {'BUY':>4} {'Dip':>4} {'Mom':>4} "
+                f"{'Sec':>4} {'Caut':>4} {'Exit':>4} {'State':>9}"
             )
             lines.append("─" * 53)
             for sig in results[:20]:  # cap at 20 to avoid spam
@@ -6522,17 +6527,21 @@ def _handle_command(text: str) -> None:
                     state_marker = "🔥"
                 elif sig.state == "SELL_ZONE":
                     state_marker = "🛑"
+                # Caution overlay: even if state=BUY_ZONE, caution>50 means
+                # "be careful, deterioration in progress" — show ⚠️
+                caut_marker = "⚠️" if sig.caution_score >= 50 else ""
                 ucits = proxy_to_ucits(sig.ticker)
                 ucits_tag = f" ({ucits})" if ucits else ""
                 ticker_disp = sig.ticker + ucits_tag if holdings_mode else sig.ticker
                 lines.append(
                     f"{ticker_disp:>7} "
-                    f"{sig.combined_buy:>5.0f} "
-                    f"{sig.dip_score:>5.0f} "
-                    f"{sig.momentum_score:>5.0f} "
-                    f"{sig.secular_risk:>5.0f} "
-                    f"{sig.exit_strength:>5.0f} "
-                    f"{state_marker + sig.state:>9}"
+                    f"{sig.combined_buy:>4.0f} "
+                    f"{sig.dip_score:>4.0f} "
+                    f"{sig.momentum_score:>4.0f} "
+                    f"{sig.secular_risk:>4.0f} "
+                    f"{sig.caution_score:>4.0f} "
+                    f"{sig.exit_strength:>4.0f} "
+                    f"{caut_marker + state_marker + sig.state:>9}"
                 )
             lines.append("```")
 
@@ -6597,11 +6606,47 @@ def _handle_command(text: str) -> None:
                     "SELL_ZONE": "🛑",
                 }.get(new_state, "⚪")
 
+                # SCALING EXIT POLICY — trim incrementally as caution rises.
+                # Instead of binary hold-or-sell, the action scales with
+                # caution_score. Rationale: leading signals catch tops earlier
+                # but have false positives; trimming gradually captures most
+                # of the upside while reducing exposure as deterioration
+                # confirms. By the time exit_strength fires, you've already
+                # cut to ~25% of original position — losing the FINAL leg
+                # down costs you less.
+                #
+                # Caution bands:
+                #   0-29:  no action — uptrend healthy
+                #   30-49: VIGIAR — leading signals starting, watch
+                #   50-69: TRIM 25% — multiple signals confirming
+                #   70-89: TRIM 50% — broad confluence of deterioration
+                #   90+:   TRIM 75% — pre-exit, brace for structural
                 action = "MANTER"
+                action_detail = ""
                 if new_state == "SELL_ZONE":
-                    action = "VENDER (sinal forte)"
+                    action = "VENDER POSIÇÃO RESTANTE (sinal estrutural)"
                 elif sig.exit_strength > 50:
-                    action = "VIGIAR (deterioração)"
+                    action = "VIGIAR — exit a aproximar-se"
+                elif sig.caution_score >= 90:
+                    action = "TRIM 75% — pre-exit"
+                    action_detail = (
+                        f" (caution {sig.caution_score:.0f}, "
+                        f"pullback {sig.pullback_from_recent_peak*100:+.1f}%)"
+                    )
+                elif sig.caution_score >= 70:
+                    action = "TRIM 50% — confluência forte"
+                    action_detail = (
+                        f" (pullback {sig.pullback_from_recent_peak*100:+.1f}% "
+                        f"+ rel.str 7d {sig.return_7d_vs_spy*100:+.1f}pp)"
+                    )
+                elif sig.caution_score >= 50:
+                    action = "TRIM 25% — deterioração confirmada"
+                    action_detail = (
+                        f" (caution {sig.caution_score:.0f}, "
+                        f"pullback {sig.pullback_from_recent_peak*100:+.1f}%)"
+                    )
+                elif sig.caution_score >= 30:
+                    action = "VIGIAR — leading signals ativos"
                 elif new_state == "BUY_ZONE":
                     action = "REFORÇAR"
 
@@ -6613,11 +6658,17 @@ def _handle_command(text: str) -> None:
                     f"DD 52w: `{sig.drawdown_52w*100:+.1f}%`"
                 )
                 lines.append(
-                    f"  Exit: `{sig.exit_strength:.0f}` | "
-                    f"Entry: `{sig.entry_strength:.0f}` | "
-                    f"Combined BUY: `{sig.combined_buy:.0f}`"
+                    f"  7d: `{sig.return_7d*100:+.1f}%` "
+                    f"(vs SPY `{sig.return_7d_vs_spy*100:+.1f}pp`) | "
+                    f"Pullback peak 30d: `{sig.pullback_from_recent_peak*100:+.1f}%`"
                 )
-                lines.append(f"  → *{action}*")
+                lines.append(
+                    f"  Caution: `{sig.caution_score:.0f}` | "
+                    f"Exit: `{sig.exit_strength:.0f}` | "
+                    f"Entry: `{sig.entry_strength:.0f}` | "
+                    f"BUY: `{sig.combined_buy:.0f}`"
+                )
+                lines.append(f"  → *{action}*{action_detail}")
                 if should_alert:
                     lines.append(f"  🚨 *Transição: {fsm_state} → {new_state}*")
                 lines.append("")
