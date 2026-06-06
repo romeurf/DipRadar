@@ -43,7 +43,11 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 _INITIAL_LOOKBACK_DAYS = 250
-_COST_BPS = 0.001
+# Trading 212 EUR ETFs have zero commission — only bid-ask spread is real
+# cost. For liquid UCITS (SXR8, IS3N, IUIT) spread is ~1-3 bps. For
+# thematic (SEC0) ~5-10 bps. 5 bps is a conservative average for the
+# universe; reality is likely lower for the broad-market positions.
+_COST_BPS = 0.0005
 _DRIFT_TRIGGER = 0.10  # rebalance if any position's weight drifts >10% from target
 
 
@@ -263,15 +267,22 @@ def backtest_rotation(
         for t in positions:
             ticker_holdings_days[t] = ticker_holdings_days.get(t, 0) + 1
 
-        # Rebalance check — monthly checkpoint OR forced (top-N membership change)
+        # Rebalance check — monthly checkpoint ONLY.
+        #
+        # The original design had a weekly forced-rebalance trigger that
+        # caught between-checkpoint regime changes, but the 1.4y test
+        # showed it produced 363 trades — 44-day average holding period
+        # vs. the ~30-day expected from pure monthly. That's nearly weekly
+        # turnover, which inflates cost and starts to look like noise
+        # trading. Pure monthly aligns with the AQR/Asness momentum
+        # literature (which validates monthly cadence) and dramatically
+        # reduces cost drag. If a sector falls hard between checkpoints,
+        # the next monthly will rotate out — at most one month of stale
+        # holding.
         is_checkpoint = date in checkpoints
         force_rebal = False
 
-        # Forced rebalance check between checkpoints: only at weekly intervals
-        # to keep simulation fast. Approximation: every 5 trading days.
-        is_weekly_check = (i % 5 == 0) and not is_checkpoint
-
-        if is_checkpoint or is_weekly_check:
+        if is_checkpoint:
             # Compute signals for all available tickers as of this date
             ticker_signals = {}
             for t, h in histories.items():
@@ -295,13 +306,8 @@ def backtest_rotation(
 
             new_top_set = set(new_top)
 
-            # Check if rebalance needed
-            if is_checkpoint:
-                # Always rebalance at monthly checkpoint
-                force_rebal = True
-            elif is_weekly_check and new_top_set != current_top and current_top:
-                # Forced: top-N changed
-                force_rebal = True
+            # Monthly checkpoint — always rebalance to new top-N
+            force_rebal = True
 
             if force_rebal and new_top:
                 # Liquidate current positions

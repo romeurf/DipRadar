@@ -107,7 +107,12 @@ THEMATIC_ETFS: list[ETF] = [
 # ─── Risk-off / alternative / factor ETFs ───────────────────────────────────
 # Added for the rotation strategy so the radar always has somewhere to
 # go even when equity is being sold off (gold/bonds), and to capture
-# factor-driven opportunities (momentum, quality, dividends, BTC).
+# factor-driven opportunities (momentum, quality, dividends).
+#
+# IBIT (Bitcoin) was originally included but is currently excluded — its
+# launch in Jan 2024 limits common-history backtests to ~1.4 years,
+# making it impossible to validate the strategy across a real bear
+# market. Add IBIT back once it has ≥3 years of clean OHLCV (~Jan 2027).
 ALT_ETFS: list[ETF] = [
     ETF("GLD", "SPDR Gold Trust", "alternative",
         ucits_ticker="IGLN", ucits_name="iShares Physical Gold ETC"),
@@ -117,8 +122,6 @@ ALT_ETFS: list[ETF] = [
         ucits_ticker="XDEM", ucits_name="Xtrackers MSCI World Momentum UCITS"),
     ETF("SCHD", "Schwab US Dividend Equity", "factor",
         ucits_ticker=None, ucits_name=None),  # No clean UCITS, use US ticker
-    ETF("IBIT", "iShares Bitcoin Trust", "alternative",
-        ucits_ticker="BTCE", ucits_name="ETC Group Physical Bitcoin"),
 ]
 
 
