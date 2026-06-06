@@ -947,6 +947,7 @@ def get_flip_summary() -> dict:
     }
 
 
+
 # ─── Sector Radar state machine ──────────────────────────────────────────────
 #
 # Each ticker tracks one state. Transitions fire alerts; staying in a state

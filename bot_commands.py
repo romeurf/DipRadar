@@ -1037,73 +1037,107 @@ def _handle_admin_test_feed(parts: list[str]) -> None:
 
 # ── /sync_portfolio ──────────────────────────────────────────────────────────────
 
+_VALID_BUCKETS_SYNC = ("CORE", "ROTATION", "MOMENTUM", "DIP")
+
+
 def _handle_sync_portfolio(parts: list[str]) -> None:
-    """/sync_portfolio — bulk-import existing holdings into the Telegram ledger.
+    """/sync_portfolio — bulk-import existing holdings + optional bucket tag.
 
     Use case: you already own positions (from before the bot, or from a broker
     export). /buy registers AND debits liquidity (purchase semantics). This
     command registers WITHOUT touching liquidity — for migrating existing
-    holdings.
+    holdings — and assigns a strategy bucket so /cash, rotation engine, etc.
+    know how each position should be managed.
 
     Uso:
-      /sync_portfolio                                    → ver estado actual
-      /sync_portfolio NVO:25:85.50 MSFT:12:410          → importar várias
-      /sync_portfolio NVO:25:85.50 --no-conviction      → não criar convicção
+      /sync_portfolio                                       → ver estado actual
+      /sync_portfolio NVO:159.59:48.0:CORE                  → 1 posição com bucket
+      /sync_portfolio NVO:159.59:48.0:CORE MSFT:5.82:336:CORE → várias
+      /sync_portfolio NVO:159.59:48.0:CORE --note=conviction → com nota
+      /sync_portfolio NVO:25:85.50 --no-conviction          → legacy (bucket=CORE)
 
-    Formato: TICKER:shares:preço_médio_usd
+    Formato:  TICKER:shares:preço_médio_usd[:BUCKET]
 
-    Cada ticker importado:
-      1. Vai para _cache["positions"] via portfolio.register_existing_position
-         (sem afectar liquidez — assume-se que já é tua há tempo)
-      2. Auto-cria convicção via conviction_radar (excepto ETFs/PPR/foreign
-         e --no-conviction). Tipo auto-classificado por ML.
+    Buckets:  CORE | ROTATION | MOMENTUM | DIP
+      CORE     — hold-for-life quality compounders (NVO, MSFT, VICI, ...)
+      ROTATION — geridos pelo sector rotation engine (SEC0, SXR8, IS3N, ...)
+      MOMENTUM — DIP positions que recuperaram, aguardam exit signal
+      DIP      — DIP positions ativas, aguardam recovery target
 
-    Idempotente: tickers já no ledger são saltados (não sobrescrevem).
-    Para alterar preço médio: /sell + /buy, ou /conviction transition.
+    Idempotente: re-correr para o mesmo ticker UPDATE o bucket sem duplicar.
 
     As env vars HOLDING_* foram DESCONTINUADAS — usa este comando ou /buy.
     """
-    from portfolio import get_positions, register_existing_position
+    from portfolio import get_positions, register_existing_position, _cache, _ensure_cache, _flush
 
     no_conviction = "--no-conviction" in parts
-    entries = [p for p in parts[1:] if p != "--no-conviction"]
+    entries = [p for p in parts[1:] if not p.startswith("--")]
 
-    # Sem argumentos → mostrar estado actual
+    # Sem argumentos → mostrar estado actual agrupado por bucket
     if not entries:
         positions = get_positions()
         if not positions:
             _reply(
                 "💼 *Carteira vazia.*\n\n"
-                "Para bulk-import (sem afectar liquidez):\n"
-                "`/sync_portfolio NVO:25:85.50 MSFT:12:410 UBER:30:65`\n\n"
+                "Para bulk-import com buckets (sem afectar liquidez):\n"
+                "`/sync_portfolio NVO:159.59:48.0:CORE SEC0:94:18:ROTATION`\n\n"
+                "Formato: `TICKER:shares:preço_médio_usd:BUCKET`\n"
+                "Buckets: `CORE | ROTATION | MOMENTUM | DIP`\n\n"
                 "Para comprar (debita liquidez):\n"
-                "`/buy TICKER PREÇO SHARES`\n\n"
-                "_Formato bulk: TICKER:shares:preço_médio_usd_"
+                "`/buy TICKER PREÇO SHARES`"
             )
             return
-        lines = [f"💼 *Carteira actual* ({len(positions)} posições)"]
+
+        # Group by bucket (category field). Map legacy categories to buckets.
+        def _normalise_bucket(cat: str) -> str:
+            c = (cat or "").upper().strip()
+            if c in _VALID_BUCKETS_SYNC:
+                return c
+            # Legacy mappings: ETF, Manual import → require user to update
+            return "UNCATEGORIZED"
+
+        by_bucket: dict[str, list] = {}
+        total_cost = 0.0
         for sym in sorted(positions.keys()):
             pos = positions[sym]
-            lines.append(
-                f"  • *{sym}*: {pos.get('shares', 0):g} @ ${pos.get('avg_price', 0):.2f}"
-                f" _({pos.get('category', '?')})_"
-            )
-        lines += [
+            bucket = _normalise_bucket(pos.get("category", ""))
+            by_bucket.setdefault(bucket, []).append((sym, pos))
+            total_cost += pos.get("total_cost", 0)
+
+        lines = [
+            f"💼 *Carteira* — {len(positions)} posições, cost basis €{total_cost:.2f}",
             "",
-            "_Para adicionar mais: `/sync_portfolio TICK:shares:preço ...`_",
-            "_Para remover: `/sell TICKER PREÇO`_",
         ]
+        for bucket in ("CORE", "ROTATION", "MOMENTUM", "DIP", "UNCATEGORIZED"):
+            if bucket not in by_bucket:
+                continue
+            entries_b = by_bucket[bucket]
+            bucket_cost = sum(p.get("total_cost", 0) for _, p in entries_b)
+            bucket_pct = (bucket_cost / total_cost * 100) if total_cost > 0 else 0.0
+            lines.append(f"*{bucket}* — €{bucket_cost:.2f} ({bucket_pct:.1f}%)")
+            for sym, pos in entries_b:
+                lines.append(
+                    f"  • `{sym}`: {pos.get('shares', 0):g} @ ${pos.get('avg_price', 0):.2f}"
+                    f" (cost €{pos.get('total_cost', 0):.2f})"
+                )
+            lines.append("")
+
+        if "UNCATEGORIZED" in by_bucket:
+            lines.append(
+                "_⚠️ Posições UNCATEGORIZED: re-corre `/sync_portfolio TICKER:shares:price:BUCKET` "
+                "para classificar._"
+            )
         _reply("\n".join(lines))
         return
 
     # Parse entries
-    parsed: list[tuple[str, float, float]] = []
+    parsed: list[tuple[str, float, float, str]] = []  # (ticker, shares, price, bucket)
     errors: list[str] = []
     for entry in entries:
         try:
             bits = entry.split(":")
             if len(bits) < 3:
-                errors.append(f"`{entry}` — falta preço (TICKER:shares:preço)")
+                errors.append(f"`{entry}` — falta preço (TICKER:shares:preço[:BUCKET])")
                 continue
             ticker = bits[0].upper().strip()
             shares = float(bits[1])
@@ -1111,7 +1145,18 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
             if shares <= 0 or price <= 0:
                 errors.append(f"`{entry}` — shares e preço têm de ser > 0")
                 continue
-            parsed.append((ticker, shares, price))
+            # Optional 4th token: bucket
+            bucket = ""
+            if len(bits) >= 4:
+                bucket_candidate = bits[3].upper().strip()
+                if bucket_candidate not in _VALID_BUCKETS_SYNC:
+                    errors.append(
+                        f"`{entry}` — bucket inválido `{bucket_candidate}`. "
+                        f"Usa: {', '.join(_VALID_BUCKETS_SYNC)}"
+                    )
+                    continue
+                bucket = bucket_candidate
+            parsed.append((ticker, shares, price, bucket))
         except (ValueError, IndexError):
             errors.append(f"`{entry}` — erro a parsear")
 
@@ -1119,18 +1164,32 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
         _reply("⚠️ *Sem entradas válidas:*\n" + "\n".join(f"  • {e}" for e in errors))
         return
 
-    imported: list[tuple[str, float, float]] = []
+    imported: list[tuple[str, float, float, str]] = []  # +bucket
+    updated:  list[tuple[str, str]] = []                  # (ticker, bucket) when bucket changes
     already:  list[str] = []
     convictions_created: list[tuple[str, str]] = []
     conviction_errors:   list[tuple[str, str]] = []
 
-    for ticker, shares, price in parsed:
+    for ticker, shares, price, bucket in parsed:
         try:
-            result = register_existing_position(ticker, price, shares)
+            result = register_existing_position(ticker, price, shares, category=bucket)
             if result["action"] == "imported":
-                imported.append((ticker, shares, price))
+                imported.append((ticker, shares, price, bucket or "(no bucket)"))
             else:
-                already.append(ticker)
+                # Already exists — if user passed a bucket, UPDATE it in place
+                # (the existing register_existing_position is idempotent and
+                # doesn't overwrite, so we do the bucket update directly).
+                if bucket:
+                    _ensure_cache()
+                    existing = _cache["positions"].get(ticker)
+                    if existing is not None and existing.get("category") != bucket:
+                        existing["category"] = bucket
+                        _flush()
+                        updated.append((ticker, bucket))
+                    else:
+                        already.append(ticker)
+                else:
+                    already.append(ticker)
         except Exception as e:
             errors.append(f"`{ticker}` — registo falhou: {e}")
             continue
@@ -1161,10 +1220,15 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
     lines = ["💼 *Bulk-import resultado*"]
     if imported:
         lines.append(f"\n✅ *{len(imported)} posições importadas* (sem alteração de liquidez):")
-        for t, s, p in imported:
-            lines.append(f"  • *{t}*: {s:g} @ ${p:.2f}")
+        for t, s, p, b in imported:
+            bucket_tag = f" → `{b}`" if b and b != "(no bucket)" else ""
+            lines.append(f"  • *{t}*: {s:g} @ ${p:.2f}{bucket_tag}")
+    if updated:
+        lines.append(f"\n🔄 *{len(updated)} buckets actualizados*:")
+        for t, b in updated:
+            lines.append(f"  • *{t}* → `{b}`")
     if already:
-        lines.append(f"\n♻️ *{len(already)} já no ledger* (saltadas):")
+        lines.append(f"\n♻️ *{len(already)} já no ledger* (sem alteração):")
         lines.append("  " + ", ".join(already))
     if convictions_created:
         lines.append(f"\n🧠 *{len(convictions_created)} convicções auto-criadas:*")
@@ -6978,6 +7042,106 @@ def _handle_command(text: str) -> None:
             _reply("\n".join(lines).rstrip())
         except Exception as e:
             _reply(f"❌ Holdings status falhou: `{e}`")
+
+    elif cmd in ("/core_picks", "/admin_core_picks", "/core_top"):
+        # Scan the Core universe (~300 quality compounders) and return the
+        # current top-scored opportunities. Uses core_radar.scan_core_universe
+        # which combines the ML model (champion=GBR, CV_IC=+0.118) with
+        # rule-based gates (rev_growth, gross_margin) and dip detection.
+        #
+        # Without this, the Core radar runs blind — alerts fire automatically
+        # but there's no way to query "who's the best Core buy today?".
+        # The /cash command depends on this to suggest Core deployments.
+        #
+        # Usage:
+        #   /core_picks            → top 10 with default min_score=60
+        #   /core_picks 15         → top 15
+        #   /core_picks 10 50      → top 10 with min_score=50 (more lenient)
+        try:
+            from core_radar import scan_core_universe
+
+            top_n = 10
+            min_score = 60.0
+            if len(parts) >= 2:
+                try:
+                    top_n = max(1, min(50, int(parts[1])))
+                except (ValueError, IndexError):
+                    pass
+            if len(parts) >= 3:
+                try:
+                    min_score = float(parts[2])
+                except (ValueError, IndexError):
+                    pass
+
+            _reply(
+                f"🏛 *Core picks a calcular* — top {top_n}, min score {min_score:.0f}\n"
+                f"_~30-60s para varrer 300 tickers + scoring ML..._"
+            )
+
+            def _run_core_scan():
+                try:
+                    opportunities = scan_core_universe(min_score=min_score)
+                    if not opportunities:
+                        _reply(
+                            f"ℹ️ Nenhum ticker do universo Core "
+                            f"com score ≥ {min_score:.0f}. "
+                            f"Mercado pode estar overheated — espera ou baixa floor."
+                        )
+                        return
+
+                    # Already sorted by -score in scan_core_universe
+                    top = opportunities[:top_n]
+
+                    lines = [
+                        f"🏛 *Core Picks — top {len(top)} de {len(opportunities)} opportunities*",
+                        f"_Score ≥ {min_score:.0f}, source: {'ML' if any(o.get('score_source') == 'ml' for o in top) else 'heurístico'}_",
+                        f"",
+                        f"```",
+                        f"{'Ticker':>7} {'Score':>6} {'Preço':>8} {'DD52w':>7} {'Yld%':>5} {'Sugerido':>9}",
+                        f"─" * 55,
+                    ]
+                    for opp in top:
+                        ticker = str(opp.get("ticker", "?"))[:6]
+                        score = float(opp.get("score", 0))
+                        price = float(opp.get("current_price", 0))
+                        dd52w = float(opp.get("dd_from_52w_high", 0)) * 100
+                        yld = float(opp.get("annual_yield_pct", 0))
+                        sug_eur = float(opp.get("suggested_eur", 0))
+                        lines.append(
+                            f"{ticker:>7} "
+                            f"{score:>6.0f} "
+                            f"${price:>7.2f} "
+                            f"{dd52w:>+6.1f}% "
+                            f"{yld:>4.1f}% "
+                            f"€{sug_eur:>7.0f}"
+                        )
+                    lines.append("```")
+
+                    # Notes on the top picks (first 3)
+                    lines.append("")
+                    lines.append("*Notas* (top 3):")
+                    for opp in top[:3]:
+                        ticker = opp.get("ticker", "?")
+                        note = opp.get("note", "")
+                        if note:
+                            lines.append(f"• `{ticker}`: {note}")
+
+                    lines.append("")
+                    lines.append(
+                        f"_Sugerido EUR é a alocação base. Em /cash o sistema "
+                        f"vai ajustar conforme conviction + capital disponível._"
+                    )
+
+                    _reply("\n".join(lines))
+                except Exception as _e:
+                    _reply(f"❌ Core scan falhou: `{_e}`")
+
+            import threading
+            threading.Thread(
+                target=_run_core_scan, daemon=True, name="core-picks"
+            ).start()
+        except Exception as e:
+            _reply(f"❌ Erro: `{e}`")
 
     elif cmd in ("/admin_disk_usage", "/admin_disk"):
         # Quick breakdown of what's eating the 5GB Railway volume.
