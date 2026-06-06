@@ -1050,13 +1050,17 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
     know how each position should be managed.
 
     Uso:
-      /sync_portfolio                                       → ver estado actual
-      /sync_portfolio NVO:159.59:48.0:CORE                  → 1 posição com bucket
-      /sync_portfolio NVO:159.59:48.0:CORE MSFT:5.82:336:CORE → várias
-      /sync_portfolio NVO:159.59:48.0:CORE --note=conviction → com nota
-      /sync_portfolio NVO:25:85.50 --no-conviction          → legacy (bucket=CORE)
+      /sync_portfolio                                              → ver estado actual
+      /sync_portfolio NVO:159.59:48.0:CORE                         → 1 posição com bucket
+      /sync_portfolio LIF:10.16:32.6:MOMENTUM:2026-02-15           → MOMENTUM com entry_date
+      /sync_portfolio NVO:159.59:48.0:CORE MSFT:5.82:336:CORE      → várias
 
-    Formato:  TICKER:shares:preço_médio_usd[:BUCKET]
+    Formato:  TICKER:shares:preço_médio[:BUCKET[:ENTRY_DATE]]
+
+    ENTRY_DATE (YYYY-MM-DD) é OPCIONAL mas RECOMENDADO para MOMENTUM/DIP —
+    sem ela, o trailing_high anchora no current price (perde info do peak
+    real que viste durante a tua posse). Com ela, fetcha max(price) desde
+    entry_date e ancora corretamente. Para CORE não importa (sem auto-exit).
 
     Buckets:  CORE | ROTATION | MOMENTUM | DIP
       CORE     — hold-for-life quality compounders (NVO, MSFT, VICI, ...)
@@ -1131,13 +1135,14 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
         return
 
     # Parse entries
-    parsed: list[tuple[str, float, float, str]] = []  # (ticker, shares, price, bucket)
+    # Tuple: (ticker, shares, price, bucket, entry_date_iso_or_empty)
+    parsed: list[tuple[str, float, float, str, str]] = []
     errors: list[str] = []
     for entry in entries:
         try:
             bits = entry.split(":")
             if len(bits) < 3:
-                errors.append(f"`{entry}` — falta preço (TICKER:shares:preço[:BUCKET])")
+                errors.append(f"`{entry}` — falta preço (TICKER:shares:preço[:BUCKET[:ENTRY_DATE]])")
                 continue
             ticker = bits[0].upper().strip()
             shares = float(bits[1])
@@ -1156,7 +1161,21 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
                     )
                     continue
                 bucket = bucket_candidate
-            parsed.append((ticker, shares, price, bucket))
+            # Optional 5th token: entry_date (YYYY-MM-DD)
+            entry_date = ""
+            if len(bits) >= 5:
+                from datetime import date as _date
+                try:
+                    entry_date = bits[4].strip()
+                    # Validate format
+                    _date.fromisoformat(entry_date)
+                except ValueError:
+                    errors.append(
+                        f"`{entry}` — entry_date `{bits[4]}` inválido. "
+                        f"Usa YYYY-MM-DD."
+                    )
+                    continue
+            parsed.append((ticker, shares, price, bucket, entry_date))
         except (ValueError, IndexError):
             errors.append(f"`{entry}` — erro a parsear")
 
@@ -1170,7 +1189,7 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
     convictions_created: list[tuple[str, str]] = []
     conviction_errors:   list[tuple[str, str]] = []
 
-    for ticker, shares, price, bucket in parsed:
+    for ticker, shares, price, bucket, entry_date in parsed:
         try:
             result = register_existing_position(ticker, price, shares, category=bucket)
             if result["action"] == "imported":
@@ -1194,8 +1213,13 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
             errors.append(f"`{ticker}` — registo falhou: {e}")
             continue
 
-        # Auto-create conviction (unless --no-conviction or deny-list)
+        # Auto-create conviction (unless --no-conviction or deny-list).
+        # Skip for ROTATION: those are ETFs managed by the sector rotation
+        # engine. yfinance also doesn't have UCITS tickers (SEC0, SXR8,
+        # IS3N) so attempting conviction creation just produces 404 spam.
         if no_conviction:
+            continue
+        if bucket == "ROTATION":
             continue
         try:
             import conviction_radar as cr
@@ -1204,12 +1228,51 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
                 continue
             if cr.get_by_ticker(ticker):
                 continue  # already a conviction
+
+            # If the bucket is explicitly specified, use it directly.
+            # MOMENTUM positions need a trailing_high that reflects the
+            # ACTUAL peak since entry, not just current price (e.g., LIF
+            # is +20% from cost but may have hit +30% before pulling
+            # back — trailing stop must anchor on the actual peak).
             current = cr._fetch_price(ticker, fallback=price)
             hist    = cr._fetch_price_history(ticker, period="6mo")
-            auto_type = cr._classify_type_from_signals(ticker, current, hist)
+            if bucket:
+                # User provided explicit bucket, honour it
+                auto_type = bucket if bucket in ("DIP", "MOMENTUM", "CORE") else \
+                            cr._classify_type_from_signals(ticker, current, hist)
+            else:
+                auto_type = cr._classify_type_from_signals(ticker, current, hist)
+
+            # Backfill trailing_high — anchor on REAL peak since purchase.
+            # The naïve "max of last 6 months" approach is wrong: if you
+            # bought LIF 2 months ago, a peak from 6 months ago that you
+            # never owned is irrelevant. Worse: it would set the trailing
+            # stop below current price, firing an instant SELL.
+            #
+            # The correct anchor is:
+            #   • entry_date provided → max(close) FROM entry_date to today
+            #   • entry_date NOT provided → just use current price (safe
+            #     default; the daily monitor will update trailing_high as
+            #     price climbs)
+            trailing_high_val = None
+            if auto_type == "MOMENTUM":
+                trailing_high_val = current  # safe default
+                if entry_date and hist is not None and not hist.empty and "Close" in hist.columns:
+                    try:
+                        import pandas as _pd
+                        entry_ts = _pd.Timestamp(entry_date)
+                        # Filter history to dates from entry onwards
+                        hist_since = hist[hist.index >= entry_ts]
+                        if not hist_since.empty:
+                            since_max = float(hist_since["Close"].max())
+                            if since_max > 0:
+                                trailing_high_val = max(since_max, current)
+                    except Exception:
+                        pass  # fallback to current price
+
             cr.add_conviction(
                 ticker, price, shares, auto_type,
-                trailing_high = current if auto_type == "MOMENTUM" else None,
+                trailing_high = trailing_high_val,
                 note          = "imported via /sync_portfolio",
             )
             convictions_created.append((ticker, auto_type))
@@ -7042,6 +7105,302 @@ def _handle_command(text: str) -> None:
             _reply("\n".join(lines).rstrip())
         except Exception as e:
             _reply(f"❌ Holdings status falhou: `{e}`")
+
+    elif cmd in ("/cash", "/allocation", "/alloc"):
+        # Main allocation flow. Triggered when user has new cash to deploy
+        # (typically monthly inflow). Performs a full scan across all 3
+        # active radars (Rotation, Core, DIP) and proposes a literal
+        # allocation per ticker, deduplicated against existing holdings.
+        #
+        # Usage:
+        #   /cash 1050           → propose allocation for €1050
+        #   /cash 1050 --no-rot  → skip rotation (use for testing)
+        #
+        # Output: literal action list ("Buy €X of TICKER UCITS"), plus
+        # remainder kept in cash with rationale.
+        if len(parts) < 2:
+            _reply(
+                "Uso: `/cash <amount_eur>`\n"
+                "Ex: `/cash 1050` — propor allocation para €1050.\n\n"
+                "_Antes de correr, garante que `/sync_portfolio` está atualizado._"
+            )
+            return
+        try:
+            cash_amount = float(parts[1])
+            if cash_amount <= 0:
+                _reply("⚠️ Amount tem que ser > 0.")
+                return
+        except ValueError:
+            _reply(f"❌ `{parts[1]}` não é um número válido.")
+            return
+
+        skip_rotation = "--no-rot" in parts or "--skip-rotation" in parts
+
+        _reply(
+            f"💰 *Allocation €{cash_amount:.2f}* — scan iniciado\n"
+            f"_~30-60s: rotation top-3 + Core picks + DIP queue..._"
+        )
+
+        def _run_allocation():
+            try:
+                from portfolio import get_positions
+
+                # ── State current portfolio ──────────────────────────────
+                positions = get_positions()
+                portfolio_by_bucket: dict = {
+                    "CORE": [], "ROTATION": [], "MOMENTUM": [], "DIP": [],
+                    "UNCATEGORIZED": [],
+                }
+                portfolio_cost = 0.0
+                for sym, pos in positions.items():
+                    bucket = (pos.get("category") or "").upper()
+                    if bucket not in portfolio_by_bucket:
+                        bucket = "UNCATEGORIZED"
+                    portfolio_by_bucket[bucket].append((sym, pos))
+                    portfolio_cost += pos.get("total_cost", 0.0)
+
+                # ── Reserve fixed buckets ────────────────────────────────
+                # Rotation gets €350/mo (33% of typical €1050)
+                # The rest is discretionary based on signals
+                rotation_budget = min(cash_amount * 0.33, 350.0)
+                remaining = cash_amount - rotation_budget if not skip_rotation else cash_amount
+
+                proposal_lines: list[str] = []
+                actions: list[str] = []  # final action list
+
+                # ── Rotation: compute current top-3 + propose ────────────
+                rotation_state_msg = ""
+                if not skip_rotation:
+                    try:
+                        from sector_radar import rank_universe
+                        from etf_universe import all_monitored_tickers, get_etf
+
+                        all_t = all_monitored_tickers()
+                        ranked = rank_universe(all_t)
+                        # Filter to top-3 dedupe-ish (use top 5, manually pick best 3 unique themes)
+                        top_3 = ranked[:3] if ranked else []
+
+                        if top_3:
+                            # Existing ROTATION holdings: what do we hold?
+                            held_rotation = {
+                                sym: pos for sym, pos in portfolio_by_bucket["ROTATION"]
+                            }
+
+                            # Map US tickers in top-3 to UCITS where possible
+                            top_3_lines = []
+                            for sig in top_3:
+                                etf = get_etf(sig.ticker)
+                                ucits = etf.ucits_ticker if etf and etf.ucits_ticker else sig.ticker
+                                marker = "✓ tens" if ucits in held_rotation else ""
+                                top_3_lines.append(
+                                    f"  • #{ranked.index(sig)+1} `{sig.ticker}` → "
+                                    f"`{ucits}` (score {sig.combined_buy:.0f}) {marker}"
+                                )
+
+                            # Determine actions
+                            # 1. Existing rotation holdings not in top-3 → suggest sell
+                            # 2. New top-3 not held → buy with budget
+                            # 3. Allocate rotation_budget by score across new entries
+                            top_3_ucits = []
+                            for sig in top_3:
+                                etf = get_etf(sig.ticker)
+                                ucits = etf.ucits_ticker if etf and etf.ucits_ticker else sig.ticker
+                                top_3_ucits.append((ucits, sig.combined_buy))
+
+                            rot_actions = []
+                            # Sells (rotation holdings not in current top-3)
+                            for sym, pos in held_rotation.items():
+                                if sym not in [u for u, _ in top_3_ucits]:
+                                    rot_actions.append(
+                                        f"  🔻 SELL `{sym}` "
+                                        f"({pos.get('shares', 0):g} shares, "
+                                        f"cost €{pos.get('total_cost', 0):.2f}) — saiu do top-3"
+                                    )
+
+                            # Buys: score-weighted allocation of rotation_budget
+                            total_score = sum(s for _, s in top_3_ucits) or 1.0
+                            for ucits, score in top_3_ucits:
+                                allocation = rotation_budget * (score / total_score)
+                                marker = "(top-up)" if ucits in held_rotation else "(NEW)"
+                                rot_actions.append(
+                                    f"  ✅ BUY `{ucits}` €{allocation:.0f} {marker} "
+                                    f"(score {score:.0f}, peso {score/total_score*100:.0f}%)"
+                                )
+
+                            proposal_lines.append("🔄 *ROTATION* — top-3 actual:")
+                            proposal_lines.extend(top_3_lines)
+                            proposal_lines.append("")
+                            proposal_lines.append("   Ações rotation:")
+                            proposal_lines.extend(rot_actions)
+                            proposal_lines.append("")
+                            actions.extend([f"ROTATION: {a.strip()}" for a in rot_actions])
+                        else:
+                            proposal_lines.append("🔄 *ROTATION*: sem rankings disponíveis (yfinance failed?)")
+                            remaining += rotation_budget  # add back to discretionary
+                    except Exception as _e:
+                        proposal_lines.append(f"⚠️ *ROTATION*: erro a scoring — `{_e}`")
+                        remaining += rotation_budget
+
+                # ── Core picks ──────────────────────────────────────────
+                try:
+                    from core_radar import scan_core_universe
+                    core_opps = scan_core_universe(min_score=70.0)
+                    if core_opps:
+                        top_core = core_opps[:3]
+                        proposal_lines.append(
+                            f"🏛 *CORE* — {len(core_opps)} signals com score ≥70:"
+                        )
+                        for opp in top_core:
+                            sug_eur = opp.get("suggested_eur", 0)
+                            proposal_lines.append(
+                                f"  • `{opp['ticker']}` score {opp['score']:.0f} "
+                                f"(${opp.get('current_price', 0):.2f}, "
+                                f"sugerido €{sug_eur:.0f})"
+                            )
+                        # Suggest deploying up to 50% of remaining to top Core pick
+                        if remaining > 0:
+                            top_opp = top_core[0]
+                            core_deploy = min(remaining * 0.5, top_opp.get("suggested_eur", 0))
+                            if core_deploy >= 50:
+                                proposal_lines.append("")
+                                proposal_lines.append(
+                                    f"   Ação Core: ✅ BUY `{top_opp['ticker']}` €{core_deploy:.0f}"
+                                )
+                                actions.append(
+                                    f"CORE: BUY {top_opp['ticker']} €{core_deploy:.0f} "
+                                    f"(score {top_opp['score']:.0f})"
+                                )
+                                remaining -= core_deploy
+                        proposal_lines.append("")
+                    else:
+                        proposal_lines.append(
+                            "🏛 *CORE*: sem signals ≥70 esta semana — sem deploy"
+                        )
+                        proposal_lines.append("")
+                except Exception as _e:
+                    proposal_lines.append(f"⚠️ *CORE*: erro a scoring — `{_e}`")
+
+                # ── DIP alerts (NEW buys) + existing position exit checks ──
+                try:
+                    import state as _st
+                    today_alerts = _st.load_alerts()
+                    if today_alerts:
+                        proposal_lines.append(
+                            f"🎯 *DIP* (entradas novas): {len(today_alerts)} alertas hoje:"
+                        )
+                        for ticker in list(today_alerts)[:5]:
+                            proposal_lines.append(f"  • `{ticker}` (corre `/analisar {ticker}` para detalhes)")
+                        proposal_lines.append("")
+                    else:
+                        proposal_lines.append(
+                            "🎯 *DIP* (entradas novas): 0 alertas activos hoje"
+                        )
+                        proposal_lines.append("")
+                except Exception as _e:
+                    proposal_lines.append(f"⚠️ *DIP*: erro a verificar entradas — `{_e}`")
+
+                # ── EXIT signals em posições MOMENTUM/DIP existentes ─────
+                # Importante: o conviction_radar monitoriza diariamente,
+                # mas user pode ter perdido o alerta. Aqui re-verifica
+                # explicitamente para mostrar status no /cash output.
+                try:
+                    import conviction_radar as cr
+                    momentum_positions = portfolio_by_bucket.get("MOMENTUM", []) + \
+                                         portfolio_by_bucket.get("DIP", [])
+                    exit_warnings = []
+                    for sym, pos in momentum_positions:
+                        try:
+                            conv = cr.get_by_ticker(sym)
+                            if conv is None:
+                                continue
+                            current_price = cr._fetch_price(sym, fallback=pos.get("avg_price", 0))
+                            if current_price <= 0:
+                                continue
+                            trailing_high = float(getattr(conv, "trailing_high", 0) or 0)
+                            if trailing_high <= 0:
+                                continue
+                            pct_from_peak = (current_price - trailing_high) / trailing_high
+                            # Threshold: 8% below trailing high triggers WARNING
+                            if pct_from_peak <= -0.08:
+                                exit_warnings.append({
+                                    "ticker":         sym,
+                                    "trailing_high":  trailing_high,
+                                    "current":        current_price,
+                                    "pct_from_peak":  pct_from_peak,
+                                    "shares":         pos.get("shares", 0),
+                                    "cost":           pos.get("total_cost", 0),
+                                })
+                        except Exception:
+                            continue
+
+                    if exit_warnings:
+                        proposal_lines.append(
+                            f"🛑 *EXIT WARNINGS* — {len(exit_warnings)} posições "
+                            f"abaixo de trailing stop:"
+                        )
+                        for w in exit_warnings:
+                            proposal_lines.append(
+                                f"  ⚠️ `{w['ticker']}`: peak ${w['trailing_high']:.2f} → "
+                                f"current ${w['current']:.2f} "
+                                f"({w['pct_from_peak']*100:+.1f}% from peak) — "
+                                f"considera SELL ({w['shares']:.2f} shares, "
+                                f"cost €{w['cost']:.2f})"
+                            )
+                        proposal_lines.append("")
+                    elif momentum_positions:
+                        # Show MOMENTUM positions still safe
+                        proposal_lines.append(
+                            f"✅ *MOMENTUM/DIP positions* ({len(momentum_positions)}): "
+                            f"todas acima do trailing stop, HOLD"
+                        )
+                        proposal_lines.append("")
+                except Exception as _e:
+                    proposal_lines.append(f"⚠️ Exit signals check falhou: `{_e}`")
+
+                # ── Cash bucket: remainder ─────────────────────────────
+                if remaining > 0:
+                    proposal_lines.append(
+                        f"📥 *CASH BUCKET*: €{remaining:.2f} restante"
+                    )
+                    proposal_lines.append(
+                        f"   Recomendação: mantém em T212 conta @ 2.2%/ano = "
+                        f"€{remaining * 0.022:.2f}/ano juros"
+                    )
+                    proposal_lines.append(
+                        f"   Dry powder para próximos Core/DIP signals."
+                    )
+
+                # ── Summary header ─────────────────────────────────────
+                summary_lines = [
+                    f"💰 *Allocation Proposal — €{cash_amount:.2f}*",
+                    f"",
+                    f"📊 Portfolio atual: €{portfolio_cost:.2f} em {len(positions)} posições",
+                    f"   CORE: {len(portfolio_by_bucket['CORE'])}, "
+                    f"ROTATION: {len(portfolio_by_bucket['ROTATION'])}, "
+                    f"MOMENTUM: {len(portfolio_by_bucket['MOMENTUM'])}",
+                    f"",
+                ]
+                summary_lines.extend(proposal_lines)
+
+                # ── Action checklist ──────────────────────────────────
+                if actions:
+                    summary_lines.append("")
+                    summary_lines.append("📋 *RESUMO de AÇÕES T212*:")
+                    for i, a in enumerate(actions, 1):
+                        summary_lines.append(f"  {i}. {a}")
+                    summary_lines.append("")
+                    summary_lines.append(
+                        f"_Executa em T212 e confirma com `/done` (TODO: implementar)._"
+                    )
+
+                _reply("\n".join(summary_lines))
+            except Exception as _e:
+                _reply(f"❌ Allocation falhou: `{_e}`")
+
+        import threading
+        threading.Thread(
+            target=_run_allocation, daemon=True, name="cash-allocation"
+        ).start()
 
     elif cmd in ("/core_picks", "/admin_core_picks", "/core_top"):
         # Scan the Core universe (~300 quality compounders) and return the
