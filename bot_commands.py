@@ -1075,6 +1075,7 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
     from portfolio import get_positions, register_existing_position, _cache, _ensure_cache, _flush
 
     no_conviction = "--no-conviction" in parts
+    update_avg    = "--update-avg" in parts  # allow overwrite of avg_price + shares
     entries = [p for p in parts[1:] if not p.startswith("--")]
 
     # Sem argumentos → mostrar estado actual agrupado por bucket
@@ -1196,15 +1197,33 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
             if result["action"] == "imported":
                 imported.append((ticker, shares, price, bucket or "(no bucket)"))
             else:
-                if bucket:
-                    _ensure_cache()
-                    existing = _cache["positions"].get(ticker)
-                    if existing is not None and existing.get("category") != bucket:
+                # Position already in ledger. Two paths:
+                # --update-avg: overwrite avg_price / shares (use when fixing
+                #               currency mismatch or correcting a typo)
+                # default:      keep existing avg_price (idempotent); only
+                #               adjust bucket if changed
+                _ensure_cache()
+                existing = _cache["positions"].get(ticker)
+                if existing is None:
+                    already.append(ticker)
+                    continue
+                if update_avg:
+                    old_avg = existing.get("avg_price", 0)
+                    old_shares = existing.get("shares", 0)
+                    existing["avg_price"]  = round(price, 4)
+                    existing["shares"]     = round(shares, 6)
+                    existing["total_cost"] = round(price * shares, 2)
+                    if bucket and existing.get("category") != bucket:
                         existing["category"] = bucket
-                        _flush()
-                        updated.append((ticker, bucket))
-                    else:
-                        already.append(ticker)
+                    _flush()
+                    updated.append((
+                        ticker,
+                        f"avg ${old_avg}→${price} | shares {old_shares}→{shares}"
+                    ))
+                elif bucket and existing.get("category") != bucket:
+                    existing["category"] = bucket
+                    _flush()
+                    updated.append((ticker, bucket))
                 else:
                     already.append(ticker)
         except Exception as e:
@@ -1253,14 +1272,12 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
 
             existing_conv = cr.get_by_ticker(ticker)
             if existing_conv is not None:
-                # Existing conviction: UPDATE in place. This is the missing
-                # path that was making the re-sync look like a no-op for
-                # LIF/HUBS. We update:
-                #   • position_type if it changed (bucket override)
-                #   • entry_date if user provided one (anchors trailing stop)
-                #   • trailing_high recomputed from new entry_date
-                # We deliberately DON'T overwrite entry_price (that's
-                # weighted-avg territory, handled by /buy DCA flow).
+                # Existing conviction: UPDATE in place.
+                # • position_type if bucket override changed it
+                # • entry_date if user provided (anchors trailing stop)
+                # • trailing_high recomputed from new entry_date
+                # • entry_price ONLY when --update-avg flag set (used when
+                #   fixing currency mismatch or correcting a typo)
                 changed = False
                 if existing_conv.position_type != auto_type:
                     existing_conv.position_type = auto_type
@@ -1270,6 +1287,10 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
                     if getattr(existing_conv, "entry_date", "") != iso_date:
                         existing_conv.entry_date = iso_date
                         changed = True
+                if update_avg and abs(existing_conv.entry_price - price) > 0.001:
+                    existing_conv.entry_price = float(price)
+                    existing_conv.shares = float(shares)
+                    changed = True
                 if auto_type == "MOMENTUM" and trailing_high_val:
                     if abs(float(existing_conv.trailing_high or 0) - trailing_high_val) > 0.01:
                         existing_conv.trailing_high = float(trailing_high_val)
