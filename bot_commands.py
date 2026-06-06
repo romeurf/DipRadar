@@ -6385,6 +6385,162 @@ def _handle_command(text: str) -> None:
         except Exception as e:
             _reply(f"❌ Erro: `{e}`")
 
+    elif cmd in ("/admin_sector_backtest", "/admin_backtest_sectors"):
+        # Backtest the scaling-exit policy over historical data.
+        # Compares strategy total return + max drawdown vs buy-and-hold.
+        # The honest test of whether trimming early on caution signals
+        # nets you ahead, or whether you're cutting too soon.
+        #
+        # Usage:
+        #   /admin_sector_backtest          → full universe (~15-20 min bg)
+        #   /admin_sector_backtest XLK      → single ticker (~1 min sync)
+        #   /admin_sector_backtest --years=5 → custom history length
+        try:
+            n_years = 3
+            single_ticker = None
+            for token in parts[1:]:
+                if token.startswith("--years="):
+                    try:
+                        n_years = int(token.split("=", 1)[1])
+                    except (ValueError, IndexError):
+                        pass
+                elif not token.startswith("--"):
+                    single_ticker = token.upper().strip()
+
+            if single_ticker:
+                # Foreground — fast enough for 1 ticker (~30-60s)
+                _reply(
+                    f"🧪 *Backtest a iniciar* — {single_ticker} ({n_years}y)\n"
+                    f"_Pode demorar 30-60s..._"
+                )
+                from sector_backtest import backtest_sector
+
+                def _run_single():
+                    try:
+                        res = backtest_sector(single_ticker, n_years=n_years)
+                        if res is None:
+                            _reply(f"⚠️ Sem dados suficientes para `{single_ticker}`.")
+                            return
+                        _strategy_dd_pct = res.strategy_max_drawdown * 100
+                        _bh_dd_pct = res.buyhold_max_drawdown * 100
+                        _alpha_pct = res.alpha * 100
+                        _str_ret = res.strategy_total_return * 100
+                        _bh_ret = res.buyhold_total_return * 100
+                        _verdict = "✅ STRATEGY VENCE" if res.alpha > 0 else "❌ Buy-hold vence"
+                        _reply(
+                            f"🧪 *Backtest — {single_ticker} ({n_years}y)*\n\n"
+                            f"```\n"
+                            f"                Strategy    Buy-Hold     Diff\n"
+                            f"Total return    {_str_ret:>7.1f}%    "
+                            f"{_bh_ret:>7.1f}%    {_alpha_pct:>+5.1f}pp\n"
+                            f"CAGR            {res.strategy_cagr*100:>7.1f}%    "
+                            f"{res.buyhold_cagr*100:>7.1f}%\n"
+                            f"Max drawdown    {_strategy_dd_pct:>7.1f}%    "
+                            f"{_bh_dd_pct:>7.1f}%    "
+                            f"{res.drawdown_reduction*100:>+5.1f}pp\n"
+                            f"Sharpe          {res.strategy_sharpe:>7.2f}     "
+                            f"{res.buyhold_sharpe:>7.2f}\n"
+                            f"```\n"
+                            f"• Trades: `{res.n_trades}`\n"
+                            f"• Custo total: `{res.total_cost_pct*100:.2f}%`\n"
+                            f"• % do tempo totalmente investido: `{res.pct_time_invested*100:.0f}%`\n"
+                            f"• Posição final: `{res.final_position*100:.0f}%`\n\n"
+                            f"*{_verdict}*"
+                        )
+                    except Exception as _e:
+                        _reply(f"❌ Backtest falhou: `{_e}`")
+
+                import threading
+                threading.Thread(
+                    target=_run_single, daemon=True,
+                    name=f"backtest-{single_ticker}"
+                ).start()
+                return
+
+            # Background — full universe
+            _reply(
+                f"🧪 *Backtest universe a iniciar* — {n_years}y\n"
+                f"_~15-20 min para 17 ETFs. Vou postar resumo no fim._"
+            )
+
+            def _run_universe():
+                try:
+                    from etf_universe import all_monitored_tickers
+                    from sector_backtest import backtest_universe
+                    tickers = all_monitored_tickers()
+
+                    def _progress(ticker, i, n):
+                        if i % 5 == 0 and i > 0:
+                            _reply(
+                                f"📊 Backtest progresso: `{i}/{n}` "
+                                f"(actual: {ticker})"
+                            )
+
+                    results = backtest_universe(
+                        tickers, n_years=n_years,
+                        progress_callback=_progress,
+                    )
+                    if not results:
+                        _reply("⚠️ Backtest sem resultados — verifica conectividade yfinance.")
+                        return
+
+                    # Aggregate by alpha
+                    results.sort(key=lambda r: r.alpha, reverse=True)
+
+                    n_wins = sum(1 for r in results if r.alpha > 0)
+                    n_losses = sum(1 for r in results if r.alpha <= 0)
+                    avg_alpha = sum(r.alpha for r in results) / len(results)
+                    avg_dd_reduction = (
+                        sum(r.drawdown_reduction for r in results) / len(results)
+                    )
+
+                    lines = [
+                        f"🧪 *Backtest universe — {n_years}y*",
+                        f"",
+                        f"Strategy vence em `{n_wins}/{len(results)}` ETFs "
+                        f"(perde em `{n_losses}`)",
+                        f"Alpha médio: `{avg_alpha*100:+.1f}pp`",
+                        f"Redução média de DD: `{avg_dd_reduction*100:+.1f}pp`",
+                        f"",
+                        f"```",
+                        f"{'Ticker':>7} {'Alpha':>7} {'StrRet':>7} {'BHRet':>7} "
+                        f"{'StrDD':>7} {'BHDD':>7} {'Trades':>6}",
+                        f"─" * 60,
+                    ]
+                    for r in results[:25]:
+                        lines.append(
+                            f"{r.ticker:>7} "
+                            f"{r.alpha*100:>+6.1f}% "
+                            f"{r.strategy_total_return*100:>+6.1f}% "
+                            f"{r.buyhold_total_return*100:>+6.1f}% "
+                            f"{r.strategy_max_drawdown*100:>+6.1f}% "
+                            f"{r.buyhold_max_drawdown*100:>+6.1f}% "
+                            f"{r.n_trades:>6}"
+                        )
+                    lines.append("```")
+                    lines.append("")
+                    if avg_alpha > 0:
+                        lines.append(
+                            "✅ *Veredicto*: scaling-exit policy é net POSITIVE "
+                            "vs buy-and-hold no período testado."
+                        )
+                    else:
+                        lines.append(
+                            "❌ *Veredicto*: scaling-exit policy é net NEGATIVE — "
+                            "estás a cortar cedo demais. Considera relaxar thresholds."
+                        )
+                    _reply("\n".join(lines))
+                except Exception as _e:
+                    _reply(f"❌ Backtest universe falhou: `{_e}`")
+
+            import threading
+            threading.Thread(
+                target=_run_universe, daemon=True,
+                name="backtest-universe"
+            ).start()
+        except Exception as e:
+            _reply(f"❌ Erro: `{e}`")
+
     elif cmd in ("/admin_reset_sector_states", "/admin_reset_sectors"):
         # Wipe the sector_radar FSM state file. Useful after fixing a
         # scoring bug — the persisted state may have wrong transitions
