@@ -300,32 +300,51 @@ def backtest_rotation(
             # Cross-sectional rotation scores
             scores = compute_rotation_scores(ticker_signals)
 
-            # Pick top-N above score_floor
+            # Sort high→low. Then pick top-N with group de-duplication
+            # (SOXX/SMH are both semis — never both in top-N at once).
             sorted_scores = sorted(scores.items(), key=lambda x: -x[1])
-            new_top = [t for t, s in sorted_scores[:top_n] if s >= score_floor]
-
+            # Apply score floor before dedup
+            sorted_filtered = [(t, s) for t, s in sorted_scores if s >= score_floor]
+            from etf_universe import select_top_n_deduped
+            new_top = select_top_n_deduped(sorted_filtered, top_n)
             new_top_set = set(new_top)
 
-            # Monthly checkpoint — always rebalance to new top-N
-            force_rebal = True
+            if new_top:
+                # Smoothing rebalance: only trade transitions.
+                # - Holdings that stay in top-N: KEEP (no trade, no cost)
+                # - Holdings dropping out: SELL
+                # - New entries: BUY with cash from sells
+                # - Then re-balance weights to equal among current holdings
+                #   (drift correction without full liquidation)
+                kept = current_top & new_top_set       # stay invested
+                dropped = current_top - new_top_set     # sell these
+                added = new_top_set - current_top       # buy these
 
-            if force_rebal and new_top:
-                # Liquidate current positions
-                for t in list(positions.keys()):
-                    if t in histories and date in histories[t].index and entry_prices.get(t):
+                # 1) Sell dropped positions → cash
+                for t in dropped:
+                    if t in positions and t in histories and date in histories[t].index and entry_prices.get(t):
                         current_price = float(histories[t].loc[date, "Close"])
                         position_value = positions[t] * (current_price / entry_prices[t])
                         cost = position_value * _COST_BPS
                         total_cost += cost
                         capital_cash += position_value - cost
                         n_trades += 1
-                    del positions[t]
+                    if t in positions:
+                        del positions[t]
                     if t in entry_prices:
                         del entry_prices[t]
 
-                # Allocate equally to new top-N
-                target_per_position = capital_cash / len(new_top)
-                for t in new_top:
+                # 2) Compute total portfolio value & target per position
+                total_pv = capital_cash
+                for t, frac in positions.items():
+                    if t in histories and date in histories[t].index and entry_prices.get(t):
+                        current_price = float(histories[t].loc[date, "Close"])
+                        total_pv += frac * (current_price / entry_prices[t])
+
+                target_per_position = total_pv / len(new_top)
+
+                # 3) Buy newly added members
+                for t in added:
                     if date in histories[t].index:
                         price = float(histories[t].loc[date, "Close"])
                         if price > 0:
@@ -335,8 +354,38 @@ def backtest_rotation(
                             actual_invested = buy_value - cost
                             positions[t] = actual_invested
                             entry_prices[t] = price
+                            capital_cash -= buy_value
                             n_trades += 1
-                capital_cash = 0.0
+
+                # 4) Drift correction on KEPT holdings — only trade if
+                #    deviation > 10% of target weight (avoid micro-trades)
+                for t in kept:
+                    if t in histories and date in histories[t].index and entry_prices.get(t):
+                        current_price = float(histories[t].loc[date, "Close"])
+                        current_value = positions[t] * (current_price / entry_prices[t])
+                        delta = target_per_position - current_value
+                        # Only trade if drift > 10% of target
+                        if abs(delta) > 0.10 * target_per_position:
+                            cost = abs(delta) * _COST_BPS
+                            total_cost += cost
+                            if delta > 0:
+                                # need to buy more
+                                if delta <= capital_cash:
+                                    additional = delta - cost
+                                    # Increase position keeping entry_price weighted
+                                    new_total_value = current_value + additional
+                                    positions[t] = new_total_value * (entry_prices[t] / current_price)
+                                    capital_cash -= delta
+                                    n_trades += 1
+                            else:
+                                # need to sell some (delta negative)
+                                excess = -delta
+                                proceeds = excess - cost
+                                new_total_value = current_value - excess
+                                positions[t] = new_total_value * (entry_prices[t] / current_price)
+                                capital_cash += proceeds
+                                n_trades += 1
+
                 current_top = new_top_set
                 n_rebalances += 1
 

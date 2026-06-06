@@ -125,6 +125,55 @@ ALT_ETFS: list[ETF] = [
 ]
 
 
+# ─── Overlapping-exposure groups (for rotation de-duplication) ──────────────
+#
+# Some ETF pairs in the universe track essentially the same underlying
+# basket — buying both is double exposure, not diversification. When the
+# rotation picks top-N, we want at most ONE member of each group; the
+# higher-scoring sibling wins.
+#
+# Conservative groups — only true near-duplicates. Cases like XLK vs SOXX
+# are NOT grouped because XLK contains Apple/Microsoft/MSFT (~50% weight)
+# which are not in pure-semi ETFs; XLK is a broader tech bet.
+ETF_GROUPS: dict[str, list[str]] = {
+    "semis":      ["SOXX", "SMH"],   # both track semiconductor index
+    "em_broad":   ["EEM", "VWO"],    # both track MSCI/FTSE EM broad
+}
+
+
+def group_for(ticker: str) -> str | None:
+    """Return the group name a ticker belongs to, or None if not grouped."""
+    t = ticker.upper()
+    for group, members in ETF_GROUPS.items():
+        if t in members:
+            return group
+    return None
+
+
+def select_top_n_deduped(
+    sorted_scores: list[tuple[str, float]],
+    top_n: int,
+) -> list[str]:
+    """Return top-N tickers from a sorted (high→low) score list, deduping groups.
+
+    Walks the sorted list, accepting each ticker unless its group is
+    already represented in the accepted list. Continues past `top_n`
+    candidates until N unique groups (or ungrouped tickers) are picked.
+    """
+    picked: list[str] = []
+    seen_groups: set[str] = set()
+    for ticker, _ in sorted_scores:
+        g = group_for(ticker)
+        if g is not None and g in seen_groups:
+            continue  # already have one from this group
+        picked.append(ticker)
+        if g is not None:
+            seen_groups.add(g)
+        if len(picked) >= top_n:
+            break
+    return picked
+
+
 # ─── User's current holdings (UCITS tickers as bought) ──────────────────────
 # These are monitored for SELL signals. Each maps to a US proxy ETF for
 # data (UCITS history is shorter and noisier; US has clean 20+ years).
