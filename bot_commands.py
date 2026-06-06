@@ -6762,47 +6762,40 @@ def _handle_command(text: str) -> None:
                     "SELL_ZONE": "🛑",
                 }.get(new_state, "⚪")
 
-                # SCALING EXIT POLICY — trim incrementally as caution rises.
-                # Instead of binary hold-or-sell, the action scales with
-                # caution_score. Rationale: leading signals catch tops earlier
-                # but have false positives; trimming gradually captures most
-                # of the upside while reducing exposure as deterioration
-                # confirms. By the time exit_strength fires, you've already
-                # cut to ~25% of original position — losing the FINAL leg
-                # down costs you less.
+                # Policy: only exit_strength (structural breakdown) triggers
+                # a SELL recommendation. caution_score is informational —
+                # backtest of caution-based TRIM showed 0/20 wins vs
+                # buy-and-hold over 3y. Leading signals catch dozens of
+                # false positives that cost more than the drawdowns saved.
                 #
-                # Caution bands:
-                #   0-29:  no action — uptrend healthy
-                #   30-49: VIGIAR — leading signals starting, watch
-                #   50-69: TRIM 25% — multiple signals confirming
-                #   70-89: TRIM 50% — broad confluence of deterioration
-                #   90+:   TRIM 75% — pre-exit, brace for structural
+                # User retains discretion: if caution ≥ 70 and you JUDGE
+                # the deterioration is real (earnings miss + macro + chart
+                # all bad), you can trim manually — the radar gives you
+                # visibility, you make the call.
                 action = "MANTER"
                 action_detail = ""
                 if new_state == "SELL_ZONE":
-                    action = "VENDER POSIÇÃO RESTANTE (sinal estrutural)"
+                    action = "VENDER — sinal estrutural confirmado"
+                    action_detail = (
+                        f" (exit_strength {sig.exit_strength:.0f}: "
+                        f"MA200 / death cross / RSI rollover)"
+                    )
                 elif sig.exit_strength > 50:
                     action = "VIGIAR — exit a aproximar-se"
-                elif sig.caution_score >= 90:
-                    action = "TRIM 75% — pre-exit"
+                    action_detail = f" (exit_strength {sig.exit_strength:.0f})"
+                elif sig.caution_score >= 70:
+                    action = "MANTER — caution alto, vigilância manual"
                     action_detail = (
                         f" (caution {sig.caution_score:.0f}, "
-                        f"pullback {sig.pullback_from_recent_peak*100:+.1f}%)"
-                    )
-                elif sig.caution_score >= 70:
-                    action = "TRIM 50% — confluência forte"
-                    action_detail = (
-                        f" (pullback {sig.pullback_from_recent_peak*100:+.1f}% "
-                        f"+ rel.str 7d {sig.return_7d_vs_spy*100:+.1f}pp)"
+                        f"pullback {sig.pullback_from_recent_peak*100:+.1f}%, "
+                        f"7d {sig.return_7d*100:+.1f}%) — *avalia tu se trims*"
                     )
                 elif sig.caution_score >= 50:
-                    action = "TRIM 25% — deterioração confirmada"
+                    action = "MANTER — sinais leading ativos"
                     action_detail = (
                         f" (caution {sig.caution_score:.0f}, "
-                        f"pullback {sig.pullback_from_recent_peak*100:+.1f}%)"
+                        f"vigia evolução)"
                     )
-                elif sig.caution_score >= 30:
-                    action = "VIGIAR — leading signals ativos"
                 elif new_state == "BUY_ZONE":
                     action = "REFORÇAR"
 

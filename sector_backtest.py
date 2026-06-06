@@ -1,28 +1,33 @@
-"""Backtest harness for the sector_radar scaling-exit policy.
+"""Backtest harness for the sector_radar exit policy.
 
 Replays the radar daily over historical OHLCV and simulates a position
-that scales between 0% and 100% invested based on caution_score. Compares
-total return + max drawdown to a passive buy-and-hold benchmark.
+that toggles between 100% and 0% based on structural exit signals.
+Compares total return + max drawdown to a passive buy-and-hold benchmark.
 
-The question this answers honestly: does cutting at the first leading
-signals net you ahead of just holding through pullbacks? Leading signals
-catch tops earlier but produce false positives. Buy-and-hold captures
-the full bull-market climb but eats the full drawdowns.
+### Policy history (lessons learned the hard way)
 
-Policy under test (matches /holdings_etf_status logic):
-  caution 0-29  → target 100%
-  caution 30-49 → target 100% (just VIGIAR — don't trim yet, too noisy)
-  caution 50-69 → target 75%  (trim 25%)
-  caution 70-89 → target 50%  (trim 50%)
-  caution 90+   → target 25%  (trim 75%)
-  exit_strength > 70 → target 0%  (full exit on structural breakdown)
-  Re-entry: target 100% when caution drops < 30 AND exit_strength < 30.
+The original design used caution_score with scaling-exit bands (TRIM 25%
+at caution 50, TRIM 50% at 70, TRIM 75% at 90). The 3y + 5y backtest
+across 20 ETFs returned a brutal verdict: **0/20 wins**, average alpha
+-18.8pp, 119 trades on SOXX over 5y eating 6.3% in costs. Leading-signal
+TRIM in trending markets catches dozens of false positives — each
+pullback you correctly trim costs more in re-entry slippage and
+opportunity cost than you saved in drawdown.
 
-Costs: 10 bps per traded fraction (round-trip ~20bps). Realistic for a
-EU broker like Trading 212 or IBKR.
+The current policy is the simplified version that survived the data:
+- Auto-exit only on `exit_strength > 70` (structural breakdown:
+  death cross / MA200 break / RSI rollover confirmed)
+- Auto-re-entry when `exit_strength < 30`
+- Hold otherwise — drawdowns up to the structural threshold are the
+  price of capturing trend returns
 
-Cooldown: 5 trading days between position changes to prevent flip-flop
-on borderline scores.
+caution_score remains in the radar display (`/sectors`,
+`/holdings_etf_status`) as a USER-FACING WARNING — the user can choose
+to trim manually based on judgment. The system no longer auto-trims.
+
+Costs: 10 bps per traded fraction. Realistic for a EU broker like
+Trading 212 or IBKR. Cooldown: 5 trading days between position changes
+to prevent flip-flop on borderline scores.
 """
 
 from __future__ import annotations
@@ -79,24 +84,22 @@ def _decide_target_position(
     exit_strength: float,
     current_position: float,
 ) -> float:
-    """Pure function: return target position based on signals.
+    """Pure function: return target position from signals.
 
-    Mirrors /holdings_etf_status logic. The "no trim until 50" floor
-    prevents the strategy from trading on isolated leading signals —
-    only acts on confluence.
+    caution_score is intentionally IGNORED for auto-decisions — the
+    universe backtest proved scaling-exit on caution destroys value in
+    20/20 sectors. caution stays in the display for user awareness, but
+    only exit_strength triggers auto-trade.
+
+    Exit/re-entry are binary (0% or 100%) with a hysteresis band:
+    exit > 70 sells out, exit < 30 buys back. The 30-70 dead zone
+    prevents flip-flop on borderline structural signals.
     """
     if exit_strength > 70:
         return 0.0
-    if caution_score >= 90:
-        return 0.25
-    if caution_score >= 70:
-        return 0.50
-    if caution_score >= 50:
-        return 0.75
-    # Re-entry: only when caution AND exit are both low
-    if caution_score < 30 and exit_strength < 30:
+    if exit_strength < 30 and current_position < 1.0:
         return 1.0
-    return current_position  # hold
+    return current_position
 
 
 def _max_drawdown(values: list[float]) -> float:
