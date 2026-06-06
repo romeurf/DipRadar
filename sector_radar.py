@@ -775,6 +775,89 @@ def fetch_and_compute(
     return compute_signals(ticker, hist, spy_hist=spy_hist)
 
 
+def compute_rotation_scores(
+    ticker_signals: dict[str, TickerSignals],
+) -> dict[str, float]:
+    """Cross-sectional rotation score for picking top-N holdings.
+
+    Different from `combined_buy` in two important ways:
+
+    1. **Relative strength is RANKED across the universe**, not measured
+       in absolute pp. In a unanimous bull market everyone has positive
+       vs-SPY (impossible by definition? No — vs equal-weight benchmark
+       it works). Rank discriminates "who leads the leaders" even when
+       all signals look strong absolutely.
+
+    2. **Momentum acceleration matters**: not just "trending up" but
+       "trending up faster than before". This captures regime changes
+       (a sector turning from laggard to leader) earlier than absolute
+       momentum scores would.
+
+    Composition (positive contributions sum to 90, penalties to -45):
+      + 30 × relative_strength_rank   (cross-sectional)
+      + 25 × trend_strength           (above MA200 + slope)
+      + 20 × momentum_acceleration    (return_30d > return_30d/2 implies
+                                       recent acceleration vs older trend)
+      + 15 × dip_recovery_quality     (oversold + bouncing)
+      - 25 × secular_risk_weight      (kill value-trap candidates)
+      - 20 × caution_score_weight     (kill actively deteriorating)
+
+    Result is clipped to [0, 100]. Used by the rotation backtest to
+    select top-N each rebalance.
+    """
+    if not ticker_signals:
+        return {}
+
+    # Step 1: cross-sectional rank of relative strength (return_30d_vs_spy).
+    # Rank lowest → 0, highest → 100. SPY itself gets ~50 by construction
+    # (it's compared to itself + others; in a market-cap weighted way it's
+    # ~middle of distribution).
+    rs_values = [
+        (t, sig.return_30d_vs_spy)
+        for t, sig in ticker_signals.items()
+    ]
+    rs_values.sort(key=lambda x: x[1])
+    n = len(rs_values)
+    rs_ranks: dict[str, float] = {}
+    for i, (t, _) in enumerate(rs_values):
+        rs_ranks[t] = (i / max(1, n - 1)) * 100.0
+
+    rotation_scores: dict[str, float] = {}
+    for t, sig in ticker_signals.items():
+        score = 0.0
+
+        # Relative strength rank — weight 30
+        score += 0.30 * rs_ranks.get(t, 50.0)
+
+        # Trend strength — weight 25. Above MA200 with cushion.
+        if sig.ma200_ratio > 1.0:
+            score += 25.0 * min(1.0, (sig.ma200_ratio - 1.0) / 0.15)
+
+        # Momentum acceleration — weight 20. Proxy: return_30d positive
+        # AND above MA50 (recent confirmation). Strict version would
+        # need return_90d for true acceleration; this approximation is
+        # cheap and works.
+        if sig.return_30d > 0.02 and sig.ma50_ratio > 1.0:
+            score += 20.0
+        elif sig.return_30d > 0.05:  # parabolic, still bullish-ish
+            score += 12.0
+
+        # Dip recovery quality — weight 15. In dip but bouncing.
+        if sig.drawdown_52w < -0.10 and sig.return_30d > 0:
+            score += 15.0
+        elif sig.dip_score > 60 and sig.return_30d > -0.03:
+            # Strong dip signal + not actively crashing
+            score += 10.0
+
+        # Penalties — secular risk + active deterioration kill candidates
+        score -= 0.25 * sig.secular_risk
+        score -= 0.20 * sig.caution_score
+
+        rotation_scores[t] = max(0.0, min(100.0, score))
+
+    return rotation_scores
+
+
 def rank_universe(tickers: list[str]) -> list[TickerSignals]:
     """Compute signals for many tickers and return sorted by combined_buy desc.
 

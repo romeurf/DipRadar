@@ -6385,6 +6385,149 @@ def _handle_command(text: str) -> None:
         except Exception as e:
             _reply(f"❌ Erro: `{e}`")
 
+    elif cmd in ("/admin_rotation_backtest", "/admin_rotation"):
+        # Top-N rotation backtest — capital flows monthly to whichever
+        # sectors have the highest cross-sectional rotation_score.
+        # Compares vs SPY buy-and-hold AND equal-weight basket buy-and-hold.
+        #
+        # The honest test: does rotation generate alpha at retail scale,
+        # or is buy-and-hold still better?
+        #
+        # Usage:
+        #   /admin_rotation_backtest                  # 3y, top-3
+        #   /admin_rotation_backtest --years=5        # 5y, top-3
+        #   /admin_rotation_backtest --top=5          # top-5
+        #   /admin_rotation_backtest --floor=30       # require score ≥30
+        try:
+            n_years = 3
+            top_n = 3
+            score_floor = 0.0
+            for token in parts[1:]:
+                if token.startswith("--years="):
+                    try:
+                        n_years = int(token.split("=", 1)[1])
+                    except Exception:
+                        pass
+                elif token.startswith("--top="):
+                    try:
+                        top_n = int(token.split("=", 1)[1])
+                    except Exception:
+                        pass
+                elif token.startswith("--floor="):
+                    try:
+                        score_floor = float(token.split("=", 1)[1])
+                    except Exception:
+                        pass
+
+            _reply(
+                f"🧪 *Rotation backtest a iniciar*\n"
+                f"  Period: `{n_years}y`\n"
+                f"  Top-N: `{top_n}`\n"
+                f"  Score floor: `{score_floor}`\n\n"
+                f"_~5-10 min para fetch + simulação. Vou postar resumo no fim._"
+            )
+
+            def _run():
+                try:
+                    from etf_universe import all_monitored_tickers
+                    from sector_rotation_backtest import backtest_rotation
+
+                    tickers = all_monitored_tickers()
+
+                    def _progress(label, i, n):
+                        if i > 0 and i % 8 == 0:
+                            _reply(f"📊 Progress: `{i}/{n}` — {label}")
+
+                    res = backtest_rotation(
+                        tickers,
+                        n_years=n_years,
+                        top_n=top_n,
+                        score_floor=score_floor,
+                        progress_callback=_progress,
+                    )
+                    if res is None:
+                        _reply("⚠️ Backtest sem resultados — verifica conectividade yfinance.")
+                        return
+
+                    # Verdict
+                    verdict_spy = "✅ VENCE SPY" if res.alpha_vs_spy > 0 else "❌ Perde para SPY"
+                    verdict_basket = "✅ VENCE basket" if res.alpha_vs_basket > 0 else "❌ Perde para basket"
+
+                    lines = [
+                        f"🧪 *Rotation backtest — {res.n_years}y, top-{res.top_n}*",
+                        f"",
+                        f"```",
+                        f"                Strategy    SPY         Basket",
+                        f"Total return    {res.strategy_total_return*100:>+7.1f}%   "
+                        f"{res.spy_total_return*100:>+7.1f}%   "
+                        f"{res.basket_total_return*100:>+7.1f}%",
+                        f"CAGR            {res.strategy_cagr*100:>+7.1f}%   "
+                        f"{res.spy_cagr*100:>+7.1f}%   "
+                        f"{res.basket_cagr*100:>+7.1f}%",
+                        f"Max drawdown    {res.strategy_max_drawdown*100:>+7.1f}%   "
+                        f"{res.spy_max_drawdown*100:>+7.1f}%   "
+                        f"{res.basket_max_drawdown*100:>+7.1f}%",
+                        f"Sharpe          {res.strategy_sharpe:>7.2f}    "
+                        f"{res.spy_sharpe:>7.2f}    "
+                        f"{res.basket_sharpe:>7.2f}",
+                        f"```",
+                        f"",
+                        f"*Alphas* (strategy − benchmark):",
+                        f"• vs SPY:    `{res.alpha_vs_spy*100:+.1f}pp` — {verdict_spy}",
+                        f"• vs Basket: `{res.alpha_vs_basket*100:+.1f}pp` — {verdict_basket}",
+                        f"",
+                        f"*Activity*:",
+                        f"• Rebalances: `{res.n_rebalances}`",
+                        f"• Trades: `{res.n_trades}`",
+                        f"• Total cost: `{res.total_cost_pct*100:.2f}%`",
+                        f"• Holding period médio: `{res.avg_holding_period_days:.0f} dias`",
+                        f"",
+                        f"*Top 5 ETFs mais ocupados*:",
+                    ]
+                    for t in res.top_tickers:
+                        days = res.ticker_appearances.get(t, 0)
+                        pct = (days / res.n_days) * 100 if res.n_days else 0
+                        lines.append(f"• `{t}`: {pct:.0f}% do tempo")
+
+                    # Final verdict
+                    lines.append("")
+                    if res.alpha_vs_spy > 0.05 and res.alpha_vs_basket > 0.05:
+                        lines.append(
+                            "🎯 *VEREDICTO: ROTATION GERA ALPHA*. "
+                            "Vence ambos benchmarks por margem real (>5pp). "
+                            "Worth pursuing para live trading."
+                        )
+                    elif res.alpha_vs_spy > 0 and res.alpha_vs_basket > 0:
+                        lines.append(
+                            "🟡 *VEREDICTO: ALPHA MARGINAL*. "
+                            "Vence mas margem pequena (<5pp). "
+                            "Depende se a complexidade vale a pena."
+                        )
+                    elif res.alpha_vs_basket > 0:
+                        lines.append(
+                            "🟡 *VEREDICTO: BATE BASKET, NÃO SPY*. "
+                            "Diversificação rotacional vence concentração no SPY, "
+                            "mas SPY puro continua melhor. Filosoficamente "
+                            "indica que SPY é o trade simples superior."
+                        )
+                    else:
+                        lines.append(
+                            "❌ *VEREDICTO: ROTATION NÃO FUNCIONA*. "
+                            "Perde para benchmarks. Buy-and-hold continua "
+                            "campeão a retail scale. Aceitar e simplificar."
+                        )
+
+                    _reply("\n".join(lines))
+                except Exception as _e:
+                    _reply(f"❌ Rotation backtest falhou: `{_e}`")
+
+            import threading
+            threading.Thread(
+                target=_run, daemon=True, name="rotation-backtest"
+            ).start()
+        except Exception as e:
+            _reply(f"❌ Erro: `{e}`")
+
     elif cmd in ("/admin_sector_backtest", "/admin_backtest_sectors"):
         # Backtest the scaling-exit policy over historical data.
         # Compares strategy total return + max drawdown vs buy-and-hold.

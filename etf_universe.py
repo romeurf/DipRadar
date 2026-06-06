@@ -104,6 +104,24 @@ THEMATIC_ETFS: list[ETF] = [
 ]
 
 
+# ─── Risk-off / alternative / factor ETFs ───────────────────────────────────
+# Added for the rotation strategy so the radar always has somewhere to
+# go even when equity is being sold off (gold/bonds), and to capture
+# factor-driven opportunities (momentum, quality, dividends, BTC).
+ALT_ETFS: list[ETF] = [
+    ETF("GLD", "SPDR Gold Trust", "alternative",
+        ucits_ticker="IGLN", ucits_name="iShares Physical Gold ETC"),
+    ETF("TLT", "iShares 20+ Year Treasury Bond", "alternative",
+        ucits_ticker="DTLA", ucits_name="iShares USD Treasury Bond 20+yr UCITS"),
+    ETF("MTUM", "iShares MSCI USA Momentum Factor", "factor",
+        ucits_ticker="XDEM", ucits_name="Xtrackers MSCI World Momentum UCITS"),
+    ETF("SCHD", "Schwab US Dividend Equity", "factor",
+        ucits_ticker=None, ucits_name=None),  # No clean UCITS, use US ticker
+    ETF("IBIT", "iShares Bitcoin Trust", "alternative",
+        ucits_ticker="BTCE", ucits_name="ETC Group Physical Bitcoin"),
+]
+
+
 # ─── User's current holdings (UCITS tickers as bought) ──────────────────────
 # These are monitored for SELL signals. Each maps to a US proxy ETF for
 # data (UCITS history is shorter and noisier; US has clean 20+ years).
@@ -117,7 +135,9 @@ USER_HOLDINGS_UCITS: dict[str, str] = {
 # ─── Lookup helpers ─────────────────────────────────────────────────────────
 
 _ALL_ETFS: dict[str, ETF] = {
-    e.ticker: e for e in US_SECTOR_ETFS + BROAD_ETFS + INTERNATIONAL_ETFS + THEMATIC_ETFS
+    e.ticker: e for e in (
+        US_SECTOR_ETFS + BROAD_ETFS + INTERNATIONAL_ETFS + THEMATIC_ETFS + ALT_ETFS
+    )
 }
 
 
