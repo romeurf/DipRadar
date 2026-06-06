@@ -1183,10 +1183,11 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
         _reply("⚠️ *Sem entradas válidas:*\n" + "\n".join(f"  • {e}" for e in errors))
         return
 
-    imported: list[tuple[str, float, float, str]] = []  # +bucket
-    updated:  list[tuple[str, str]] = []                  # (ticker, bucket) when bucket changes
+    imported: list[tuple[str, float, float, str]] = []
+    updated:  list[tuple[str, str]] = []
     already:  list[str] = []
     convictions_created: list[tuple[str, str]] = []
+    convictions_updated: list[tuple[str, str, float]] = []  # (ticker, entry_date, trailing_high)
     conviction_errors:   list[tuple[str, str]] = []
 
     for ticker, shares, price, bucket, entry_date in parsed:
@@ -1195,9 +1196,6 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
             if result["action"] == "imported":
                 imported.append((ticker, shares, price, bucket or "(no bucket)"))
             else:
-                # Already exists — if user passed a bucket, UPDATE it in place
-                # (the existing register_existing_position is idempotent and
-                # doesn't overwrite, so we do the bucket update directly).
                 if bucket:
                     _ensure_cache()
                     existing = _cache["positions"].get(ticker)
@@ -1213,10 +1211,6 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
             errors.append(f"`{ticker}` — registo falhou: {e}")
             continue
 
-        # Auto-create conviction (unless --no-conviction or deny-list).
-        # Skip for ROTATION: those are ETFs managed by the sector rotation
-        # engine. yfinance also doesn't have UCITS tickers (SEC0, SXR8,
-        # IS3N) so attempting conviction creation just produces 404 spam.
         if no_conviction:
             continue
         if bucket == "ROTATION":
@@ -1226,49 +1220,67 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
             deny = cr._get_deny_list()
             if ticker in deny or "." in ticker:
                 continue
-            if cr.get_by_ticker(ticker):
-                continue  # already a conviction
 
-            # If the bucket is explicitly specified, use it directly.
-            # MOMENTUM positions need a trailing_high that reflects the
-            # ACTUAL peak since entry, not just current price (e.g., LIF
-            # is +20% from cost but may have hit +30% before pulling
-            # back — trailing stop must anchor on the actual peak).
             current = cr._fetch_price(ticker, fallback=price)
             hist    = cr._fetch_price_history(ticker, period="6mo")
-            if bucket:
-                # User provided explicit bucket, honour it
-                auto_type = bucket if bucket in ("DIP", "MOMENTUM", "CORE") else \
-                            cr._classify_type_from_signals(ticker, current, hist)
+            if bucket and bucket in ("DIP", "MOMENTUM", "CORE"):
+                auto_type = bucket
             else:
                 auto_type = cr._classify_type_from_signals(ticker, current, hist)
 
-            # Backfill trailing_high — anchor on REAL peak since purchase.
-            # The naïve "max of last 6 months" approach is wrong: if you
-            # bought LIF 2 months ago, a peak from 6 months ago that you
-            # never owned is irrelevant. Worse: it would set the trailing
-            # stop below current price, firing an instant SELL.
-            #
-            # The correct anchor is:
-            #   • entry_date provided → max(close) FROM entry_date to today
-            #   • entry_date NOT provided → just use current price (safe
-            #     default; the daily monitor will update trailing_high as
-            #     price climbs)
-            trailing_high_val = None
-            if auto_type == "MOMENTUM":
-                trailing_high_val = current  # safe default
-                if entry_date and hist is not None and not hist.empty and "Close" in hist.columns:
-                    try:
-                        import pandas as _pd
-                        entry_ts = _pd.Timestamp(entry_date)
-                        # Filter history to dates from entry onwards
-                        hist_since = hist[hist.index >= entry_ts]
-                        if not hist_since.empty:
-                            since_max = float(hist_since["Close"].max())
-                            if since_max > 0:
-                                trailing_high_val = max(since_max, current)
-                    except Exception:
-                        pass  # fallback to current price
+            # Compute trailing_high anchored on entry_date when provided.
+            # Without entry_date we use current price (safe default — the
+            # daily monitor will update trailing_high as price climbs).
+            trailing_high_val = current  # safe default
+            if auto_type == "MOMENTUM" and entry_date and hist is not None \
+                    and not hist.empty and "Close" in hist.columns:
+                try:
+                    import pandas as _pd
+                    entry_ts = _pd.Timestamp(entry_date)
+                    # tz-strip both sides so the comparison doesn't raise
+                    if hist.index.tz is not None:
+                        hist_naive = hist.copy()
+                        hist_naive.index = hist_naive.index.tz_localize(None)
+                    else:
+                        hist_naive = hist
+                    hist_since = hist_naive[hist_naive.index >= entry_ts]
+                    if not hist_since.empty:
+                        since_max = float(hist_since["Close"].max())
+                        if since_max > 0:
+                            trailing_high_val = max(since_max, current)
+                except Exception:
+                    pass
+
+            existing_conv = cr.get_by_ticker(ticker)
+            if existing_conv is not None:
+                # Existing conviction: UPDATE in place. This is the missing
+                # path that was making the re-sync look like a no-op for
+                # LIF/HUBS. We update:
+                #   • position_type if it changed (bucket override)
+                #   • entry_date if user provided one (anchors trailing stop)
+                #   • trailing_high recomputed from new entry_date
+                # We deliberately DON'T overwrite entry_price (that's
+                # weighted-avg territory, handled by /buy DCA flow).
+                changed = False
+                if existing_conv.position_type != auto_type:
+                    existing_conv.position_type = auto_type
+                    changed = True
+                if entry_date:
+                    iso_date = entry_date
+                    if getattr(existing_conv, "entry_date", "") != iso_date:
+                        existing_conv.entry_date = iso_date
+                        changed = True
+                if auto_type == "MOMENTUM" and trailing_high_val:
+                    if abs(float(existing_conv.trailing_high or 0) - trailing_high_val) > 0.01:
+                        existing_conv.trailing_high = float(trailing_high_val)
+                        changed = True
+                if changed:
+                    cr.update_conviction(existing_conv)
+                    convictions_updated.append(
+                        (ticker, entry_date or "(unchanged)",
+                         float(existing_conv.trailing_high or 0))
+                    )
+                continue  # done with this ticker, skip add_conviction below
 
             cr.add_conviction(
                 ticker, price, shares, auto_type,
@@ -1297,6 +1309,11 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
         lines.append(f"\n🧠 *{len(convictions_created)} convicções auto-criadas:*")
         for t, tp in convictions_created:
             lines.append(f"  • {t} → {tp}")
+    if convictions_updated:
+        lines.append(f"\n🔄 *{len(convictions_updated)} convicções actualizadas:*")
+        for t, ed, th in convictions_updated:
+            th_str = f"€{th:.2f}" if th > 0 else "n/a"
+            lines.append(f"  • `{t}` entry_date `{ed}` | trailing_high {th_str}")
     if conviction_errors:
         lines.append(f"\n⚠️ *Convicção falhou para:*")
         for t, e in conviction_errors:

@@ -180,6 +180,24 @@ def save_convictions(positions: list[ConvictionPosition]) -> None:
     _save_json(_POSITIONS_FILE, [asdict(p) for p in positions])
 
 
+def update_conviction(updated: ConvictionPosition) -> bool:
+    """Persist changes to a single conviction record (matched by ticker).
+
+    Returns True if the record was found and saved, False otherwise.
+    Used by /sync_portfolio to amend entry_date / trailing_high / type
+    on positions that already exist — without going through the legacy
+    close+reopen ritual which would lose history.
+    """
+    convictions = load_convictions()
+    target_ticker = updated.ticker.upper().strip()
+    for i, p in enumerate(convictions):
+        if p.ticker == target_ticker:
+            convictions[i] = updated
+            save_convictions(convictions)
+            return True
+    return False
+
+
 def load_outcomes() -> list[dict]:
     raw = _load_json(_OUTCOMES_FILE, default=[]) or []
     return raw if isinstance(raw, list) else []
