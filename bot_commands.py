@@ -6394,14 +6394,18 @@ def _handle_command(text: str) -> None:
         # or is buy-and-hold still better?
         #
         # Usage:
-        #   /admin_rotation_backtest                  # 3y, top-3
-        #   /admin_rotation_backtest --years=5        # 5y, top-3
-        #   /admin_rotation_backtest --top=5          # top-5
-        #   /admin_rotation_backtest --floor=30       # require score ≥30
+        #   /admin_rotation_backtest                              # 3y, top-3, new_only
+        #   /admin_rotation_backtest --years=5                    # 5y
+        #   /admin_rotation_backtest --top=5                      # top-5
+        #   /admin_rotation_backtest --floor=30                   # require score ≥30
+        #   /admin_rotation_backtest --alloc=new_only             # cash to NEW entries only
+        #   /admin_rotation_backtest --alloc=equal_top_n          # cash equal to all top-N
+        #   /admin_rotation_backtest --alloc=score_weighted       # cash weighted by score
         try:
             n_years = 3
             top_n = 3
             score_floor = 0.0
+            allocation_mode = "new_only"
             for token in parts[1:]:
                 if token.startswith("--years="):
                     try:
@@ -6418,12 +6422,17 @@ def _handle_command(text: str) -> None:
                         score_floor = float(token.split("=", 1)[1])
                     except Exception:
                         pass
+                elif token.startswith("--alloc="):
+                    val = token.split("=", 1)[1].strip().lower()
+                    if val in ("new_only", "equal_top_n", "score_weighted"):
+                        allocation_mode = val
 
             _reply(
                 f"🧪 *Rotation backtest a iniciar*\n"
                 f"  Period: `{n_years}y`\n"
                 f"  Top-N: `{top_n}`\n"
-                f"  Score floor: `{score_floor}`\n\n"
+                f"  Score floor: `{score_floor}`\n"
+                f"  Allocation: `{allocation_mode}`\n\n"
                 f"_~5-10 min para fetch + simulação. Vou postar resumo no fim._"
             )
 
@@ -6443,6 +6452,7 @@ def _handle_command(text: str) -> None:
                         n_years=n_years,
                         top_n=top_n,
                         score_floor=score_floor,
+                        allocation_mode=allocation_mode,
                         progress_callback=_progress,
                     )
                     if res is None:

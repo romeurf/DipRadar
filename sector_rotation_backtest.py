@@ -129,9 +129,28 @@ def backtest_rotation(
     n_years: int = 3,
     top_n: int = 3,
     score_floor: float = 0.0,
+    allocation_mode: str = "new_only",
     progress_callback=None,
 ) -> Optional[RotationResult]:
     """Run the top-N rotation backtest over n_years of history.
+
+    `allocation_mode` controls how cash from sold positions is
+    distributed at each monthly rebalance:
+
+      "new_only"      → all cash goes to NEW entries (added) only;
+                        kept holdings stay untouched. If no new entries,
+                        cash distributes equally to kept (rare edge
+                        case from dedup-collapse).
+      "equal_top_n"   → cash from sells splits equally among ALL
+                        members of new top-N (added + kept). Kept
+                        positions get topped up.
+      "score_weighted"→ same targets as equal_top_n but weighted by
+                        rotation_score. Higher-conviction picks get
+                        more cash.
+
+    NO target weight enforcement — positions drift freely with
+    performance. The user explicitly accepts concentrated exposure
+    in winners to maximise alpha.
 
     Heavy lifting is upfront — fetch all histories once, align dates,
     then walk forward day by day. Signal computation only happens at
@@ -311,18 +330,10 @@ def backtest_rotation(
 
             if new_top:
                 # Rotation rebalance: trade only transitions, NO drift
-                # correction. The user explicitly accepts concentrated
-                # weight in winners — letting positions drift means a
-                # 33% allocation can grow to 60% if that ETF rallies,
-                # and we keep riding. The dedup also DROPS duplicates
-                # without replacement, so a 3-position portfolio may
-                # shrink to 2 when both top-2 are in the same group
-                # (semis). When that happens, cash from any sells gets
-                # distributed equally to the EXISTING (kept) positions
-                # rather than going to a third lower-scoring candidate.
-                kept = current_top & new_top_set       # stay invested
-                dropped = current_top - new_top_set     # sell these
-                added = new_top_set - current_top       # buy these
+                # correction (winners are allowed to keep growing).
+                kept = current_top & new_top_set
+                dropped = current_top - new_top_set
+                added = new_top_set - current_top
 
                 # 1) Sell dropped positions → cash
                 for t in dropped:
@@ -338,45 +349,69 @@ def backtest_rotation(
                     if t in entry_prices:
                         del entry_prices[t]
 
-                # 2) Buy newly added members. Split available cash
-                #    equally among them. NOT a target weight — just
-                #    a fair entry size for new bets.
-                if added:
-                    cash_per_new = capital_cash / len(added)
-                    for t in added:
-                        if date in histories[t].index:
-                            price = float(histories[t].loc[date, "Close"])
-                            if price > 0:
-                                buy_value = cash_per_new
-                                cost = buy_value * _COST_BPS
-                                total_cost += cost
-                                actual_invested = buy_value - cost
-                                positions[t] = actual_invested
-                                entry_prices[t] = price
-                                capital_cash -= buy_value
-                                n_trades += 1
-                elif kept and capital_cash > 0:
-                    # No new entries (e.g., dedup reduced top-N below
-                    # current N, or all new picks happen to be already
-                    # held). Distribute leftover cash from sells equally
-                    # to existing kept holdings — the user's explicit
-                    # "put the money in what I already have" preference.
-                    cash_per_kept = capital_cash / len(kept)
-                    for t in kept:
-                        if t in histories and date in histories[t].index and entry_prices.get(t):
-                            current_price = float(histories[t].loc[date, "Close"])
-                            cost = cash_per_kept * _COST_BPS
-                            total_cost += cost
-                            additional = cash_per_kept - cost
-                            current_value = positions[t] * (current_price / entry_prices[t])
-                            new_total_value = current_value + additional
-                            # Re-anchor position size at current price
-                            positions[t] = new_total_value * (entry_prices[t] / current_price)
-                            capital_cash -= cash_per_kept
-                            n_trades += 1
+                # 2) Determine where the freed cash goes, per mode
+                cash_allocation: dict[str, float] = {}
+                if allocation_mode == "new_only":
+                    # Cash → only new entries. Kept untouched.
+                    if added:
+                        per = capital_cash / len(added)
+                        cash_allocation = {t: per for t in added}
+                    elif kept:
+                        # Fallback when dedup collapsed top-N and there
+                        # are no new entries: distribute cash to kept.
+                        per = capital_cash / len(kept)
+                        cash_allocation = {t: per for t in kept}
+                elif allocation_mode == "equal_top_n":
+                    # Cash → split equally among ALL members of new top-N
+                    # (both added and kept). Kept positions get topped up.
+                    targets = added | kept
+                    if targets:
+                        per = capital_cash / len(targets)
+                        cash_allocation = {t: per for t in targets}
+                elif allocation_mode == "score_weighted":
+                    # Cash → distributed by rotation_score weight across
+                    # all new top-N. Higher-conviction picks get more.
+                    targets = added | kept
+                    if targets:
+                        weights = {t: max(1.0, scores.get(t, 0.0)) for t in targets}
+                        total_w = sum(weights.values())
+                        for t in targets:
+                            cash_allocation[t] = capital_cash * (weights[t] / total_w)
+                else:
+                    # Unknown mode — fail to new_only
+                    if added:
+                        per = capital_cash / len(added)
+                        cash_allocation = {t: per for t in added}
 
-                # NO drift correction on kept positions — let winners run.
-                # Concentration is the point.
+                # 3) Execute allocations
+                for t, cash_to_alloc in cash_allocation.items():
+                    if cash_to_alloc <= 0:
+                        continue
+                    if t not in histories or date not in histories[t].index:
+                        continue
+                    price = float(histories[t].loc[date, "Close"])
+                    if price <= 0:
+                        continue
+                    cost = cash_to_alloc * _COST_BPS
+                    total_cost += cost
+                    net_invested = cash_to_alloc - cost
+
+                    if t in added:
+                        # Brand new position
+                        positions[t] = net_invested
+                        entry_prices[t] = price
+                    else:
+                        # Top up existing kept position. Re-anchor the
+                        # `positions[t]` scalar so that
+                        # positions[t] * (current_price / entry_price)
+                        # equals the new total value at the current price.
+                        current_value = positions[t] * (price / entry_prices[t])
+                        new_total_value = current_value + net_invested
+                        positions[t] = new_total_value * (entry_prices[t] / price)
+
+                    capital_cash -= cash_to_alloc
+                    n_trades += 1
+
                 current_top = new_top_set
                 n_rebalances += 1
 
