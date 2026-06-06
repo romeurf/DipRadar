@@ -1332,8 +1332,12 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
             lines.append(f"  • {t} → {tp}")
     if convictions_updated:
         lines.append(f"\n🔄 *{len(convictions_updated)} convicções actualizadas:*")
+        # Display trailing_high in native currency. yfinance returns USD
+        # for US-listed tickers, so the stored trailing_high is USD —
+        # display with $. (Currency awareness is per-ticker; UCITS would
+        # be EUR, but those are ROTATION bucket and skipped here.)
         for t, ed, th in convictions_updated:
-            th_str = f"€{th:.2f}" if th > 0 else "n/a"
+            th_str = f"${th:.2f}" if th > 0 else "n/a"
             lines.append(f"  • `{t}` entry_date `{ed}` | trailing_high {th_str}")
     if conviction_errors:
         lines.append(f"\n⚠️ *Convicção falhou para:*")
