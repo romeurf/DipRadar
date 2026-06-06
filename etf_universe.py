@@ -154,23 +154,32 @@ def select_top_n_deduped(
     sorted_scores: list[tuple[str, float]],
     top_n: int,
 ) -> list[str]:
-    """Return top-N tickers from a sorted (high→low) score list, deduping groups.
+    """Pick top-N tickers from sorted (high→low) list, DROPPING duplicates.
 
-    Walks the sorted list, accepting each ticker unless its group is
-    already represented in the accepted list. Continues past `top_n`
-    candidates until N unique groups (or ungrouped tickers) are picked.
+    Unlike a "walk-and-replace" dedup, this looks only at the top-N
+    positions of the sorted list and drops any that duplicate a higher
+    sibling's group. The result may have FEWER than N entries — that's
+    intentional: the user prefers concentrated exposure in fewer winners
+    over diluting into replacement-candidate setors.
+
+    Example with top_n=3 and sorted = [SOXX-95, SMH-92, XLK-90, GLD-85]:
+      - SOXX: picked (semis claimed)
+      - SMH: duplicate semis → dropped, NOT replaced
+      - XLK: picked (no group conflict)
+      - Result: ["SOXX", "XLK"] — 2 entries, not 3. GLD is NOT pulled up.
+
+    This concentrates capital in fewer, higher-conviction picks.
     """
     picked: list[str] = []
     seen_groups: set[str] = set()
-    for ticker, _ in sorted_scores:
+    # Look at exactly top_n positions of the sorted list (no walking past)
+    for ticker, _ in sorted_scores[:top_n]:
         g = group_for(ticker)
         if g is not None and g in seen_groups:
-            continue  # already have one from this group
+            continue  # duplicate — drop, do NOT replace
         picked.append(ticker)
         if g is not None:
             seen_groups.add(g)
-        if len(picked) >= top_n:
-            break
     return picked
 
 

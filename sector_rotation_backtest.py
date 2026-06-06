@@ -310,12 +310,16 @@ def backtest_rotation(
             new_top_set = set(new_top)
 
             if new_top:
-                # Smoothing rebalance: only trade transitions.
-                # - Holdings that stay in top-N: KEEP (no trade, no cost)
-                # - Holdings dropping out: SELL
-                # - New entries: BUY with cash from sells
-                # - Then re-balance weights to equal among current holdings
-                #   (drift correction without full liquidation)
+                # Rotation rebalance: trade only transitions, NO drift
+                # correction. The user explicitly accepts concentrated
+                # weight in winners — letting positions drift means a
+                # 33% allocation can grow to 60% if that ETF rallies,
+                # and we keep riding. The dedup also DROPS duplicates
+                # without replacement, so a 3-position portfolio may
+                # shrink to 2 when both top-2 are in the same group
+                # (semis). When that happens, cash from any sells gets
+                # distributed equally to the EXISTING (kept) positions
+                # rather than going to a third lower-scoring candidate.
                 kept = current_top & new_top_set       # stay invested
                 dropped = current_top - new_top_set     # sell these
                 added = new_top_set - current_top       # buy these
@@ -334,58 +338,45 @@ def backtest_rotation(
                     if t in entry_prices:
                         del entry_prices[t]
 
-                # 2) Compute total portfolio value & target per position
-                total_pv = capital_cash
-                for t, frac in positions.items():
-                    if t in histories and date in histories[t].index and entry_prices.get(t):
-                        current_price = float(histories[t].loc[date, "Close"])
-                        total_pv += frac * (current_price / entry_prices[t])
-
-                target_per_position = total_pv / len(new_top)
-
-                # 3) Buy newly added members
-                for t in added:
-                    if date in histories[t].index:
-                        price = float(histories[t].loc[date, "Close"])
-                        if price > 0:
-                            buy_value = target_per_position
-                            cost = buy_value * _COST_BPS
+                # 2) Buy newly added members. Split available cash
+                #    equally among them. NOT a target weight — just
+                #    a fair entry size for new bets.
+                if added:
+                    cash_per_new = capital_cash / len(added)
+                    for t in added:
+                        if date in histories[t].index:
+                            price = float(histories[t].loc[date, "Close"])
+                            if price > 0:
+                                buy_value = cash_per_new
+                                cost = buy_value * _COST_BPS
+                                total_cost += cost
+                                actual_invested = buy_value - cost
+                                positions[t] = actual_invested
+                                entry_prices[t] = price
+                                capital_cash -= buy_value
+                                n_trades += 1
+                elif kept and capital_cash > 0:
+                    # No new entries (e.g., dedup reduced top-N below
+                    # current N, or all new picks happen to be already
+                    # held). Distribute leftover cash from sells equally
+                    # to existing kept holdings — the user's explicit
+                    # "put the money in what I already have" preference.
+                    cash_per_kept = capital_cash / len(kept)
+                    for t in kept:
+                        if t in histories and date in histories[t].index and entry_prices.get(t):
+                            current_price = float(histories[t].loc[date, "Close"])
+                            cost = cash_per_kept * _COST_BPS
                             total_cost += cost
-                            actual_invested = buy_value - cost
-                            positions[t] = actual_invested
-                            entry_prices[t] = price
-                            capital_cash -= buy_value
+                            additional = cash_per_kept - cost
+                            current_value = positions[t] * (current_price / entry_prices[t])
+                            new_total_value = current_value + additional
+                            # Re-anchor position size at current price
+                            positions[t] = new_total_value * (entry_prices[t] / current_price)
+                            capital_cash -= cash_per_kept
                             n_trades += 1
 
-                # 4) Drift correction on KEPT holdings — only trade if
-                #    deviation > 10% of target weight (avoid micro-trades)
-                for t in kept:
-                    if t in histories and date in histories[t].index and entry_prices.get(t):
-                        current_price = float(histories[t].loc[date, "Close"])
-                        current_value = positions[t] * (current_price / entry_prices[t])
-                        delta = target_per_position - current_value
-                        # Only trade if drift > 10% of target
-                        if abs(delta) > 0.10 * target_per_position:
-                            cost = abs(delta) * _COST_BPS
-                            total_cost += cost
-                            if delta > 0:
-                                # need to buy more
-                                if delta <= capital_cash:
-                                    additional = delta - cost
-                                    # Increase position keeping entry_price weighted
-                                    new_total_value = current_value + additional
-                                    positions[t] = new_total_value * (entry_prices[t] / current_price)
-                                    capital_cash -= delta
-                                    n_trades += 1
-                            else:
-                                # need to sell some (delta negative)
-                                excess = -delta
-                                proceeds = excess - cost
-                                new_total_value = current_value - excess
-                                positions[t] = new_total_value * (entry_prices[t] / current_price)
-                                capital_cash += proceeds
-                                n_trades += 1
-
+                # NO drift correction on kept positions — let winners run.
+                # Concentration is the point.
                 current_top = new_top_set
                 n_rebalances += 1
 
