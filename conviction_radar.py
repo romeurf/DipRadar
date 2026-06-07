@@ -1114,6 +1114,16 @@ def auto_sync_from_portfolio(send_telegram: Optional[Callable[[str], None]] = No
             skipped.append((ticker, "foreign-listed"))
             continue
 
+        # Respect bucket: ROTATION positions are managed by the sector
+        # rotation engine, not by conviction_radar. Without this gate,
+        # closing SEC0/SXR8 manually would resurrect them as MOMENTUM
+        # on the next nightly auto-sync — and yfinance can't even
+        # fetch prices for UCITS, so monitor would just error.
+        bucket = (info.get("category") or "").upper().strip()
+        if bucket == "ROTATION":
+            skipped.append((ticker, "ROTATION bucket (sector rotation engine)"))
+            continue
+
         try:
             entry_price = float(info.get("avg_price", 0) or 0)
             shares      = float(info.get("shares", 0) or 0)
@@ -1124,10 +1134,17 @@ def auto_sync_from_portfolio(send_telegram: Optional[Callable[[str], None]] = No
             skipped.append((ticker, "zero shares/price"))
             continue
 
-        # Auto-classify
+        # Prefer explicit bucket over auto-classification. The user has
+        # already labelled their positions via /sync_portfolio; falling
+        # back to price-signal classification would silently override
+        # their intent (e.g., a CORE conviction getting demoted to
+        # MOMENTUM because price is up).
         current = _fetch_price(ticker, fallback=entry_price)
-        hist    = _fetch_price_history(ticker, period="6mo")
-        ptype   = _classify_type_from_signals(ticker, current, hist)
+        if bucket in ("CORE", "MOMENTUM", "DIP"):
+            ptype = bucket
+        else:
+            hist  = _fetch_price_history(ticker, period="6mo")
+            ptype = _classify_type_from_signals(ticker, current, hist)
 
         try:
             add_conviction(
