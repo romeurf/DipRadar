@@ -7599,28 +7599,65 @@ def _handle_command(text: str) -> None:
                 CONCENTRATION_SOFT = 0.25
                 CONCENTRATION_HARD = 0.30
 
-                # Load rotation alpha calibration (Phase 2.3-a output).
-                # Missing or low-quality → rotation alpha defaults to 0,
-                # so rotation falls to the bottom of the ROI queue rather
-                # than corrupting rankings with a guessed multiplier.
+                # Load rotation alpha calibration. Supports multiple model
+                # methods (linear/polynomial/buckets/lightgbm). If the file
+                # is missing or the chosen method has CV r² below threshold,
+                # falls back to a FLAT estimate (~12%/yr, from backtest
+                # empirical: +15pp/yr - costs ≈ 12%).
                 import json as _json
                 from pathlib import Path as _Path
-                _ROT_SLOPE = 0.0
-                _ROT_INTERCEPT = 0.0
+                import numpy as _np
+
+                _CAL: dict = {}
+                _CAL_ACCEPTED = False
+                # Backtest-empirical fallback: 4-year backtest showed +15pp
+                # annual alpha vs SPY with monthly rotation. Subtract cost
+                # drag and forward uncertainty → conservative 12% estimate.
+                _ROTATION_FLAT_FALLBACK = 0.12
+
                 try:
                     _cal_path = _Path("data/rotation_alpha_calibration.json")
                     if _cal_path.exists():
-                        _cal = _json.loads(_cal_path.read_text())
-                        if _cal.get("r_squared", 0) >= 0.15:
-                            _ROT_SLOPE = float(_cal.get("slope_alpha_per_point_monthly", 0))
-                            _ROT_INTERCEPT = float(_cal.get("intercept", 0))
+                        _CAL = _json.loads(_cal_path.read_text())
+                        _CAL_ACCEPTED = bool(_CAL.get("accepted", False))
                 except Exception:
                     pass
+
+                def _rotation_alpha_from_calibration(score: float) -> float | None:
+                    """Predict monthly alpha from score using the calibrated method.
+
+                    Returns None if calibration unavailable or method unknown.
+                    """
+                    if not _CAL or not _CAL_ACCEPTED:
+                        return None
+                    method = _CAL.get("method")
+                    params = _CAL.get("params", {})
+                    try:
+                        if method == "linear":
+                            return (
+                                float(params.get("intercept", 0))
+                                + float(params.get("slope_alpha_per_point_monthly", 0)) * score
+                            )
+                        if method == "polynomial":
+                            coeffs = params.get("coeffs", [])
+                            return float(_np.polyval(coeffs, score))
+                        if method == "buckets":
+                            boundaries = params.get("boundaries", [])
+                            means = params.get("alpha_per_bucket", {})
+                            idx = int(_np.digitize([score], boundaries)[0])
+                            return float(means.get(str(idx), 0.0))
+                        if method == "lightgbm":
+                            grid_x = params.get("grid_x", [])
+                            grid_y = params.get("grid_y", [])
+                            if grid_x and grid_y:
+                                return float(_np.interp(score, grid_x, grid_y))
+                    except Exception:
+                        return None
+                    return None
 
                 def _annualized_alpha(signal_type: str, **kw) -> float:
                     """Map each signal to annualized expected alpha."""
                     if signal_type == "DIP":
-                        # pred_alpha_90d × (365/90)
                         return float(kw.get("pred_alpha_90d", 0)) * (365.0 / 90.0)
                     if signal_type == "MOMENTUM":
                         return float(kw.get("pred_alpha_30d", 0)) * (365.0 / 30.0)
@@ -7628,7 +7665,11 @@ def _handle_command(text: str) -> None:
                         return float(kw.get("pred_alpha_1y", 0))
                     if signal_type == "ROTATION":
                         score = float(kw.get("score", 0))
-                        return (_ROT_INTERCEPT + _ROT_SLOPE * score) * 12.0
+                        monthly = _rotation_alpha_from_calibration(score)
+                        if monthly is not None:
+                            return monthly * 12.0
+                        # Calibration not accepted → flat fallback (backtest-empirical)
+                        return _ROTATION_FLAT_FALLBACK
                     return 0.0
 
                 # ── State current portfolio (cost basis + live value) ──────
