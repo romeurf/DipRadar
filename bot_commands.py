@@ -8244,6 +8244,109 @@ def _handle_command(text: str) -> None:
             target=_run_allocation, daemon=True, name="cash-allocation"
         ).start()
 
+    elif cmd in ("/admin_core_debug", "/core_debug"):
+        # Debug a single ticker through the Core radar scoring pipeline.
+        # Useful when a stock unexpectedly drops in or out of /core_picks
+        # (e.g., NVO at score 80 one scan, missing the next). Surfaces:
+        #   - all yfinance fundamentals fetched
+        #   - is_investment_phase result + reason
+        #   - gate triggers (rev_growth, gross_margin, MA200w)
+        #   - final score + source (ML vs heuristic)
+        if len(parts) < 2:
+            _reply("Uso: `/admin_core_debug TICKER`\nEx: `/admin_core_debug NVO`")
+            return
+        ticker = parts[1].upper().strip()
+        _reply(f"🔬 *Core debug* — {ticker} — scan iniciado...")
+
+        def _run_debug():
+            try:
+                from core_radar import (
+                    _fetch_hist, _fetch_quality_metrics, _score_core_dip,
+                    _is_investment_phase, _load_universe,
+                )
+                # Static yield from universe
+                universe = _load_universe() or []
+                ann_yield_static = 0.0
+                for e in universe:
+                    if e.get("ticker") == ticker:
+                        ann_yield_static = float(e.get("annual_yield_pct") or 0.0)
+                        break
+
+                # Fetch history
+                hist = _fetch_hist(ticker)
+                if hist is None or hist.empty:
+                    _reply(f"❌ Sem histórico para {ticker} (yfinance falhou)")
+                    return
+
+                close = hist["Close"]
+                volume = hist["Volume"] if "Volume" in hist.columns else None
+                current_price = float(close.iloc[-1])
+
+                # Fetch quality metrics
+                quality = _fetch_quality_metrics(ticker)
+
+                # Investment phase detector
+                rev = quality.get("revenue_growth")
+                gm = quality.get("gross_margin")
+                roe = quality.get("roe")
+                fcf = quality.get("fcf_yield")
+                ip = _is_investment_phase(rev, gm, roe, fcf)
+
+                # Run full scoring
+                score, signals = _score_core_dip(
+                    close, current_price, ann_yield_static,
+                    ticker=ticker, volume=volume,
+                )
+
+                # Build report
+                lines = [
+                    f"🔬 *Core debug — {ticker}*",
+                    f"",
+                    f"💰 *Price*: ${current_price:.2f}",
+                    f"📥 *Static yield (universe)*: {ann_yield_static:.2f}%",
+                    f"📤 *Live yield (yfinance)*: "
+                    f"{signals.get('dividend_yield_live'):.2f}%"
+                    if signals.get('dividend_yield_live') is not None
+                    else "📤 *Live yield (yfinance)*: N/A",
+                    f"",
+                    f"🏗 *Fundamentals (yfinance)*:",
+                    f"  revenue_growth: `{rev}`",
+                    f"  gross_margin:   `{gm}`",
+                    f"  roe:            `{roe}`",
+                    f"  fcf_yield:      `{fcf}`",
+                    f"  analyst_upside: `{quality.get('analyst_upside')}`",
+                    f"",
+                    f"🌱 *Investment-phase detector*: `{ip}`",
+                    f"  • fcf < 0: `{fcf is not None and fcf < 0}`",
+                    f"  • rev > 10%: `{rev is not None and rev > 0.10}`",
+                    f"  • gm > 40%: `{gm is not None and gm > 0.40}`",
+                    f"  • roe > 15%: `{roe is not None and roe > 0.15}`",
+                    f"",
+                    f"⛔ *Hard gates*:",
+                    f"  rev_growth < -10%: `{rev is not None and rev < -0.10}` (kill if True)",
+                    f"  gross_margin < 25%: `{gm is not None and gm < 0.25}` (kill if True)",
+                    f"",
+                    f"📊 *Score*: `{score}`",
+                    f"  source: `{signals.get('score_source', '?')}`",
+                    f"  fcf_override_applied: `{signals.get('fcf_override_applied', False)}`",
+                    f"",
+                    f"📉 *Price signals*:",
+                    f"  near_ma200w: `{signals.get('near_ma200w')}`",
+                    f"  below_ma200w: `{signals.get('below_ma200w')}`",
+                    f"  return_20d: `{signals.get('return_20d')}`",
+                    f"  rsi_14: `{signals.get('rsi_14')}`",
+                    f"  dd_from_52w_high: `{signals.get('dd_from_52w_high')}`",
+                ]
+                _reply("\n".join(lines))
+            except Exception as _e:
+                _reply(f"❌ Debug falhou: `{_e}`")
+                import traceback
+                _reply(f"```\n{traceback.format_exc()[-1500:]}\n```")
+
+        threading.Thread(
+            target=_run_debug, daemon=True, name=f"core-debug-{ticker}"
+        ).start()
+
     elif cmd in ("/core_picks", "/admin_core_picks", "/core_top"):
         # Scan the Core universe (~300 quality compounders) and return the
         # current top-scored opportunities. Uses core_radar.scan_core_universe
