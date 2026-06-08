@@ -208,7 +208,55 @@ def run_momentum_training(
     if "forward_return_30d" not in df.columns:
         return {"decision": "FAILED", "reason": "Coluna forward_return_30d em falta"}
 
-    df = df.dropna(subset=FEATURE_COLS).reset_index(drop=True)
+    # ── Smart dropna based on model type ──
+    # The global dropna(subset=FEATURE_COLS) used to fire here unconditionally,
+    # decimating the training set by 50-70% because features like mfi_14,
+    # volume_poc_ratio, and vwap_from_low_ratio need 60+ days of history and
+    # are NaN at the start of every ticker's series.
+    #
+    # But the default model is LightGBM which handles NaN natively (the
+    # _is_tree check at line 180 confirms this — it skips col_means for
+    # tree models). Dropping rows with any NaN starved the tree model of
+    # training data → IC stayed near zero.
+    #
+    # Fix: probe the model type. For tree-based (LGBM): drop only rows
+    # with ALL features NaN (no signal at all). For linear (Ridge): keep
+    # the strict dropna because Ridge needs complete vectors.
+    n_pre_feat = len(df)
+    missing_rates = {
+        col: int(df[col].isna().sum())
+        for col in FEATURE_COLS if col in df.columns
+    }
+
+    _probe_model = _make_momentum_model()
+    _uses_native_nan = _is_tree(_probe_model)
+
+    if _uses_native_nan:
+        # Drop only rows where every feature is NaN (no signal at all).
+        # Otherwise keep the row — LGBM handles partial NaN via its
+        # missing-value splits.
+        df = df.dropna(subset=FEATURE_COLS, how="all").reset_index(drop=True)
+        log.info(
+            f"[momentum_train] tree model: dropna(how='all') {n_pre_feat} → {len(df)} rows"
+        )
+    else:
+        df = df.dropna(subset=FEATURE_COLS).reset_index(drop=True)
+        log.info(
+            f"[momentum_train] linear model: dropna(any) {n_pre_feat} → {len(df)} rows"
+        )
+
+    # Surface decimation: if we lost >50% of rows, log per-feature missing
+    # rates so the operator can see which features are problematic
+    if n_pre_feat > 0 and len(df) < n_pre_feat * 0.5:
+        log.warning(
+            f"[momentum_train] dropna lost {n_pre_feat - len(df)}/{n_pre_feat} "
+            f"({(n_pre_feat - len(df)) / n_pre_feat * 100:.1f}%) of rows. "
+            f"Per-feature missing rates (sorted desc):"
+        )
+        for col, miss in sorted(missing_rates.items(), key=lambda kv: -kv[1]):
+            pct = miss / n_pre_feat * 100 if n_pre_feat > 0 else 0
+            log.warning(f"  {col:25s} missing: {miss}/{n_pre_feat} ({pct:.1f}%)")
+
     if len(df) < 200:
         return {"decision": "FAILED", "reason": f"Dados insuficientes: {len(df)} amostras (mínimo 200)"}
 
