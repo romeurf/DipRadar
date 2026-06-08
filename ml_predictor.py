@@ -501,6 +501,23 @@ def ml_score(
 
     enriched = dict(features) if features else {}
 
+    # Option B — Investment-phase FCF override (mirrors core_radar fix):
+    # If the stock pattern matches a reinvesting compounder (NVO-style:
+    # rev growth > 10%, GM > 40%, ROE > 15%, FCF < 0), neutralize fcf_yield
+    # at inference so the model doesn't false-flag a capex-driven negative
+    # FCF as deterioration. We use the ml_features fallback as the neutral
+    # value (close to typical training-time median).
+    try:
+        from score import _is_investment_phase_compounder
+        if _is_investment_phase_compounder(enriched):
+            from ml_features import _FALLBACK as _FB
+            enriched["fcf_yield"] = float(_FB.get("fcf_yield", 0.04))
+            enriched["_fcf_override_applied"] = True
+            logging.info(f"[ml_predictor] FCF override applied for {symbol or 'unknown'} "
+                         f"(investment-phase compounder)")
+    except Exception as _e:
+        logging.debug(f"[ml_predictor] investment-phase check failed: {_e}")
+
     # Features a usar — bundle pode sobrepor a lista default
     cols = _bundle.get("feature_cols", _FEATURE_COLS)
     X    = _build_feature_vector(enriched, cols)

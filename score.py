@@ -432,12 +432,61 @@ def unjustified_drawdown(
 #
 # is_preprofit dispara skip_recommended=True automaticamente.
 
+def _is_investment_phase_compounder(features: dict) -> bool:
+    """Detect a 'reinvesting compounder' pattern: negative FCF but strong
+    underlying business (growth + margins + ROE all healthy).
+
+    Used to neutralize the FCF Negativo penalty when the evidence points
+    to capex-driven negative FCF rather than business deterioration.
+
+    All 4 must be true:
+      - fcf_yield < 0 (the FCF-negative case we're correcting)
+      - revenue_growth > 10%
+      - gross_margin > 40%
+      - roe > 15%
+
+    Mirrors core_radar._is_investment_phase. Duplicated (not imported)
+    to keep score.py free of core_radar dependency — both modules can
+    score independently and use this heuristic locally.
+
+    Examples that match: AMZN 1997-2015, NFLX during content buildout,
+    hyperscalers building AI data centers 2024-2025, NVO 2025-2026
+    GLP-1 manufacturing capacity buildout.
+    """
+    def _to_float(x):
+        try:
+            v = float(x)
+            return v if math.isfinite(v) else None
+        except (TypeError, ValueError):
+            return None
+
+    fcf = _to_float(features.get("fcf_yield")) or _to_float(features.get("fcf_margin"))
+    if fcf is None or fcf >= 0:
+        return False
+    rev = _to_float(features.get("revenue_growth"))
+    if rev is None or rev < 0.10:
+        return False
+    gm = _to_float(features.get("gross_margin"))
+    if gm is None or gm < 0.40:
+        return False
+    roe = _to_float(features.get("roe"))
+    if roe is None or roe < 0.15:
+        return False
+    return True
+
+
 def _detect_red_flags(features: dict) -> tuple[float, list[str], bool]:
     """
     Avalia red flags e devolve (quality_multiplier, red_flags, is_preprofit).
 
     quality_multiplier ∈ [0.10, 1.00] — clipado para baixo a 0.10.
     is_preprofit = True quando FCF/FCF_margin negativo (empresa queima caixa).
+
+    Investment-phase override: if a stock has negative FCF but the rest of
+    the fundamental picture is strong (rev growth, gross margin, ROE), we
+    treat the FCF as capex-driven rather than deterioration and SKIP the
+    penalty. is_preprofit stays False so downstream valuation logic uses
+    the full framework (NVO has real profits, just heavy reinvestment).
     """
     quality_multiplier = 1.0
     red_flags: list[str] = []
@@ -461,10 +510,17 @@ def _detect_red_flags(features: dict) -> tuple[float, list[str], bool]:
                     break
             except (TypeError, ValueError):
                 continue
+
+    invest_phase = _is_investment_phase_compounder(features)
+
     if fcf is not None and fcf < 0:
-        quality_multiplier -= 0.20
-        red_flags.append("FCF Negativo")
-        is_preprofit = True
+        if invest_phase:
+            # Capex-driven negative FCF — no penalty. Tag as informational.
+            red_flags.append("FCF Negativo (investment-phase 🌱)")
+        else:
+            quality_multiplier -= 0.20
+            red_flags.append("FCF Negativo")
+            is_preprofit = True
 
     # PE extremo (>200 ou <0) — lucro distorcido
     if pe is not None:
