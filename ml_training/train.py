@@ -1100,6 +1100,29 @@ def run_training(
     # win_rate: fracção do dataset com alpha > calibrator threshold
     win_rate_alpha = float((df[_active_target] > CALIBRATOR_THRESHOLD).mean())
 
+    # Training-time medians per feature, persisted into the bundle so the
+    # inference path can impute / override features against the actual
+    # training distribution instead of guessed static fallbacks. Used by
+    # ml_predictor's Option B FCF override (NVO-style investment-phase
+    # detection), and as the principled NaN imputation source for future
+    # inference improvements.
+    impute_medians: dict = {}
+    try:
+        for col in feats_used:
+            if col in df.columns:
+                med = df[col].median(skipna=True)
+                if med is not None:
+                    try:
+                        med_val = float(med)
+                        # Skip NaN/inf
+                        if med_val == med_val and abs(med_val) != float("inf"):
+                            impute_medians[col] = round(med_val, 6)
+                    except (TypeError, ValueError):
+                        continue
+    except Exception as _e:
+        log.warning(f"[train] impute_medians computation failed: {_e}")
+        impute_medians = {}
+
     # Bundle
     bundle = DipModels(
         model_up=champ_alpha,
@@ -1121,6 +1144,7 @@ def run_training(
         rho_down=rho_down_final,
         topk_pnl=topk_pnl_final,
         fold_metrics=results.get(single_champion_name, []),
+        impute_medians=impute_medians,
     )
 
     # Modelos por sector individual (11 sectores GICS): um ScaledRidge por sector.

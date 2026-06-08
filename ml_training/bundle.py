@@ -46,6 +46,12 @@ class DipModels:
     # Inference: use sector model if available; global as fallback.
     # Absent in old bundles → inference uses only the global model.
     sector_models:    dict = field(default_factory=dict)
+    # Training-time column medians, used by inference for principled NaN
+    # imputation and for Option B FCF override (replace fcf_yield with a
+    # value the model is calibrated against rather than an ad-hoc constant).
+    # {feature_name: median_value}. Absent in old bundles → caller falls
+    # back to ml_features._FALLBACK static defaults.
+    impute_medians:   dict = field(default_factory=dict)
 
 
 # Backwards-compatible alias. Existing pickles reference `DipModelsV3` in
