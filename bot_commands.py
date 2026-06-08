@@ -7142,6 +7142,85 @@ def _handle_command(text: str) -> None:
         except Exception as e:
             _reply(f"❌ Holdings status falhou: `{e}`")
 
+    elif cmd in ("/admin_calibrate_rotation", "/calibrate_rotation"):
+        # Run scripts/calibrate_rotation_alpha.py in the background.
+        # Reads N years of rotation backtest history, fits alpha-vs-score
+        # regression, writes data/rotation_alpha_calibration.json. /cash
+        # picks up the result on next invocation.
+        #
+        # Usage:
+        #   /admin_calibrate_rotation        → 4-year window (default)
+        #   /admin_calibrate_rotation 5      → 5-year window
+        years = 4
+        if len(parts) >= 2:
+            try:
+                years = max(2, min(10, int(parts[1])))
+            except ValueError:
+                pass
+
+        _reply(
+            f"🔧 *Rotation alpha calibration* — iniciado\n"
+            f"_Janela: {years}y | ~10-15min | escreve "
+            f"`data/rotation_alpha_calibration.json`_"
+        )
+
+        def _run_calibration():
+            try:
+                import subprocess
+                import sys as _sys
+                result = subprocess.run(
+                    [_sys.executable, "scripts/calibrate_rotation_alpha.py", "--years", str(years)],
+                    capture_output=True, text=True, timeout=1800,
+                )
+                out_tail = (result.stdout or "")[-1500:]
+                err_tail = (result.stderr or "")[-800:]
+
+                # Read the produced JSON to surface key numbers
+                summary = ""
+                try:
+                    import json as _json
+                    from pathlib import Path as _Path
+                    cal_path = _Path("data/rotation_alpha_calibration.json")
+                    if cal_path.exists():
+                        cal = _json.loads(cal_path.read_text())
+                        summary = (
+                            f"\n📊 *Resultado*:\n"
+                            f"  slope = `{cal.get('slope_alpha_per_point_monthly')}`\n"
+                            f"  intercept = `{cal.get('intercept')}`\n"
+                            f"  r² = `{cal.get('r_squared')}`\n"
+                            f"  n_picks = `{cal.get('n_picks')}`\n"
+                            f"  accepted = `{cal.get('accepted')}` "
+                            f"(threshold {cal.get('accept_threshold')})"
+                        )
+                except Exception:
+                    pass
+
+                if result.returncode == 0:
+                    _reply(
+                        f"✅ Calibration done.{summary}\n\n"
+                        f"_Log tail:_\n```\n{out_tail}\n```"
+                    )
+                elif result.returncode == 2:
+                    _reply(
+                        f"⚠️ Calibration completed but r² below threshold.{summary}\n"
+                        f"_Rotation alpha defaultará a 0 no `/cash` até próxima calibration._\n\n"
+                        f"_Log tail:_\n```\n{out_tail}\n```"
+                    )
+                else:
+                    _reply(
+                        f"❌ Calibration failed (exit {result.returncode}).\n"
+                        f"_stderr:_\n```\n{err_tail}\n```\n"
+                        f"_stdout tail:_\n```\n{out_tail}\n```"
+                    )
+            except subprocess.TimeoutExpired:
+                _reply("❌ Calibration timeout (30min). Reduce --years ou investiga.")
+            except Exception as _e:
+                _reply(f"❌ Erro: `{_e}`")
+
+        threading.Thread(
+            target=_run_calibration, daemon=True, name="rotation-calibrate"
+        ).start()
+
     elif cmd in ("/monthly_check", "/monthly", "/portfolio_check"):
         # Comprehensive monthly portfolio review. Iterates EVERY registered
         # position and reports its current state with HOLD/SELL/WATCH
@@ -7303,12 +7382,23 @@ def _handle_command(text: str) -> None:
                             "HOLD": "🟢", "WATCH": "🟡", "SELL": "🛑",
                         }.get(s["state"], "⚪")
 
-                        # Compact line
+                        # Compact line with concentration %
                         days_str = f"d{s['days_held']}" if s["days_held"] > 0 else "—"
                         pnl_str  = f"{s['pnl_pct']:+.1f}%"
+                        conc_pct = (
+                            (s['value_now'] / total_value * 100)
+                            if total_value > 0 else 0.0
+                        )
+                        # Mark positions near or over the 25%/30% caps
+                        conc_marker = ""
+                        if conc_pct >= 30.0:
+                            conc_marker = " 🛑"
+                        elif conc_pct >= 25.0:
+                            conc_marker = " ⚠️"
                         lines.append(
                             f"  {state_emoji} `{s['ticker']:<5}` "
-                            f"€{s['value_now']:>7.0f} ({pnl_str}) {days_str}"
+                            f"€{s['value_now']:>7.0f} ({pnl_str}) "
+                            f"{conc_pct:>4.1f}%{conc_marker} {days_str}"
                         )
                         # Reason on a separate line if non-HOLD
                         if s["state"] != "HOLD" and s["reason"]:
@@ -7467,40 +7557,129 @@ def _handle_command(text: str) -> None:
         def _run_allocation():
             try:
                 from portfolio import get_positions
+                import conviction_radar as cr
+                from tax_engine import should_rotate as tax_should_rotate
 
-                # ── State current portfolio ──────────────────────────────
+                # Concentration caps (per-ticker share of total portfolio)
+                CONCENTRATION_SOFT = 0.25
+                CONCENTRATION_HARD = 0.30
+
+                # Load rotation alpha calibration (Phase 2.3-a output).
+                # Missing or low-quality → rotation alpha defaults to 0,
+                # so rotation falls to the bottom of the ROI queue rather
+                # than corrupting rankings with a guessed multiplier.
+                import json as _json
+                from pathlib import Path as _Path
+                _ROT_SLOPE = 0.0
+                _ROT_INTERCEPT = 0.0
+                try:
+                    _cal_path = _Path("data/rotation_alpha_calibration.json")
+                    if _cal_path.exists():
+                        _cal = _json.loads(_cal_path.read_text())
+                        if _cal.get("r_squared", 0) >= 0.15:
+                            _ROT_SLOPE = float(_cal.get("slope_alpha_per_point_monthly", 0))
+                            _ROT_INTERCEPT = float(_cal.get("intercept", 0))
+                except Exception:
+                    pass
+
+                def _annualized_alpha(signal_type: str, **kw) -> float:
+                    """Map each signal to annualized expected alpha."""
+                    if signal_type == "DIP":
+                        # pred_alpha_90d × (365/90)
+                        return float(kw.get("pred_alpha_90d", 0)) * (365.0 / 90.0)
+                    if signal_type == "MOMENTUM":
+                        return float(kw.get("pred_alpha_30d", 0)) * (365.0 / 30.0)
+                    if signal_type == "CORE":
+                        return float(kw.get("pred_alpha_1y", 0))
+                    if signal_type == "ROTATION":
+                        score = float(kw.get("score", 0))
+                        return (_ROT_INTERCEPT + _ROT_SLOPE * score) * 12.0
+                    return 0.0
+
+                # ── State current portfolio (cost basis + live value) ──────
                 positions = get_positions()
                 portfolio_by_bucket: dict = {
                     "CORE": [], "ROTATION": [], "MOMENTUM": [], "DIP": [],
                     "UNCATEGORIZED": [],
                 }
                 portfolio_cost = 0.0
+                portfolio_value = 0.0
+                ticker_current_value: dict[str, float] = {}  # for concentration math
                 for sym, pos in positions.items():
                     bucket = (pos.get("category") or "").upper()
                     if bucket not in portfolio_by_bucket:
                         bucket = "UNCATEGORIZED"
                     portfolio_by_bucket[bucket].append((sym, pos))
                     portfolio_cost += pos.get("total_cost", 0.0)
+                    # Live value: yfinance current × shares. ROTATION UCITS
+                    # fall back to avg_price (yfinance has no UCITS data).
+                    avg = float(pos.get("avg_price", 0) or 0)
+                    shares = float(pos.get("shares", 0) or 0)
+                    current_px = avg
+                    if bucket != "ROTATION":
+                        try:
+                            current_px = float(cr._fetch_price(sym, fallback=avg))
+                        except Exception:
+                            current_px = avg
+                    val = current_px * shares
+                    ticker_current_value[sym.upper()] = val
+                    portfolio_value += val
 
-                sell_actions: list[dict] = []   # {ticker, reason, value_eur, ...}
-                buy_actions:  list[dict] = []   # {ticker, reason, value_eur, ...}
+                sell_actions: list[dict] = []
+                buy_actions:  list[dict] = []
                 info_lines:   list[str] = []
+
+                def _can_top_up(ticker: str, requested_eur: float) -> tuple[bool, float, str]:
+                    """Concentration cap gate.
+
+                    Returns (allowed, max_alloc_eur, reason). Allows up to
+                    CONCENTRATION_HARD (30%) — typical buys are sized to land
+                    within CONCENTRATION_SOFT (25%) but the hard cap is the
+                    binding constraint for the alloc.
+                    """
+                    if portfolio_value <= 0:
+                        return True, requested_eur, ""
+                    held = ticker_current_value.get(ticker.upper(), 0.0)
+                    held_pct = held / portfolio_value
+                    if held_pct >= CONCENTRATION_HARD:
+                        return False, 0.0, (
+                            f"concentration {held_pct*100:.1f}% ≥ hard cap "
+                            f"{CONCENTRATION_HARD*100:.0f}%"
+                        )
+                    # Cap so post-buy stays under hard cap on the new total
+                    new_total = portfolio_value + requested_eur
+                    max_held_eur = new_total * CONCENTRATION_HARD
+                    headroom_eur = max(0.0, max_held_eur - held)
+                    allowed = min(requested_eur, headroom_eur)
+                    if allowed < requested_eur - 0.5:  # capped
+                        return True, allowed, (
+                            f"capped at €{allowed:.0f} (post-buy would be "
+                            f"{(held + allowed) / new_total * 100:.1f}%, "
+                            f"hard cap {CONCENTRATION_HARD*100:.0f}%)"
+                        )
+                    return True, allowed, ""
 
                 # ╔════════════════════════════════════════════════════════╗
                 # ║ PASS 1 — Compute all proposed SELLs (freed_cash)       ║
                 # ╚════════════════════════════════════════════════════════╝
 
-                # ── ROTATION sells: positions held that fell out of top-3 ─
+                # ── ROTATION sells: tax-friction-aware rotation gate ─────
+                # A ROTATION holding sells ONLY when (target - current) score
+                # gap exceeds the tax friction implied by realising the
+                # unrealized gain (see tax_engine.should_rotate). Override
+                # cases: structural exit, severe deterioration, sector decay.
                 rotation_top3 = []
                 rotation_holdings = {sym: pos for sym, pos in portfolio_by_bucket["ROTATION"]}
+                rotation_holds_kept: list[dict] = []  # HOLD lines for display
+                rotation_ranked = []
                 if not skip_rotation:
                     try:
                         from sector_radar import rank_universe
                         from etf_universe import all_monitored_tickers, get_etf
                         all_t = all_monitored_tickers()
                         ranked = rank_universe(all_t)
+                        rotation_ranked = ranked
                         top_signals = ranked[:3] if ranked else []
-                        # Build top-3 ticker → UCITS map
                         for sig in top_signals:
                             etf = get_etf(sig.ticker)
                             ucits = etf.ucits_ticker if etf and etf.ucits_ticker else sig.ticker
@@ -7508,27 +7687,55 @@ def _handle_command(text: str) -> None:
                                 "us_ticker":     sig.ticker,
                                 "ucits":         ucits,
                                 "score":         sig.combined_buy,
+                                "exit_strength": getattr(sig, "exit_strength", 0.0),
+                                "secular_risk":  getattr(sig, "secular_risk", 0.0),
                                 "already_held":  ucits in rotation_holdings,
                             })
 
                         top3_ucits_set = {r["ucits"] for r in rotation_top3}
+                        best_target_score = rotation_top3[0]["score"] if rotation_top3 else 0.0
+
+                        # Build US-proxy → current score map for held UCITS
+                        # (so we can compute the "current score" of each
+                        # holding by looking up its US proxy in ranked).
+                        from etf_universe import USER_HOLDINGS_UCITS
+                        held_score_map: dict[str, float] = {}
+                        for sig in ranked:
+                            for ucits, us_proxy in USER_HOLDINGS_UCITS.items():
+                                if sig.ticker == us_proxy and ucits in rotation_holdings:
+                                    held_score_map[ucits] = sig.combined_buy
+
                         for sym, pos in rotation_holdings.items():
-                            if sym not in top3_ucits_set:
-                                # Held but not in top-3 → SELL recommendation
-                                avg_price = pos.get("avg_price", 0.0)
-                                shares = pos.get("shares", 0.0)
-                                # Use avg_price as proxy for current value
-                                # (refresh from yfinance would be slower/may fail
-                                # for UCITS). Cost basis is the conservative
-                                # estimate of cash freed.
-                                value = avg_price * shares
+                            if sym in top3_ucits_set:
+                                continue  # in top-3, keep
+                            avg_price = float(pos.get("avg_price", 0.0))
+                            shares    = float(pos.get("shares", 0.0))
+                            cost      = avg_price * shares  # UCITS: no live price available
+                            value     = cost
+                            unrealized_gain_pct = 0.0  # UCITS PnL unknown without live price
+                            current_score = held_score_map.get(sym, 50.0)  # neutral fallback
+
+                            # Check the best alternative (top of rotation_top3)
+                            do_sell, reason = tax_should_rotate(
+                                unrealized_gain_pct=unrealized_gain_pct,
+                                current_score=current_score,
+                                target_score=best_target_score,
+                            )
+                            if do_sell:
                                 sell_actions.append({
                                     "ticker":  sym,
                                     "bucket":  "ROTATION",
-                                    "reason":  f"saiu do top-3 (current: {', '.join(r['ucits'] for r in rotation_top3)})",
+                                    "reason":  reason,
                                     "shares":  shares,
                                     "value":   value,
-                                    "current_pnl_pct": 0.0,  # unknown without refresh
+                                    "current_pnl_pct": 0.0,
+                                })
+                            else:
+                                rotation_holds_kept.append({
+                                    "ticker":  sym,
+                                    "shares":  shares,
+                                    "value":   value,
+                                    "reason":  reason,
                                 })
                     except Exception as _e:
                         info_lines.append(f"⚠️ Rotation scoring falhou: `{_e}`")
@@ -7595,117 +7802,144 @@ def _handle_command(text: str) -> None:
                 total_budget = cash_amount + freed_cash
 
                 # ╔════════════════════════════════════════════════════════╗
-                # ║ PASS 2 — Allocate total_budget across BUY signals      ║
+                # ║ PASS 2 — Build candidate BUY queue, rank by ROI        ║
                 # ╚════════════════════════════════════════════════════════╝
-                # Allocation policy:
-                # - 33% to rotation (or proportional if budget < €1050)
-                # - Up to 30% to top-N Core picks
-                # - Up to 20% to DIP entries (active alerts)
-                # - Remainder → cash bucket
+                # No per-radar budget reserves. Every candidate buy across
+                # Rotation, Core, and DIP is annualized to a comparable
+                # expected alpha, ranked DESC, and deployed top-down until
+                # budget exhausted (or concentration cap kicks in).
 
-                if total_budget > 0:
-                    rotation_pct = 0.33 if not skip_rotation else 0.0
-                    rotation_budget = total_budget * rotation_pct
-                else:
-                    rotation_budget = 0.0
-                remaining = total_budget - rotation_budget
+                candidates: list[dict] = []
+                # Default suggested allocation per signal — radar-specific
+                # but adjustable. We size big for high-conviction (Core 100)
+                # and modest for short-horizon DIP (more positions, smaller
+                # each, since the model's pred_alpha already prices the bet).
+                CORE_BASE_ALLOC = 250.0
+                DIP_BASE_ALLOC = 150.0
+                ROT_BASE_ALLOC = 200.0  # only used if no calibration
 
-                # Rotation BUYs (score-weighted on new top-3 entries)
-                rotation_buys: list[dict] = []
-                if not skip_rotation and rotation_top3 and rotation_budget > 0:
-                    total_score = sum(r["score"] for r in rotation_top3) or 1.0
+                # ── Rotation candidates: top-3 (NEW or top-up) ──────────
+                if not skip_rotation and rotation_top3:
                     for r in rotation_top3:
-                        if r["already_held"]:
-                            # Skip — kept position, no top-up (concentration policy)
-                            continue
-                        weight = r["score"] / total_score
-                        alloc = round(rotation_budget * weight, 0)
-                        if alloc < 10:
-                            continue
-                        rotation_buys.append({
-                            "ticker":   r["ucits"],
-                            "us_proxy": r["us_ticker"],
-                            "bucket":   "ROTATION",
-                            "value":    alloc,
-                            "score":    r["score"],
-                            "weight":   weight,
-                        })
-                        buy_actions.append({
-                            "ticker":  r["ucits"],
-                            "bucket":  "ROTATION",
-                            "reason":  f"top-{rotation_top3.index(r)+1} score {r['score']:.0f}",
-                            "value":   alloc,
+                        ann_alpha = _annualized_alpha(
+                            "ROTATION", score=r["score"]
+                        )
+                        # Score-weighted size within rotation: top-1 gets
+                        # more than top-3 even though they share the ROI
+                        # queue with Core and DIP.
+                        total_score = sum(x["score"] for x in rotation_top3) or 1.0
+                        size = ROT_BASE_ALLOC * 3.0 * (r["score"] / total_score)
+                        candidates.append({
+                            "ticker":     r["ucits"],
+                            "bucket":     "ROTATION",
+                            "reason":     f"rotation top-{rotation_top3.index(r)+1} score {r['score']:.0f}",
+                            "suggested":  size,
+                            "ann_alpha":  ann_alpha,
+                            "confidence": 1.0,  # rule-based score is its own confidence
+                            "extra":      {"us_proxy": r["us_ticker"], "score": r["score"]},
                         })
 
-                # Unallocated rotation budget (e.g., all top-3 already held)
-                # rolls into remaining.
-                rotation_deployed = sum(b["value"] for b in rotation_buys)
-                rotation_leftover = rotation_budget - rotation_deployed
-                remaining += rotation_leftover
-
-                # ── Core picks (top-N from /core_picks) ─────────────────
-                core_buys: list[dict] = []
+                # ── Core picks: all (including held — concentration cap gates) ─
                 try:
                     from core_radar import scan_core_universe
                     core_opps = scan_core_universe(min_score=70.0)
-                    if core_opps and remaining > 0:
-                        # Filter out tickers already in CORE bucket (avoid duplicate buy)
-                        core_held = {sym.upper() for sym, _ in portfolio_by_bucket["CORE"]}
-                        fresh_picks = [o for o in core_opps if o["ticker"].upper() not in core_held]
-                        if fresh_picks:
-                            # Budget for Core: up to 30% of remaining at most
-                            core_budget = min(remaining * 0.30, remaining)
-                            # Take top picks, distribute by score
-                            top_n = min(3, len(fresh_picks))
-                            top_picks = fresh_picks[:top_n]
-                            total_pick_score = sum(p["score"] for p in top_picks) or 1.0
-                            for p in top_picks:
-                                weight = p["score"] / total_pick_score
-                                alloc = round(core_budget * weight, 0)
-                                if alloc < 50:  # ignore tiny allocations
-                                    continue
-                                core_buys.append({
-                                    "ticker":  p["ticker"],
-                                    "score":   p["score"],
-                                    "price":   p.get("current_price", 0),
-                                    "value":   alloc,
-                                    "note":    p.get("note", ""),
-                                })
-                                buy_actions.append({
-                                    "ticker":  p["ticker"],
-                                    "bucket":  "CORE",
-                                    "reason":  f"score {p['score']:.0f} (${p.get('current_price', 0):.2f})",
-                                    "value":   alloc,
-                                })
-                                remaining -= alloc
+                    for p in core_opps:
+                        # Convert score back to alpha estimate for ranking.
+                        # Score uses tanh(alpha × 3) × 50 + 50, so inverse:
+                        # alpha = atanh((score - 50) / 50) / 3
+                        import math as _m
+                        score_norm = (float(p["score"]) - 50.0) / 50.0
+                        score_norm = max(-0.999, min(0.999, score_norm))
+                        alpha_1y = _m.atanh(score_norm) / 3.0
+                        candidates.append({
+                            "ticker":     p["ticker"],
+                            "bucket":     "CORE",
+                            "reason":     f"Core score {p['score']:.0f} (${p.get('current_price', 0):.2f})",
+                            "suggested":  float(p.get("suggested_eur", CORE_BASE_ALLOC)) or CORE_BASE_ALLOC,
+                            "ann_alpha":  alpha_1y,
+                            "confidence": 1.0,
+                            "extra":      {"score": p["score"], "price": p.get("current_price")},
+                        })
                 except Exception as _e:
                     info_lines.append(f"⚠️ Core picks falhou: `{_e}`")
 
-                # ── DIP entries (new BUY alerts today) ──────────────────
-                dip_buys: list[dict] = []
+                # ── DIP entries (real tickers only — WL_ filtered) ──────
                 try:
                     import state as _st
-                    today_alerts = list(_st.load_alerts())
-                    if today_alerts and remaining > 0:
-                        # Conservative: €100-200 per DIP alert based on conviction
-                        # Without conviction scores per alert we use uniform €150
-                        per_alert = 150.0
-                        for ticker in today_alerts[:3]:  # cap at 3 to avoid overdeploy
-                            if remaining < per_alert:
-                                break
-                            dip_buys.append({
-                                "ticker": ticker,
-                                "value":  per_alert,
-                            })
-                            buy_actions.append({
-                                "ticker":  ticker,
-                                "bucket":  "DIP",
-                                "reason":  "DIP alert ativo hoje",
-                                "value":   per_alert,
-                            })
-                            remaining -= per_alert
+                    raw_alerts = list(_st.load_alerts())
+                    today_alerts = [
+                        t for t in raw_alerts
+                        if not str(t).upper().startswith("WL_")
+                        and "_" not in str(t)
+                    ]
+                    for ticker in today_alerts:
+                        # Without per-alert pred_alpha at /cash time, assume
+                        # the alert fired because it crossed the model's
+                        # ≥70 win-prob threshold → conservative annualized
+                        # alpha estimate of 24%/year (8% in 90d horizon).
+                        # If we ever wire per-alert pred to state.load_alerts,
+                        # swap this for the real value.
+                        pred_alpha_90d_default = 0.08
+                        ann_alpha = pred_alpha_90d_default * (365.0 / 90.0)
+                        candidates.append({
+                            "ticker":     ticker,
+                            "bucket":     "DIP",
+                            "reason":     "DIP alert activo hoje (default conviction)",
+                            "suggested":  DIP_BASE_ALLOC,
+                            "ann_alpha":  ann_alpha,
+                            "confidence": 0.7,  # conservative — no per-alert score
+                            "extra":      {},
+                        })
                 except Exception as _e:
                     info_lines.append(f"⚠️ DIP queue falhou: `{_e}`")
+
+                # ── Rank by ROI score = ann_alpha × max(0.5, confidence) ───
+                for c in candidates:
+                    c["roi_score"] = c["ann_alpha"] * max(0.5, c["confidence"])
+
+                # Drop signals with confidence < 0.3 (per plan)
+                candidates = [c for c in candidates if c["confidence"] >= 0.3]
+                candidates.sort(key=lambda c: -c["roi_score"])
+
+                # ── Deploy top-down respecting concentration cap ───────
+                remaining = total_budget
+                ranked_deploys: list[dict] = []  # for display
+
+                for c in candidates:
+                    if remaining <= 5:
+                        break  # negligible
+                    requested = min(c["suggested"], remaining)
+                    allowed, capped_alloc, cap_reason = _can_top_up(c["ticker"], requested)
+                    if not allowed or capped_alloc < 25:
+                        if cap_reason:
+                            info_lines.append(
+                                f"⏭️ `{c['ticker']}` [{c['bucket']}] skipped — {cap_reason}"
+                            )
+                        continue
+                    final_alloc = round(capped_alloc, 0)
+                    if final_alloc < 25:
+                        continue
+                    reason = c["reason"]
+                    if cap_reason:
+                        reason = f"{reason} | {cap_reason}"
+                    # Update virtual portfolio for next iteration's cap math
+                    ticker_current_value[c["ticker"].upper()] = (
+                        ticker_current_value.get(c["ticker"].upper(), 0.0) + final_alloc
+                    )
+                    buy_actions.append({
+                        "ticker": c["ticker"],
+                        "bucket": c["bucket"],
+                        "reason": reason,
+                        "value":  final_alloc,
+                        "ann_alpha_pct": c["ann_alpha"] * 100,
+                    })
+                    ranked_deploys.append({
+                        "ticker":   c["ticker"],
+                        "bucket":   c["bucket"],
+                        "roi":      c["roi_score"] * 100,
+                        "alpha":    c["ann_alpha"] * 100,
+                    })
+                    remaining -= final_alloc
 
                 # ── Cash bucket: whatever's left ───────────────────────
                 cash_bucket = max(0.0, remaining)
@@ -7717,7 +7951,11 @@ def _handle_command(text: str) -> None:
                 lines: list[str] = []
                 lines.append(f"💰 *Allocation Proposal*")
                 lines.append("")
-                lines.append(f"📊 *Portfolio actual*: €{portfolio_cost:.2f} em {len(positions)} posições")
+                lines.append(
+                    f"📊 *Portfolio*: cost €{portfolio_cost:.2f} | "
+                    f"live €{portfolio_value:.2f} | "
+                    f"{len(positions)} posições"
+                )
                 lines.append(
                     f"   CORE: {len(portfolio_by_bucket['CORE'])} | "
                     f"ROTATION: {len(portfolio_by_bucket['ROTATION'])} | "
@@ -7726,12 +7964,12 @@ def _handle_command(text: str) -> None:
                 )
                 lines.append("")
                 lines.append(f"💵 *Budget*:")
-                lines.append(f"   Cash inflow:     €{cash_amount:,.2f}")
+                lines.append(f"   Cash inflow:      €{cash_amount:,.2f}")
                 lines.append(
                     f"   Freed from sells: €{freed_cash:,.2f}"
                     f"{' (ignorado)' if ignore_sells else ''}"
                 )
-                lines.append(f"   *TOTAL budget*:  €{total_budget:,.2f}")
+                lines.append(f"   *TOTAL budget*:   €{total_budget:,.2f}")
                 lines.append("")
 
                 # SELLs section
@@ -7746,6 +7984,19 @@ def _handle_command(text: str) -> None:
                         lines.append(f"      _{s['reason']}_")
                     lines.append("")
 
+                # ROTATION HOLDs (kept by tax-aware gate — informational)
+                if rotation_holds_kept:
+                    lines.append(
+                        f"🟢 *ROTATION HOLDs* ({len(rotation_holds_kept)} — "
+                        f"tax-friction gate kept):"
+                    )
+                    for h in rotation_holds_kept:
+                        lines.append(
+                            f"  • `{h['ticker']}`: {h['shares']:g} sh "
+                            f"(€{h['value']:.0f}) — _{h['reason']}_"
+                        )
+                    lines.append("")
+
                 # EXIT WARNINGS (medium severity, not yet sell)
                 if exit_warnings_list:
                     lines.append(f"⚠️ *EXIT WARNINGS* ({len(exit_warnings_list)} — sinais MED, monitorizar):")
@@ -7756,7 +8007,7 @@ def _handle_command(text: str) -> None:
                         )
                     lines.append("")
 
-                # ROTATION top-3 status
+                # ROTATION top-3 status (informational)
                 if not skip_rotation and rotation_top3:
                     lines.append(f"🔄 *ROTATION* top-3 hoje:")
                     for i, r in enumerate(rotation_top3, 1):
@@ -7767,12 +8018,17 @@ def _handle_command(text: str) -> None:
                         )
                     lines.append("")
 
-                # BUYs section
+                # BUYs section — ranked by ROI
                 if buy_actions:
-                    lines.append(f"✅ *BUYs propostos* ({len(buy_actions)}):")
+                    lines.append(f"✅ *BUYs propostos* ({len(buy_actions)}, ROI-ranked):")
                     for b in buy_actions:
+                        ann_str = (
+                            f" • α={b.get('ann_alpha_pct', 0):.1f}%/y"
+                            if b.get("ann_alpha_pct") else ""
+                        )
                         lines.append(
-                            f"  • `{b['ticker']}` [{b['bucket']}]: €{b['value']:.0f}"
+                            f"  • `{b['ticker']}` [{b['bucket']}]: "
+                            f"€{b['value']:.0f}{ann_str}"
                         )
                         lines.append(f"      _{b['reason']}_")
                     lines.append("")

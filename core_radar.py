@@ -99,16 +99,25 @@ def is_model_ready() -> bool:
 
 
 def _ml_score(signals: dict, annual_yield_pct: float) -> float | None:
-    """Score a candidate using the ML model. Returns predicted alpha_1y converted
-    to 0-100 scale, or None if the model is not ready or has poor CV quality.
+    """Score a candidate using the ML model. Returns predicted alpha_1y mapped
+    to 0-100 via tanh compression, or None if the model is not ready or has
+    poor CV quality.
 
-    Conversion: score = clamp(50 + alpha_1y * 250, 0, 100)
-      alpha_1y =  0.00 → score 50  (no edge vs SPY)
-      alpha_1y = +0.20 → score 100 (20% outperformance expected)
-      alpha_1y = -0.20 → score   0 (underperformance expected)
+    Conversion: score = 50 + tanh(alpha_1y × 3) × 50  (asymptotic, never saturates)
+      alpha_1y =  0.00 → 50.0
+      alpha_1y = +0.10 → 64.6
+      alpha_1y = +0.20 → 76.9
+      alpha_1y = +0.50 → 95.2
+      alpha_1y = +1.00 → 99.75 (never exactly 100)
+      alpha_1y = -0.20 → 23.1
 
-    Quality gate: if the bundle's CV R² is below _MIN_CV_R2_FOR_USE, predictions
-    are worse than the mean → return None so the caller falls back to rule-based.
+    Why tanh, not linear: the previous formula `clamp(50 + alpha * 250, 0, 100)`
+    saturated at alpha ≥ 0.20, tying NVO/GIS/CMG all at 100 even when their
+    underlying alpha predictions were materially different. Tanh keeps the
+    distinction across the high end.
+
+    Quality gate: if the bundle's CV IC is below _MIN_CV_IC_FOR_USE, predictions
+    aren't predictive enough → return None so the caller falls back to rule-based.
     """
     bundle = _load_core_model()
     if bundle is None:
@@ -130,7 +139,7 @@ def _ml_score(signals: dict, annual_yield_pct: float) -> float | None:
         X = np.array(row).reshape(1, -1)
         X_scaled = bundle.scaler.transform(X)
         alpha_pred = float(bundle.model.predict(X_scaled)[0])
-        score = max(0.0, min(100.0, 50.0 + alpha_pred * 250.0))
+        score = 50.0 + math.tanh(alpha_pred * 3.0) * 50.0
         return round(score, 1)
     except Exception as e:
         log.debug(f"[core_radar] ML score failed: {e}")

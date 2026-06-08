@@ -195,10 +195,12 @@ def get_stock_themes(
 ) -> list[dict]:
     """Devolve lista de temas que matcham este stock (pode ser vazia).
 
-    Match por:
-      1. Ticker explícito na lista do tema
-      2. Sector do stock está na lista de sectores do tema
-      3. Nome da empresa contém algum keyword do tema (fuzzy, case-insensitive)
+    Match prioritário (sem fall-through ambíguo):
+      1. Ticker explícito na lista do tema  → match forte
+      2. Keyword do tema no nome da empresa → match nominal
+      3. Sector match REQUER keyword match  → sector sozinho é demasiado
+         genérico (DUOL é Technology mas não é AI infra). Por sí só
+         dispara temas amplos para qualquer stock do sector.
     """
     themes = _load()
     ticker_u = ticker.upper().strip()
@@ -210,23 +212,22 @@ def get_stock_themes(
         matched = False
         reason  = ""
 
-        # 1. Match por ticker
+        # 1. Match por ticker — forte, sempre vence
         if ticker_u in [x.upper() for x in t.get("tickers", [])]:
             matched = True
             reason  = "ticker"
 
-        # 2. Match por sector
-        elif sector_l and sector_l in t.get("sectors", []):
-            matched = True
-            reason  = "sector"
-
-        # 3. Match por keyword no nome
+        # 2. Match por keyword no nome
         elif name_l:
             for kw in t.get("keywords", []):
                 if kw.lower() in name_l:
                     matched = True
                     reason  = f"keyword:{kw}"
                     break
+
+        # 3. Sector match — APENAS se também já houve keyword match acima
+        # (i.e., reforça o match nominal). Sector sozinho não basta para
+        # evitar mismatches como DUOL → "ai_infra" só por ser Technology.
 
         if matched:
             bonus = _theme_bonus_for_confidence(

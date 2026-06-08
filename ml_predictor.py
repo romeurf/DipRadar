@@ -110,6 +110,12 @@ def _to_dict(obj: Any) -> dict:
         d.setdefault("champion", d["champion_name"])
     if "n_train_samples" in d:
         d.setdefault("n_samples", d["n_train_samples"])
+    # Older bundles only wrote `rho_alpha`; the canonical display key is
+    # `rho_mean` (post-PR #23 the trainer writes BOTH, but in-flight bundles
+    # may have only one). Alias rho_alpha → rho_mean so /admin_check_config
+    # doesn't show "rho_alpha=None" just because the field name evolved.
+    if d.get("rho_mean") in (None, "") and d.get("rho_alpha") not in (None, ""):
+        d["rho_mean"] = d["rho_alpha"]
     return d
 
 

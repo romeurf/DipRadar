@@ -131,7 +131,8 @@
       "Bash(git stash *)",
       "Bash(python -c \"import ast; ast.parse\\(open\\('ml_training/train.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(git revert *)",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/backfill_fundamentals.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/backfill_fundamentals.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)"
     ],
     "additionalDirectories": [
       "c:\\Users\\Romeu\\OneDrive\\Documentos\\GitHub\\DipRadar"
