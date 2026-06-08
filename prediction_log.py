@@ -51,6 +51,7 @@ def _header_fields() -> list[str]:
         "symbol",
         "snapshot_date",
         "win_prob",
+        "score_raw",       # alpha_90d predicted (log-return excess vs SPY)
         "prob_price",
         "prob_fund",
         "win40_prob",
@@ -144,6 +145,7 @@ def log_prediction(
         row["symbol"]        = symbol
         row["snapshot_date"] = snapshot_date or datetime.utcnow().date().isoformat()
         row["win_prob"]      = getattr(result, "win_prob", None)
+        row["score_raw"]     = getattr(result, "score_raw", None)
         row["prob_price"]    = getattr(result, "prob_price", None)
         row["prob_fund"]     = getattr(result, "prob_fund", None)
         row["win40_prob"]    = getattr(result, "win40_prob", None)
@@ -163,6 +165,58 @@ def log_prediction(
 
     except Exception as e:
         log.debug(f"[prediction_log] {symbol}: log falhou ({e}) — ignorado.")
+
+
+def get_recent_predictions_by_ticker(
+    tickers: list[str],
+    lookback_days: int = 7,
+) -> dict[str, dict]:
+    """Return the most recent prediction per ticker from the last N days.
+
+    Output: {ticker: {win_prob, score_raw, ts}} for tickers found.
+    Missing tickers are simply not in the result dict.
+
+    Used by /cash to fetch per-DIP-alert alpha estimate instead of
+    hardcoding a default. score_raw is the model's raw alpha_90d
+    prediction; win_prob is the calibrated probability.
+    """
+    if not PREDICTIONS_PATH.exists() or not tickers:
+        return {}
+    try:
+        from datetime import date, timedelta
+        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        wanted = {t.upper() for t in tickers}
+        latest: dict[str, dict] = {}
+        with PREDICTIONS_PATH.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                sym = (row.get("symbol") or "").upper()
+                if sym not in wanted:
+                    continue
+                ts = row.get("ts") or ""
+                snap = row.get("snapshot_date") or ""
+                if snap and snap < cutoff:
+                    continue
+                # Track latest by ts per symbol
+                if sym not in latest or ts > latest[sym].get("ts", ""):
+                    try:
+                        wp = float(row.get("win_prob") or "")
+                    except (TypeError, ValueError):
+                        wp = None
+                    try:
+                        sr = float(row.get("score_raw") or "")
+                    except (TypeError, ValueError):
+                        sr = None
+                    latest[sym] = {
+                        "win_prob":  wp,
+                        "score_raw": sr,
+                        "ts":        ts,
+                        "snapshot_date": snap,
+                    }
+        return latest
+    except Exception as e:
+        log.debug(f"[prediction_log] get_recent_predictions failed: {e}")
+        return {}
 
 
 def compute_ml_accuracy() -> dict:

@@ -7175,7 +7175,9 @@ def _handle_command(text: str) -> None:
                 out_tail = (result.stdout or "")[-1500:]
                 err_tail = (result.stderr or "")[-800:]
 
-                # Read the produced JSON to surface key numbers
+                # Read the produced JSON to surface key numbers.
+                # Supports both legacy (single-method linear) and new
+                # multi-method format with `method` + `params` + `all_methods`.
                 summary = ""
                 try:
                     import json as _json
@@ -7183,17 +7185,54 @@ def _handle_command(text: str) -> None:
                     cal_path = _Path("data/rotation_alpha_calibration.json")
                     if cal_path.exists():
                         cal = _json.loads(cal_path.read_text())
-                        summary = (
-                            f"\n📊 *Resultado*:\n"
-                            f"  slope = `{cal.get('slope_alpha_per_point_monthly')}`\n"
-                            f"  intercept = `{cal.get('intercept')}`\n"
-                            f"  r² = `{cal.get('r_squared')}`\n"
-                            f"  n_picks = `{cal.get('n_picks')}`\n"
+                        chosen_method = cal.get("method", "linear")
+                        cv_r2 = cal.get("cv_r_squared", cal.get("r_squared"))
+                        lines_sum = [
+                            f"\n📊 *Resultado*:",
+                            f"  Método escolhido: `{chosen_method}`",
+                            f"  CV r² (out-of-fold) = `{cv_r2}`",
+                            f"  In-sample r² = `{cal.get('r_squared')}`",
+                            f"  n_picks = `{cal.get('n_picks')}`",
                             f"  accepted = `{cal.get('accepted')}` "
-                            f"(threshold {cal.get('accept_threshold')})"
-                        )
-                except Exception:
-                    pass
+                            f"(threshold {cal.get('accept_threshold')})",
+                        ]
+                        # Show comparison if all_methods present
+                        all_m = cal.get("all_methods", [])
+                        if all_m:
+                            lines_sum.append("\n  Comparação dos 4 métodos (CV r²):")
+                            for m in all_m:
+                                err = (
+                                    f" ({m.get('error')})"
+                                    if m.get("error") else ""
+                                )
+                                marker = " ←" if m.get("method") == chosen_method else ""
+                                lines_sum.append(
+                                    f"    {m.get('method'):11} "
+                                    f"in={m.get('r_squared'):.3f} "
+                                    f"cv={m.get('cv_r_squared'):.3f}{err}{marker}"
+                                )
+                        # Method-specific params
+                        params = cal.get("params", {})
+                        if chosen_method == "linear" and params:
+                            lines_sum.append(
+                                f"  slope = `{params.get('slope_alpha_per_point_monthly')}` | "
+                                f"intercept = `{params.get('intercept')}`"
+                            )
+                        elif chosen_method == "polynomial" and params:
+                            lines_sum.append(
+                                f"  degree = `{params.get('degree')}` | "
+                                f"coeffs = `{params.get('coeffs')}`"
+                            )
+                        elif chosen_method == "buckets" and params:
+                            lines_sum.append(
+                                f"  boundaries = `{params.get('boundaries')}`"
+                            )
+                            lines_sum.append(
+                                f"  alpha/bucket = `{params.get('alpha_per_bucket')}`"
+                            )
+                        summary = "\n".join(lines_sum)
+                except Exception as _e:
+                    summary = f"\n_(erro a ler JSON: {_e})_"
 
                 if result.returncode == 0:
                     _reply(
@@ -7965,29 +8004,61 @@ def _handle_command(text: str) -> None:
                 # ── DIP entries (real tickers only — WL_ filtered) ──────
                 try:
                     import state as _st
+                    from prediction_log import get_recent_predictions_by_ticker
+
                     raw_alerts = list(_st.load_alerts())
                     today_alerts = [
                         t for t in raw_alerts
                         if not str(t).upper().startswith("WL_")
                         and "_" not in str(t)
                     ]
+                    # Look up each ticker's most recent prediction (last 7d)
+                    # so DIP alphas reflect the actual model output instead
+                    # of a hardcoded default. Older alerts predating the
+                    # score_raw schema add won't have score_raw but will
+                    # have win_prob, which we convert via a linear mapping
+                    # calibrated against the trainer's threshold table.
+                    recent_preds = get_recent_predictions_by_ticker(today_alerts, lookback_days=7)
+
                     for ticker in today_alerts:
-                        # Without per-alert pred_alpha at /cash time, assume
-                        # the alert fired because it crossed the model's
-                        # ≥70 win-prob threshold → conservative annualized
-                        # alpha estimate of 24%/year (8% in 90d horizon).
-                        # If we ever wire per-alert pred to state.load_alerts,
-                        # swap this for the real value.
-                        pred_alpha_90d_default = 0.08
-                        ann_alpha = pred_alpha_90d_default * (365.0 / 90.0)
+                        pred = recent_preds.get(ticker.upper(), {})
+                        score_raw = pred.get("score_raw")
+                        win_prob = pred.get("win_prob")
+
+                        # Resolve alpha_90d:
+                        #   1. score_raw if present (direct model output)
+                        #   2. else estimate from win_prob via linear mapping
+                        #      anchored on ml_predictor's threshold table:
+                        #        win_prob 0.50 → alpha ~0.00 (random)
+                        #        win_prob 0.60 → alpha ~0.05
+                        #        win_prob 0.70 → alpha ~0.10
+                        #        win_prob 0.80 → alpha ~0.15
+                        #      Linear: alpha ≈ (win_prob - 0.50) × 0.5
+                        #   3. else fallback to 0.05 (modest entry threshold)
+                        if score_raw is not None and score_raw > 0:
+                            pred_alpha_90d = float(score_raw)
+                            source = "score_raw"
+                            confidence = min(1.0, max(0.3, (win_prob or 0.6)))
+                        elif win_prob is not None:
+                            pred_alpha_90d = max(0.0, (float(win_prob) - 0.50) * 0.5)
+                            source = f"win_prob {win_prob:.2f}"
+                            confidence = min(1.0, max(0.3, float(win_prob)))
+                        else:
+                            # No prediction log entry — alert may predate
+                            # the log schema. Conservative fallback.
+                            pred_alpha_90d = 0.05
+                            source = "no log entry — fallback"
+                            confidence = 0.4
+
+                        ann_alpha = pred_alpha_90d * (365.0 / 90.0)
                         candidates.append({
                             "ticker":     ticker,
                             "bucket":     "DIP",
-                            "reason":     "DIP alert activo hoje (default conviction)",
+                            "reason":     f"DIP alert ({source})",
                             "suggested":  DIP_BASE_ALLOC,
                             "ann_alpha":  ann_alpha,
-                            "confidence": 0.7,  # conservative — no per-alert score
-                            "extra":      {},
+                            "confidence": confidence,
+                            "extra":      {"pred_alpha_90d": pred_alpha_90d, "win_prob": win_prob},
                         })
                 except Exception as _e:
                     info_lines.append(f"⚠️ DIP queue falhou: `{_e}`")
