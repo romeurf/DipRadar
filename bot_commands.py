@@ -7276,11 +7276,26 @@ def _handle_command(text: str) -> None:
                         shares    = float(pos.get("shares", 0) or 0)
                         cost      = float(pos.get("total_cost", 0) or 0)
 
-                        # Live price via conviction_radar fetcher (handles US tickers).
-                        # UCITS (ROTATION) won't have yfinance data → fallback to
-                        # avg_price (PnL=0% effective).
+                        # Live price:
+                        # - US tickers: yfinance via conviction_radar fetcher
+                        # - UCITS (ROTATION): yfinance has no data, so estimate
+                        #   from the US proxy's % change since entry_date
+                        #   (USER_HOLDINGS_UCITS mapping). PnL is approximate.
                         current = avg_price
-                        if bucket_name != "ROTATION":
+                        ucits_estimated = False
+                        if bucket_name == "ROTATION":
+                            try:
+                                from ucits_proxy import estimate_ucits_current_price
+                                est = estimate_ucits_current_price(
+                                    sym, avg_price,
+                                    entry_date_iso=pos.get("entry_date_iso"),
+                                )
+                                if est is not None and est > 0:
+                                    current = est
+                                    ucits_estimated = True
+                            except Exception:
+                                pass
+                        else:
                             try:
                                 current = float(cr._fetch_price(sym, fallback=avg_price))
                             except Exception:
@@ -7329,19 +7344,20 @@ def _handle_command(text: str) -> None:
                                 pass
 
                         position_states.append({
-                            "ticker":      sym,
-                            "bucket":      bucket_name,
-                            "shares":      shares,
-                            "avg_price":   avg_price,
-                            "current":     current,
-                            "value_now":   value_now,
-                            "cost":        cost,
-                            "pnl_eur":     pnl_eur,
-                            "pnl_pct":     pnl_pct,
-                            "state":       state,
-                            "reason":      reason,
-                            "days_held":   days_held,
-                            "conv_state":  conv_state,
+                            "ticker":           sym,
+                            "bucket":           bucket_name,
+                            "shares":           shares,
+                            "avg_price":        avg_price,
+                            "current":          current,
+                            "value_now":        value_now,
+                            "cost":             cost,
+                            "pnl_eur":          pnl_eur,
+                            "pnl_pct":          pnl_pct,
+                            "state":            state,
+                            "reason":           reason,
+                            "days_held":        days_held,
+                            "conv_state":       conv_state,
+                            "ucits_estimated":  ucits_estimated,
                         })
 
                 total_value = sum(bucket_value.values())
@@ -7384,7 +7400,16 @@ def _handle_command(text: str) -> None:
 
                         # Compact line with concentration %
                         days_str = f"d{s['days_held']}" if s["days_held"] > 0 else "—"
-                        pnl_str  = f"{s['pnl_pct']:+.1f}%"
+                        # UCITS positions use proxy-derived PnL when available
+                        # (marked with ~ to flag the approximation). Otherwise
+                        # show "no live" rather than misleading 0%.
+                        if b == "ROTATION":
+                            if s.get("ucits_estimated"):
+                                pnl_str = f"~{s['pnl_pct']:+.1f}%"
+                            else:
+                                pnl_str = "no live"
+                        else:
+                            pnl_str = f"{s['pnl_pct']:+.1f}%"
                         conc_pct = (
                             (s['value_now'] / total_value * 100)
                             if total_value > 0 else 0.0
@@ -7463,17 +7488,27 @@ def _handle_command(text: str) -> None:
                     lines.append(f"  ⚠️ Core picks falhou: `{_e}`")
                     lines.append("")
 
-                # DIP alerts
+                # DIP alerts (real tickers only — WL_ watchlist pseudo-tickers filtered)
                 try:
                     import state as _st
-                    today_alerts = list(_st.load_alerts())
+                    raw_alerts = list(_st.load_alerts())
+                    today_alerts = [
+                        t for t in raw_alerts
+                        if not str(t).upper().startswith("WL_")
+                        and "_" not in str(t)
+                    ]
+                    wl_count = len(raw_alerts) - len(today_alerts)
                     if today_alerts:
-                        lines.append(f"🎯 DIP alerts hoje ({len(today_alerts)}):")
+                        suffix = f" (+{wl_count} watchlist)" if wl_count else ""
+                        lines.append(f"🎯 DIP alerts hoje ({len(today_alerts)}{suffix}):")
                         for t in today_alerts[:5]:
                             lines.append(f"  • `{t}`")
                         lines.append("")
                     else:
-                        lines.append("🎯 DIP alerts hoje: 0")
+                        lines.append(
+                            f"🎯 DIP alerts hoje: 0"
+                            + (f" ({wl_count} watchlist apenas)" if wl_count else "")
+                        )
                         lines.append("")
                 except Exception as _e:
                     lines.append(f"  ⚠️ DIP queue falhou: `{_e}`")
@@ -7705,21 +7740,44 @@ def _handle_command(text: str) -> None:
                                 if sig.ticker == us_proxy and ucits in rotation_holdings:
                                     held_score_map[ucits] = sig.combined_buy
 
+                        # Use US proxy for UCITS PnL estimation (yfinance
+                        # has no UCITS data). proxy % change since entry →
+                        # apply to cost basis → estimate current value.
+                        from ucits_proxy import estimate_ucits_current_price
+
                         for sym, pos in rotation_holdings.items():
                             if sym in top3_ucits_set:
                                 continue  # in top-3, keep
                             avg_price = float(pos.get("avg_price", 0.0))
                             shares    = float(pos.get("shares", 0.0))
-                            cost      = avg_price * shares  # UCITS: no live price available
-                            value     = cost
-                            unrealized_gain_pct = 0.0  # UCITS PnL unknown without live price
-                            current_score = held_score_map.get(sym, 50.0)  # neutral fallback
+                            cost      = avg_price * shares
 
-                            # Check the best alternative (top of rotation_top3)
+                            # Estimate UCITS current price via US proxy
+                            current_est = estimate_ucits_current_price(
+                                sym, avg_price,
+                                entry_date_iso=pos.get("entry_date_iso"),
+                            )
+                            if current_est is not None and current_est > 0:
+                                value = current_est * shares
+                                unrealized_gain_pct: float | None = (current_est / avg_price) - 1.0
+                            else:
+                                # Proxy fetch failed → unknown PnL (None signals
+                                # tax_engine to use conservative default)
+                                value = cost
+                                unrealized_gain_pct = None
+
+                            # current_score lookup: held_score_map returns the US
+                            # proxy's combined_buy. Missing key → None (data-starved).
+                            score_for_sym = held_score_map.get(sym)
+
                             do_sell, reason = tax_should_rotate(
                                 unrealized_gain_pct=unrealized_gain_pct,
-                                current_score=current_score,
+                                current_score=score_for_sym,
                                 target_score=best_target_score,
+                            )
+                            pnl_pct_display = (
+                                unrealized_gain_pct * 100
+                                if unrealized_gain_pct is not None else 0.0
                             )
                             if do_sell:
                                 sell_actions.append({
@@ -7728,7 +7786,7 @@ def _handle_command(text: str) -> None:
                                     "reason":  reason,
                                     "shares":  shares,
                                     "value":   value,
-                                    "current_pnl_pct": 0.0,
+                                    "current_pnl_pct": pnl_pct_display,
                                 })
                             else:
                                 rotation_holds_kept.append({

@@ -48,9 +48,16 @@ def _default_effective_tax() -> float:
     return 0.07  # IRS Jovem 75% exemption default
 
 
+# Used when the caller can't determine the real unrealized gain (e.g., UCITS
+# where yfinance has no price feed). Conservative middle estimate — keeps
+# tax friction non-zero so we don't rotate "for free" on positions where the
+# real PnL might be substantially positive.
+_UNKNOWN_GAIN_DEFAULT = 0.10
+
+
 def should_rotate(
-    unrealized_gain_pct: float,
-    current_score: float,
+    unrealized_gain_pct: float | None,
+    current_score: float | None,
     target_score: float,
     effective_tax_pct: float | None = None,
     *,
@@ -61,12 +68,18 @@ def should_rotate(
 
     Args:
       unrealized_gain_pct: position PnL as decimal (e.g., 0.18 for +18%).
-        Negative = loss position (no tax friction; selling realises a
-        tax-deductible loss).
+        Negative = loss position (no tax friction).
+        None or exact 0 = unknown (e.g., UCITS without price feed) →
+        substituted with _UNKNOWN_GAIN_DEFAULT to keep tax friction
+        non-trivial. Don't trust a "free rotation" inference from missing
+        data.
       current_score: rotation score of the position currently held.
+        None = unknown → HOLD (don't fire SELL on missing signal).
       target_score: rotation score of the candidate to rotate INTO.
       effective_tax_pct: defaults to env var or IRS Jovem 7%.
       exit_strength: structural exit signal (0-100). >70 forces rotate.
+        This is the ONLY structural override — a low rotation score alone
+        is "no signal", not "active deterioration".
       secular_risk: sector decay signal (0-100). >60 forces rotate.
 
     Returns:
@@ -75,31 +88,49 @@ def should_rotate(
     if effective_tax_pct is None:
         effective_tax_pct = _default_effective_tax()
 
-    # Overrides: structural reasons that override tax math
+    # If we have no score for the current position, the rotation decision
+    # is data-starved — default to HOLD rather than triggering a sell on
+    # a missing-data fallback (the old behaviour was to fire "severe
+    # deterioration" when held_score_map returned 0, which conflated
+    # "no signal" with "active breakdown").
+    if current_score is None:
+        return False, "current_score unavailable — HOLD on missing signal"
+
+    # Overrides: structural reasons that override tax math.
+    # NOTE: "current_score < 30" used to be an override here but is removed
+    # because a low rotation score is just "not a top pick today" — not
+    # active deterioration. Use exit_strength / secular_risk for that.
     if exit_strength > 70:
         return True, f"exit_strength {exit_strength:.0f} > 70 (structural breakdown)"
     if secular_risk > 60:
         return True, f"secular_risk {secular_risk:.0f} > 60 (sector dying)"
-    if current_score < 30:
-        return True, f"current_score {current_score:.0f} < 30 (severe deterioration)"
 
     score_gap = target_score - current_score
     if score_gap <= 0:
         return False, f"target score {target_score:.0f} ≤ current {current_score:.0f}"
 
-    if unrealized_gain_pct <= 0:
-        # Loss position — selling realises tax-deductible loss → no friction
+    # Loss override: ONLY for explicit losses. unrealized=0 is "unknown"
+    # or "exactly break-even" — neither warrants the friction-free path.
+    if unrealized_gain_pct is not None and unrealized_gain_pct < 0:
         return True, f"unrealized loss {unrealized_gain_pct*100:.1f}% — no tax cost"
 
-    tax_cost_pct = unrealized_gain_pct * effective_tax_pct
+    # Unknown gain → use conservative default so we don't rotate "for free"
+    if unrealized_gain_pct is None or unrealized_gain_pct == 0:
+        effective_gain = _UNKNOWN_GAIN_DEFAULT
+        gain_label = f"gain unknown — using {_UNKNOWN_GAIN_DEFAULT*100:.0f}% default"
+    else:
+        effective_gain = unrealized_gain_pct
+        gain_label = f"gain {unrealized_gain_pct*100:.1f}%"
+
+    tax_cost_pct = effective_gain * effective_tax_pct
     required_gap = tax_cost_pct * TAX_FRICTION_MULTIPLIER
 
     if score_gap >= required_gap:
         return True, (
             f"score gap {score_gap:.0f} ≥ required {required_gap:.1f} "
-            f"(gain {unrealized_gain_pct*100:.1f}%, tax {tax_cost_pct*100:.2f}%)"
+            f"({gain_label}, tax {tax_cost_pct*100:.2f}%)"
         )
     return False, (
         f"score gap {score_gap:.0f} < required {required_gap:.1f} "
-        f"(tax friction at {effective_tax_pct*100:.0f}% on {unrealized_gain_pct*100:.1f}% gain)"
+        f"(tax friction at {effective_tax_pct*100:.0f}% on {gain_label})"
     )
