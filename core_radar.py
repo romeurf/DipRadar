@@ -324,29 +324,30 @@ def _fetch_quality_metrics(ticker: str) -> dict:
         fcf_yield       = (fcf / mktcap) if (mktcap > 0 and fcf != 0) else None
         analyst_upside  = ((target / price) - 1) if (price > 0 and target > 0) else None
 
-        # Live dividend yield: yfinance has returned this in BOTH formats
-        # depending on version — sometimes decimal (0.042 = 4.2%), sometimes
-        # already percentage (4.2 = 4.2%). Heuristic detect + sanity bound:
+        # Live dividend yield — compute from dividendRate / currentPrice
+        # instead of using info["dividendYield"] which yfinance has returned
+        # in TWO formats (decimal 0.042 = 4.2% in some versions, percentage
+        # 4.2 = 4.2% in others). The heuristic to detect which format breaks
+        # for very-low-yield stocks (e.g., NVDA at 0.03% could be either):
         #
-        #   raw ∈ (0, 0.30]   → decimal,  multiply by 100   (e.g., 0.042 → 4.2)
-        #   raw ∈ (0.30, 30]  → already percentage, pass through (e.g., 4.2)
-        #   raw > 30          → garbage (data error), skip live yield entirely
+        #   - 0.03 raw could mean 3% (decimal interpretation) OR 0.03%
+        #     (already percentage). The heuristic can't tell.
         #
-        # The 30% upper bound is loose enough to allow REITs/MLPs with
-        # genuinely high yields but tight enough to catch the "yfinance
-        # returned 419 by accident" bug class.
-        div_yield_raw = info.get("dividendYield")
+        # Computing yield ourselves from dividendRate (annual USD per share)
+        # divided by currentPrice gives a single, unambiguous value. Always
+        # decimal, always correct, agnostic to yfinance version drift.
         div_yield_pct = None
-        if div_yield_raw is not None:
-            try:
-                v = float(div_yield_raw)
-                if 0 < v <= 0.30:
-                    div_yield_pct = v * 100.0
-                elif 0.30 < v <= 30:
-                    div_yield_pct = v
-                # else: out of bounds → leave as None, fall back to static
-            except (TypeError, ValueError):
-                div_yield_pct = None
+        try:
+            div_rate = info.get("dividendRate")
+            if div_rate is not None and price and price > 0:
+                yield_decimal = float(div_rate) / float(price)
+                # Sanity bound — 30% is loose enough for REITs/MLPs but
+                # tight enough to catch yfinance data errors (e.g., rate
+                # accidentally being market cap)
+                if 0 < yield_decimal <= 0.30:
+                    div_yield_pct = yield_decimal * 100.0
+        except (TypeError, ValueError):
+            div_yield_pct = None
 
         return {
             "revenue_growth":  info.get("revenueGrowth"),      # decimal, y/y
