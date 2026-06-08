@@ -65,20 +65,26 @@ def _is_tree_model(model) -> bool:
     return any(x in name for x in ("xgb", "lgbm", "lightgbm", "forest", "tree", "dart"))
 
 
-def _prepare_X(df: pd.DataFrame, feats: list[str], col_means: dict[str, float], model=None) -> np.ndarray:
-    """Prepara a matriz X com tratamento de NaN honesto.
+def _prepare_X(df: pd.DataFrame, feats: list[str], col_means: dict[str, float], model=None):
+    """Prepara X. Returns DataFrame for tree models (preserves feature names
+    so LightGBM can map columns by name at predict() time) and numpy for
+    linear models (Ridge does pure matrix math, names are wasted).
 
     Tree models (XGB, LGBM, RF): passam NaN directamente — o algoritmo
     aprendeu durante treino o que fazer quando um dado está ausente.
-    Não se inventa nenhum valor.
+    Não se inventa nenhum valor. **Returns DataFrame.** Without this,
+    sklearn warns "X does not have valid feature names, but LGBMRegressor
+    was fitted with feature names" because the .values conversion at the
+    boundary drops the columns LGBM had memorized. The warning is
+    cosmetic in isolation but a strong indicator of column-misalignment
+    risk if feature order ever drifts between fit and predict.
 
     Linear models (Ridge): NaN é matematicamente impossível. Usa a média
-    calculada APENAS das linhas com dados reais (sem data leakage, sem zeros
-    artificiais). Para features com cobertura < 20%, loga um aviso.
+    calculada APENAS das linhas com dados reais. Returns numpy.
     """
     if model is not None and _is_tree_model(model):
-        # Trees tratam NaN nativamente — não alterar nada
-        return df[feats].values.astype(np.float32)
+        # Trees tratam NaN nativamente — return DataFrame, preserving names
+        return df[feats].astype(np.float32)
     # Linear: mean imputation com médias do training set
     result = df[feats].copy()
     for col in feats:
