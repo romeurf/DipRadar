@@ -835,6 +835,10 @@ def score_from_fundamentals(
         "average_volume":     fundamentals.get("average_volume"),
         # Near-earnings uncertainty
         "earnings_days":      earnings_days,
+        # Investment-phase detection inputs (Option B). Without these
+        # passed-through, _is_investment_phase_compounder can't see the
+        # real gross_margin and the override never fires for /analisar.
+        "gross_margin":       fundamentals.get("gross_margin"),
     }
     return calculate_score(features, ml_prob=ml_prob)
 

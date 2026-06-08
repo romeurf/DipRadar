@@ -324,13 +324,27 @@ def _fetch_quality_metrics(ticker: str) -> dict:
         fcf_yield       = (fcf / mktcap) if (mktcap > 0 and fcf != 0) else None
         analyst_upside  = ((target / price) - 1) if (price > 0 and target > 0) else None
 
-        # Live dividend yield: yfinance gives it as decimal (0.042 = 4.2%)
-        # Convert to percentage for consistency with core_universe.json
+        # Live dividend yield: yfinance has returned this in BOTH formats
+        # depending on version — sometimes decimal (0.042 = 4.2%), sometimes
+        # already percentage (4.2 = 4.2%). Heuristic detect + sanity bound:
+        #
+        #   raw ∈ (0, 0.30]   → decimal,  multiply by 100   (e.g., 0.042 → 4.2)
+        #   raw ∈ (0.30, 30]  → already percentage, pass through (e.g., 4.2)
+        #   raw > 30          → garbage (data error), skip live yield entirely
+        #
+        # The 30% upper bound is loose enough to allow REITs/MLPs with
+        # genuinely high yields but tight enough to catch the "yfinance
+        # returned 419 by accident" bug class.
         div_yield_raw = info.get("dividendYield")
         div_yield_pct = None
         if div_yield_raw is not None:
             try:
-                div_yield_pct = float(div_yield_raw) * 100.0
+                v = float(div_yield_raw)
+                if 0 < v <= 0.30:
+                    div_yield_pct = v * 100.0
+                elif 0.30 < v <= 30:
+                    div_yield_pct = v
+                # else: out of bounds → leave as None, fall back to static
             except (TypeError, ValueError):
                 div_yield_pct = None
 
