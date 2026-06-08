@@ -501,20 +501,41 @@ def ml_score(
 
     enriched = dict(features) if features else {}
 
-    # Option B — Investment-phase FCF override (mirrors core_radar fix):
+    # Option B — Investment-phase FCF override (mirrors core_radar fix).
     # If the stock pattern matches a reinvesting compounder (NVO-style:
     # rev growth > 10%, GM > 40%, ROE > 15%, FCF < 0), neutralize fcf_yield
     # at inference so the model doesn't false-flag a capex-driven negative
-    # FCF as deterioration. We use the ml_features fallback as the neutral
-    # value (close to typical training-time median).
+    # FCF as deterioration.
+    #
+    # The neutral-value source preference (best → fallback):
+    #   1. bundle["impute_medians"]["fcf_yield"]   — exact training median
+    #      (preferred: matches the distribution the model trained on)
+    #   2. ml_features._FALLBACK["fcf_yield"]      — manually-maintained
+    #      "plausibly-neutral" constant (~0.04)
+    #
+    # TECH DEBT: the DIP bundle currently doesn't store impute_medians (see
+    # comment in _resolve_feature). When the DIP model is retrained, the
+    # trainer should persist column medians into the bundle so this fallback
+    # path becomes principled. Until then we use _FALLBACK which is "close
+    # to typical col_means" by manual curation.
     try:
         from score import _is_investment_phase_compounder
         if _is_investment_phase_compounder(enriched):
-            from ml_features import _FALLBACK as _FB
-            enriched["fcf_yield"] = float(_FB.get("fcf_yield", 0.04))
+            # Try bundle median first; fall back to static if unavailable
+            bundle_medians = _bundle.get("impute_medians") if _bundle else None
+            if bundle_medians and "fcf_yield" in bundle_medians:
+                neutral = float(bundle_medians["fcf_yield"])
+                source = "bundle.impute_medians"
+            else:
+                from ml_features import _FALLBACK as _FB
+                neutral = float(_FB.get("fcf_yield", 0.04))
+                source = "ml_features._FALLBACK"
+            enriched["fcf_yield"] = neutral
             enriched["_fcf_override_applied"] = True
-            logging.info(f"[ml_predictor] FCF override applied for {symbol or 'unknown'} "
-                         f"(investment-phase compounder)")
+            logging.info(
+                f"[ml_predictor] FCF override applied for {symbol or 'unknown'} "
+                f"(investment-phase compounder, neutral={neutral:.4f} from {source})"
+            )
     except Exception as _e:
         logging.debug(f"[ml_predictor] investment-phase check failed: {_e}")
 

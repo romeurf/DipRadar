@@ -303,10 +303,15 @@ def _fetch_quality_metrics(ticker: str) -> dict:
     """Busca métricas de qualidade fundamental via yfinance.
 
     Retorna dict com: revenue_growth, gross_margin, roe, fcf_yield,
-    analyst_upside, pe_forward. Valores None se não disponíveis.
+    analyst_upside, pe_forward, dividend_yield. Valores None se não disponíveis.
 
     Chamado no scan para enriquecer o score com sinais fundamentais —
     distingue "compounder sólido em desconto" de "negócio a deteriorar-se".
+
+    dividend_yield é live (não o valor estático em core_universe.json) porque
+    o yield varia inversamente com o preço — uma posição que estava a 1.5%
+    yield a $135 pode estar a 4.2% a $41 (mesmo valor de dividendo nominal).
+    O scan reflete a realidade actual.
     """
     try:
         import yfinance as yf
@@ -319,6 +324,16 @@ def _fetch_quality_metrics(ticker: str) -> dict:
         fcf_yield       = (fcf / mktcap) if (mktcap > 0 and fcf != 0) else None
         analyst_upside  = ((target / price) - 1) if (price > 0 and target > 0) else None
 
+        # Live dividend yield: yfinance gives it as decimal (0.042 = 4.2%)
+        # Convert to percentage for consistency with core_universe.json
+        div_yield_raw = info.get("dividendYield")
+        div_yield_pct = None
+        if div_yield_raw is not None:
+            try:
+                div_yield_pct = float(div_yield_raw) * 100.0
+            except (TypeError, ValueError):
+                div_yield_pct = None
+
         return {
             "revenue_growth":  info.get("revenueGrowth"),      # decimal, y/y
             "gross_margin":    info.get("grossMargins"),        # decimal
@@ -327,6 +342,7 @@ def _fetch_quality_metrics(ticker: str) -> dict:
             "analyst_upside":  analyst_upside,                  # decimal
             "pe_forward":      info.get("forwardPE"),           # ratio
             "earnings_growth": info.get("earningsGrowth"),      # decimal, y/y
+            "dividend_yield":  div_yield_pct,                   # PERCENTAGE (e.g., 4.2 not 0.042)
         }
     except Exception as e:
         log.debug(f"[core_radar] quality_metrics {ticker}: {e}")
@@ -511,6 +527,10 @@ def _score_core_dip(
     signals["fcf_yield_fund"]  = round(fcf_yield_q, 4)  if fcf_yield_q  is not None else None
     signals["analyst_upside"]  = round(analyst_up, 4)   if analyst_up   is not None else None
     signals["earnings_growth"] = round(earn_growth, 4)  if earn_growth  is not None else None
+    # Live dividend yield (yfinance) — overrides the static value in
+    # core_universe.json which can drift with price moves.
+    div_yield_live = quality.get("dividend_yield")
+    signals["dividend_yield_live"] = round(div_yield_live, 4) if div_yield_live is not None else None
 
     # Investment-phase detection: distinguish capex-driven negative FCF from
     # deterioration-driven negative FCF. A reinvesting compounder (AMZN
@@ -721,7 +741,7 @@ def scan_core_universe(min_score: float = 60.0) -> list[dict]:
 
     for entry in universe:
         ticker     = entry["ticker"]
-        ann_yield  = float(entry.get("annual_yield_pct") or 0.0)
+        ann_yield_static = float(entry.get("annual_yield_pct") or 0.0)
         note       = entry.get("note", "")
 
         hist = _fetch_hist(ticker)
@@ -732,7 +752,15 @@ def scan_core_universe(min_score: float = 60.0) -> list[dict]:
         volume        = hist["Volume"] if "Volume" in hist.columns else None
         current_price = float(close.iloc[-1])
 
-        score, signals = _score_core_dip(close, current_price, ann_yield, ticker=ticker, volume=volume)
+        # Score uses the live dividend yield when yfinance returns it; falls
+        # back to the static seed value in core_universe.json (which can drift
+        # as prices move — e.g., NVO was 1.5% at $135, now ~4.2% at $41).
+        # _fetch_quality_metrics is called inside _score_core_dip, so to
+        # avoid two yfinance round-trips we pass the static value through
+        # and let the scoring layer override from its own quality fetch.
+        score, signals = _score_core_dip(close, current_price, ann_yield_static, ticker=ticker, volume=volume)
+        live_yield = signals.get("dividend_yield_live")
+        ann_yield = float(live_yield) if live_yield is not None and live_yield > 0 else ann_yield_static
         if score < min_score:
             continue
 
