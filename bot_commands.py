@@ -8308,13 +8308,15 @@ def _handle_command(text: str) -> None:
                         dd52w = float(opp.get("dd_from_52w_high", 0)) * 100
                         yld = float(opp.get("annual_yield_pct", 0))
                         sug_eur = float(opp.get("suggested_eur", 0))
+                        # Mark stocks where FCF override fired (investment-phase compounder)
+                        marker = " 🌱" if opp.get("fcf_override_applied") else ""
                         lines.append(
                             f"{ticker:>7} "
                             f"{score:>6.0f} "
                             f"${price:>7.2f} "
                             f"{dd52w:>+6.1f}% "
                             f"{yld:>4.1f}% "
-                            f"€{sug_eur:>7.0f}"
+                            f"€{sug_eur:>7.0f}{marker}"
                         )
                     lines.append("```")
 
@@ -8326,6 +8328,19 @@ def _handle_command(text: str) -> None:
                         note = opp.get("note", "")
                         if note:
                             lines.append(f"• `{ticker}`: {note}")
+
+                    # Investment-phase footer if any pick triggered override
+                    invest_phase_picks = [
+                        opp for opp in top
+                        if opp.get("fcf_override_applied")
+                    ]
+                    if invest_phase_picks:
+                        lines.append("")
+                        lines.append(
+                            "🌱 _= FCF negativo neutralizado (investment-phase "
+                            "compounder: rev growth >10%, GM >40%, ROE >15%). "
+                            "Capex spike, não deterioração._"
+                        )
 
                     lines.append("")
                     lines.append(

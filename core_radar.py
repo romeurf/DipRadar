@@ -98,6 +98,42 @@ def is_model_ready() -> bool:
     return cv_ic >= _MIN_CV_IC_FOR_USE
 
 
+def _is_investment_phase(
+    rev_growth: float | None,
+    gross_margin: float | None,
+    roe: float | None,
+    fcf_yield: float | None,
+) -> bool:
+    """Classify a negative-FCF stock as 'reinvesting compounder' vs 'deterioration'.
+
+    Returns True when the financial pattern matches a healthy business that
+    happens to be in a heavy investment cycle (CapEx > OperatingCF for now):
+
+      - fcf_yield < 0                  (i.e., this IS an FCF-negative case)
+      - revenue_growth > 10%           (expanding fast — investment is funding growth)
+      - gross_margin > 40%             (real pricing power — not commoditized)
+      - roe > 15%                      (reinvested capital is productive)
+
+    All 4 conditions must be true. The strictness reflects that we're
+    OVERRIDING the model's penalty, so we want a high-precision detector
+    rather than a high-recall one. False positives (treating deterioration
+    as investment) are worse than false negatives.
+
+    Historical examples that match: AMZN 1997-2015, NFLX during content
+    buildout, hyperscalers (MSFT/GOOG/META/AMZN) building AI data centers
+    in 2024-2025, NVO 2025-2026 GLP-1 manufacturing capacity expansion.
+    """
+    if fcf_yield is None or fcf_yield >= 0:
+        return False
+    if rev_growth is None or rev_growth < 0.10:
+        return False
+    if gross_margin is None or gross_margin < 0.40:
+        return False
+    if roe is None or roe < 0.15:
+        return False
+    return True
+
+
 def _ml_score(signals: dict, annual_yield_pct: float) -> float | None:
     """Score a candidate using the ML model. Returns predicted alpha_1y mapped
     to 0-100 via tanh compression, or None if the model is not ready or has
@@ -128,10 +164,33 @@ def _ml_score(signals: dict, annual_yield_pct: float) -> float | None:
     try:
         import numpy as np
         medians = bundle.impute_medians
+
+        # Option B — Investment-phase FCF override:
+        # If the stock pattern matches a reinvesting compounder, replace
+        # fcf_yield_fund with the dataset median before feeding to the
+        # model. The model was trained on a mix that includes both
+        # deteriorating businesses (FCF negative = bad signal) and rare
+        # investment-phase compounders (FCF negative = neutral/good).
+        # Since it can't distinguish, we strip the signal in cases where
+        # we have orthogonal evidence (rev growth + margin + ROE) that
+        # the negative FCF is investment, not deterioration.
+        #
+        # Diagnostics: signals["fcf_override_applied"] tracks when this
+        # fires so the user can audit via /analisar or log dumps.
+        invest_phase = bool(signals.get("is_investment_phase", False))
+        signals["fcf_override_applied"] = False
+
         row = []
         for col in bundle.feature_cols:
             if col == "annual_yield_pct":
                 val = annual_yield_pct
+            elif invest_phase and col == "fcf_yield_fund":
+                val = float(medians.get("fcf_yield_fund", 0.0))
+                signals["fcf_override_applied"] = True
+                log.info(
+                    f"[core_radar] FCF override applied "
+                    f"(investment-phase compounder)"
+                )
             else:
                 raw = signals.get(col)
                 val = float(raw) if raw is not None and not math.isnan(float(raw)) else medians.get(col, 0.0)
@@ -452,6 +511,21 @@ def _score_core_dip(
     signals["fcf_yield_fund"]  = round(fcf_yield_q, 4)  if fcf_yield_q  is not None else None
     signals["analyst_upside"]  = round(analyst_up, 4)   if analyst_up   is not None else None
     signals["earnings_growth"] = round(earn_growth, 4)  if earn_growth  is not None else None
+
+    # Investment-phase detection: distinguish capex-driven negative FCF from
+    # deterioration-driven negative FCF. A reinvesting compounder (AMZN
+    # 1997-2015, NVO 2025 GLP-1 capacity buildout, hyperscalers building
+    # AI data centers) has negative FCF temporarily because OpEx + CapEx >
+    # OperatingCF — but topline growth + margins + ROE show the business
+    # is fundamentally healthy and the investment is productive.
+    #
+    # When TRUE, the ML model's fcf_yield_fund input is neutralized at
+    # inference (Option B) so the model doesn't false-flag the stock as
+    # deteriorating. This is a heuristic override; Option C (retrain with
+    # is_investment_phase as a model feature) is the long-term fix.
+    signals["is_investment_phase"] = _is_investment_phase(
+        rev_growth, gross_margin, roe, fcf_yield_q
+    )
 
     # ── Mandatory fundamental quality gate ──────────────────────────────────
     # CoreRadar is for quality compounders only. A business with badly declining
