@@ -7957,23 +7957,26 @@ def _handle_command(text: str) -> None:
                 ROT_BASE_ALLOC = 200.0  # only used if no calibration
 
                 # ── Rotation candidates: top-3 (NEW or top-up) ──────────
+                # Equal allocation within top-3: the calibration test
+                # showed CV r² ≤ 0.007 across all methods (linear, poly,
+                # buckets, lightgbm). rotation_score identifies WHO is
+                # in top-3 but doesn't predict per-pick alpha within it.
+                # Score-weighted sizing would be adding noise — equal
+                # is the honest choice given the data.
                 if not skip_rotation and rotation_top3:
+                    n_picks = len(rotation_top3)
+                    equal_size = ROT_BASE_ALLOC * 3.0 / n_picks if n_picks > 0 else 0.0
                     for r in rotation_top3:
                         ann_alpha = _annualized_alpha(
                             "ROTATION", score=r["score"]
                         )
-                        # Score-weighted size within rotation: top-1 gets
-                        # more than top-3 even though they share the ROI
-                        # queue with Core and DIP.
-                        total_score = sum(x["score"] for x in rotation_top3) or 1.0
-                        size = ROT_BASE_ALLOC * 3.0 * (r["score"] / total_score)
                         candidates.append({
                             "ticker":     r["ucits"],
                             "bucket":     "ROTATION",
-                            "reason":     f"rotation top-{rotation_top3.index(r)+1} score {r['score']:.0f}",
-                            "suggested":  size,
+                            "reason":     f"rotation top-{rotation_top3.index(r)+1} score {r['score']:.0f} (equal alloc)",
+                            "suggested":  equal_size,
                             "ann_alpha":  ann_alpha,
-                            "confidence": 1.0,  # rule-based score is its own confidence
+                            "confidence": 1.0,
                             "extra":      {"us_proxy": r["us_ticker"], "score": r["score"]},
                         })
 
