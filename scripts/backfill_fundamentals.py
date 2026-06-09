@@ -127,8 +127,8 @@ def _process_row(row: pd.Series, cache_dir: Path) -> dict:
         _compute_pit_fundamentals_row,
         _compute_fase5_row,
     )
-    from sec_guard import has_sec_filings
-    from ml_features import add_derived_features
+    from utils.sec_guard import has_sec_filings
+    from ml.ml_features import add_derived_features
 
     # Fast path: pre-2003 rows have no fundamentals or Form 4 to fetch.
     # Return NaN for all refresh cols (honest: we know we won't find data)
@@ -266,7 +266,7 @@ def backfill(
         row = df.loc[idx]
         if not _diag_emitted:
             try:
-                from sec_guard import has_sec_filings as _has_sec
+                from utils.sec_guard import has_sec_filings as _has_sec
                 _hs = _has_sec(str(row["ticker"]), "", "")
             except Exception as _e:
                 _hs = f"ERR({type(_e).__name__})"

@@ -55,8 +55,8 @@ from scripts.regenerate_training_base import (
     FASE5_COLS,
 )
 from config import MIN_MARKET_CAP_USD
-from universe import is_us_universe
-from sec_guard import has_sec_filings
+from core.universe import is_us_universe
+from utils.sec_guard import has_sec_filings
 
 log = logging.getLogger("build_dip_dataset")
 
@@ -202,7 +202,7 @@ def build_dip_dataset(
                      re-resume from there.
     checkpoint_every: write cadence in tickers (default 100).
     """
-    from ml_features import (
+    from ml.ml_features import (
         FEATURE_COLUMNS, _FALLBACK, add_derived_features,
         add_momentum_features, add_raw_ohlcv_features,
         add_regime_features, add_market_structure_features,
@@ -540,7 +540,7 @@ def main() -> int:
                     pass
         log.info(f"Test mode: purged {_purged} cache files — will re-download full history")
     else:
-        from universe import get_ml_universe
+        from core.universe import get_ml_universe
         tickers = get_ml_universe()
         log.info(f"Full universe: {len(tickers)} tickers")
 
@@ -675,7 +675,7 @@ def main() -> int:
         log.info(f"alpha_90d: mean={v.mean():.3f} std={v.std():.3f} ({len(v)} amostras)")
 
     # Per-column stats (same format as regenerate_training_base.py)
-    from ml_features import FEATURE_COLUMNS as _FC
+    from ml.ml_features import FEATURE_COLUMNS as _FC
     log.info("[stats] feature summary:")
     for col in _FC:
         if col not in combined.columns:

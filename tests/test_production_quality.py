@@ -132,18 +132,18 @@ class TestThemes(unittest.TestCase):
     def setUp(self):
         """Usa directório temporário para não poluir /data/themes.json."""
         self._tmp = tempfile.TemporaryDirectory()
-        import themes as tm
+        from scanners import themes as tm
         self._orig_path = tm._THEMES_PATH
         tm._THEMES_PATH = Path(self._tmp.name) / "themes_test.json"
 
     def tearDown(self):
-        import themes as tm
+        from scanners import themes as tm
         tm._THEMES_PATH = self._orig_path
         self._tmp.cleanup()
 
     def test_builtin_themes_loaded(self):
         """Sem ficheiro, deve carregar os temas built-in."""
-        from themes import list_themes
+        from scanners.themes import list_themes
         ts = list_themes()
         self.assertGreater(len(ts), 0)
         keys = [t["key"] for t in ts]
@@ -152,26 +152,26 @@ class TestThemes(unittest.TestCase):
 
     def test_match_by_ticker(self):
         """CIEN deve matchar fotónica."""
-        from themes import get_stock_themes
+        from scanners.themes import get_stock_themes
         matches = get_stock_themes("CIEN", "Technology", "Ciena Corp")
         self.assertTrue(any(m["key"] == "photonics" for m in matches),
                         f"CIEN não matchou photonics: {matches}")
 
     def test_match_by_keyword(self):
         """Empresa com 'optical' no nome deve matchar fotónica."""
-        from themes import get_stock_themes
+        from scanners.themes import get_stock_themes
         matches = get_stock_themes("UNKWN", "", "Optical Systems Inc")
         self.assertTrue(any(m["key"] == "photonics" for m in matches))
 
     def test_match_by_sector(self):
         """Ticker desconhecido mas sector Healthcare deve matchar glp1."""
-        from themes import get_stock_themes
+        from scanners.themes import get_stock_themes
         matches = get_stock_themes("XYZPH", "Healthcare", "Pharma Co")
         self.assertTrue(any(m["key"] == "glp1" for m in matches))
 
     def test_no_match_irrelevant(self):
         """Ticker e sector sem tema não deve dar match."""
-        from themes import get_stock_themes
+        from scanners.themes import get_stock_themes
         matches = get_stock_themes("UTIL123", "Utilities", "Water Utility Corp")
         # Utilities está em energy_transition, mas 'water' não está nos keywords
         # e UTIL123 não está em nenhuma lista de tickers
@@ -181,20 +181,20 @@ class TestThemes(unittest.TestCase):
 
     def test_get_theme_bonus_returns_one_for_no_match(self):
         """Stock sem tema deve dar bonus 1.0 (sem alteração de sizing)."""
-        from themes import get_theme_bonus
+        from scanners.themes import get_theme_bonus
         bonus = get_theme_bonus("ZZZNONE", "Unknown", "Random Corp")
         self.assertAlmostEqual(bonus, 1.0, places=3)
 
     def test_get_theme_bonus_above_one_for_match(self):
         """Stock em tema deve dar bonus > 1.0."""
-        from themes import get_theme_bonus
+        from scanners.themes import get_theme_bonus
         bonus = get_theme_bonus("NVO", "Healthcare", "Novo Nordisk")
         self.assertGreater(bonus, 1.0)
         self.assertLessEqual(bonus, 1.21)  # max THEME_BONUS_MAX
 
     def test_add_remove_theme(self):
         """add_theme e remove_theme devem persistir e remover correctamente."""
-        from themes import add_theme, remove_theme, list_themes
+        from scanners.themes import add_theme, remove_theme, list_themes
         add_theme(
             key="test_robotics",
             label="Robótica Test",
@@ -213,7 +213,7 @@ class TestThemes(unittest.TestCase):
         self.assertNotIn("test_robotics", keys2)
 
     def test_remove_nonexistent_returns_false(self):
-        from themes import remove_theme
+        from scanners.themes import remove_theme
         self.assertFalse(remove_theme("nao_existe_mesmo"))
 
 
@@ -234,7 +234,7 @@ class TestLoadAlertDb(unittest.TestCase):
 
     def test_basic_parsing(self):
         """CSV válido com outcome_label preenchido deve ser carregado."""
-        import monthly_retrain as mr
+        from ml import monthly_retrain as mr
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "alert_db.csv"
             rows = [
@@ -284,7 +284,7 @@ class TestLoadAlertDb(unittest.TestCase):
 
     def test_empty_outcome_label_excluded(self):
         """Linhas sem outcome_label devem ser excluídas."""
-        import monthly_retrain as mr
+        from ml import monthly_retrain as mr
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "alert_db.csv"
             rows = [
@@ -307,7 +307,7 @@ class TestLoadAlertDb(unittest.TestCase):
 
     def test_nonexistent_file_returns_empty(self):
         """Ficheiro inexistente deve retornar DataFrame vazio."""
-        import monthly_retrain as mr
+        from ml import monthly_retrain as mr
         orig = mr.ALERT_DB_PATH
         mr.ALERT_DB_PATH = Path("/tmp/nonexistent_alert_db_xyz.csv")
         try:
@@ -408,7 +408,7 @@ class TestWinProbDrift(unittest.TestCase):
 
     def test_no_drift_stable(self):
         """Previsões estáveis vs baseline não devem levantar drift_flag."""
-        import prediction_log as pl
+        from ml import prediction_log as pl
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "ml_predictions.csv"
             self._write_predictions(p, [0.55] * 30)
@@ -423,7 +423,7 @@ class TestWinProbDrift(unittest.TestCase):
 
     def test_large_drift_raises_flag(self):
         """Shift de >10pp deve activar drift_flag."""
-        import prediction_log as pl
+        from ml import prediction_log as pl
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "ml_predictions.csv"
             self._write_predictions(p, [0.35] * 30)   # 35% vs baseline 50%
@@ -438,7 +438,7 @@ class TestWinProbDrift(unittest.TestCase):
                         f"drift_flag devia ser True: delta={result.get('delta')}")
 
     def test_no_file_returns_skipped(self):
-        import prediction_log as pl
+        from ml import prediction_log as pl
         orig = pl.PREDICTIONS_PATH
         pl.PREDICTIONS_PATH = Path("/tmp/no_predictions_xyz.csv")
         try:

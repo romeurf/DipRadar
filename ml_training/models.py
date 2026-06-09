@@ -268,7 +268,7 @@ def build_feature_lists() -> tuple[list[str], list[str]]:
     dip_features = FEATURE_SETS["dip_us"] — single source of truth in ml_features.py.
     dip_baseline = dip_features minus calendar/count context features (controlled comparison).
     """
-    from ml_features import get_feature_columns
+    from ml.ml_features import get_feature_columns
 
     _EXCLUDE_BASELINE = {"month_of_year", "sector_alert_count_7d"}
 

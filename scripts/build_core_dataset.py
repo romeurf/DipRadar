@@ -470,7 +470,7 @@ def _process_one_ticker(
         targets = _compute_alpha_targets(hist, alert_date, spy_hist)
 
         # ── pe_vs_sector_median: stock fwd PE / sector median fwd PE ─────
-        from ml_features import _SECTOR_MEDIAN_FWD_PE as _SMED_PE
+        from ml.ml_features import _SECTOR_MEDIAN_FWD_PE as _SMED_PE
         _sec_med = _SMED_PE.get(sector, 18.0)
         if fwd_pe_ticker is not None and _sec_med > 0:
             pe_vs_sector_med = round(min(fwd_pe_ticker / _sec_med, 5.0), 4)
@@ -498,7 +498,7 @@ def _process_one_ticker(
         fund: dict = {}
         if add_fundamentals:
             try:
-                from fundamental_history import get_pit_fundamentals
+                from data.fundamental_history import get_pit_fundamentals
                 fund_raw = get_pit_fundamentals(
                     ticker,
                     alert_date.date() if hasattr(alert_date, "date") else alert_date,

@@ -53,7 +53,7 @@ _spec.loader.exec_module(_regen)
 _fetch_batch = _regen._fetch_batch
 _slice_history = _regen._slice_history
 
-from ml_features import _FALLBACK, add_raw_ohlcv_features  # noqa: E402
+from ml.ml_features import _FALLBACK, add_raw_ohlcv_features  # noqa: E402
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Constants

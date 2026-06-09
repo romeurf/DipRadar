@@ -175,7 +175,7 @@ def _build_momentum_features(hist: pd.DataFrame, idx: int) -> Optional[dict]:
     # Market Structure: VWAP ancorado no mínimo e Volume Profile POC
     hist_slice = hist.iloc[:idx + 1]
     try:
-        from ml_features import _anchored_vwap_ratio, _volume_poc_ratio, _compute_mfi, _compute_volume_up_pct
+        from ml.ml_features import _anchored_vwap_ratio, _volume_poc_ratio, _compute_mfi, _compute_volume_up_pct
         vwap_low_ratio = _anchored_vwap_ratio(hist_slice, use_high=False)
         poc_ratio      = _volume_poc_ratio(hist_slice, lookback=60)
         mfi_val        = _compute_mfi(hist_slice, period=14)
@@ -381,7 +381,7 @@ def main() -> int:
         tickers = [t.strip().upper() for t in args.tickers.split(",")]
         log.info(f"Modo teste: {len(tickers)} tickers")
     else:
-        from universe import get_ml_universe
+        from core.universe import get_ml_universe
         tickers = get_ml_universe()
         log.info(f"Universo completo: {len(tickers)} tickers")
 

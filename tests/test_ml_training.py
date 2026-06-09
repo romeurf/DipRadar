@@ -131,7 +131,7 @@ class TestModels(unittest.TestCase):
         FEATURE_COLUMNS = 34 features. Baseline exclui as features
         Stage-3* + Stage-3b multi-window novas mantidas."""
         from ml_training.models import build_feature_lists
-        from ml_features import FEATURE_COLUMNS
+        from ml.ml_features import FEATURE_COLUMNS
         full, baseline = build_feature_lists()
         self.assertEqual(len(full), len(FEATURE_COLUMNS))
         self.assertGreater(len(full), len(baseline))

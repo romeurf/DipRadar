@@ -37,17 +37,17 @@ class TestGateAndPromote(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _make_candidate(self, rho: float = 0.40):
-        import monthly_retrain as m
+        from ml import monthly_retrain as m
         m.CANDIDATE_BUNDLE.write_text("fake_pkl_bytes")
         m.CANDIDATE_REPORT.write_text(json.dumps({"metrics": {"rho_alpha_mean": rho}}))
 
     def _make_production(self, rho: float = 0.35):
-        import monthly_retrain as m
+        from ml import monthly_retrain as m
         m.PRODUCTION_BUNDLE.write_text("old_prod_pkl_bytes")
         m.PRODUCTION_REPORT.write_text(json.dumps({"metrics": {"rho_alpha_mean": rho}}))
 
     def test_failed_when_candidate_rho_missing(self):
-        from monthly_retrain import gate_and_promote_v3
+        from ml.monthly_retrain import gate_and_promote_v3
         result = gate_and_promote_v3(
             cand_metrics={"rho_alpha_mean": None},
             prod_metrics={"rho_alpha_mean": 0.35},
@@ -55,7 +55,7 @@ class TestGateAndPromote(unittest.TestCase):
         self.assertEqual(result["decision"], "FAILED")
 
     def test_kept_floor_when_below_absolute_floor(self):
-        from monthly_retrain import gate_and_promote_v3, FLOOR_RHO_ALPHA_DEFAULT
+        from ml.monthly_retrain import gate_and_promote_v3, FLOOR_RHO_ALPHA_DEFAULT
         # Pick a candidate ρ_α clearly below the default floor (currently 0.08).
         rho_below = FLOOR_RHO_ALPHA_DEFAULT / 2
         result = gate_and_promote_v3(
@@ -68,20 +68,20 @@ class TestGateAndPromote(unittest.TestCase):
     def test_promoted_cold_start(self):
         """Sem produção, candidate só precisa passar o floor."""
         self._make_candidate(rho=0.40)
-        from monthly_retrain import gate_and_promote_v3
+        from ml.monthly_retrain import gate_and_promote_v3
         result = gate_and_promote_v3(
             cand_metrics={"rho_alpha_mean": 0.40},
             prod_metrics={"rho_alpha_mean": None},
         )
         self.assertEqual(result["decision"], "PROMOTED")
         # Bundle deve ter sido copiado para production
-        import monthly_retrain as m
+        from ml import monthly_retrain as m
         self.assertTrue(m.PRODUCTION_BUNDLE.exists())
 
     def test_promoted_with_better_candidate(self):
         self._make_candidate(rho=0.40)
         self._make_production(rho=0.35)
-        from monthly_retrain import gate_and_promote_v3
+        from ml.monthly_retrain import gate_and_promote_v3
         result = gate_and_promote_v3(
             cand_metrics={"rho_alpha_mean": 0.40},
             prod_metrics={"rho_alpha_mean": 0.35},
@@ -94,7 +94,7 @@ class TestGateAndPromote(unittest.TestCase):
         """ρ_α drop de 5% (cand 0.333, prod 0.350) — deve promover (90% threshold)."""
         self._make_candidate(rho=0.333)
         self._make_production(rho=0.350)
-        from monthly_retrain import gate_and_promote_v3
+        from ml.monthly_retrain import gate_and_promote_v3
         result = gate_and_promote_v3(
             cand_metrics={"rho_alpha_mean": 0.333},
             prod_metrics={"rho_alpha_mean": 0.350},
@@ -106,8 +106,8 @@ class TestGateAndPromote(unittest.TestCase):
         """ρ_α drop de 20% — recusa promoção, guarda pending."""
         self._make_candidate(rho=0.28)
         self._make_production(rho=0.35)
-        from monthly_retrain import gate_and_promote_v3
-        import monthly_retrain as m
+        from ml.monthly_retrain import gate_and_promote_v3
+        from ml import monthly_retrain as m
         prod_content_before = m.PRODUCTION_BUNDLE.read_text()
         result = gate_and_promote_v3(
             cand_metrics={"rho_alpha_mean": 0.28},
@@ -125,18 +125,18 @@ class TestGateAndPromote(unittest.TestCase):
     def test_archive_created_on_promote(self):
         self._make_candidate(rho=0.40)
         self._make_production(rho=0.35)
-        from monthly_retrain import gate_and_promote_v3
+        from ml.monthly_retrain import gate_and_promote_v3
         gate_and_promote_v3(
             cand_metrics={"rho_alpha_mean": 0.40},
             prod_metrics={"rho_alpha_mean": 0.35},
         )
-        import monthly_retrain as m
+        from ml import monthly_retrain as m
         archives = list(m.ARCHIVE_DIR.glob("dip_models_*.pkl"))
         self.assertEqual(len(archives), 1, "Deve criar exactamente 1 archive da prod anterior")
 
     def test_floor_file_created_with_default(self):
-        from monthly_retrain import _read_floor_rho_alpha
-        import monthly_retrain as m
+        from ml.monthly_retrain import _read_floor_rho_alpha
+        from ml import monthly_retrain as m
         floor = _read_floor_rho_alpha()
         self.assertEqual(floor, m.FLOOR_RHO_ALPHA_DEFAULT)
         self.assertTrue(m.FLOOR_PATH.exists())
@@ -144,8 +144,8 @@ class TestGateAndPromote(unittest.TestCase):
         self.assertEqual(data["floor_rho_alpha"], m.FLOOR_RHO_ALPHA_DEFAULT)
 
     def test_floor_file_respects_user_override(self):
-        from monthly_retrain import _read_floor_rho_alpha
-        import monthly_retrain as m
+        from ml.monthly_retrain import _read_floor_rho_alpha
+        from ml import monthly_retrain as m
         m.FLOOR_PATH.parent.mkdir(parents=True, exist_ok=True)
         m.FLOOR_PATH.write_text(json.dumps({"floor_rho_alpha": 0.30}))
         self.assertEqual(_read_floor_rho_alpha(), 0.30)
@@ -176,7 +176,7 @@ class TestBuildTrainingInput(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_bootstrap_only_input(self):
-        from monthly_retrain import build_training_input
+        from ml.monthly_retrain import build_training_input
         path = build_training_input(include_snapshot=False, include_alert_db=False)
         self.assertTrue(path.exists())
         import pandas as pd
@@ -216,7 +216,7 @@ class TestBootstrapFallback(unittest.TestCase):
         shutil.rmtree(self.tmp_repo, ignore_errors=True)
 
     def test_falls_back_to_repo_parquet_when_data_dir_empty(self):
-        from monthly_retrain import build_training_input
+        from ml.monthly_retrain import build_training_input
         path = build_training_input(include_snapshot=False, include_alert_db=False)
         self.assertTrue(path.exists())
         import pandas as pd
@@ -227,7 +227,7 @@ class TestBootstrapFallback(unittest.TestCase):
     def test_prefers_data_dir_when_both_exist(self):
         """Se `/data/ml_training_base.parquet` existe, é usado e ignora o
         fallback (volume é a fonte da verdade depois do primeiro retrain)."""
-        import monthly_retrain as m
+        from ml import monthly_retrain as m
         import pandas as pd
 
         df_data = pd.DataFrame({
@@ -239,7 +239,7 @@ class TestBootstrapFallback(unittest.TestCase):
         })
         df_data.to_parquet(m.BOOTSTRAP_PATH, index=False)
 
-        from monthly_retrain import build_training_input
+        from ml.monthly_retrain import build_training_input
         path = build_training_input(include_snapshot=False, include_alert_db=False)
         df = pd.read_parquet(path)
         # Tem de ter NVDA (do volume), não AAPL/MSFT (do fallback)
@@ -248,10 +248,10 @@ class TestBootstrapFallback(unittest.TestCase):
 
     def test_raises_when_neither_exists(self):
         """Sem volume e sem repo → erro claro."""
-        import monthly_retrain as m
+        from ml import monthly_retrain as m
         m.BOOTSTRAP_FALLBACK = self.tmp_repo / "does_not_exist.parquet"
 
-        from monthly_retrain import build_training_input
+        from ml.monthly_retrain import build_training_input
         with self.assertRaises(RuntimeError) as ctx:
             build_training_input(include_snapshot=False, include_alert_db=False)
         self.assertIn("Sem dados de treino", str(ctx.exception))
@@ -261,7 +261,7 @@ class TestMetricsRead(unittest.TestCase):
 
     def test_read_v3_metrics_canonical(self):
         from tempfile import NamedTemporaryFile
-        from monthly_retrain import _read_v3_metrics
+        from ml.monthly_retrain import _read_v3_metrics
         with NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump({"metrics": {
                 "rho_alpha_mean": 0.42,
@@ -276,7 +276,7 @@ class TestMetricsRead(unittest.TestCase):
         self.assertAlmostEqual(metrics["topk_pnl_mean"], 0.12)
 
     def test_read_v3_metrics_missing_file(self):
-        from monthly_retrain import _read_v3_metrics
+        from ml.monthly_retrain import _read_v3_metrics
         metrics = _read_v3_metrics(Path("/tmp/nonexistent_report_v3.json"))
         # Função tolera ficheiro ausente — devolve dict com Nones
         self.assertIsNone(metrics.get("rho_alpha_mean"))

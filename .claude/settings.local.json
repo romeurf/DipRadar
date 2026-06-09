@@ -132,7 +132,14 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\('ml_training/train.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(git revert *)",
       "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/backfill_fundamentals.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
-      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)"
+      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)",
+      "Bash(mv portfolio_pkg portfolio_temp)",
+      "Bash(mkdir -p portfolio_new)",
+      "Bash(mv portfolio.py portfolio_temp/)",
+      "Bash(mv portfolio_temp/__init__.py portfolio_new/)",
+      "Bash(mv portfolio_temp/portfolio.py portfolio_new/)",
+      "Bash(PYTHONIOENCODING=utf-8 python _restructure.py)",
+      "Bash(PYTHONIOENCODING=utf-8 grep -rn \"^import ml_features\\\\|^from ml_features\" --include=\"*.py\")"
     ],
     "additionalDirectories": [
       "c:\\Users\\Romeu\\OneDrive\\Documentos\\GitHub\\DipRadar"

@@ -84,8 +84,8 @@ import logging
 import threading
 import requests
 from datetime import datetime
-from rate_limiter import is_allowed, rate_status
-from i18n import t, set_language, get_language
+from utils.rate_limiter import is_allowed, rate_status
+from utils.i18n import t, set_language, get_language
 from config import SUPPORTED_LANGUAGES
 from state import (
     load_dynamic_watchlist,
@@ -95,8 +95,7 @@ from state import (
     get_ticker_score_history,
 )
 # Flip log imports removed Phase 6 — Flip Fund deprecated
-import health_monitor
-
+from utils import health_monitor
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
@@ -481,7 +480,7 @@ def _handle_comparar(symbols: list[str]) -> None:
     _reply(f"_🔄 A comparar {' vs '.join(symbols)}... (pode demorar até 30s)_")
 
     def _run():
-        from score import calculate_dip_score, classify_dip_category, is_bluechip
+        from scanners.score import calculate_dip_score, classify_dip_category, is_bluechip
         rows = []
         for sym in symbols:
             try:
@@ -852,7 +851,7 @@ def _handle_admin_load_models(parts: list[str]) -> None:
                 meta["auc_pr"] = s1.get("auc_pr_test") or s1.get("auc_pr")
             else:  # v3
                 # Importa o helper que normaliza dataclass → dict canonical
-                from ml_predictor import _safe_load, _to_dict
+                from ml.ml_predictor import _safe_load, _to_dict
                 raw = _safe_load(local["dip_models.pkl"])
                 bundle = _to_dict(raw)
                 if not bundle:
@@ -969,7 +968,7 @@ def _handle_admin_test_feed(parts: list[str]) -> None:
         lines = [f"Feed test: {ticker}", ""]
         try:
             # 1. data_feed
-            from data_feed import get_eod_prices
+            from data.data_feed import get_eod_prices
             df = get_eod_prices(ticker, lookback_days=10)
             if df is not None and not df.empty:
                 cols = [_safe_str(c) for c in list(df.columns)[:5]]
@@ -1064,7 +1063,7 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
 
     As env vars HOLDING_* foram DESCONTINUADAS — usa este comando ou /buy.
     """
-    from portfolio import get_positions, register_existing_position, _cache, _ensure_cache, _flush
+    from portfolio.portfolio.portfolio.portfolio import get_positions, register_existing_position, _cache, _ensure_cache, _flush
 
     no_conviction = "--no-conviction" in parts
     update_avg    = "--update-avg" in parts  # allow overwrite of avg_price + shares
@@ -1227,7 +1226,7 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
         if bucket == "ROTATION":
             continue
         try:
-            import conviction_radar as cr
+            from core import conviction_radar as cr
             deny = cr._get_deny_list()
             if ticker in deny or "." in ticker:
                 continue
@@ -1356,7 +1355,7 @@ def _handle_ml_accuracy() -> None:
     """
     def _run():
         try:
-            from prediction_log import compute_ml_accuracy
+            from ml.prediction_log import compute_ml_accuracy
             acc = compute_ml_accuracy()
             if acc.get("skipped"):
                 _reply(f"ML Accuracy: {acc.get('reason', 'sem dados')}")
@@ -1421,7 +1420,7 @@ def _handle_admin_features(parts: list[str]) -> None:
         if not path.exists():
             path = _repo / "ml_training_base.parquet"
         try:
-            from ml_features import get_feature_columns
+            from ml.ml_features import get_feature_columns
             feat_cols = get_feature_columns("dip_us")
         except Exception:
             feat_cols = None
@@ -1577,7 +1576,7 @@ def _handle_admin_check_config() -> None:
 
     # DIP model (dip_models.pkl)
     try:
-        from ml_predictor import is_model_ready, get_model_info
+        from ml.ml_predictor import is_model_ready, get_model_info
         if is_model_ready():
             info = get_model_info()
             rho  = info.get("rho_mean")
@@ -1619,7 +1618,7 @@ def _handle_admin_check_config() -> None:
     # by CV IC ≥ core_radar._MIN_CV_IC_FOR_USE. Below that, falls back to
     # rule-based scoring even if the pkl is on disk.
     try:
-        import core_radar as _cr
+        from core import core_radar as _cr
         if _cr.is_model_ready():
             b = _cr._core_model_bundle
             cv_ic = float(getattr(b, "cv_ic", 0.0))
@@ -2236,7 +2235,7 @@ def _handle_admin_momentum_retrain(parts: list[str]) -> None:
                     except Exception as _cp:
                         logging.warning(f"[momentum_retrain] cópia repo {name}: {_cp}")
                 try:
-                    from github_sync import sync_momentum_artifacts
+                    from utils.github_sync import sync_momentum_artifacts
                     sync_momentum_artifacts(data_dir)
                 except Exception as _gs:
                     logging.warning(f"[momentum_retrain] github_sync: {_gs}")
@@ -2610,7 +2609,7 @@ def _handle_admin_train_core_model(parts: list[str]) -> None:
 
         # Reload model in the running process so the scan picks it up immediately
         try:
-            import core_radar as _cr
+            from core import core_radar as _cr
             _cr._core_model_checked = False
             _cr._core_model_bundle  = None
             _cr._load_core_model()
@@ -2779,7 +2778,7 @@ def _handle_admin_full_pipeline(parts: list[str]) -> None:
             nonlocal dip_train_res, dip_train_err2
             _plog("Fase 2 DipRadar: treino iniciado")
             try:
-                from monthly_retrain import run_monthly_retrain
+                from ml.monthly_retrain import run_monthly_retrain
                 dip_train_res = run_monthly_retrain() or {}
                 dec = dip_train_res.get("decision", "?")
                 _plog(f"Fase 2 DipRadar: {dec}")
@@ -2872,7 +2871,7 @@ def _handle_admin_full_pipeline(parts: list[str]) -> None:
         # GitHub sync para modelos promovidos
         try:
             from pathlib import Path as _Pg
-            from github_sync import sync_training_artifacts, sync_momentum_artifacts
+            from utils.github_sync import sync_training_artifacts, sync_momentum_artifacts
             _dd_g = _Pg("/data") if _Pg("/data").exists() else _Pg("/tmp")
             if train_dip and dip_train_res.get("decision") == "PROMOTED":
                 sync_training_artifacts(_dd_g)
@@ -3156,7 +3155,7 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                     _reply("⏳ <b>Step 2/6 — DIP retrain</b>...")
                     t0 = _t.time()
                     try:
-                        from monthly_retrain import run_monthly_retrain
+                        from ml.monthly_retrain import run_monthly_retrain
                         result = run_monthly_retrain() or {}
                         dec    = result.get("decision", "?")
                         rho    = result.get("candidate_rho_alpha")
@@ -3225,7 +3224,7 @@ def _handle_admin_overnight(parts: list[str]) -> None:
                         _plog(f"Step 4: Core model trained ({elapsed:.0f}m)")
                         # Reload model in-process
                         try:
-                            import core_radar as _cr
+                            from core import core_radar as _cr
                             _cr._core_model_checked = False
                             _cr._core_model_bundle  = None
                             _cr._load_core_model()
@@ -3544,7 +3543,7 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
         if train_dip:
             _plog("Phase 2 — DIP retrain: starting")
             try:
-                from monthly_retrain import run_monthly_retrain
+                from ml.monthly_retrain import run_monthly_retrain
                 dip_result = run_monthly_retrain() or {}
                 dec = dip_result.get("decision", "?")
                 rho = dip_result.get("rho_alpha_mean")
@@ -3575,7 +3574,7 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
 
         # ── GitHub sync for promoted models ───────────────────────────────────
         try:
-            from github_sync import sync_training_artifacts, sync_momentum_artifacts
+            from utils.github_sync import sync_training_artifacts, sync_momentum_artifacts
             if train_dip and dip_result.get("decision") == "PROMOTED":
                 sync_training_artifacts(data_dir)
             if train_mom and mom_result.get("decision") == "PROMOTED":
@@ -3585,10 +3584,10 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
 
         # ── auto-publish charts after successful retrain ───────────────────────
         try:
-            from chart_generator import generate_all_charts
+            from utils.chart_generator import generate_all_charts
             generate_all_charts()
             if os.environ.get("GITHUB_TOKEN") and os.environ.get("GITHUB_CHARTS_REPO"):
-                from github_publisher import push_all_charts
+                from utils.github_publisher import push_all_charts
                 push_all_charts()
                 _plog("Charts published to GitHub")
         except Exception as e:
@@ -3669,7 +3668,7 @@ def _handle_admin_retrain(parts: list[str]) -> None:
         _retrain_running = True
         start_ts = time.time()
         try:
-            from monthly_retrain import run_monthly_retrain
+            from ml.monthly_retrain import run_monthly_retrain
             kwargs = dict(
                 dry_run=dry_run,
                 include_alert_db=include_alert_db,
@@ -3890,7 +3889,7 @@ def _handle_admin_set_floor(parts: list[str]) -> None:
         return
 
     try:
-        from monthly_retrain import set_floor_rho_alpha
+        from ml.monthly_retrain import set_floor_rho_alpha
         result = set_floor_rho_alpha(new_value, comment="Ajustado via /admin_set_floor.")
     except ValueError as e:
         _reply(f"❌ *Valor fora de range:*\n`{_md_safe(e)}`")
@@ -3926,7 +3925,7 @@ def _handle_paper_performance(parts: list[str]) -> None:
     """
     def _run():
         try:
-            from paper_trading import (
+            from portfolio.portfolio.paper_trading import (
                 get_monthly_performance, format_performance_report, _load
             )
 
@@ -3934,7 +3933,7 @@ def _handle_paper_performance(parts: list[str]) -> None:
 
             # ── open positions ────────────────────────────────────────────────
             if sub == "open":
-                from paper_trading import (
+                from portfolio.portfolio.paper_trading import (
                     get_paper_portfolio_value, get_paper_allocated,
                     get_paper_available, PAPER_PORTFOLIO_EUR,
                 )
@@ -3967,7 +3966,7 @@ def _handle_paper_performance(parts: list[str]) -> None:
 
             # ── DRIP audit trail ──────────────────────────────────────────────
             if sub == "drip":
-                from paper_trading import get_drip_history, _TAX_DISCLAIMER
+                from portfolio.portfolio.paper_trading import get_drip_history, _TAX_DISCLAIMER
                 data = get_drip_history()
                 pos  = data["positions"]
                 tot  = data["totals"]
@@ -4019,7 +4018,7 @@ def _handle_paper_performance(parts: list[str]) -> None:
                     _reply("\n".join(block))
 
                 # Send the full ledger as a downloadable Markdown file
-                from paper_trading import format_drip_report_md
+                from portfolio.portfolio.paper_trading import format_drip_report_md
                 md_content = format_drip_report_md()
                 sent = _send_document(
                     md_content.encode("utf-8"),
@@ -4036,7 +4035,7 @@ def _handle_paper_performance(parts: list[str]) -> None:
 
             # ── missed signals ────────────────────────────────────────────────
             if sub == "missed":
-                from paper_trading import get_missed_trades_stats, _load as _pt_load
+                from portfolio.portfolio.paper_trading import get_missed_trades_stats, _load as _pt_load
                 trades = _pt_load()
                 missed = [t for t in trades if t.get("status") == "MISSED_CAPITAL"]
                 stats  = get_missed_trades_stats(trades)
@@ -4078,7 +4077,7 @@ def _handle_paper_performance(parts: list[str]) -> None:
             report = format_performance_report(perf)
             _reply(f"Paper Trading — Bot vs Market\n\n{report}")
 
-            from paper_trading import format_monthly_trade_list
+            from portfolio.portfolio.paper_trading import format_monthly_trade_list
             trade_list = format_monthly_trade_list(months_back=months)
             if trade_list and "Sem trades" not in trade_list:
                 _reply(f"Trades by month:\n{trade_list}")
@@ -4109,7 +4108,7 @@ def _handle_performance(parts: list[str]) -> None:
 
     def _run():
         try:
-            from portfolio_simulator import run_portfolio_backtest, format_portfolio_result
+            from portfolio.portfolio.portfolio_simulator import run_portfolio_backtest, format_portfolio_result
 
             period_start = None
             score_min    = 60.0
@@ -4144,7 +4143,7 @@ def _handle_performance(parts: list[str]) -> None:
 def _handle_themes() -> None:
     """Lista todos os temas activos com rationale e bonus de sizing."""
     try:
-        from themes import format_themes_list
+        from scanners.themes import format_themes_list
         _reply(format_themes_list())
     except Exception as e:
         _reply(f"_Erro ao carregar temas: {e}_")
@@ -4187,7 +4186,7 @@ def _handle_add_theme(parts: list[str]) -> None:
         return
 
     try:
-        from themes import add_theme
+        from scanners.themes import add_theme
         t = add_theme(key, label, tickers, confidence=confidence, added_by="user_bot")
         _reply(
             f"✅ *Tema adicionado:* `{key}`\n"
@@ -4206,7 +4205,7 @@ def _handle_remove_theme(parts: list[str]) -> None:
         return
     key = parts[1].lower().strip()
     try:
-        from themes import remove_theme
+        from scanners.themes import remove_theme
         removed = remove_theme(key)
         if removed:
             _reply(f"✅ Tema `{key}` removido.")
@@ -4385,7 +4384,7 @@ def _handle_buy(parts: list[str]) -> None:
             return
 
     try:
-        from portfolio import buy as portfolio_buy, get_liquidity
+        from portfolio.portfolio.portfolio.portfolio import buy as portfolio_buy, get_liquidity
         result = portfolio_buy(symbol, price, shares, entry_score=score)
     except Exception as e:
         _reply(f"❌ Erro ao registar compra: `{e}`")
@@ -4402,7 +4401,7 @@ def _handle_buy(parts: list[str]) -> None:
     # If conviction already exists, surface the DCA hint instead of duplicating.
     conviction_tail = ""
     try:
-        import conviction_radar as cr
+        from core import conviction_radar as cr
         existing_conv = cr.get_by_ticker(symbol)
         if existing_conv:
             conviction_tail = (
@@ -4490,7 +4489,7 @@ def _handle_sell(parts: list[str]) -> None:
             return
 
     try:
-        from portfolio import sell as portfolio_sell
+        from portfolio.portfolio.portfolio.portfolio import sell as portfolio_sell
         result = portfolio_sell(symbol, price, shares)
     except Exception as e:
         _reply(f"❌ Erro ao registar venda: `{e}`")
@@ -4513,7 +4512,7 @@ def _handle_sell(parts: list[str]) -> None:
     # partial → leave a hint for the user.
     conviction_tail = ""
     try:
-        import conviction_radar as cr
+        from core import conviction_radar as cr
         existing_conv = cr.get_by_ticker(symbol)
         if existing_conv:
             if result["action"] == "closed":
@@ -4554,7 +4553,7 @@ def _handle_conviction(parts: list[str]) -> None:
     sub = parts[1].lower() if len(parts) > 1 else "help"
 
     try:
-        import conviction_radar as cr
+        from core import conviction_radar as cr
     except Exception as e:
         _reply(f"❌ Módulo conviction não disponível: `{e}`")
         return
@@ -4617,7 +4616,7 @@ def _handle_conviction(parts: list[str]) -> None:
         # Only auto-buy if ticker not already in portfolio (avoids accidental DCA).
         buy_tail = ""
         try:
-            from portfolio import get_position, buy as portfolio_buy
+            from portfolio.portfolio.portfolio.portfolio import get_position, buy as portfolio_buy
             if get_position(ticker) is None:
                 _br = portfolio_buy(ticker, price, shares)
                 buy_tail = (
@@ -5196,7 +5195,7 @@ def _handle_etf(parts: list[str]) -> None:
 
 def _handle_liquidez(parts: list[str]) -> None:
     try:
-        from portfolio import get_liquidity, add_liquidity, set_liquidity
+        from portfolio.portfolio.portfolio.portfolio import get_liquidity, add_liquidity, set_liquidity
     except Exception as e:
         _reply(f"❌ Módulo portfolio não disponível: `{e}`")
         return
@@ -5275,7 +5274,7 @@ def _fetch_eur_usd() -> float:
 def _handle_core(parts: list[str]) -> None:
     """/core — mostra todas as posições CORE com P&L e yield acumulado."""
     try:
-        from paper_trading import format_core_holdings_report
+        from portfolio.portfolio.paper_trading import format_core_holdings_report
         _reply(format_core_holdings_report())
     except Exception as e:
         _reply(f"❌ Erro ao ler posições CORE: `{e}`")
@@ -5322,7 +5321,7 @@ def _handle_core_add(parts: list[str]) -> None:
             i += 1
 
     try:
-        from paper_trading import record_core_holding
+        from portfolio.portfolio.paper_trading import record_core_holding
         trade_id = record_core_holding(
             ticker=ticker, open_price=open_price, amount_eur=amount_eur,
             annual_yield_pct=annual_yield, note=note,
@@ -5354,7 +5353,7 @@ def _handle_core_close(parts: list[str]) -> None:
         _reply("❌ Preço inválido.")
         return
     try:
-        from paper_trading import close_core_holding
+        from portfolio.portfolio.paper_trading import close_core_holding
         closed_trade = close_core_holding(ticker, close_price)
         if closed_trade:
             ret_s   = f"{closed_trade.get('return_pct', 0):+.1f}%"
@@ -5365,7 +5364,7 @@ def _handle_core_close(parts: list[str]) -> None:
             )
             # Generate and send trade card (CORE cards include yield income line)
             try:
-                from chart_generator import generate_trade_card
+                from utils.chart_generator import generate_trade_card
                 card = generate_trade_card(closed_trade)
                 if card and card.exists():
                     _send_photo(card.read_bytes(), caption=f"CORE {ticker} — trade card")
@@ -5383,7 +5382,7 @@ def _handle_core_close(parts: list[str]) -> None:
 def _handle_core_universe(parts: list[str]) -> None:
     """/core_universe — lista o universo CoreRadar."""
     try:
-        from core_radar import get_universe
+        from core.core_radar import get_universe
         entries = get_universe()
         if not entries:
             _reply(
@@ -5431,7 +5430,7 @@ def _handle_core_universe_add(parts: list[str]) -> None:
         except ValueError:
             note = " ".join(parts[2:])
     try:
-        from core_radar import add_to_universe
+        from core.core_radar import add_to_universe
         added = add_to_universe(ticker, annual_yield_pct=annual_yield, note=note)
         if added:
             yld_str  = f" | Yield: {annual_yield:.1f}%/ano" if annual_yield > 0 else ""
@@ -5453,7 +5452,7 @@ def _handle_core_universe_remove(parts: list[str]) -> None:
         return
     ticker = parts[1].upper().strip()
     try:
-        from core_radar import remove_from_universe
+        from core.core_radar import remove_from_universe
         removed = remove_from_universe(ticker)
         if removed:
             _reply(f"✅ *{ticker}* removido do universo CoreRadar.")
@@ -5467,7 +5466,7 @@ def _handle_core_universe_remove(parts: list[str]) -> None:
 
 def _handle_portfolio(parts: list[str]) -> None:
     try:
-        from portfolio import get_positions, get_liquidity, EUR_TICKERS
+        from portfolio.portfolio.portfolio.portfolio import get_positions, get_liquidity, EUR_TICKERS
     except Exception as e:
         _reply(f"❌ Módulo portfolio não disponível: `{e}`")
         return
@@ -5758,7 +5757,7 @@ def _handle_command(text: str) -> None:
         )
 
         try:
-            from portfolio import get_liquidity, get_active_symbols
+            from portfolio.portfolio.portfolio.portfolio import get_liquidity, get_active_symbols
             liq      = get_liquidity()
             n_pos    = len(get_active_symbols())
             port_str = f"\nCarteira: *{n_pos} posições* | Liquidez: *€{liq:.2f}*"
@@ -5830,7 +5829,7 @@ def _handle_command(text: str) -> None:
         if not _check_rate(cmd_key): return
         months = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 3
         try:
-            from paper_trading import format_unified_report
+            from portfolio.portfolio.paper_trading import format_unified_report
             _reply(format_unified_report(months_back=months))
         except Exception as e:
             _reply(f"_Erro ao gerar relatório: {e}_")
@@ -6000,7 +5999,7 @@ def _handle_command(text: str) -> None:
         # Per-model configuration
         def _load_universe_for(m: str) -> set[str]:
             if m in ("dip", "momentum"):
-                from universe import get_ml_universe
+                from core.universe import get_ml_universe
                 return set(get_ml_universe())
             elif m == "core":
                 # Read core_universe.json directly (avoids subprocess hop)
@@ -6207,7 +6206,7 @@ def _handle_command(text: str) -> None:
 
                 # 1. Schema check
                 try:
-                    from ml_features import FEATURE_COLUMNS
+                    from ml.ml_features import FEATURE_COLUMNS
                     missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
                     if missing:
                         lines.append(f"❌ *Schema check FAIL:* {len(missing)} cols em falta:")
@@ -6225,7 +6224,7 @@ def _handle_command(text: str) -> None:
                 lines.append("📉 *NaN coverage + sanidade:*")
                 problems_severe = []
                 problems_warn = []
-                from ml_features import FEATURE_COLUMNS as _FC
+                from ml.ml_features import FEATURE_COLUMNS as _FC
                 for col in _FC:
                     if col not in df.columns:
                         continue
@@ -6491,8 +6490,8 @@ def _handle_command(text: str) -> None:
 
             def _run():
                 try:
-                    from etf_universe import all_monitored_tickers
-                    from sector_rotation_backtest import backtest_rotation
+                    from core.etf_universe import all_monitored_tickers
+                    from core.sector_rotation_backtest import backtest_rotation
 
                     tickers = all_monitored_tickers()
 
@@ -6618,7 +6617,7 @@ def _handle_command(text: str) -> None:
                     f"🧪 *Backtest a iniciar* — {single_ticker} ({n_years}y)\n"
                     f"_Pode demorar 30-60s..._"
                 )
-                from sector_backtest import backtest_sector
+                from core.sector_backtest import backtest_sector
 
                 def _run_single():
                     try:
@@ -6669,8 +6668,8 @@ def _handle_command(text: str) -> None:
 
             def _run_universe():
                 try:
-                    from etf_universe import all_monitored_tickers
-                    from sector_backtest import backtest_universe
+                    from core.etf_universe import all_monitored_tickers
+                    from core.sector_backtest import backtest_universe
                     tickers = all_monitored_tickers()
 
                     def _progress(ticker, i, n):
@@ -6770,8 +6769,8 @@ def _handle_command(text: str) -> None:
         #   /sectors XLK       → deep dive on one ticker
         #   /sectors holdings  → only the user's current ETF positions
         try:
-            from sector_radar import rank_universe, fetch_and_compute
-            from etf_universe import (
+            from core.sector_radar import rank_universe, fetch_and_compute
+            from core.etf_universe import (
                 all_monitored_tickers,
                 sector_etf_tickers,
                 broad_etf_tickers,
@@ -6930,8 +6929,8 @@ def _handle_command(text: str) -> None:
         # via their US proxies. Shows exit_strength and entry_strength so
         # you can decide whether to trim / hold / re-enter.
         try:
-            from sector_radar import fetch_and_compute, fetch_spy_history
-            from etf_universe import user_holding_proxies, proxy_to_ucits, get_etf
+            from core.sector_radar import fetch_and_compute, fetch_spy_history
+            from core.etf_universe import user_holding_proxies, proxy_to_ucits, get_etf
             import state as _st
 
             proxies = user_holding_proxies()  # {UCITS: US_proxy}
@@ -7171,7 +7170,7 @@ def _handle_command(text: str) -> None:
 
         def _run_monthly():
             try:
-                from portfolio import get_positions
+                from portfolio.portfolio.portfolio.portfolio import get_positions
                 from datetime import datetime as _dt
 
                 positions = get_positions()
@@ -7192,7 +7191,7 @@ def _handle_command(text: str) -> None:
                     total_cost += pos.get("total_cost", 0.0)
 
                 # Compute current values to derive bucket weights
-                import conviction_radar as cr
+                from core import conviction_radar as cr
                 bucket_value: dict[str, float] = {b: 0.0 for b in portfolio_by_bucket}
                 position_states: list[dict] = []
 
@@ -7211,7 +7210,7 @@ def _handle_command(text: str) -> None:
                         ucits_estimated = False
                         if bucket_name == "ROTATION":
                             try:
-                                from ucits_proxy import estimate_ucits_current_price
+                                from core.ucits_proxy import estimate_ucits_current_price
                                 est = estimate_ucits_current_price(
                                     sym, avg_price,
                                     entry_date_iso=pos.get("entry_date_iso"),
@@ -7364,8 +7363,8 @@ def _handle_command(text: str) -> None:
 
                 # Rotation top-3
                 try:
-                    from sector_radar import rank_universe
-                    from etf_universe import all_monitored_tickers, get_etf
+                    from core.sector_radar import rank_universe
+                    from core.etf_universe import all_monitored_tickers, get_etf
                     all_t = all_monitored_tickers()
                     ranked = rank_universe(all_t)
                     if ranked:
@@ -7395,7 +7394,7 @@ def _handle_command(text: str) -> None:
 
                 # Core picks
                 try:
-                    from core_radar import scan_core_universe
+                    from core.core_radar import scan_core_universe
                     core_opps = scan_core_universe(min_score=70.0)
                     if core_opps:
                         core_held = {sym.upper() for sym, _ in portfolio_by_bucket["CORE"]}
@@ -7579,9 +7578,9 @@ def _handle_command(text: str) -> None:
 
         def _run_allocation():
             try:
-                from portfolio import get_positions
-                import conviction_radar as cr
-                from tax_engine import should_rotate as tax_should_rotate
+                from portfolio.portfolio.portfolio.portfolio import get_positions
+                from core import conviction_radar as cr
+                from core.tax_engine import should_rotate as tax_should_rotate
 
                 # Concentration caps (per-ticker share of total portfolio)
                 CONCENTRATION_SOFT = 0.25
@@ -7738,8 +7737,8 @@ def _handle_command(text: str) -> None:
                 rotation_ranked = []
                 if not skip_rotation:
                     try:
-                        from sector_radar import rank_universe
-                        from etf_universe import all_monitored_tickers, get_etf
+                        from core.sector_radar import rank_universe
+                        from core.etf_universe import all_monitored_tickers, get_etf
                         all_t = all_monitored_tickers()
                         ranked = rank_universe(all_t)
                         rotation_ranked = ranked
@@ -7762,7 +7761,7 @@ def _handle_command(text: str) -> None:
                         # Build US-proxy → current score map for held UCITS
                         # (so we can compute the "current score" of each
                         # holding by looking up its US proxy in ranked).
-                        from etf_universe import USER_HOLDINGS_UCITS
+                        from core.etf_universe import USER_HOLDINGS_UCITS
                         held_score_map: dict[str, float] = {}
                         for sig in ranked:
                             for ucits, us_proxy in USER_HOLDINGS_UCITS.items():
@@ -7772,7 +7771,7 @@ def _handle_command(text: str) -> None:
                         # Use US proxy for UCITS PnL estimation (yfinance
                         # has no UCITS data). proxy % change since entry →
                         # apply to cost basis → estimate current value.
-                        from ucits_proxy import estimate_ucits_current_price
+                        from core.ucits_proxy import estimate_ucits_current_price
 
                         for sym, pos in rotation_holdings.items():
                             if sym in top3_ucits_set:
@@ -7831,7 +7830,7 @@ def _handle_command(text: str) -> None:
                 # ── MOMENTUM/DIP sells: positions below ATR trailing stop ─
                 exit_warnings_list = []
                 try:
-                    import conviction_radar as cr
+                    from core import conviction_radar as cr
                     momentum_positions = portfolio_by_bucket.get("MOMENTUM", []) + \
                                          portfolio_by_bucket.get("DIP", [])
                     for sym, pos in momentum_positions:
@@ -7931,7 +7930,7 @@ def _handle_command(text: str) -> None:
 
                 # ── Core picks: all (including held — concentration cap gates) ─
                 try:
-                    from core_radar import scan_core_universe
+                    from core.core_radar import scan_core_universe
                     core_opps = scan_core_universe(min_score=70.0)
                     for p in core_opps:
                         # Convert score back to alpha estimate for ranking.
@@ -7956,7 +7955,7 @@ def _handle_command(text: str) -> None:
                 # ── DIP entries (real tickers only — WL_ filtered) ──────
                 try:
                     import state as _st
-                    from prediction_log import get_recent_predictions_by_ticker
+                    from ml.prediction_log import get_recent_predictions_by_ticker
 
                     raw_alerts = list(_st.load_alerts())
                     today_alerts = [
@@ -8220,7 +8219,7 @@ def _handle_command(text: str) -> None:
 
         def _run_debug():
             try:
-                from core_radar import (
+                from core.core_radar import (
                     _fetch_hist, _fetch_quality_metrics, _score_core_dip,
                     _is_investment_phase, _load_universe,
                 )
@@ -8322,7 +8321,7 @@ def _handle_command(text: str) -> None:
         #   /core_picks 15         → top 15
         #   /core_picks 10 50      → top 10 with min_score=50 (more lenient)
         try:
-            from core_radar import scan_core_universe
+            from core.core_radar import scan_core_universe
 
             top_n = 10
             min_score = 60.0
@@ -8828,7 +8827,7 @@ def _handle_command(text: str) -> None:
             try:
                 from pathlib import Path as _P
                 from datetime import date as _date
-                from fundamental_history import _yf_pit_earnings_signals, get_pit_fundamentals
+                from data.fundamental_history import _yf_pit_earnings_signals, get_pit_fundamentals
                 _dd = _P("/data") if _P("/data").exists() else _P("/tmp")
                 cache = _dd / "fundamentals_cache"
                 cache.mkdir(parents=True, exist_ok=True)
@@ -8995,7 +8994,7 @@ def _handle_command(text: str) -> None:
             )
         else:
             try:
-                from portfolio import _cache, _PORTFOLIO_FILE
+                from portfolio.portfolio.portfolio.portfolio import _cache, _PORTFOLIO_FILE
                 _cache["positions"] = {}
                 # _cache["liquidity"] preserved — that's a separate concern
                 if _PORTFOLIO_FILE.exists():
@@ -9013,8 +9012,8 @@ def _handle_command(text: str) -> None:
     elif cmd in ("/admin_portfolio_diag", "/admin_carteira_diag"):
         # Diagnostic: dump exact contents of _cache["positions"] + computed values
         try:
-            from portfolio import get_positions, get_holdings_tuples, _cache
-            from market_client import get_usdeur, get_portfolio_snapshot
+            from portfolio.portfolio.portfolio.portfolio import get_positions, get_holdings_tuples, _cache
+            from data.market_client import get_usdeur, get_portfolio_snapshot
             from state import get_etfs, get_ppr
             import json, yfinance as _yf
 
@@ -9374,7 +9373,7 @@ def _handle_command(text: str) -> None:
                     _report_pending.unlink()
                 # Forçar reload do bundle em memória
                 try:
-                    import ml_predictor as _mp
+                    from ml import ml_predictor as _mp
                     _mp._bundle = None
                     _mp._load_bundle(force=True)
                 except Exception:
@@ -9468,7 +9467,7 @@ def _handle_command(text: str) -> None:
             )
         def _run_publish():
             try:
-                from chart_generator import generate_all_charts
+                from utils.chart_generator import generate_all_charts
                 chart_paths = generate_all_charts()
                 if not chart_paths:
                     _reply("No files generated — no closed trades yet.")
@@ -9496,7 +9495,7 @@ def _handle_command(text: str) -> None:
 
                 # Step 2: push to GitHub if configured
                 if has_github:
-                    from github_publisher import push_all_charts
+                    from utils.github_publisher import push_all_charts
                     results = push_all_charts()
                     charts_ok  = [(n, u) for n, u in results.items() if u and not u.startswith("ERROR") and not n.endswith(".md")]
                     reports_ok = [(n, u) for n, u in results.items() if u and not u.startswith("ERROR") and n.endswith(".md")]

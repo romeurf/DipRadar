@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from ml_features import get_feature_columns
+from ml.ml_features import get_feature_columns
 
 # ── Horizons ─────────────────────────────────────────────────────────────────
 # Primary target: close_90d alpha (rotação de capital em ~90 dias).

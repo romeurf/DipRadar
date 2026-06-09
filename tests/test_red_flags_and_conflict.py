@@ -14,8 +14,8 @@ from pathlib import Path
 # Garante import a partir do raiz do repo
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from score import _detect_red_flags, calculate_score, format_score_v2_breakdown
-from conflict_resolver import ConflictState, resolve_conflict
+from scanners.score import _detect_red_flags, calculate_score, format_score_v2_breakdown
+from core.conflict_resolver import ConflictState, resolve_conflict
 
 
 # ---------------------------------------------------------------------------

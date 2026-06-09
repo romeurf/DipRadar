@@ -33,7 +33,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron       import CronTrigger
 import pytz
 
-from market_client import (
+from data.market_client import (
     screen_global_dips, screen_structural_dips, screen_period_dips,
     get_fundamentals, get_news, get_historical_pe,
     get_52w_drawdown, get_earnings_date, get_earnings_days,
@@ -41,15 +41,15 @@ from market_client import (
     get_usdeur, get_portfolio_snapshot,
     get_macro_context,
 )
-from portfolio import (
+from portfolio.portfolio.portfolio.portfolio import (
     get_holdings_tuples, PPR_SHARES, PPR_AVG_COST,
     DIRECT_TICKERS, FLIP_FUND_EUR, suggest_position_size,
     get_positions, update_position_data,
     mark_degradation_alerted, reset_degradation_flag,
 )
-from sectors import get_sector_config, score_fundamentals
-from valuation import format_valuation_block
-from score import (
+from core.sectors import get_sector_config, score_fundamentals
+from core.valuation import format_valuation_block
+from scanners.score import (
     calculate_dip_score, build_score_breakdown, classify_dip_category,
     is_bluechip,
     score_from_fundamentals, format_score_v2_breakdown,
@@ -75,30 +75,30 @@ from state import (
     # ── Feature 8: Dip Persistente ──────────────────────────────────
     record_dip_day, mark_persistent_alerted, expire_missing_streaks,
 )
-from backtest import backtest_runner, build_backtest_summary
-from watchlist import run_watchlist_scan, build_watchlist_morning_summary, WATCHLIST
-from alert_db import log_alert_snapshot, get_db_stats, fill_db_outcomes
+from scanners.backtest import backtest_runner, build_backtest_summary
+from scanners.watchlist import run_watchlist_scan, build_watchlist_morning_summary, WATCHLIST
+from scanners.alert_db import log_alert_snapshot, get_db_stats, fill_db_outcomes
 import bot_commands
-from position_monitor import run_daily_check
+from portfolio.portfolio.position_monitor import run_daily_check
 from momentum_radar.scanner import scan_momentum_universe, format_momentum_alert, clear_sector_cache
 
 # Chunk 3a — data feed
-from data_feed import get_eod_prices, get_latest_price, is_tiingo_available
+from data.data_feed import get_eod_prices, get_latest_price, is_tiingo_available
 
 # Chunk 3 — universe
-from universe import get_full_universe, get_ml_universe, ETF_TICKERS, is_etf
+from core.universe import get_full_universe, get_ml_universe, ETF_TICKERS, is_etf
 
 # Chunk 6 — ML predictor
-from ml_predictor import ml_score, ml_badge, is_model_ready, MLResult
+from ml.ml_predictor import ml_score, ml_badge, is_model_ready, MLResult
 
 # Feature 8 — Dip Persistente
-from persistent_dip import check_and_alert_streak
+from scanners.persistent_dip import check_and_alert_streak
 
 # ── Label Resolver — Flywheel de ML ──────────────────────────────────────────
-from label_resolver import run_label_resolver_job
+from data.label_resolver import run_label_resolver_job
 
 # ── Backup diário ──────────────────────────────────────────────────────────────
-from backup_data import run_backup, build_telegram_summary as backup_telegram_summary
+from utils.backup_data import run_backup, build_telegram_summary as backup_telegram_summary
 
 logging.basicConfig(
     level=logging.INFO,
@@ -339,7 +339,7 @@ def _get_snapshot() -> dict:
     usd_eur = get_usdeur()
     # PPR + ETFs are Telegram-managed (state-backed) — refresh each call
     # so /ppr set / /etf set changes take effect immediately, no restart.
-    from portfolio import _get_ppr_values
+    from portfolio.portfolio.portfolio.portfolio import _get_ppr_values
     from state import get_etfs, get_ppr
     ppr_shares, ppr_avg_cost = _get_ppr_values()
     ppr_state = get_ppr()
@@ -1229,13 +1229,13 @@ def build_alert(
     # Narrativa de sinais (Chunk 6b) — explica o PORQUÊ em linguagem natural
     signal_narrative_text = ""
     try:
-        from signal_narrative import generate_signal_narrative, generate_8k_veto
-        from ml_features import _FALLBACK as _mf_fallback
+        from core.signal_narrative import generate_signal_narrative, generate_8k_veto
+        from ml.ml_features import _FALLBACK as _mf_fallback
         _feats = {**fundamentals} if fundamentals else {}
         _eight_k = _feats.get("recent_8k_score") or _mf_fallback.get("recent_8k_score")
         # Detalhes insider e 8-K (nome, cargo, descrição exacta)
         try:
-            from fundamental_signals import get_insider_details, get_8k_details
+            from data.fundamental_signals import get_insider_details, get_8k_details
             _ins_det = get_insider_details(symbol)
             _8k_det  = get_8k_details(symbol)
         except Exception:
@@ -1267,7 +1267,7 @@ def build_alert(
     # Tema/trend (Chunk 7) — identifica se o stock está num sector em trend
     theme_line = ""
     try:
-        from themes import get_stock_themes, format_theme_tag
+        from scanners.themes import get_stock_themes, format_theme_tag
         matched_themes = get_stock_themes(
             ticker=symbol,
             sector=sector,
@@ -1458,7 +1458,7 @@ def run_scan() -> None:
         # Se ≥ 3 sectores caírem >2% em simultâneo, é rotação agressiva ou
         # bear market — aumentamos o score mínimo para evitar "apanhar facas".
         try:
-            from macro_data import get_dynamic_min_score
+            from data.macro_data import get_dynamic_min_score
             effective_min_score = get_dynamic_min_score(base_min_score=MIN_DIP_SCORE)
             if effective_min_score > MIN_DIP_SCORE:
                 logging.info(
@@ -1582,7 +1582,7 @@ def run_scan() -> None:
                 # eleva o alerta para MONITORIZAR independentemente do ML score.
                 _8k_val = fund.get("recent_8k_score")
                 try:
-                    from signal_narrative import generate_8k_veto
+                    from core.signal_narrative import generate_8k_veto
                     _veto = generate_8k_veto(_8k_val) if _8k_val is not None else None
                     if _veto and verdict == "COMPRAR":
                         verdict    = "MONITORIZAR"
@@ -1641,7 +1641,7 @@ def run_scan() -> None:
                 _cap_util_pct = None
                 _n_open       = None
                 try:
-                    from paper_trading import (
+                    from portfolio.portfolio.paper_trading import (
                         get_paper_portfolio_value, get_paper_allocated,
                         get_paper_available, _load as _pt_load,
                     )
@@ -1668,7 +1668,7 @@ def run_scan() -> None:
                 _monthly_budget = float(os.environ.get("MONTHLY_BUDGET_EUR", "0") or 0)
                 _capital_used   = 0.0
                 try:
-                    from paper_trading import _capital_used_this_month as _cup
+                    from portfolio.portfolio.paper_trading import _capital_used_this_month as _cup
                     _capital_used = _cup()
                 except Exception:
                     pass
@@ -1702,8 +1702,8 @@ def run_scan() -> None:
                 # aqueles em que havia dinheiro disponível (selection bias).
                 if verdict == "COMPRAR":
                     try:
-                        from paper_trading import record_paper_buy
-                        from portfolio import FLIP_FUND_EUR
+                        from portfolio.portfolio.paper_trading import record_paper_buy
+                        from portfolio.portfolio.portfolio.portfolio import FLIP_FUND_EUR
                         paper_amount = float(
                             decision.amount_eur
                             if "decision" in dir() and hasattr(decision, "amount_eur") and decision.amount_eur > 0
@@ -1746,8 +1746,8 @@ def run_scan() -> None:
                 # Não requer intervenção manual — nunca perdes o tracking de uma posição.
                 if verdict == "COMPRAR":
                     try:
-                        import position_db as _pdb
-                        from ml_engine import predict_dip as _predict
+                        from portfolio.portfolio.portfolio import position_db as _pdb
+                        from ml.ml_engine import predict_dip as _predict
                         _price_now  = float(fund.get("price") or stock.get("price") or 0)
                         _feat_row   = {**fund, "score": score, "sector": fund.get("sector",""), "change_day_pct": stock["change_pct"]}
                         _pred       = _predict(_feat_row, current_price=_price_now, ticker=sym, bundle=None)
@@ -1966,7 +1966,7 @@ def run_monthly_retrain() -> None:
             except Exception as _be:
                 logging.warning(f"[monthly_retrain] DIP incremental skipped: {_be}")
 
-            from monthly_retrain import run_monthly_retrain
+            from ml.monthly_retrain import run_monthly_retrain
             _result_holder[0] = run_monthly_retrain()
         except Exception as e:
             _error_holder[0] = e
@@ -2118,7 +2118,7 @@ def run_monthly_retrain() -> None:
     # persistência entre deploys do Railway.
     if decision == "PROMOTED":
         try:
-            from github_sync import sync_training_artifacts
+            from utils.github_sync import sync_training_artifacts
             _data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
             sync_results = sync_training_artifacts(_data_dir)
             _ok = sum(1 for v in sync_results.values() if v == "ok")
@@ -2145,7 +2145,7 @@ def run_momentum_scan() -> None:
       21h30 Lisboa — janela US (após fecho americano ~22h inverno/21h verão)
     """
     try:
-        from paper_trading import (
+        from portfolio.portfolio.paper_trading import (
             record_momentum_paper_buy, allocate_capital_unified,
             _get_monthly_budget, _capital_used_this_month,
         )
@@ -2236,8 +2236,8 @@ def run_core_scan() -> None:
     Schedule: 22:00 Lisboa (dados EOD US limpos, uma vez por dia)
     """
     try:
-        from core_radar import scan_core_universe, format_core_alert, is_model_ready
-        from paper_trading import record_core_holding, get_core_holdings_summary
+        from core.core_radar import scan_core_universe, format_core_alert, is_model_ready
+        from portfolio.portfolio.paper_trading import record_core_holding, get_core_holdings_summary
 
         if not is_model_ready():
             logging.warning(
@@ -2379,7 +2379,7 @@ def main() -> None:
 
     # Migrar alert_db.csv para o schema actual no arranque.
     try:
-        from alert_db import migrate_schema
+        from scanners.alert_db import migrate_schema
         if migrate_schema():
             logging.info("[main] alert_db.csv migrado para schema actual.")
     except Exception as _e:
@@ -2536,7 +2536,7 @@ def main() -> None:
     # state (personal_positions.json + conviction_outcomes.json).
     def _run_conviction_monitor():
         try:
-            import conviction_radar
+            from core import conviction_radar
             conviction_radar.run_daily_check(send_telegram)
         except Exception as e:
             logging.error(f"[conviction] daily check failed: {e}", exc_info=True)
@@ -2610,7 +2610,7 @@ def main() -> None:
     # CORE — CORE is always user-explicit upgrade.
     def _run_conviction_auto_sync():
         try:
-            import conviction_radar
+            from core import conviction_radar
             conviction_radar.auto_sync_from_portfolio(send_telegram)
         except Exception as e:
             logging.error(f"[conviction] auto-sync failed: {e}", exc_info=True)
@@ -2832,7 +2832,7 @@ def main() -> None:
             if train_proc.returncode == 0:
                 # Reload in-process so the new model is active immediately
                 try:
-                    import core_radar as _cr
+                    from core import core_radar as _cr
                     _cr._core_model_checked = False
                     _cr._core_model_bundle  = None
                     _cr._load_core_model()
@@ -2864,7 +2864,7 @@ def main() -> None:
     # Fecha posições que atingiram o target ou esgotaram o hold_days.
     def _run_paper_update():
         try:
-            from paper_trading import (
+            from portfolio.portfolio.paper_trading import (
                 update_open_positions,
                 update_momentum_positions,
                 update_core_positions,
@@ -2879,7 +2879,7 @@ def main() -> None:
             _just_closed = stats.get("just_closed", []) + stats2.get("just_closed", [])
             if _just_closed:
                 try:
-                    from chart_generator import generate_trade_card
+                    from utils.chart_generator import generate_trade_card
                     for _trade in _just_closed:
                         _card = generate_trade_card(_trade)
                         if _card and _card.exists():
@@ -2940,7 +2940,7 @@ def main() -> None:
     # ── Paper Performance: relatório mensal (dia 1, 07:00 Lisboa) ─────────────
     def _run_paper_report():
         try:
-            from paper_trading import get_monthly_performance, format_performance_report
+            from portfolio.portfolio.paper_trading import get_monthly_performance, format_performance_report
             perf = get_monthly_performance(months_back=3)
             send_telegram(f"📊 Paper Trading — Relatório Mensal\n\n{format_performance_report(perf)}")
         except Exception as e:

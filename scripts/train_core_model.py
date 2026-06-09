@@ -33,7 +33,7 @@ from sklearn.preprocessing import QuantileTransformer
 _REPO_ROOT_FOR_IMPORT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT_FOR_IMPORT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT_FOR_IMPORT))
-from core_bundle import CoreModelBundle  # noqa: E402  pickle-compat shared dataclass
+from core.core_bundle import CoreModelBundle  # noqa: E402  pickle-compat shared dataclass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("train_core_model")

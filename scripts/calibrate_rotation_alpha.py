@@ -50,9 +50,9 @@ def _ensure_data_dir() -> None:
 
 def _gather_picks(n_years: int) -> tuple[list[float], list[float], dict]:
     """Walk the rotation backtest, collecting (score, fwd_1m_alpha) per pick."""
-    from etf_universe import all_monitored_tickers
-    from sector_radar import compute_signals, compute_rotation_scores
-    from sector_rotation_backtest import _INITIAL_LOOKBACK_DAYS
+    from core.etf_universe import all_monitored_tickers
+    from core.sector_radar import compute_signals, compute_rotation_scores
+    from core.sector_rotation_backtest import _INITIAL_LOOKBACK_DAYS
 
     import yfinance as yf
     import pandas as pd

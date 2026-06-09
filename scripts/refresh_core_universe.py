@@ -183,7 +183,7 @@ def run_refresh(
     else:
         # Full universe from universe.py (same ~3,500 as DIP/Momentum)
         try:
-            from universe import get_ml_universe
+            from core.universe import get_ml_universe
             to_screen = get_ml_universe()
             log.info(f"Full universe: {len(to_screen)} tickers to screen")
         except Exception as e:

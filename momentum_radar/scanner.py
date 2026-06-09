@@ -98,7 +98,7 @@ def _calc_momentum_signals(hist: pd.DataFrame) -> dict:
 
     # Market Structure + Volume Flow
     try:
-        from ml_features import _anchored_vwap_ratio, _volume_poc_ratio, _compute_mfi, _compute_volume_up_pct
+        from ml.ml_features import _anchored_vwap_ratio, _volume_poc_ratio, _compute_mfi, _compute_volume_up_pct
         vwap_low_ratio = _anchored_vwap_ratio(hist, use_high=False)
         poc_ratio      = _volume_poc_ratio(hist, lookback=60)
         mfi_val        = _compute_mfi(hist, period=14)
@@ -181,7 +181,7 @@ def _sector_return_20d(sector: str, _cache: dict = _SECTOR_ETF_CACHE) -> float:
         return _cache[sector]
 
     from ml_training.config import SECTOR_ETF
-    from data_feed import get_eod_prices
+    from data.data_feed import get_eod_prices
     etf = SECTOR_ETF.get(sector, "SPY")
     result = 0.0
     try:
@@ -435,9 +435,9 @@ def scan_momentum_universe(
     Devolve lista de candidatos ordenados por score, cada um com:
       ticker, score, price, return_20d, volume_ratio_20d, rsi_14, reasons, fund
     """
-    from universe import get_ml_universe
-    from data_feed import get_eod_prices
-    from market_client import get_fundamentals
+    from core.universe import get_ml_universe
+    from data.data_feed import get_eod_prices
+    from data.market_client import get_fundamentals
 
     if tickers is None:
         try:

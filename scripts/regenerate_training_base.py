@@ -297,7 +297,7 @@ def _compute_row_features(
     macro_cache: dict[str, pd.DataFrame],
 ) -> dict[str, float]:
     """Compute the new features (momentum/regime/OHLCV/market-structure)."""
-    from ml_features import (
+    from ml.ml_features import (
         _FALLBACK,
         add_momentum_features,
         add_raw_ohlcv_features,
@@ -362,7 +362,7 @@ def _compute_row_features(
     # Volume Flow — MFI 14d + buying pressure ratio 20d
     if hist is not None:
         try:
-            from ml_features import add_volume_flow_features
+            from ml.ml_features import add_volume_flow_features
             add_volume_flow_features(fv, hist)
         except Exception as e:
             log.debug(f"  volume_flow failed {ticker}@{alert_date.date()}: {e}")
@@ -392,8 +392,8 @@ def _compute_pit_fundamentals_row(
     """
     import sys
     sys.path.insert(0, str(_REPO_ROOT))
-    from fundamental_history import get_pit_fundamentals, _yf_pit_earnings_signals
-    from ml_features import _FALLBACK
+    from data.fundamental_history import get_pit_fundamentals, _yf_pit_earnings_signals
+    from ml.ml_features import _FALLBACK
 
     ticker     = str(row["ticker"])
     alert_date = pd.Timestamp(row["alert_date"]).date()
@@ -604,8 +604,8 @@ def _compute_fase5_row(
     here because they are not PIT for historical data.
     EDGAR calls are gated by has_sec_filings() — skipped for non-US tickers.
     """
-    from ml_features import _FALLBACK
-    from sec_guard import has_sec_filings as _has_sec
+    from ml.ml_features import _FALLBACK
+    from utils.sec_guard import has_sec_filings as _has_sec
     import math as _math
 
     ticker     = str(row["ticker"])
@@ -856,7 +856,7 @@ def regenerate(
     # Redução de 200x no número de chamadas à API SEC.
     if add_fase5 and add_features:
         log.info("[compute] sinais Fase 5 (EDGAR Form4/8-K + preços) — por ticker único...")
-        from ml_features import _FALLBACK
+        from ml.ml_features import _FALLBACK
         fase5_results = {idx: {k: _FALLBACK.get(k, 0.0) for k in FASE5_COLS}
                          for idx in df.index}
         n_edgar = 0
@@ -894,7 +894,7 @@ def regenerate(
 
             # EDGAR calls — uma vez por ticker, aplica a todas as datas
             try:
-                from fundamental_signals import (
+                from data.fundamental_signals import (
                     insider_buy_recent, insider_buy_amount_score,
                     classify_recent_8k, earnings_call_tone as _et,
                 )
@@ -960,7 +960,7 @@ def regenerate(
     if add_features:
         log.info("[compute] sector-conditioned features (vectorizado)...")
         try:
-            from ml_features import _SECTOR_TYPE, _RSI_OVERSOLD_THRESHOLD
+            from ml.ml_features import _SECTOR_TYPE, _RSI_OVERSOLD_THRESHOLD
 
             _VIX_FACTOR   = {"growth": -1.0, "cyclical": -0.5, "commodity": 0.0, "defensive": +0.5}
             _DD_TYPICAL    = {"growth": -25.0, "cyclical": -30.0, "commodity": -40.0, "defensive": -20.0}
@@ -1030,7 +1030,7 @@ def regenerate(
 
     # ── Validate feature completeness before saving ───────────────────────────
     try:
-        from ml_features import FEATURE_COLUMNS
+        from ml.ml_features import FEATURE_COLUMNS
         missing_cols = [c for c in FEATURE_COLUMNS if c not in df.columns]
         if missing_cols:
             log.error(
@@ -1055,7 +1055,7 @@ def regenerate(
     log.info(f"[out] DONE in {elapsed:.0f}s. shape={df.shape}  size={out_path.stat().st_size/1e6:.1f} MB")
 
     # Sanity stats finais — all FEATURE_COLUMNS + targets
-    from ml_features import FEATURE_COLUMNS as _FC
+    from ml.ml_features import FEATURE_COLUMNS as _FC
     stat_cols = _FC + [c for c in (TARGET_COLS + FUNDAMENTAL_COLS) if c not in _FC]
     log.info(f"[stats] feature summary ({len(_FC)} features + targets):")
     for col in stat_cols:

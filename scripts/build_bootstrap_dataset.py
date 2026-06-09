@@ -420,7 +420,7 @@ def main() -> int:
         tickers = [t.strip().upper() for t in args.tickers.split(",")]
         log.info(f"Modo teste: {len(tickers)} tickers")
     else:
-        from universe import get_ml_universe
+        from core.universe import get_ml_universe
         tickers = get_ml_universe()
         log.info(f"Universo completo: {len(tickers)} tickers")
 

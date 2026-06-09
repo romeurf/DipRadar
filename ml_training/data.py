@@ -49,7 +49,7 @@ def load_base_dataset(parquet_path: Path) -> pd.DataFrame:
     # proceed; a fresh bootstrap will replace fallback values on the next overnight.
     missing_cols = [c for c in FEATURE_COLS if c not in df.columns]
     if missing_cols:
-        from ml_features import _FALLBACK
+        from ml.ml_features import _FALLBACK
         log.warning(
             f"Parquet missing {len(missing_cols)} DIP feature(s) — filling with _FALLBACK. "
             f"Re-run bootstrap to fix permanently. Missing: {missing_cols}"
@@ -111,7 +111,7 @@ def _build_targets(alert_date: pd.Timestamp, entry_price: float, future_closes: 
 
 
 def _build_v2_features(row: pd.Series, hist: pd.DataFrame) -> dict:
-    from ml_features import _FALLBACK
+    from ml.ml_features import _FALLBACK
     if hist.empty:
         return {}
     close = hist["Close"]
@@ -199,7 +199,7 @@ def add_cross_sectional_rank(df: pd.DataFrame, target_col: str = "alpha_60d", ra
 
 
 def build_dataset(base_df: pd.DataFrame, price_cache: dict[str, pd.DataFrame], etf_cache: dict[str, pd.DataFrame], horizon_days: int = HORIZON_DAYS, macro_price_cache: Optional[dict[str, pd.DataFrame]] = None) -> tuple[pd.DataFrame, dict[str, int]]:
-    from ml_features import (
+    from ml.ml_features import (
         _FALLBACK, add_derived_features, add_momentum_features, add_context_features,
         add_raw_ohlcv_features, add_regime_features, add_short_earnings_features,
         add_market_structure_features, add_volume_flow_features,
@@ -259,7 +259,7 @@ def build_dataset(base_df: pd.DataFrame, price_cache: dict[str, pd.DataFrame], e
         # earnings_beat_rate, analyst_rating, short_interest_pct (yfinance live).
         # NOTA: insider/earnings/analyst chamam APIs externas → lento; silent-fail com NaN.
         try:
-            from fundamental_signals import compute_fundamental_signals
+            from data.fundamental_signals import compute_fundamental_signals
             _fase5 = compute_fundamental_signals(
                 ticker,
                 price_history=hist,  # já sliced point-in-time
