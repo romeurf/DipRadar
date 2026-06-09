@@ -1307,6 +1307,23 @@ def build_alert(
         # right after "Rejeitado: sem suporte técnico" is contradictory and
         # confused users into thinking the bot was recommending a buy.
         body += f"\n💶 *Sizing:* {sizing_str}"
+
+    # Cash reserve hint: when /cash recommended holding €X liquid (no signals
+    # at that time) and now a high-conviction COMPRAR fires, remind the user
+    # that the capital is available. The system NEVER auto-buys — just shows
+    # the reserve so the user can decide manually.
+    if verdict == "COMPRAR":
+        try:
+            from state import get_cash_reserve_eur
+            reserve = get_cash_reserve_eur()
+            if reserve >= 50:
+                body += (
+                    f"\n📥 _Reserva disponível: €{reserve:.0f} "
+                    f"(definida pelo último /cash). Considera deploy parcial._"
+                )
+        except Exception:
+            pass
+
     return body
 
 

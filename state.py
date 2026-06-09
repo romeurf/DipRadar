@@ -21,6 +21,12 @@ Funções exportadas:
   concept replaced by /cash command which manages all allocation in a
   unified ROI-ranked queue without per-day spend tracking)
 
+  load_cash_reserve / set_cash_reserve / add_cash_reserve
+  consume_cash_reserve
+  — Cash that /cash recommended to keep liquid (no signals available).
+    When new DIP/Core signals fire later in the month, alerts surface
+    this reserve so the user can deploy without re-running /cash.
+
 NOTA DE SEGURANÇA (race condition):
   _save_json usa escrita atómica via ficheiro temporário + os.replace().
   Garante que nenhum leitor vê um JSON parcialmente escrito, mesmo que
@@ -719,7 +725,15 @@ def update_sector_state(
     new_state = prev_state
     should_alert = False
 
-    # Transition logic — hysteresis built in
+    # Transition logic — hysteresis + DIRECT transitions to avoid
+    # trapping a sector in the wrong zone when the opposite signal
+    # appears strong before the current one faded.
+    #
+    # Without direct SELL→BUY (and BUY→SELL), a sector in SELL_ZONE
+    # could see combined_buy spike to 90 but stay locked in SELL_ZONE
+    # until exit_strength first dropped below 50. Real-world signals
+    # don't politely cool down before the opposite fires — we honour
+    # the stronger current signal.
     if prev_state == "NEUTRAL":
         # SELL takes priority: a holding flagged for exit is more urgent
         # than another buy opportunity (defensive bias).
@@ -731,18 +745,35 @@ def update_sector_state(
             should_alert = True
 
     elif prev_state == "SELL_ZONE":
-        if exit_strength < _SELL_RESET_THRESHOLD:
+        # Direct flip to BUY_ZONE if buy signal is dominant
+        # AND exit signal has lost meaningful strength
+        if (combined_buy >= _BUY_TRIGGER_THRESHOLD
+                and exit_strength < _SELL_TRIGGER_THRESHOLD):
+            new_state = "BUY_ZONE"
+            should_alert = True
+        elif exit_strength < _SELL_RESET_THRESHOLD:
             new_state = "NEUTRAL"
             # Silent — signal faded
-        # else: stay in SELL_ZONE, no new alert
 
     elif prev_state == "BUY_ZONE":
-        if combined_buy < _BUY_RESET_THRESHOLD:
+        # Direct flip to SELL_ZONE if exit signal is dominant
+        # AND buy signal has lost meaningful strength
+        if (exit_strength >= _SELL_TRIGGER_THRESHOLD
+                and combined_buy < _BUY_TRIGGER_THRESHOLD):
+            new_state = "SELL_ZONE"
+            should_alert = True
+        elif combined_buy < _BUY_RESET_THRESHOLD:
             new_state = "NEUTRAL"
-        # else: stay in BUY_ZONE, no new alert
 
-    # Persist
-    now_iso = datetime.utcnow().isoformat()
+    # Persist — BUG-11 fix: use Lisbon timezone for consistency with
+    # the rest of state.py (score_log, weekly_log, etc. use local time).
+    # utcnow() was leaving sector timestamps 1h off from everything else.
+    try:
+        from zoneinfo import ZoneInfo
+        _TZ = ZoneInfo("Europe/Lisbon")
+        now_iso = datetime.now(_TZ).isoformat()
+    except Exception:
+        now_iso = datetime.now().isoformat()
     record["state"] = new_state
     record["last_combined_buy"]  = float(combined_buy)
     record["last_exit_strength"] = float(exit_strength)
@@ -763,7 +794,11 @@ def reset_sector_state(ticker: str) -> bool:
     if t not in states:
         return False
     states[t]["state"] = "NEUTRAL"
-    states[t]["updated_at"] = datetime.utcnow().isoformat()
+    try:
+        from zoneinfo import ZoneInfo
+        states[t]["updated_at"] = datetime.now(ZoneInfo("Europe/Lisbon")).isoformat()
+    except Exception:
+        states[t]["updated_at"] = datetime.now().isoformat()
     save_sector_states(states)
     return True
 
@@ -782,3 +817,82 @@ def sector_states_summary() -> dict:
         "tickers_in_buy_zone":  [t for t, r in states.items() if r.get("state") == "BUY_ZONE"],
         "tickers_in_sell_zone": [t for t, r in states.items() if r.get("state") == "SELL_ZONE"],
     }
+
+
+# ── Cash reserve tracker ─────────────────────────────────────────────────────
+#
+# When /cash is invoked and recommends keeping €X liquid (no actionable signals
+# at runtime), we record that amount as "reserve". When DIP/Core signals fire
+# later in the month (via the daily scanner), alerts surface this reserve so
+# the user can deploy without re-running /cash from scratch.
+#
+# Design intent from user:
+#   "se cash recomendar guardar dinheiro em T212 a aguardar deploy que depois
+#    efectivamente o deploye assim que surgir oportunidade ao longo do mês.
+#    No entanto, não quero deploys forçados, nunca ser demasiado defensivo
+#    mas também nunca fazer deploys por fazer"
+#
+# So the system NEVER auto-buys. It only displays "you have €X reserve
+# available" alongside high-conviction signals (DIP score≥70, Core score≥70).
+
+_CASH_RESERVE_FILE = "cash_reserve.json"
+
+
+def load_cash_reserve() -> dict:
+    """Return {amount_eur: float, set_at: iso_datetime, source: str}."""
+    return _load_json(_CASH_RESERVE_FILE, default={
+        "amount_eur": 0.0,
+        "set_at":     "",
+        "source":     "",
+        "history":    [],
+    })
+
+
+def set_cash_reserve(amount_eur: float, source: str = "/cash") -> dict:
+    """Overwrite the current reserve. Used at the end of /cash when the
+    cash_bucket is non-zero (system genuinely had no place to deploy)."""
+    try:
+        from zoneinfo import ZoneInfo
+        now_iso = datetime.now(ZoneInfo("Europe/Lisbon")).isoformat()
+    except Exception:
+        now_iso = datetime.now().isoformat()
+    data = load_cash_reserve()
+    if data.get("amount_eur", 0) > 0:
+        data["history"].append({
+            "amount_eur": data["amount_eur"],
+            "set_at":     data["set_at"],
+            "ended_at":   now_iso,
+            "reason":     "overwritten",
+        })
+    data["amount_eur"] = float(amount_eur)
+    data["set_at"]     = now_iso
+    data["source"]     = source
+    _save_json(_CASH_RESERVE_FILE, data)
+    return data
+
+
+def consume_cash_reserve(amount_eur: float, reason: str = "deploy") -> dict:
+    """Subtract from the reserve when user manually deploys (e.g., /buy)."""
+    data = load_cash_reserve()
+    current = float(data.get("amount_eur", 0))
+    consumed = min(current, amount_eur)
+    data["amount_eur"] = max(0.0, current - consumed)
+    if consumed > 0:
+        try:
+            from zoneinfo import ZoneInfo
+            now_iso = datetime.now(ZoneInfo("Europe/Lisbon")).isoformat()
+        except Exception:
+            now_iso = datetime.now().isoformat()
+        data["history"].append({
+            "amount_eur": consumed,
+            "set_at":     data.get("set_at", ""),
+            "ended_at":   now_iso,
+            "reason":     reason,
+        })
+    _save_json(_CASH_RESERVE_FILE, data)
+    return data
+
+
+def get_cash_reserve_eur() -> float:
+    """Quick accessor: just the current EUR amount."""
+    return float(load_cash_reserve().get("amount_eur", 0.0))

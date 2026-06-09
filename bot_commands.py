@@ -7468,6 +7468,68 @@ def _handle_command(text: str) -> None:
             target=_run_monthly, daemon=True, name="monthly-check"
         ).start()
 
+    elif cmd in ("/cash_reserve", "/reserve"):
+        # View or clear the cash reserve that /cash recommended to hold.
+        # Reserve is the residual after /cash deploys signals; it's
+        # available for opportunistic deploy when high-conviction
+        # alerts fire during the month.
+        #
+        # Usage:
+        #   /cash_reserve         → view current reserve
+        #   /cash_reserve clear   → manually clear (after physical T212 deploy)
+        try:
+            import state as _st_r
+            data = _st_r.load_cash_reserve()
+            current = float(data.get("amount_eur", 0))
+
+            if len(parts) >= 2 and parts[1].lower() in ("clear", "reset", "zero"):
+                _st_r.consume_cash_reserve(current, reason="manual clear")
+                _reply(
+                    f"🧹 Cash reserve limpa.\n"
+                    f"Valor anterior: €{current:.2f}\n"
+                    f"_Use quando já deployaste manualmente em T212 e queres "
+                    f"que os alerts deixem de mencionar a reserva._"
+                )
+                return
+
+            if current <= 0:
+                _reply(
+                    "📥 *Cash reserve*: €0.00\n\n"
+                    "_Sem reserva pendente. O próximo /cash pode definir "
+                    "uma se houver budget sem signals para deploy._"
+                )
+                return
+
+            set_at = data.get("set_at", "?")
+            source = data.get("source", "?")
+            history = data.get("history", [])
+            lines = [
+                f"📥 *Cash reserve*: *€{current:,.2f}*",
+                f"",
+                f"_Definida em_ `{set_at[:16]}` _via_ `{source}`",
+                f"_Yield em T212 @ 2.2%/ano = €{current * 0.022:.2f}/ano_",
+                f"",
+                f"Será mostrada em DIP/Core alerts (score ≥ 70) "
+                f"para te lembrar de deploy parcial sem esperar inflow novo.",
+            ]
+            if history:
+                lines.append("")
+                lines.append(f"_Histórico ({len(history)} entries anteriores):_")
+                for h in history[-3:]:
+                    lines.append(
+                        f"  • €{h.get('amount_eur', 0):.0f} "
+                        f"({h.get('reason', '?')[:30]}) "
+                        f"até {h.get('ended_at', '?')[:10]}"
+                    )
+            lines.append("")
+            lines.append(
+                "_Para limpar manualmente_ (e.g., após deploy físico em T212): "
+                "`/cash_reserve clear`"
+            )
+            _reply("\n".join(lines))
+        except Exception as e:
+            _reply(f"❌ Cash reserve falhou: `{e}`")
+
     elif cmd in ("/cash", "/allocation", "/alloc"):
         # Allocation flow with freed-cash incorporation.
         #
@@ -8004,6 +8066,17 @@ def _handle_command(text: str) -> None:
                 # ── Cash bucket: whatever's left ───────────────────────
                 cash_bucket = max(0.0, remaining)
 
+                # Persist reserve so future scanner alerts can surface it.
+                # The user explicitly opted for "deploy when opportunity
+                # arises, never forced" — we never auto-buy, only display
+                # availability alongside high-conviction signals.
+                if cash_bucket > 0:
+                    try:
+                        import state as _st_cr
+                        _st_cr.set_cash_reserve(cash_bucket, source="/cash")
+                    except Exception as _e:
+                        info_lines.append(f"⚠️ Cash reserve persist failed: `{_e}`")
+
                 # ╔════════════════════════════════════════════════════════╗
                 # ║ Build output                                           ║
                 # ╚════════════════════════════════════════════════════════╝
@@ -8337,6 +8410,22 @@ def _handle_command(text: str) -> None:
                         f"_Sugerido EUR é a alocação base. Em /cash o sistema "
                         f"vai ajustar conforme conviction + capital disponível._"
                     )
+
+                    # Surface cash reserve if available — opportunity-driven
+                    # deploy reminder per user's stated policy
+                    try:
+                        from state import get_cash_reserve_eur
+                        reserve = get_cash_reserve_eur()
+                        if reserve >= 50:
+                            lines.append("")
+                            lines.append(
+                                f"📥 _Reserva disponível: *€{reserve:.0f}* "
+                                f"(definida pelo último /cash). "
+                                f"Se algum pick acima tem conviction alta, "
+                                f"podes deploy parcial sem esperar inflow novo._"
+                            )
+                    except Exception:
+                        pass
 
                     _reply("\n".join(lines))
                 except Exception as _e:
