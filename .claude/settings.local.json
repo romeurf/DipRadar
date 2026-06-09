@@ -146,7 +146,11 @@
       "Bash(PYTHONIOENCODING=utf-8 grep -rn \"from portfolio\\\\.portfolio import\" --include=\"*.py\")",
       "Bash(PYTHONIOENCODING=utf-8 grep -E \"^def |^_|^[A-Z][A-Z_]* =\" portfolio/portfolio.py)",
       "Bash(PYTHONIOENCODING=utf-8 grep -rn \"^import portfolio\\\\|from portfolio import\" --include=\"*.py\")",
-      "Bash(PYTHONIOENCODING=utf-8 grep -rn \"get_etfs\\\\|set_etfs\\\\|add_etf\\\\|remove_etf\" --include=\"*.py\")"
+      "Bash(PYTHONIOENCODING=utf-8 grep -rn \"get_etfs\\\\|set_etfs\\\\|add_etf\\\\|remove_etf\" --include=\"*.py\")",
+      "Bash(PYTHONIOENCODING=utf-8 grep -n \"^def _handle_\\\\|^def setup\\\\|^def register_callbacks\\\\|^def _poll_telegram\" bot_commands.py)",
+      "Bash(mkdir -p commands)",
+      "Bash(echo \"# commands/ package — Bot command handlers split by group\")",
+      "Bash(PYTHONIOENCODING=utf-8 grep -n \"^def _reply\\\\|^def _check_rate\\\\|^_reply =\\\\|^_poll_context\" bot_commands.py)"
     ],
     "additionalDirectories": [
       "c:\\Users\\Romeu\\OneDrive\\Documentos\\GitHub\\DipRadar"
