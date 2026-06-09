@@ -1,126 +1,169 @@
-# 📡 DipRadar — Caçador Quantitativo de Assimetrias
+# 📡 DipRadar — Multi-Strategy Quant Portfolio System
 
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![Railway](https://img.shields.io/badge/Deploy-Railway-000000?style=for-the-badge&logo=railway&logoColor=white)](https://railway.app/)
 [![Telegram](https://img.shields.io/badge/Telegram-Bot-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://core.telegram.org/bots)
 
-> **Bot de trading quantitativo que caça dips em empresas de qualidade, dimensiona o capital de forma inteligente e evolui continuamente com dados reais.**
+> **Sistema de trading quantitativo multi-estratégia.** Cinco radares paralelos identificam oportunidades, um motor unificado (`/cash`) distribui capital com awareness fiscal e gestão de concentração, e a execução é sempre manual pelo utilizador no T212.
 
 ---
 
-## 💡 A Filosofia
+## 🏛️ Os 5 Radares
 
-O DipRadar executa uma única filosofia com precisão institucional: **Dip Hunting**. Varre o mercado à procura de quedas abruptas, separa empresas de excelência do lixo especulativo, e diz-te exactamente quanto capital arriscar na recuperação — sem intervenção humana.
-
----
-
-## 🏛️ Os 4 Pilares
-
-### 1. O Radar (Machine Learning)
-Modelo preditivo treinado com dados históricos validados com regras de walk-forward CV (padrão institucional):
-- **Target**: `alpha_90d = log1p(stock_return_90d) − log1p(spy_return_90d)` — excesso sobre o S&P 500 em 90 dias
-- **IC actual**: 0.124 (IC SR: 4.49) | 100% folds positivos
-- **Features (33)**: técnicas + fundamentais PIT + sentimento SEC + short interest + earnings call tone
-- **Modelos**: ScaledRidge (champion), XGBoost DART, LightGBM GOSS, RF com walk-forward CV purged
-- **Sector models**: modelos especializados por grupo sectorial (Tech/HC, Fin/Industrial, Commodity, Defensivos)
-- **Retreino**: automático Dia 1 do mês, watchdog 3h, notificação de início + conclusão
-
-### 2. O Escudo (Análise Fundamental)
-Sistema de filtragem em 3 camadas:
-- **Score V2 (0–100)**: Quality (40%) + Value (20%) + Timing (20%) + Divergência (20%)
-- **Red Flags**: FCF negativo → pre-profit cap; P/E > 200 → rejeição; D/E extremo → penalidade
-- **Dividend Safety**: FCF/dividendos < 0.8 → penalidade 15% (excl. REITs/Utilities que usam FFO)
-- **8-K Veto**: restatement ou default → muda COMPRAR para MONITORIZAR automaticamente
-- **RSI Crossover**: só entra em COMPRAR se RSI < 42 (oversold confirmado)
-- **Volume Capitulação**: preferencialmente dips com volume > média (pânico esgotado)
-
-### 3. O Tesoureiro (Allocation Engine)
-Não diz apenas "Compra ServiceNow". Calcula exactamente quanto:
-- **Sizing dinâmico**: edge × R:R × max_position (Kelly-inspired)
-- **Correlação de posições**: penaliza entries correlacionadas (>0.65) com portfolio actual
-- **Sector concentration cap**: 35% máximo por sector (configurável)
-- **Portfolio VaR**: se VaR > 8%, reduz sizing automaticamente
-- **Pyramiding**: entrada faseada 65%/35% para dips severos
-- **Scale Out / Moonbag**: realiza 50% no target, deixa 50% a rolar
-- **Early Alpha Capture**: sai quando captura 70%+ do alpha em <50% do tempo
-- **Stop-loss**: sai automaticamente se preço cair >12% do entry (configurável)
-
-### 4. Evolução Contínua (MLOps)
-Sistema vivo que aprende com os seus próprios erros:
-- **Paper trading autónomo**: cada COMPRAR cria posição simulada com o budget real (€850/mês)
-- **Self-evaluation**: mede se bate o SPY sem intervenção humana
-- **Saída antecipada inteligente**: fecha paper trades quando target atingido cedo
-- **ML Accuracy**: `/ml_accuracy` mede precision, recall, F1, Brier score vs outcomes reais
-- **Retreino mensal**: watchdog 3h, notificação de início e conclusão
-- **Drift detection**: win_prob médio monitorizado vs baseline de treino
+| Radar | Objetivo | Métrica | Status |
+|---|---|---|---|
+| **DIP Scanner** | Quedas abruptas em empresas de qualidade | IC=+0.118 | ✅ Funcional |
+| **Core Radar** | Compounders em desconto vs MA200 semanal | IC=+0.119 | ✅ Funcional |
+| **Sector Rotation** | Top-3 sectores mensais | +15pp alpha vs SPY (backtest) | ✅ Funcional |
+| **Momentum Scanner** | Breakouts com momentum durável | IC=0.0045 | ⚠️ Em retreinamento |
+| **Conviction Radar** | Exit signals para posições MOMENTUM/DIP | Trailing stop ATR | ✅ Funcional |
 
 ---
 
-## 🤖 Comandos Telegram
+## 💰 O Motor de Alocação: `/cash`
 
-### Mercado e análise
+Comando único que substitui o legacy `/allocate` e `/flip`. Quando recebes inflow novo (ou só queres verificar estado):
+
+```
+/cash 1050        → propõe allocation completa
+/cash 0           → health check sem deploy
+/cash 1050 --no-rot      → skip rotation evaluation
+/cash 1050 --no-sells    → ignora SELLs sugeridos
+```
+
+**Two-pass design**:
+
+1. **Pass 1 — SELLs**: identifica posições para sair
+   - ROTATION holdings fora do top-3 → tax-aware via `tax_engine.should_rotate()`
+   - MOMENTUM/DIP com triggers HIGH severity → SELL imediato
+   - MOMENTUM/DIP com triggers MED → EXIT WARNING (não vende)
+
+2. **Pass 2 — BUYs**: ROI-ranked unified queue
+   - Cada candidato (Rotation/Core/DIP) tem `annualized_expected_alpha × confidence`
+   - Sort DESC → deploy top-down até budget esgotar
+   - Concentration cap 25% soft / 30% hard por ticker
+   - Resto → cash reserve (persistido para alerts futuros)
+
+**Tax-aware rotation** (IRS Jovem 7% effective):
+- Vende só se `score gap ≥ tax_friction × 500` OR override (exit_strength > 70 / secular_risk > 60 / current_score < 30)
+- Para gain de 25% com 7% tax → required gap = 8.75 pontos
+
+---
+
+## 🤖 Comandos Principais
+
+### Análise e alocação
 | Comando | Descrição |
 |---------|-----------|
-| `/scan` | Força scan imediato |
-| `/analisar <TICKER>` | Análise completa com narrativa natural dos sinais |
-| `/comparar T1 T2 ...` | Comparar scores de 2-5 tickers |
+| `/analisar <TICKER>` | Análise full: score, ML, valuation, sizing |
+| `/cash <eur>` | Allocation proposal multi-estratégia |
+| `/cash_reserve` | Vê reserva de cash + histórico |
+| `/cash_reserve clear` | Limpa reserva (após deploy manual) |
+| `/monthly_check` | Relatório mensal do portfolio com concentration % |
+| `/core_picks [N] [min_score]` | Top picks do Core radar (default top 10, score≥60) |
+| `/comparar T1 T2 ...` | Comparar scores de múltiplos tickers |
 | `/historico <TICKER>` | Histórico de scores |
-| `/rejeitados` | Stocks rejeitados hoje (com razão) |
-| `/tier3` | Gems do último resumo de fecho |
 
-### Performance e simulação
+### Portfolio
 | Comando | Descrição |
 |---------|-----------|
-| `/performance [data] [score]` | Retorno histórico seguindo o bot |
-| `/paper_portfolio` | Paper trading: retorno do bot vs SPY |
-| `/paper_portfolio open` | Posições simuladas abertas |
-| `/paper_portfolio 6` | Últimos 6 meses de simulação |
-| `/ml_accuracy` | Precisão real do modelo vs outcomes reais |
+| `/sync_portfolio` | Vê portfolio actual agrupado por bucket |
+| `/sync_portfolio TICK:shares:price:BUCKET[:DATE]` | Bulk import positions |
+| `/sync_portfolio --update-avg TICK:...` | Overwrite avg_price + shares |
+| `/buy TICK PREÇO SHARES` | Comprar (debita liquidez) |
+| `/sell TICK PREÇO [SHARES]` | Vender |
+| `/carteira` | Snapshot real-time |
 
-### Temas / Trends
+**Buckets**: `CORE` (hold-for-life) | `ROTATION` (sector ETFs) | `MOMENTUM` (DIP que recuperou) | `DIP` (active recovery)
+
+### Sectors e Rotation
 | Comando | Descrição |
 |---------|-----------|
-| `/themes` | Ver temas em trend (fotónica, GLP-1, IA...) |
-| `/add_theme key label TICK1,TICK2` | Adicionar tema |
-| `/remove_theme key` | Remover tema |
+| `/sectors` | Rotation engine ranking real-time |
+| `/sectors TICKER` | Detail per ETF |
+| `/sectors holdings` | Status dos teus ETFs |
+| `/admin_calibrate_rotation [years]` | Calibrar rotation alpha (linear/poly/buckets/lightgbm) |
 
-### Carteira e posições
+### Conviction (exit signals para CORE/MOMENTUM/DIP holdings)
 | Comando | Descrição |
 |---------|-----------|
-| `/carteira` | Snapshot em tempo real |
-| `/portfolio` | Posições activas com P&L |
-| `/sync_portfolio TICK:shares:preco ...` | Sincronizar carteira via Telegram |
-| `/buy TICK PREÇO SHARES` | Registar compra |
-| `/sell TICK PREÇO [SHARES]` | Registar venda |
-| `/liquidez [+\|-VALOR]` | Ajustar saldo |
-| `/allocate <TICKER>` | Sugestão de alocação com VaR e sector check |
-| `/flip` | Flip Fund P&L |
+| `/conviction list` | Posições activas com trailing stop |
+| `/conviction TICKER` | Deep dive de uma posição |
+| `/conviction close TICKER PRECO [motivo]` | Fechar posição |
+| `/conviction transition TICKER TIPO` | Mudar tipo (DIP→MOMENTUM→CORE) |
 
 ### Watchlist
 | Comando | Descrição |
 |---------|-----------|
 | `/watchlist` | Estado da watchlist |
-| `/watchlist add TICKER` | Adicionar |
-| `/watchlist rm TICKER` | Remover |
+| `/watchlist add/rm TICKER` | Add/remove |
 
-### ML e retreino
+### ML e admin
 | Comando | Descrição |
 |---------|-----------|
-| `/mldata` | Stats da base de dados ML |
-| `/mldata update` | Forçar update de outcomes |
-| `/admin_retrain [dry-run]` | Disparar retreino (notificação de início imediata) |
-| `/retrigger` | Alias de `/admin_retrain` |
-| `/admin_regen_parquet [--targets-only]` | Regenerar parquet (EDGAR PIT + alpha_90d) |
-| `/admin_set_floor <valor>` | Ajustar floor de IC |
+| `/ml_accuracy` | Precision/recall/F1 vs outcomes reais |
+| `/admin_check_config` | Estado dos modelos + IC |
+| `/admin_retrain` | Retreinar DIP model |
+| `/admin_momentum_retrain [force]` | Retreinar Momentum (force = full rebuild) |
+| `/admin_core_debug TICKER` | Debug Core score per ticker |
+| `/admin_calibrate_rotation` | Calibrar rotation alpha |
+| `/scan` | Forçar scan imediato |
+| `/health` | Dashboard sistema |
+| `/backtest` | Resumo backtest |
 
-### Sistema e diagnóstico
-| Comando | Descrição |
-|---------|-----------|
-| `/status` | Estado do bot |
-| `/health` | Dashboard: RAM, CPU, drift, APIs |
-| `/admin_check_config` | Verificar env vars |
-| `/admin_test_feed TICKER` | Testar pipeline de dados |
-| `/backtest` | Resumo do backtest |
+---
+
+## 🧮 Architecture overview
+
+### Modelos ML
+
+**DIP scanner** (`ml_predictor.py`):
+- Target: `alpha_90d = log(stock_close_90d) - log(spy_close_90d)`
+- IC=+0.118 validado (Spearman, walk-forward purged 5-fold)
+- Champion: XGB-v2 / Ridge ensemble
+- Sector models per GICS sector
+- Score persiste `score_raw` + `win_prob` no prediction_log
+
+**Core radar** (`core_radar.py`):
+- Target: `alpha_1y` (1-year excess vs SPY)
+- IC=+0.119, champion=GBR
+- 20 features: price/MA, volume, sector context, fundamentals (rev_growth, gross_margin, ROE, fcf_yield_fund)
+- **Option B FCF override**: stocks com investment-phase signature (rev growth >10% + GM >40% + ROE >15% + FCF <0) têm o feature FCF substituído pela mediana de treino antes da inferência. Permite que reinvesting compounders (AMZN-style, NVO em GLP-1 buildout) não sejam falsamente classificados como deterioração
+
+**Momentum** (`momentum_radar/`):
+- Multi-horizonte: alpha_30d, alpha_90d, alpha_180d
+- IC actualmente baixo (em retreinamento — ver Phase 3)
+
+**Sector rotation** (`sector_radar.py`):
+- 24 ETFs (sector SPDR + thematic + alternatives)
+- US tickers para data + UCITS mapping para deploy (SXR8/SEC0/IS3N/IUIT/etc.)
+- Backtest validado: +15pp alpha vs SPY em 4 anos com monthly rebalance
+- Calibration multi-method: linear → polynomial → buckets → lightgbm (best CV r²)
+
+### Tax engine (`tax_engine.py`)
+- IRS Jovem 75% exemption default (effective CGT 7%)
+- Override via `EFFECTIVE_CGT_PCT` env var
+- `should_rotate(unrealized_gain, current_score, target_score)` decide quando vender:
+  - Override structural: `exit_strength > 70`, `secular_risk > 60`, `current_score < 30`
+  - Loss positions → sempre rotate (loss = tax deduction)
+  - Profit → `score gap ≥ tax_cost_pct × TAX_FRICTION_MULTIPLIER (500)`
+
+### UCITS proxy (`ucits_proxy.py`)
+- yfinance não tem UCITS (SEC0, SXR8, IS3N) — só US listed
+- Computa PnL via US proxy (SOXX/SPY/EEM) % change desde entry_date
+- Approximation: não captura FX drift EUR/USD
+
+### Conviction radar (`conviction_radar.py`)
+- Daily check 22h05 (Lisbon) seg-sex
+- Monitoriza CORE/MOMENTUM/DIP positions sincronizadas
+- Triggers: trailing stop ATR (12-21% dependendo de vol), structural decline, 8-K events
+- Auto-sync `/sync_portfolio` → conviction records (ROTATION skipped)
+
+### Cash reserve
+- `/cash` persiste residual em `state.cash_reserve.json`
+- DIP/Core alerts (verdict=COMPRAR, score≥70) mostram "reserva disponível €X"
+- Sistema **nunca** auto-compra; apenas surface availability para deploy opportunistic
+- `/cash_reserve clear` para limpar após deploy físico
 
 ---
 
@@ -131,121 +174,119 @@ Sistema vivo que aprende com os seus próprios erros:
 |----------|-----------|
 | `TELEGRAM_TOKEN` | Token do bot |
 | `TELEGRAM_CHAT_ID` | Chat ID |
-| `MONTHLY_BUDGET_EUR` | Orçamento mensal total (ex: `1050`) |
+| `MONTHLY_BUDGET_EUR` | Orçamento mensal (ex: `1050`) |
 | `TZ` | `Europe/Lisbon` |
 
-### Orçamento e alocação
+### Tax + allocation
 | Variável | Default | Descrição |
 |----------|---------|-----------|
-| `PAPER_BUDGET_EUR` | — | Capital para dip hunting (ex: `850` se investes €200 em ETFs) |
-| `ETF_DCA_EUR` | `0` | ETFs mensais a excluir do paper trading (ex: `200`) |
-| `FLIP_FUND_EUR` | 10% do budget | Capital do Flip Fund (auto-deriva se não definido) |
-| `SECTOR_CONCENTRATION_CAP` | `0.35` | Limite de exposição por sector (35%) |
+| `EFFECTIVE_CGT_PCT` | `0.07` | Effective CGT (IRS Jovem 75% = 7%) |
+| `SECTOR_CONCENTRATION_CAP` | `0.35` | Sector cap (legacy, /cash usa per-ticker) |
 
 ### Gestão de risco
 | Variável | Default | Descrição |
 |----------|---------|-----------|
-| `POSITION_STOP_LOSS_PCT` | `0.12` | Stop-loss automático (12% abaixo do entry) |
-| `MIN_DIP_SCORE` | `50` | Score V2 mínimo (sobe automaticamente em stress sectorial) |
+| `POSITION_STOP_LOSS_PCT` | `0.12` | Stop-loss DIP positions |
+| `MIN_DIP_SCORE` | `50` | DIP score mínimo para alert |
+| `ML_SCORE_FLOOR` | `0.01` | Floor de alpha previsto |
 
 ### Retrain
 | Variável | Default | Descrição |
 |----------|---------|-----------|
-| `INLINE_TICKER_TIMEOUT` | `25` | Segundos por ticker no download de preços |
-| `INLINE_BUDGET_MINUTES` | `60` | Minutos máximo para computar alpha_90d |
-| `RETRAIN_MAX_HOURS` | `3` | Watchdog: mata o retrain se demorar mais |
+| `RETRAIN_MAX_HOURS` | `3` | Watchdog timeout retrain |
+| `INLINE_TICKER_TIMEOUT` | `25` | Download timeout por ticker |
 
-### APIs gratuitas
+### APIs
 | Variável | Fonte | Descrição |
 |----------|-------|-----------|
-| `TIINGO_API_KEY` | api.tiingo.com | EOD de qualidade |
-| `FRED_API_KEY` | fred.stlouisfed.org | Recession probability |
-| `TAVILY_API_KEY` | tavily.com | Catalisadores e notícias |
-
-### Carteira (privados — nunca no repo)
-```
-HOLDING_NVO=<shares>,<avg_cost>
-HOLDING_ADBE=<shares>,<avg_cost>
-HOLDING_MSFT=<shares>,<avg_cost>
-...
-PPR_SHARES=<shares>
-PPR_AVG_COST=<preco_medio>
-```
-> **Alternativa**: `/sync_portfolio NVO:25:85.50 ADBE:8:420` no Telegram
+| `TIINGO_API_KEY` | api.tiingo.com | EOD prices de qualidade |
+| `FRED_API_KEY` | fred.stlouisfed.org | Macro: recession prob |
 
 ---
 
-## 🧠 Features do Modelo ML (33 features)
+## 🚀 Arranque
 
-### Técnicas (base)
-RSI, drawdown 52w, momentum 1m/3m/6m, beta, vol_of_vol, bb_width, VIX regime, VIX percentil 1y, SPY RSI, sector relative, volume zscore, up days pct, true range, drop × drawdown
+### Cold start
+1. Configure Railway com `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, `MONTHLY_BUDGET_EUR`, `TZ=Europe/Lisbon`
+2. Deploy → bot inicia automaticamente
+3. Telegram: `/admin_check_config` para validar estado dos modelos
+4. Se primeiro arranque: `/sync_portfolio TICK:shares:price:BUCKET` para registar posições existentes
 
-### Macro
-VIX, sector alert count 7d, sector drawdown 5d
+### Fluxo mensal típico
+1. Receber inflow (~€1050)
+2. `/cash 1050` para proposta de allocation
+3. Executar SELLs + BUYs manualmente em T212
+4. Resto (se houver) fica como cash_reserve automaticamente
+5. Durante o mês: DIP/Core alerts mostram reserve quando high-conviction signal → decide deploy opportunistic
 
-### Sentimento e qualidade (Fase 5 — SEC EDGAR + yfinance)
-| Feature | Fonte | O que mede |
-|---------|-------|-----------|
-| `insider_buy_recent` | SEC Form 4 | Houve compra de insider nos últimos 30 dias? |
-| `insider_buy_amount_score` | SEC Form 4 XML | Magnitude normalizada da compra (0-1) |
-| `recent_8k_score` | SEC 8-K item codes | Tipo de evento: -1=restatement, +1=M&A target |
-| `earnings_call_tone` | SEC 8-K texto | Sentimento da earnings call [-1=pessimista, +1=confiante] |
-| `short_interest_pct` | yfinance | Short interest % do float |
-| `short_interest_trend` | yfinance | Variação do short interest vs mês anterior |
-| `consecutive_red_days` | Price history | Dias consecutivos em queda (capitulação) |
-| `ma_200d_ratio` | Price history | Price / MA200 (quão abaixo da média de longo prazo) |
-| `earnings_beat_rate` | yfinance | % de últimos 4 trimestres com EPS beat |
-| `analyst_rating` | yfinance | Consenso analistas: 1=Strong Buy … 5=Strong Sell |
+### Conviction monitoring (automático)
+- 22h05 Lisbon seg-sex: conviction daily check
+- Trailing stop ATR + structural decline → alert push se trigger fire
+- Tu decides em T212 se vendes (sistema nunca auto-executa)
 
 ---
 
-## 📊 Arquitectura de Risco
+## 🗑️ Deprecated (Phase 6 cleanup)
 
-```
-Novo alerta COMPRAR →
-  ├── RSI < 42? (oversold confirmado)     ← se não: MONITORIZAR
-  ├── 8-K restatement recente?            ← se sim: veto → MONITORIZAR
-  ├── Volume spike no dip?                ← se não: menos confiança
-  ├── Score V2 > threshold macro-ajustado?← threshold sobe em stress sectorial
-  │
-  ├── Allocation Engine:
-  │   ├── Sector concentration < 35%?
-  │   ├── Correlação < 0.65 com portfolio?
-  │   ├── Portfolio VaR OK?
-  │   └── Sizing = edge × R:R × budget
-  │
-  └── Paper trade criado automaticamente
+Removidos em favor do `/cash` unificado:
+- ❌ `/allocate <TICKER>` (allocation_engine.py)
+- ❌ `/flip` (Flip Fund concept)
+- ❌ `HOLDING_*` env vars (use `/sync_portfolio`)
+- ❌ `daily_flip_spent.json` tracker
+- ❌ `_dipr_flip_log.json`
 
-Position Monitor (diário 22h):
-  ├── Target atingido → TAKE_PROFIT
-  ├── 70%+ alpha em <50% tempo → EARLY_ALPHA_CAPTURE
-  ├── Preço < entry × 0.88 → STOP_LOSS
-  ├── 2+ critérios de deterioração → STRUCTURAL_DECLINE
-  └── Rotina → update silencioso
-```
+Categorias legacy (`CAT_HIGH_CONVICTION`, `CAT_GROWTH`) ainda em uso interno por score.py, watchlist.py, alert_db.py — vão ser removidas numa próxima sessão de refactor.
 
 ---
 
-## 🎯 Paper Trading Autónomo
+## 📊 Status atual (Junho 2026)
 
-O bot simula as suas próprias recomendações para provar se bate o mercado:
-
-```
-Dia 1 do mês → budget renovado (PAPER_BUDGET_EUR)
-Cada COMPRAR → posição criada automaticamente
-22h50 diariamente → fecha posições que:
-  - Atingiram o target de preço
-  - 70%+ do alpha em <50% do tempo (early exit)
-  - Esgotaram o período de holding (90 dias)
-Dia 1 → relatório: "Se seguisses o bot, ganharias X% vs SPY Y%"
-```
-
-**Comandos**:
-- `/paper_portfolio` — performance dos últimos 3 meses
-- `/paper_portfolio 6` — últimos 6 meses
-- `/paper_portfolio open` — posições abertas
+✅ **Funcionais**: DIP, Core, Sector Rotation, Conviction, Cash engine, Tax engine, UCITS proxy
+⚠️ **Em retreino**: Momentum (IC=0.0045, debugging em curso)
+🟡 **Tech debt**: `bot_commands.py` 424KB (Phase 7 split pendente), folder restructure pendente
 
 ---
 
-## ⚠️ Disclaimer
-*DipRadar é uma ferramenta de research e screening. Não constitui aconselhamento financeiro. Faz sempre a tua própria análise antes de investir.*
+## 📁 Estrutura
+
+```
+DipRadar/
+├── main.py                          # Entry point + APScheduler
+├── bot_commands.py                  # Telegram bot dispatcher (monolithic; split TBD)
+├── state.py                         # JSON persistence layer
+├── config.py                        # Central config
+├── categories.py                    # Position category constants (legacy)
+│
+├── core_radar.py                    # Core radar (compounders)
+├── core_bundle.py                   # Core ML bundle dataclass
+├── sector_radar.py                  # Sector rotation engine
+├── sector_backtest.py / sector_rotation_backtest.py
+├── conviction_radar.py              # CORE/MOMENTUM/DIP exit monitor
+│
+├── ml_predictor.py / ml_engine.py / ml_features.py
+├── monthly_retrain.py / model_registry.py
+├── ml_training/                     # Trainer infra
+│
+├── momentum_radar/                  # Momentum scanner
+├── scripts/                         # Build/calibrate/retrain scripts
+│
+├── tax_engine.py                    # IRS Jovem-aware rotation logic
+├── ucits_proxy.py                   # UCITS PnL via US proxy
+├── etf_universe.py                  # ETF ↔ UCITS mapping
+│
+├── portfolio.py                     # Cost basis ledger
+├── position_db.py / position_monitor.py
+├── paper_trading.py                 # Paper trading parallel ledger
+│
+├── fundamental_data.py / fundamental_history.py / fundamental_signals.py
+├── tiingo_client.py / tiingo_fundamentals_client.py
+├── macro_data.py / macro_semaphore.py
+│
+├── alert_db.py / score.py / signal_narrative.py
+├── watchlist.py / persistent_dip.py
+├── insider_radar.py / sectors.py / themes.py / universe.py
+│
+└── README.md (este ficheiro)
+```
+
+Para detalhes técnicos por módulo, ver docstrings inline.
