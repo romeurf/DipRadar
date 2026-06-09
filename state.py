@@ -896,3 +896,49 @@ def consume_cash_reserve(amount_eur: float, reason: str = "deploy") -> dict:
 def get_cash_reserve_eur() -> float:
     """Quick accessor: just the current EUR amount."""
     return float(load_cash_reserve().get("amount_eur", 0.0))
+
+
+# ── Passive ETF tracker ─────────────────────────────────────────────────────
+#
+# Standalone ETF holdings registry used by /etf command. Distinct from the
+# main portfolio.py ledger because these are typically Xetra/LSE listed
+# UCITS (SXR8.DE, IS3N.DE, CSPX.L) that aren't actively monitored by the
+# scanner — just tracked for portfolio overview purposes.
+#
+# Format: {ticker: {"shares": float, "avg_cost": float}}
+
+_ETFS_FILE = "etfs.json"
+
+
+def get_etfs() -> dict:
+    """Return {ticker: {shares, avg_cost}} for all tracked passive ETFs."""
+    return _load_json(_ETFS_FILE, default={}) or {}
+
+
+def set_etf(ticker: str, shares: float, avg_cost: float) -> None:
+    """Register or update a passive ETF position."""
+    etfs = get_etfs()
+    etfs[ticker.upper().strip()] = {
+        "shares":   round(float(shares), 6),
+        "avg_cost": round(float(avg_cost), 4),
+    }
+    _save_json(_ETFS_FILE, etfs)
+
+
+def remove_etf(ticker: str) -> bool:
+    """Remove a tracked ETF. Returns True if existed and removed."""
+    etfs = get_etfs()
+    t = ticker.upper().strip()
+    if t not in etfs:
+        return False
+    del etfs[t]
+    _save_json(_ETFS_FILE, etfs)
+    return True
+
+
+def clear_etfs() -> int:
+    """Clear all tracked ETFs. Returns count that was removed."""
+    etfs = get_etfs()
+    n = len(etfs)
+    _save_json(_ETFS_FILE, {})
+    return n
