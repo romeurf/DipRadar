@@ -153,7 +153,8 @@
       "Bash(PYTHONIOENCODING=utf-8 grep -n \"^def _reply\\\\|^def _check_rate\\\\|^_reply =\\\\|^_poll_context\" bot_commands.py)",
       "Bash(PYTHONIOENCODING=utf-8 grep -n \"^def _handle_conviction\\\\|^def _handle_ppr\\\\|^def _handle_etf\\\\|^def _handle_liquidez\" bot_commands.py)",
       "Bash(PYTHONIOENCODING=utf-8 grep -n \"^def _handle_conviction\\\\|^def _handle_ppr\" bot_commands.py)",
-      "Bash(PYTHONIOENCODING=utf-8 grep -n \"^def _handle_buy\\\\|^def _handle_sell\\\\|^def _handle_ppr\\\\|^def _handle_etf\\\\|^def _handle_liquidez\\\\|^def _handle_core\\\\b\" bot_commands.py)"
+      "Bash(PYTHONIOENCODING=utf-8 grep -n \"^def _handle_buy\\\\|^def _handle_sell\\\\|^def _handle_ppr\\\\|^def _handle_etf\\\\|^def _handle_liquidez\\\\|^def _handle_core\\\\b\" bot_commands.py)",
+      "Bash(PYTHONIOENCODING=utf-8 grep -n \"^def _handle_\" bot_commands.py)"
     ],
     "additionalDirectories": [
       "c:\\Users\\Romeu\\OneDrive\\Documentos\\GitHub\\DipRadar"
