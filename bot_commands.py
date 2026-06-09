@@ -2150,24 +2150,47 @@ def _handle_admin_momentum_dataset(parts: list[str]) -> None:
 # ── /admin_momentum_retrain ─────────────────────────────────────────────────────
 
 def _handle_admin_momentum_retrain(parts: list[str]) -> None:
-    """/admin_momentum_retrain
+    """/admin_momentum_retrain [force]
 
     Treina o Breakout ML com todos os dados históricos acumulados.
     Corre automaticamente no dia 1 de cada mês (após o DipRadar retrain).
 
-    Pipeline:
-      1. Actualiza o dataset com os últimos 30 dias (incremental, nunca apaga dados)
-      2. Treina ScaledRidge + sector models
+    Modes:
+      /admin_momentum_retrain        → incremental (~20-40 min)
+        - lê parquet existente, computa só últimos ~220 dias
+        - preserva todo o histórico anterior intacto
+
+      /admin_momentum_retrain force  → FORCE-REBUILD (~1-3 horas)
+        - reconstrói parquet do zero
+        - aplica fixes recentes (ex: alpha horizon trading-day fix em 7a6f000)
+          a TODOS os históricos
+        - usar quando há mudança no schema ou bug fix no target
+
+    Pipeline (ambos os modos):
+      1. Build dataset (incremental ou force)
+      2. Treina LightGBM + sector models
       3. Gating: promove só se IC ≥ IC actual × 0.90
     """
-    _reply(
-        "*MomentumRadar — Retrain*\n"
-        "1. Actualizar dataset (incremental)\n"
-        "2. Treinar Breakout ML + sector models\n"
-        "3. Gating vs modelo actual\n"
-        "Duração: ~20-40 min\n"
-        "Podes continuar a usar o bot."
-    )
+    force_rebuild = len(parts) >= 2 and parts[1].lower() in ("force", "rebuild", "--force-rebuild")
+
+    if force_rebuild:
+        _reply(
+            "*MomentumRadar — FORCE REBUILD*\n"
+            "1. ⚠️ Reconstruir parquet do zero\n"
+            "2. Treinar LightGBM + sector models\n"
+            "3. Gating vs modelo actual\n"
+            "Duração: ~1-3 horas\n"
+            "Podes continuar a usar o bot."
+        )
+    else:
+        _reply(
+            "*MomentumRadar — Retrain*\n"
+            "1. Actualizar dataset (incremental)\n"
+            "2. Treinar LightGBM + sector models\n"
+            "3. Gating vs modelo actual\n"
+            "Duração: ~20-40 min\n"
+            "Podes continuar a usar o bot."
+        )
 
     def _run():
         import subprocess, sys, shutil
@@ -2178,13 +2201,16 @@ def _handle_admin_momentum_retrain(parts: list[str]) -> None:
             bundle_path = data_dir / "momentum_model.pkl"
             report_path = data_dir / "momentum_report.json"
 
-            # Passo 1: actualizar dataset (só últimos 35 dias — incremental).
+            # Passo 1: actualizar dataset.
             # 12h timeout — momentum dataset now queries EDGAR per episode for
             # the 4 insider features (commit 0c4703c), which dramatically
             # slowed the bulk build. Incremental updates are still fast.
             script = Path(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py"
+            cmd = [sys.executable, str(script), "--out", str(ds_path)]
+            if force_rebuild:
+                cmd.append("--force-rebuild")
             result = subprocess.run(
-                [sys.executable, str(script), "--out", str(ds_path)],
+                cmd,
                 capture_output=True, text=True, timeout=12 * 3600
             )
             if result.returncode != 0:
