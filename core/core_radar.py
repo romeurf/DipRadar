@@ -836,7 +836,7 @@ def _append_core_alert_db(opp: dict) -> None:
 def _suggest_core_allocation() -> float:
     """Alocação sugerida para uma entrada CORE — 1.5× a base mensal per-trade."""
     try:
-        from portfolio.portfolio.paper_trading import _get_monthly_budget, _capital_used_this_month
+        from portfolio.paper_trading import _get_monthly_budget, _capital_used_this_month
         budget    = _get_monthly_budget()
         used      = _capital_used_this_month()
         remaining = budget - used

@@ -48,7 +48,7 @@ from typing import Optional
 import yfinance as yf
 
 from portfolio.portfolio import position_db
-from portfolio.portfolio.position_db import PositionRecord
+from portfolio.position_db import PositionRecord
 from ml.ml_engine import (
     load_predictor,
     predict_dip,
@@ -813,7 +813,7 @@ def _monitor_one(
                     _ml_score_momentum,
                     score_momentum as _score_mom,
                 )
-                from portfolio.portfolio.paper_trading import (
+                from portfolio.paper_trading import (
                     _trailing_stop_for_durability as _t_stop_fn,
                     _hold_days_for_durability    as _hold_fn,
                 )
@@ -839,7 +839,7 @@ def _monitor_one(
             )
             # Upgrade do paper trade: trata como alerta MOMENTUM fresco.
             try:
-                from portfolio.portfolio.paper_trading import upgrade_paper_dip_to_momentum as _upgrade
+                from portfolio.paper_trading import upgrade_paper_dip_to_momentum as _upgrade
                 _upgrade(
                     record.ticker, current_price,
                     trailing_stop_pct = _ml_stop,

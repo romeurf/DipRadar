@@ -3925,7 +3925,7 @@ def _handle_paper_performance(parts: list[str]) -> None:
     """
     def _run():
         try:
-            from portfolio.portfolio.paper_trading import (
+            from portfolio.paper_trading import (
                 get_monthly_performance, format_performance_report, _load
             )
 
@@ -3933,7 +3933,7 @@ def _handle_paper_performance(parts: list[str]) -> None:
 
             # ── open positions ────────────────────────────────────────────────
             if sub == "open":
-                from portfolio.portfolio.paper_trading import (
+                from portfolio.paper_trading import (
                     get_paper_portfolio_value, get_paper_allocated,
                     get_paper_available, PAPER_PORTFOLIO_EUR,
                 )
@@ -3966,7 +3966,7 @@ def _handle_paper_performance(parts: list[str]) -> None:
 
             # ── DRIP audit trail ──────────────────────────────────────────────
             if sub == "drip":
-                from portfolio.portfolio.paper_trading import get_drip_history, _TAX_DISCLAIMER
+                from portfolio.paper_trading import get_drip_history, _TAX_DISCLAIMER
                 data = get_drip_history()
                 pos  = data["positions"]
                 tot  = data["totals"]
@@ -4018,7 +4018,7 @@ def _handle_paper_performance(parts: list[str]) -> None:
                     _reply("\n".join(block))
 
                 # Send the full ledger as a downloadable Markdown file
-                from portfolio.portfolio.paper_trading import format_drip_report_md
+                from portfolio.paper_trading import format_drip_report_md
                 md_content = format_drip_report_md()
                 sent = _send_document(
                     md_content.encode("utf-8"),
@@ -4035,7 +4035,7 @@ def _handle_paper_performance(parts: list[str]) -> None:
 
             # ── missed signals ────────────────────────────────────────────────
             if sub == "missed":
-                from portfolio.portfolio.paper_trading import get_missed_trades_stats, _load as _pt_load
+                from portfolio.paper_trading import get_missed_trades_stats, _load as _pt_load
                 trades = _pt_load()
                 missed = [t for t in trades if t.get("status") == "MISSED_CAPITAL"]
                 stats  = get_missed_trades_stats(trades)
@@ -4077,7 +4077,7 @@ def _handle_paper_performance(parts: list[str]) -> None:
             report = format_performance_report(perf)
             _reply(f"Paper Trading — Bot vs Market\n\n{report}")
 
-            from portfolio.portfolio.paper_trading import format_monthly_trade_list
+            from portfolio.paper_trading import format_monthly_trade_list
             trade_list = format_monthly_trade_list(months_back=months)
             if trade_list and "Sem trades" not in trade_list:
                 _reply(f"Trades by month:\n{trade_list}")
@@ -5274,7 +5274,7 @@ def _fetch_eur_usd() -> float:
 def _handle_core(parts: list[str]) -> None:
     """/core — mostra todas as posições CORE com P&L e yield acumulado."""
     try:
-        from portfolio.portfolio.paper_trading import format_core_holdings_report
+        from portfolio.paper_trading import format_core_holdings_report
         _reply(format_core_holdings_report())
     except Exception as e:
         _reply(f"❌ Erro ao ler posições CORE: `{e}`")
@@ -5321,7 +5321,7 @@ def _handle_core_add(parts: list[str]) -> None:
             i += 1
 
     try:
-        from portfolio.portfolio.paper_trading import record_core_holding
+        from portfolio.paper_trading import record_core_holding
         trade_id = record_core_holding(
             ticker=ticker, open_price=open_price, amount_eur=amount_eur,
             annual_yield_pct=annual_yield, note=note,
@@ -5353,7 +5353,7 @@ def _handle_core_close(parts: list[str]) -> None:
         _reply("❌ Preço inválido.")
         return
     try:
-        from portfolio.portfolio.paper_trading import close_core_holding
+        from portfolio.paper_trading import close_core_holding
         closed_trade = close_core_holding(ticker, close_price)
         if closed_trade:
             ret_s   = f"{closed_trade.get('return_pct', 0):+.1f}%"
@@ -5829,7 +5829,7 @@ def _handle_command(text: str) -> None:
         if not _check_rate(cmd_key): return
         months = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 3
         try:
-            from portfolio.portfolio.paper_trading import format_unified_report
+            from portfolio.paper_trading import format_unified_report
             _reply(format_unified_report(months_back=months))
         except Exception as e:
             _reply(f"_Erro ao gerar relatório: {e}_")

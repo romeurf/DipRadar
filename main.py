@@ -79,7 +79,7 @@ from scanners.backtest import backtest_runner, build_backtest_summary
 from scanners.watchlist import run_watchlist_scan, build_watchlist_morning_summary, WATCHLIST
 from scanners.alert_db import log_alert_snapshot, get_db_stats, fill_db_outcomes
 import bot_commands
-from portfolio.portfolio.position_monitor import run_daily_check
+from portfolio.position_monitor import run_daily_check
 from momentum_radar.scanner import scan_momentum_universe, format_momentum_alert, clear_sector_cache
 
 # Chunk 3a — data feed
@@ -1641,7 +1641,7 @@ def run_scan() -> None:
                 _cap_util_pct = None
                 _n_open       = None
                 try:
-                    from portfolio.portfolio.paper_trading import (
+                    from portfolio.paper_trading import (
                         get_paper_portfolio_value, get_paper_allocated,
                         get_paper_available, _load as _pt_load,
                     )
@@ -1668,7 +1668,7 @@ def run_scan() -> None:
                 _monthly_budget = float(os.environ.get("MONTHLY_BUDGET_EUR", "0") or 0)
                 _capital_used   = 0.0
                 try:
-                    from portfolio.portfolio.paper_trading import _capital_used_this_month as _cup
+                    from portfolio.paper_trading import _capital_used_this_month as _cup
                     _capital_used = _cup()
                 except Exception:
                     pass
@@ -1702,7 +1702,7 @@ def run_scan() -> None:
                 # aqueles em que havia dinheiro disponível (selection bias).
                 if verdict == "COMPRAR":
                     try:
-                        from portfolio.portfolio.paper_trading import record_paper_buy
+                        from portfolio.paper_trading import record_paper_buy
                         from portfolio.portfolio import FLIP_FUND_EUR
                         paper_amount = float(
                             decision.amount_eur
@@ -2145,7 +2145,7 @@ def run_momentum_scan() -> None:
       21h30 Lisboa — janela US (após fecho americano ~22h inverno/21h verão)
     """
     try:
-        from portfolio.portfolio.paper_trading import (
+        from portfolio.paper_trading import (
             record_momentum_paper_buy, allocate_capital_unified,
             _get_monthly_budget, _capital_used_this_month,
         )
@@ -2237,7 +2237,7 @@ def run_core_scan() -> None:
     """
     try:
         from core.core_radar import scan_core_universe, format_core_alert, is_model_ready
-        from portfolio.portfolio.paper_trading import record_core_holding, get_core_holdings_summary
+        from portfolio.paper_trading import record_core_holding, get_core_holdings_summary
 
         if not is_model_ready():
             logging.warning(
@@ -2864,7 +2864,7 @@ def main() -> None:
     # Fecha posições que atingiram o target ou esgotaram o hold_days.
     def _run_paper_update():
         try:
-            from portfolio.portfolio.paper_trading import (
+            from portfolio.paper_trading import (
                 update_open_positions,
                 update_momentum_positions,
                 update_core_positions,
@@ -2940,7 +2940,7 @@ def main() -> None:
     # ── Paper Performance: relatório mensal (dia 1, 07:00 Lisboa) ─────────────
     def _run_paper_report():
         try:
-            from portfolio.portfolio.paper_trading import get_monthly_performance, format_performance_report
+            from portfolio.paper_trading import get_monthly_performance, format_performance_report
             perf = get_monthly_performance(months_back=3)
             send_telegram(f"📊 Paper Trading — Relatório Mensal\n\n{format_performance_report(perf)}")
         except Exception as e:

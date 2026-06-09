@@ -115,7 +115,7 @@ def generate_equity_curve(trades: list[dict]) -> Optional[Path]:
         return None
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
-    from portfolio.portfolio.paper_trading import PAPER_PORTFOLIO_EUR
+    from portfolio.paper_trading import PAPER_PORTFOLIO_EUR
 
     closed = [
         t for t in trades
@@ -607,7 +607,7 @@ def generate_all_charts() -> list[Path]:
     passing to generate_core_holdings_chart.
     """
     try:
-        from portfolio.portfolio.paper_trading import _load, get_core_holdings_summary
+        from portfolio.paper_trading import _load, get_core_holdings_summary
         trades = _load()
     except Exception as e:
         log.error(f"[charts] Could not load trades: {e}")
@@ -662,7 +662,7 @@ def generate_drip_report() -> Optional[Path]:
     Returns the path to the written file, or None on error.
     """
     try:
-        from portfolio.portfolio.paper_trading import format_drip_report_md
+        from portfolio.paper_trading import format_drip_report_md
         md_content = format_drip_report_md()
     except Exception as e:
         log.warning(f"[drip_report] Could not generate DRIP markdown: {e}")
