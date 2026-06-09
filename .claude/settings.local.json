@@ -142,7 +142,10 @@
       "Bash(PYTHONIOENCODING=utf-8 grep -rn \"^import ml_features\\\\|^from ml_features\" --include=\"*.py\")",
       "Bash(PYTHONIOENCODING=utf-8 grep -rn \"portfolio\\\\.portfolio\" --include=\"*.py\")",
       "Bash(PYTHONIOENCODING=utf-8 grep -rn \"portfolio\\\\.portfolio\\\\.portfolio\" --include=\"*.py\")",
-      "Bash(PYTHONIOENCODING=utf-8 grep -rn \"portfolio\\\\.portfolio\\\\.\" --include=\"*.py\")"
+      "Bash(PYTHONIOENCODING=utf-8 grep -rn \"portfolio\\\\.portfolio\\\\.\" --include=\"*.py\")",
+      "Bash(PYTHONIOENCODING=utf-8 grep -rn \"from portfolio\\\\.portfolio import\" --include=\"*.py\")",
+      "Bash(PYTHONIOENCODING=utf-8 grep -E \"^def |^_|^[A-Z][A-Z_]* =\" portfolio/portfolio.py)",
+      "Bash(PYTHONIOENCODING=utf-8 grep -rn \"^import portfolio\\\\|from portfolio import\" --include=\"*.py\")"
     ],
     "additionalDirectories": [
       "c:\\Users\\Romeu\\OneDrive\\Documentos\\GitHub\\DipRadar"

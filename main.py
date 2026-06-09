@@ -1746,7 +1746,7 @@ def run_scan() -> None:
                 # Não requer intervenção manual — nunca perdes o tracking de uma posição.
                 if verdict == "COMPRAR":
                     try:
-                        from portfolio.portfolio import position_db as _pdb
+                        from portfolio import position_db as _pdb
                         from ml.ml_engine import predict_dip as _predict
                         _price_now  = float(fund.get("price") or stock.get("price") or 0)
                         _feat_row   = {**fund, "score": score, "sector": fund.get("sector",""), "change_day_pct": stock["change_pct"]}
