@@ -362,6 +362,11 @@ def run_momentum_training(
     # raw returns conflate market regime with stock-specific signal.
     # Mean-imputation per sector (instead of fillna(0)) so missing features
     # don't pull ScaledRidge predictions toward the wrong baseline.
+    #
+    # Both in-sample IC AND walk-forward CV IC are computed. The in-sample
+    # number is always optimistic (the model literally saw the same rows
+    # in fit and predict); the CV number is what actually matters for
+    # deciding whether a sector has real signal.
     sector_models: dict = {}
     if "sector" in df.columns and "alpha_90d" in df.columns:
         from scipy.stats import spearmanr as _spr
@@ -374,9 +379,50 @@ def run_momentum_training(
             log.warning("[momentum_train] ml_training infra unavailable — sector models skipped")
 
         if _sector_infra:
-            df_l2 = df.dropna(subset=["alpha_90d"])
-            for sector, grp in df_l2.groupby("sector"):
+            df_l2 = df.dropna(subset=["alpha_90d"]).sort_values("date").reset_index(drop=True)
+
+            def _sector_walk_forward_ic(grp: pd.DataFrame, n_folds: int = 3) -> float:
+                """Out-of-fold IC for a single sector's data.
+
+                Uses 3 folds (fewer than the 5 used for global) because each
+                sector has less data — bigger folds preserve enough samples
+                per fit to give meaningful IC estimates.
+                """
+                if len(grp) < 60:
+                    return float("nan")
+                fold_size = len(grp) // (n_folds + 1)
+                fold_ics: list[float] = []
+                for k in range(n_folds):
+                    train_end_idx = fold_size * (k + 1)
+                    test_start_idx = train_end_idx + max(1, PURGE_DAYS // 2)
+                    test_end_idx = min(fold_size * (k + 2), len(grp))
+                    if test_start_idx >= test_end_idx:
+                        continue
+                    tr = grp.iloc[:train_end_idx]
+                    te = grp.iloc[test_start_idx:test_end_idx]
+                    if len(tr) < 30 or len(te) < 10:
+                        continue
+                    m_cv = ScaledRidge(alpha=10.0)
+                    cm = _compute_col_means(tr, FEATURE_COLS, m_cv)
+                    Xt = _prepare_X(tr, FEATURE_COLS, cm, m_cv)
+                    Xte = _prepare_X(te, FEATURE_COLS, cm, m_cv)
+                    yt = tr["alpha_90d"].values.astype(float)
+                    yte = te["alpha_90d"].values.astype(float)
+                    try:
+                        m_cv.fit(Xt, yt)
+                        preds = m_cv.predict(Xte)
+                        ic = _spr(preds, yte).statistic
+                        if math.isfinite(ic):
+                            fold_ics.append(float(ic))
+                    except Exception:
+                        continue
+                return float(np.mean(fold_ics)) if fold_ics else float("nan")
+
+            log.info("[momentum_train] Sector L2 — IC_train (in-sample) vs IC_cv (out-of-fold):")
+            for sector, grp_unsorted in df_l2.groupby("sector"):
+                grp = grp_unsorted.sort_values("date").reset_index(drop=True)
                 if len(grp) < 100:
+                    log.info(f"  {sector}: {len(grp)} samples — SKIPPED (< 100)")
                     continue
                 sm = ScaledRidge(alpha=10.0)
                 col_means = _compute_col_means(grp, FEATURE_COLS, sm)
@@ -388,13 +434,22 @@ def run_momentum_training(
                     ic_train = round(float(_spr(preds, ys).statistic), 4)
                 except Exception:
                     ic_train = None
+                ic_cv = _sector_walk_forward_ic(grp)
+                ic_cv_round = round(ic_cv, 4) if math.isfinite(ic_cv) else None
+                # Only keep sectors with positive CV IC — others are noise
                 sector_models[sector] = {
                     "model":    sm,
                     "means":    col_means,
                     "n_train":  len(grp),
                     "ic_train": ic_train,
+                    "ic_cv":    ic_cv_round,
+                    "usable":   bool(ic_cv_round is not None and ic_cv_round > 0.02),
                 }
-                log.info(f"[momentum_train] Sector L2 {sector}: {len(grp)} samples | IC_train={ic_train}")
+                marker = "✓" if sector_models[sector]["usable"] else "✗"
+                log.info(
+                    f"  {marker} {sector:30s} n={len(grp):>5} "
+                    f"IC_train={ic_train:>+.4f} IC_cv={ic_cv_round}"
+                )
 
     bundle = {
         "models":        models,         # {"L1": {...}, "L2": {...}, "L3": {...}}
@@ -423,7 +478,16 @@ def run_momentum_training(
         "ic_prod":       ic_prod,
         "horizons":      {lbl: {"ic": r["ic"], "ic_sr": r["ic_sr"], "weight": r["weight"]} for lbl, r in horizon_results.items()},
         "feature_cols":  FEATURE_COLS,
-        "sector_models": {s: {"n_train": v["n_train"], "ic_train": v.get("ic_train")} for s, v in sector_models.items()},
+        "sector_models": {
+            s: {
+                "n_train":  v["n_train"],
+                "ic_train": v.get("ic_train"),
+                "ic_cv":    v.get("ic_cv"),
+                "usable":   v.get("usable", False),
+            }
+            for s, v in sector_models.items()
+        },
+        "n_usable_sectors": sum(1 for v in sector_models.values() if v.get("usable")),
     }
     report_path.write_text(json.dumps(report, indent=2))
 
