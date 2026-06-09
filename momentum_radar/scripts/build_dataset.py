@@ -282,21 +282,34 @@ def build_dataset(
 
             def _spy_alpha(horizon_days: int, stock_ret: Optional[float]) -> Optional[float]:
                 # Log-alpha for consistency with DIP and Core models.
-                # Arithmetic differences diverge from log differences at long horizons
-                # (e.g. 180d: stock +50%/SPY +10% gives arith=0.40, log=0.31 — a 30% gap).
+                # CRITICAL: stock_ret is computed over TRADING days (close.iloc[idx + N]).
+                # The SPY return MUST be computed over the same trading-day horizon,
+                # not calendar days. The previous version filtered SPY by
+                #   spy_hist.index <= alert_date + horizon_days CALENDAR days + 5
+                # which gave a SPY window of ~35 days for a 30-trading-day stock
+                # window of ~42 days. The horizon mismatch produced noise alpha
+                # and crippled the model (IC ≈ 0).
+                #
+                # Fix: index SPY by trading-day offset just like we do for stock.
                 if stock_ret is None or stock_ret <= -1.0:
                     return None
                 try:
-                    spy_at  = spy_hist[spy_hist.index <= alert_date]["Close"]
-                    spy_fwd = spy_hist[
-                        (spy_hist.index > alert_date) &
-                        (spy_hist.index <= alert_date + pd.Timedelta(days=horizon_days + 5))
-                    ]["Close"]
-                    if not spy_at.empty and not spy_fwd.empty:
-                        spy_ret = float(spy_fwd.iloc[-1] / spy_at.iloc[-1] - 1)
-                        if spy_ret <= -1.0:
-                            return None
-                        return round(math.log1p(stock_ret) - math.log1p(spy_ret), 4)
+                    # Find SPY's row for alert_date (or the latest before it).
+                    spy_idx_arr = spy_hist.index.get_indexer([alert_date], method="pad")
+                    if len(spy_idx_arr) == 0 or spy_idx_arr[0] < 0:
+                        return None
+                    spy_at_idx = int(spy_idx_arr[0])
+                    spy_fwd_idx = spy_at_idx + horizon_days
+                    if spy_fwd_idx >= len(spy_hist):
+                        return None
+                    spy_at_px = float(spy_hist["Close"].iloc[spy_at_idx])
+                    spy_fwd_px = float(spy_hist["Close"].iloc[spy_fwd_idx])
+                    if spy_at_px <= 0:
+                        return None
+                    spy_ret = spy_fwd_px / spy_at_px - 1
+                    if spy_ret <= -1.0:
+                        return None
+                    return round(math.log1p(stock_ret) - math.log1p(spy_ret), 4)
                 except Exception:
                     pass
                 return None
