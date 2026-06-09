@@ -39,7 +39,7 @@ from typing import Any
 import pytz
 import yfinance as yf
 from state import load_alerts, save_alerts
-from allocation_engine import CAT_HIGH_CONVICTION, CAT_GROWTH
+from categories import CAT_HIGH_CONVICTION, CAT_GROWTH
 from data_feed import get_tiingo_confirmation
 
 LISBON_TZ = pytz.timezone("Europe/Lisbon")

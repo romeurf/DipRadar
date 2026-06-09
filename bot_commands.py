@@ -93,12 +93,8 @@ from state import (
     remove_from_dynamic_watchlist,
     save_dynamic_watchlist,
     get_ticker_score_history,
-    load_flip_log,
-    add_flip_trade,
-    close_flip_trade,
-    delete_flip_trade,
-    get_flip_summary,
 )
+# Flip log imports removed Phase 6 — Flip Fund deprecated
 import health_monitor
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
@@ -249,7 +245,7 @@ _cb_earnings_days    = None
 _cb_get_db_stats     = None
 _cb_fill_db_outcomes = None
 _cb_clear_alerts     = None
-_cb_allocate_ticker  = None
+# _cb_allocate_ticker removed Phase 6 — /allocate replaced by /cash
 
 
 # ── setup() — bootstrap leve usado pelo main.py ───────────────────────────────
@@ -266,7 +262,6 @@ def setup(
     send_fn,
     analyze_fn=None,
     clear_alerts_fn=None,
-    allocate_fn=None,
     **extras,
 ) -> None:
     """Regista callbacks essenciais e arranca o listener Telegram.
@@ -275,17 +270,14 @@ def setup(
         send_fn: função send_telegram(text) — usada por todos os _reply().
         analyze_fn: usada pelo /analisar.
         clear_alerts_fn: usada por /admin (futuramente).
-        allocate_fn: usada pelo /allocate.
         **extras: chaves adicionais injectadas em _poll_context
                   (forward-compat; permite passar context ad-hoc sem
                   alterar a assinatura).
     """
-    global _cb_send_telegram, _cb_analyze_ticker
-    global _cb_clear_alerts, _cb_allocate_ticker
-    _cb_send_telegram   = send_fn
-    _cb_analyze_ticker  = analyze_fn
-    _cb_clear_alerts    = clear_alerts_fn
-    _cb_allocate_ticker = allocate_fn
+    global _cb_send_telegram, _cb_analyze_ticker, _cb_clear_alerts
+    _cb_send_telegram  = send_fn
+    _cb_analyze_ticker = analyze_fn
+    _cb_clear_alerts   = clear_alerts_fn
 
     if extras:
         _poll_context.update(extras)
@@ -4355,136 +4347,10 @@ def _handle_watchlist(parts: list[str]) -> None:
         )
 
 
-# ── /flip handler ─────────────────────────────────────────────────────────────────
-
-# ── /allocate ────────────────────────────────────────────────────────────────
-
-def _handle_allocate(parts: list[str]) -> None:
-    """Sugere alocação read-only para um ticker (Fase 1 — sem execução).
-
-    Usa o callback _cb_allocate_ticker registado pelo main.py via setup().
-    """
-    if len(parts) < 2:
-        _reply(
-            "⚠️ Usa: `/allocate <TICKER>`\n"
-            "_Exemplo: `/allocate NVO`_\n"
-            "_Sugere categoria (Core / High Conviction / Growth / Flip)\n"
-            "+ sizing em €. Não executa nenhuma ordem._"
-        )
-        return
-    symbol = parts[1].upper().strip()
-    fn = _cb_allocate_ticker
-    if fn is None:
-        _reply(
-            "_Allocation engine não disponível neste deployment._\n"
-            "_(verifica que main.py passou `allocate_fn=` ao bot_commands.setup)_"
-        )
-        return
-    _reply(f"_💼 A calcular alocação para *{symbol}*..._")
-    threading.Thread(
-        target=lambda: _reply(fn(symbol)),
-        daemon=True,
-    ).start()
+# /allocate removed in Phase 6 — replaced by /cash which handles all
+# allocation logic in a unified, tax-aware, ROI-ranked queue.
 
 
-def _handle_flip(parts: list[str]) -> None:
-    sub = parts[1].lower() if len(parts) > 1 else "summary"
-
-    if sub in ("summary", "list", "ls", "ver", "show") or len(parts) == 1:
-        summary  = get_flip_summary()
-        pnl      = summary["total_pnl"]
-        pnl_em   = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
-        lines = [
-            f"*🎯 Flip Fund — {datetime.now().strftime('%d/%m/%Y')}*", "",
-            f"  {pnl_em} *P&L realizado:* ${'+' if pnl >= 0 else ''}{pnl:.2f}",
-            f"  📊 Trades fechados: *{summary['n_closed']}* | Win rate: *{summary['win_rate']:.0f}%*",
-        ]
-        if summary["best_trade"]:
-            b = summary["best_trade"]
-            lines.append(f"  🏆 Melhor: *{b['symbol']}* ${b['pnl_eur']:+.2f}")
-        opened = summary["trades_open"]
-        if opened:
-            lines += ["", f"*📂 Posições abertas ({len(opened)}):*"]
-            for t in opened:
-                notes_str = f" — _{t['notes']}_" if t.get("notes") else ""
-                lines.append(f"  #{t['id']} *{t['symbol']}* x{t['shares']} @ ${t['price_entry']:.2f} (desde {t['date_entry']}){notes_str}")
-        else:
-            lines += ["", "_Sem posições abertas._"]
-        if sub in ("list", "ls"):
-            closed = summary["trades_closed"]
-            if closed:
-                lines += ["", f"*✅ Trades fechados ({len(closed)}):*"]
-                for t in sorted(closed, key=lambda x: x["date_exit"] or "", reverse=True)[:10]:
-                    pnl_s = f"${t['pnl_eur']:+.2f}" if t["pnl_eur"] is not None else "N/D"
-                    em    = "🟢" if (t["pnl_eur"] or 0) > 0 else "🔴"
-                    lines.append(f"  {em} #{t['id']} *{t['symbol']}* ${t['price_entry']:.2f}→${t['price_exit']:.2f} | *{pnl_s}*")
-        lines += ["", "_`/flip add TICK ENTRY SHR` · `/flip close ID EXIT`_"]
-        _reply("\n".join(lines))
-        return
-
-    if sub in ("add", "entrada", "open"):
-        if len(parts) < 5:
-            _reply("⚠️ Uso: `/flip add <TICKER> <ENTRADA> <SHARES> [nota]`")
-            return
-        ticker = parts[2].upper().strip()
-        try: entry, shares = float(parts[3]), float(parts[4])
-        except ValueError:
-            _reply("⚠️ Preço e shares têm de ser números.")
-            return
-        if entry <= 0 or shares <= 0:
-            _reply("⚠️ Valores têm de ser positivos.")
-            return
-        notes = " ".join(parts[5:]) if len(parts) > 5 else ""
-        trade = add_flip_trade(ticker, shares, entry, notes=notes)
-        _reply(
-            f"✅ *Trade registado!*\n"
-            f"  #{trade['id']} *{ticker}* x{shares} @ ${entry:.2f}\n"
-            f"  💰 Custo: *${entry*shares:.2f}*\n"
-            f"  _Fecha com `/flip close {trade['id']} <PREÇO>`_"
-            + (f"\n  📝 _{notes}_" if notes else "")
-        )
-        return
-
-    if sub in ("close", "fechar", "sell"):
-        if len(parts) < 4:
-            _reply("⚠️ Uso: `/flip close <ID> <PREÇO_SAÍDA>`")
-            return
-        try: trade_id, exit_px = int(parts[2]), float(parts[3])
-        except ValueError:
-            _reply("⚠️ ID inteiro e preço numérico.")
-            return
-        trade = close_flip_trade(trade_id, exit_px)
-        if trade is None:
-            _reply(f"⚠️ Trade `#{trade_id}` não encontrado ou já fechado.")
-            return
-        pnl = trade["pnl_eur"]
-        pct = (exit_px - trade["price_entry"]) / trade["price_entry"] * 100
-        em  = "🟢" if pnl > 0 else "🔴"
-        _reply(
-            f"{em} *Trade fechado!*\n"
-            f"  #{trade_id} *{trade['symbol']}* — ${trade['price_entry']:.2f} → ${exit_px:.2f}\n"
-            f"  *{'Lucro' if pnl > 0 else 'Perda'}: ${pnl:+.2f}* ({pct:+.1f}%)"
-        )
-        return
-
-    if sub in ("del", "delete", "rm", "apagar"):
-        if len(parts) < 3:
-            _reply("⚠️ Uso: `/flip del <ID>`")
-            return
-        try: trade_id = int(parts[2])
-        except ValueError:
-            _reply("⚠️ ID tem de ser inteiro.")
-            return
-        if delete_flip_trade(trade_id):
-            _reply(f"🗑️ Trade `#{trade_id}` removido.")
-        else:
-            _reply(f"⚠️ Trade `#{trade_id}` não encontrado.")
-        return
-
-    _reply("⚠️ Usa `/flip` · `/flip list` · `/flip add` · `/flip close` · `/flip del`")
-
-
-# ── /buy handler ──────────────────────────────────────────────────────────────────
 
 def _handle_buy(parts: list[str]) -> None:
     if len(parts) < 4:
@@ -5866,8 +5732,8 @@ def _handle_command(text: str) -> None:
         is_open_fn = _poll_context.get("is_market_open")
         market     = "🟢 Aberto" if (is_open_fn and is_open_fn()) else "🔴 Fechado"
         wl         = load_dynamic_watchlist()
-        summary    = get_flip_summary()
-        flip_str   = f" | Flip: {summary['n_open']} abertos / P&L ${summary['total_pnl']:+.0f}"
+        # Flip log removed Phase 6 — Flip Fund deprecated
+        flip_str   = ""
         db_fn      = _poll_context.get("get_db_stats") or _cb_get_db_stats
         db_str     = ""
         if db_fn:
@@ -6052,9 +5918,6 @@ def _handle_command(text: str) -> None:
         if not _check_rate(cmd_key): return
         _handle_watchlist(parts)
 
-    elif cmd == "/flip":
-        if not _check_rate(cmd_key): return
-        _handle_flip(parts)
 
     elif cmd == "/buy":
         if not _check_rate(cmd_key): return
@@ -6084,9 +5947,7 @@ def _handle_command(text: str) -> None:
         if not _check_rate(cmd_key): return
         _handle_portfolio(parts)
 
-    elif cmd == "/allocate":
-        if not _check_rate(cmd_key): return
-        _handle_allocate(parts)
+    # /allocate removed in Phase 6 — use /cash for unified allocation
 
     elif cmd == "/mldata":
         if not _check_rate(cmd_key): return

@@ -39,7 +39,7 @@ from typing import Any
 import numpy as np
 
 
-from allocation_engine import CAT_HIGH_CONVICTION, CAT_GROWTH
+from categories import CAT_HIGH_CONVICTION, CAT_GROWTH
 
 
 # ---------------------------------------------------------------------------

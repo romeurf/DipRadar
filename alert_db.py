@@ -318,7 +318,7 @@ def fill_db_outcomes() -> dict:
     HIGH_CONVICTION nunca recebe outcome_label (hold de longo prazo, sem target).
     Só actualiza linhas onde os campos ainda estão vazios.
     """
-    from allocation_engine import CAT_HIGH_CONVICTION
+    from categories import CAT_HIGH_CONVICTION
 
     # Tentar Tiingo primeiro; fallback para yfinance se indisponível.
     # Encapsula o acesso a preços para não abortar toda a função se Tiingo falhar.

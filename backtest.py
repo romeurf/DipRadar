@@ -414,7 +414,7 @@ def _forward_outcomes(
     category: str,
 ) -> dict:
     from alert_db import _resolve_outcome_label
-    from allocation_engine import CAT_HIGH_CONVICTION
+    from categories import CAT_HIGH_CONVICTION
 
     total_rows  = len(df)
     max_forward = total_rows - dip_iloc - 1
