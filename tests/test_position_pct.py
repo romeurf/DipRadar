@@ -16,7 +16,7 @@ from pathlib import Path
 os.environ.setdefault("MONTHLY_BUDGET_EUR", "1050")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from portfolio.portfolio.portfolio import portfolio as pf
+from portfolio.portfolio import portfolio as pf
 
 
 def _seed_cache(liquidity: float, positions: dict) -> None:

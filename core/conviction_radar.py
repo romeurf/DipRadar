@@ -1083,7 +1083,7 @@ def auto_sync_from_portfolio(send_telegram: Optional[Callable[[str], None]] = No
     Returns: {"added": N, "skipped": M, "items": [(ticker, type, reason)...]}
     """
     try:
-        from portfolio.portfolio.portfolio.portfolio import get_positions
+        from portfolio.portfolio import get_positions
     except Exception as e:
         logger.warning(f"[conviction] portfolio import failed: {e}")
         return {"added": 0, "skipped": 0, "items": []}

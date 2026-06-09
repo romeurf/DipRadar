@@ -1063,7 +1063,7 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
 
     As env vars HOLDING_* foram DESCONTINUADAS — usa este comando ou /buy.
     """
-    from portfolio.portfolio.portfolio.portfolio import get_positions, register_existing_position, _cache, _ensure_cache, _flush
+    from portfolio.portfolio import get_positions, register_existing_position, _cache, _ensure_cache, _flush
 
     no_conviction = "--no-conviction" in parts
     update_avg    = "--update-avg" in parts  # allow overwrite of avg_price + shares
@@ -4108,7 +4108,7 @@ def _handle_performance(parts: list[str]) -> None:
 
     def _run():
         try:
-            from portfolio.portfolio.portfolio_simulator import run_portfolio_backtest, format_portfolio_result
+            from portfolio.portfolio_simulator import run_portfolio_backtest, format_portfolio_result
 
             period_start = None
             score_min    = 60.0
@@ -4384,7 +4384,7 @@ def _handle_buy(parts: list[str]) -> None:
             return
 
     try:
-        from portfolio.portfolio.portfolio.portfolio import buy as portfolio_buy, get_liquidity
+        from portfolio.portfolio import buy as portfolio_buy, get_liquidity
         result = portfolio_buy(symbol, price, shares, entry_score=score)
     except Exception as e:
         _reply(f"❌ Erro ao registar compra: `{e}`")
@@ -4489,7 +4489,7 @@ def _handle_sell(parts: list[str]) -> None:
             return
 
     try:
-        from portfolio.portfolio.portfolio.portfolio import sell as portfolio_sell
+        from portfolio.portfolio import sell as portfolio_sell
         result = portfolio_sell(symbol, price, shares)
     except Exception as e:
         _reply(f"❌ Erro ao registar venda: `{e}`")
@@ -4616,7 +4616,7 @@ def _handle_conviction(parts: list[str]) -> None:
         # Only auto-buy if ticker not already in portfolio (avoids accidental DCA).
         buy_tail = ""
         try:
-            from portfolio.portfolio.portfolio.portfolio import get_position, buy as portfolio_buy
+            from portfolio.portfolio import get_position, buy as portfolio_buy
             if get_position(ticker) is None:
                 _br = portfolio_buy(ticker, price, shares)
                 buy_tail = (
@@ -5195,7 +5195,7 @@ def _handle_etf(parts: list[str]) -> None:
 
 def _handle_liquidez(parts: list[str]) -> None:
     try:
-        from portfolio.portfolio.portfolio.portfolio import get_liquidity, add_liquidity, set_liquidity
+        from portfolio.portfolio import get_liquidity, add_liquidity, set_liquidity
     except Exception as e:
         _reply(f"❌ Módulo portfolio não disponível: `{e}`")
         return
@@ -5466,7 +5466,7 @@ def _handle_core_universe_remove(parts: list[str]) -> None:
 
 def _handle_portfolio(parts: list[str]) -> None:
     try:
-        from portfolio.portfolio.portfolio.portfolio import get_positions, get_liquidity, EUR_TICKERS
+        from portfolio.portfolio import get_positions, get_liquidity, EUR_TICKERS
     except Exception as e:
         _reply(f"❌ Módulo portfolio não disponível: `{e}`")
         return
@@ -5757,7 +5757,7 @@ def _handle_command(text: str) -> None:
         )
 
         try:
-            from portfolio.portfolio.portfolio.portfolio import get_liquidity, get_active_symbols
+            from portfolio.portfolio import get_liquidity, get_active_symbols
             liq      = get_liquidity()
             n_pos    = len(get_active_symbols())
             port_str = f"\nCarteira: *{n_pos} posições* | Liquidez: *€{liq:.2f}*"
@@ -7170,7 +7170,7 @@ def _handle_command(text: str) -> None:
 
         def _run_monthly():
             try:
-                from portfolio.portfolio.portfolio.portfolio import get_positions
+                from portfolio.portfolio import get_positions
                 from datetime import datetime as _dt
 
                 positions = get_positions()
@@ -7578,7 +7578,7 @@ def _handle_command(text: str) -> None:
 
         def _run_allocation():
             try:
-                from portfolio.portfolio.portfolio.portfolio import get_positions
+                from portfolio.portfolio import get_positions
                 from core import conviction_radar as cr
                 from core.tax_engine import should_rotate as tax_should_rotate
 
@@ -8994,7 +8994,7 @@ def _handle_command(text: str) -> None:
             )
         else:
             try:
-                from portfolio.portfolio.portfolio.portfolio import _cache, _PORTFOLIO_FILE
+                from portfolio.portfolio import _cache, _PORTFOLIO_FILE
                 _cache["positions"] = {}
                 # _cache["liquidity"] preserved — that's a separate concern
                 if _PORTFOLIO_FILE.exists():
@@ -9012,7 +9012,7 @@ def _handle_command(text: str) -> None:
     elif cmd in ("/admin_portfolio_diag", "/admin_carteira_diag"):
         # Diagnostic: dump exact contents of _cache["positions"] + computed values
         try:
-            from portfolio.portfolio.portfolio.portfolio import get_positions, get_holdings_tuples, _cache
+            from portfolio.portfolio import get_positions, get_holdings_tuples, _cache
             from data.market_client import get_usdeur, get_portfolio_snapshot
             from state import get_etfs, get_ppr
             import json, yfinance as _yf

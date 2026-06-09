@@ -570,7 +570,7 @@ def get_portfolio_snapshot(holdings, ppr_shares, ppr_avg_cost, usd_eur, etfs=Non
       Valor = ppr_shares * ppr_avg_cost  (custo histórico em EUR)
       P&L diário/semanal/mensal = valor_ppr * retorno_% do ACWI no período (proxy)
     """
-    from portfolio.portfolio.portfolio.portfolio import USD_TICKERS, get_positions
+    from portfolio.portfolio import USD_TICKERS, get_positions
 
     # Custo de referência do GSheets (fonte primária)
     try:

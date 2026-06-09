@@ -41,7 +41,7 @@ from data.market_client import (
     get_usdeur, get_portfolio_snapshot,
     get_macro_context,
 )
-from portfolio.portfolio.portfolio.portfolio import (
+from portfolio.portfolio import (
     get_holdings_tuples, PPR_SHARES, PPR_AVG_COST,
     DIRECT_TICKERS, FLIP_FUND_EUR, suggest_position_size,
     get_positions, update_position_data,
@@ -339,7 +339,7 @@ def _get_snapshot() -> dict:
     usd_eur = get_usdeur()
     # PPR + ETFs are Telegram-managed (state-backed) — refresh each call
     # so /ppr set / /etf set changes take effect immediately, no restart.
-    from portfolio.portfolio.portfolio.portfolio import _get_ppr_values
+    from portfolio.portfolio import _get_ppr_values
     from state import get_etfs, get_ppr
     ppr_shares, ppr_avg_cost = _get_ppr_values()
     ppr_state = get_ppr()
@@ -1703,7 +1703,7 @@ def run_scan() -> None:
                 if verdict == "COMPRAR":
                     try:
                         from portfolio.portfolio.paper_trading import record_paper_buy
-                        from portfolio.portfolio.portfolio.portfolio import FLIP_FUND_EUR
+                        from portfolio.portfolio import FLIP_FUND_EUR
                         paper_amount = float(
                             decision.amount_eur
                             if "decision" in dir() and hasattr(decision, "amount_eur") and decision.amount_eur > 0
@@ -1746,7 +1746,7 @@ def run_scan() -> None:
                 # Não requer intervenção manual — nunca perdes o tracking de uma posição.
                 if verdict == "COMPRAR":
                     try:
-                        from portfolio.portfolio.portfolio import position_db as _pdb
+                        from portfolio.portfolio import position_db as _pdb
                         from ml.ml_engine import predict_dip as _predict
                         _price_now  = float(fund.get("price") or stock.get("price") or 0)
                         _feat_row   = {**fund, "score": score, "sector": fund.get("sector",""), "change_day_pct": stock["change_pct"]}

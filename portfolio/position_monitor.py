@@ -47,7 +47,7 @@ from typing import Optional
 
 import yfinance as yf
 
-from portfolio.portfolio.portfolio import position_db
+from portfolio.portfolio import position_db
 from portfolio.portfolio.position_db import PositionRecord
 from ml.ml_engine import (
     load_predictor,
