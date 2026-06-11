@@ -762,6 +762,125 @@ def send_weekly_dip_scan() -> None:
     send_telegram("\n".join(lines))
 
 
+# ── Structural 52w intraday DIP scan (Fase 4 — D) ────────────────────────────
+#
+# Companion to:
+#   - screen_global_dips (intraday -8%, hourly, via run_scan)
+#   - send_weekly_dip_scan (Monday-only, drawdown 25%, score 70 — intocável)
+#
+# Catches the gap between them: tickers that drifted -20%+ over weeks
+# without any single intraday move big enough to enter Yahoo's day_losers
+# list. This is the HUBS-at-52w-low case where the position is in deep
+# drawdown but the daily change today is small.
+#
+# Anti-spam discipline:
+#   - drawdown ≥ 20% (looser than weekly's 25% so it catches earlier)
+#   - dip score ≥ 55 (above MIN_DIP_SCORE=50, below COMPRAR=75)
+#   - ranking: score × |drawdown| desc → bigger structural signals first
+#   - cap: top 3 fresh per scan run
+#   - dedup: _alerted_today[f"{sym}_dip52w"] → 1 alert per ticker per day
+#     even if the hourly sweep sees it five times
+# Expected: 0-2/day in normal conditions; 1-3 on volatile days.
+
+def run_structural_dip_intraday_scan() -> int:
+    """Fase 4 — emit alerts for tickers in deep 52w drawdown that the
+    intraday DIP screener misses. Returns count of fresh alerts sent.
+    """
+    try:
+        candidates = screen_structural_dips(
+            min_drawdown_pct=20.0,
+            min_market_cap=MIN_MARKET_CAP,
+            max_results=15,
+        )
+    except Exception as e:
+        logging.warning(f"[dip52w] screener falhou: {e}")
+        return 0
+    if not candidates:
+        return 0
+
+    fresh = [
+        c for c in candidates
+        if f"{c['symbol']}_dip52w" not in _alerted_today
+    ]
+    if not fresh:
+        return 0
+
+    scored: list[dict] = []
+    for stock in fresh:
+        sym = stock.get("symbol", "")
+        if not sym:
+            continue
+        try:
+            time.sleep(2)
+            fund = get_fundamentals(sym, min_market_cap=MIN_MARKET_CAP)
+            if fund.get("skip"):
+                continue
+            earnings_days = get_earnings_days(sym)
+            sector_chg    = get_sector_change(fund.get("sector", ""))
+            score, rsi_str = calculate_dip_score(
+                fund, sym, earnings_days, sector_change=sector_chg,
+            )
+            if score < 55:
+                continue
+            drawdown   = float(stock.get("drawdown_52w") or 0.0)
+            rank_score = float(score) * abs(drawdown)
+            bc_flag    = is_bluechip(fund)
+            category   = classify_dip_category(fund, score, bc_flag)
+            scored.append({
+                "stock":      stock,
+                "fund":       fund,
+                "score":      score,
+                "drawdown":   drawdown,
+                "rank_score": rank_score,
+                "category":   category,
+                "rsi_str":    rsi_str,
+            })
+        except Exception as e:
+            logging.debug(f"[dip52w] {sym}: {e}")
+            continue
+
+    scored.sort(key=lambda x: -x["rank_score"])
+    top = scored[:3]
+    if not top:
+        return 0
+
+    n_sent = 0
+    for item in top:
+        stock    = item["stock"]
+        fund     = item["fund"]
+        sym      = stock["symbol"]
+        score    = item["score"]
+        drawdown = item["drawdown"]
+        category = item["category"]
+        rsi_str  = item["rsi_str"]
+        try:
+            _name      = fund.get("name") or sym
+            _price     = fund.get("price")
+            _price_s   = f"${_price:.2f}" if _price else "?"
+            _change_p  = float(stock.get("change_pct") or 0.0)
+            _rsi_s     = f" | RSI: {rsi_str}" if rsi_str else ""
+            _sector_s  = f" _{fund.get('sector') or ''}_" if fund.get("sector") else ""
+            badge      = "🔥" if score >= 75 else ("⭐" if score >= 65 else "📉")
+            msg = (
+                f"📉 *STRUCTURAL DIP — {_name} ({sym})*{_sector_s}\n"
+                f"_Drift 52w fora do screener intraday._\n\n"
+                f"Pico 52w: *{drawdown:+.0f}%* | Hoje: *{_change_p:+.1f}%* — {_price_s}{_rsi_s}\n"
+                f"{badge} DIP score: *{score:.0f}/100* | _{category}_\n\n"
+                f"_Dedup: {sym}_dip52w · próxima janela 24h._"
+            )
+            send_telegram(msg)
+            _alerted_today.add(f"{sym}_dip52w")
+            n_sent += 1
+        except Exception as e:
+            logging.warning(f"[dip52w] {sym}: emit failed: {e}")
+            continue
+
+    if n_sent > 0:
+        save_alerts(_alerted_today)
+        logging.info(f"[dip52w] {n_sent} structural alerts sent (from {len(top)} ranked)")
+    return n_sent
+
+
 # ── Saturday Weekly Report ────────────────────────────────────────────────────
 
 def send_saturday_report() -> None:
@@ -2575,6 +2694,7 @@ def main() -> None:
             check_thesis_degradation(),
             check_recovery_alerts(),
             _run_active_stops_check(),
+            run_structural_dip_intraday_scan(),
         ),
         CronTrigger(day_of_week="mon-fri", hour=17, minute=45, timezone=LISBON_TZ),
         id="scan_intraday", name="Scan US Intraday 17h45",
@@ -2597,6 +2717,7 @@ def main() -> None:
             check_thesis_degradation(),
             check_recovery_alerts(),
             _run_active_stops_check(),
+            run_structural_dip_intraday_scan(),
         ),
         CronTrigger(day_of_week="mon-fri", hour="15,16,18,19,20", minute=0, timezone=LISBON_TZ),
         id="scan_hourly_intraday", name="Scan Hourly Intraday (15h,16h,18h,19h,20h)",
@@ -2609,6 +2730,7 @@ def main() -> None:
             check_thesis_degradation(),
             check_recovery_alerts(),
             _run_active_stops_check(),
+            run_structural_dip_intraday_scan(),
             send_weekly_dip_scan(),
         ),
         CronTrigger(day_of_week="mon-fri", hour=21, minute=15, timezone=LISBON_TZ),
