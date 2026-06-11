@@ -321,7 +321,11 @@ def compute_win_prob_drift(
                 import json
                 from pathlib import Path
                 _data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
+                # Phase 7 moved this module to /app/ml/, so Path(__file__).parent
+                # is now /app/ml — walk up one to /app for the repo path.
+                _repo_root = Path(__file__).parent.parent
                 for rp in [_data_dir / "ml_report.json",
+                           _repo_root / "ml_training" / "ml_report.json",
                            Path(__file__).parent / "ml_training" / "ml_report.json"]:
                     if rp.exists():
                         rdata = json.loads(rp.read_text())

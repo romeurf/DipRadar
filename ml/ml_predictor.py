@@ -121,18 +121,27 @@ def _to_dict(obj: Any) -> dict:
 
 # ── Caminhos ───────────────────────────────────────────────────────────────────
 
-_REPO_DIR = Path(__file__).parent
-_DATA_DIR = Path("/data") if Path("/data").exists() else Path("/tmp")
+_REPO_DIR  = Path(__file__).parent          # /app/ml (this module's dir)
+_REPO_ROOT = _REPO_DIR.parent               # /app    (project root)
+_DATA_DIR  = Path("/data") if Path("/data").exists() else Path("/tmp")
 
 # Bundle ML v3 — procura em ordem (Railway volume / repo / legacy v3 names).
 # Após PR de robustez 2026-05, o nome canónico é `dip_models.pkl` em /data ou
 # no sub-package `ml_training/`. Os nomes legacy `dip_models_v3.pkl` são lidos
 # como fallback durante a migração para não quebrar volumes antigos.
+#
+# Phase 7 (folder restructure) moved ml_predictor.py from /app/ to /app/ml/,
+# which silently broke the repo-relative paths: _REPO_DIR / "ml_training"
+# was resolving to /app/ml/ml_training/ (does NOT exist) instead of the
+# actual /app/ml_training/. Fixed by anchoring at _REPO_ROOT (project root)
+# and keeping the pre-Phase-7 path as a defensive fallback.
 _BUNDLE_CANDIDATES = [
-    _DATA_DIR / "dip_models.pkl",
-    _REPO_DIR / "ml_training" / "dip_models.pkl",
-    _DATA_DIR / "dip_models_v3.pkl",
-    _REPO_DIR / "dip_models_v3.pkl",
+    _DATA_DIR  / "dip_models.pkl",
+    _REPO_ROOT / "ml_training" / "dip_models.pkl",     # /app/ml_training/...
+    _REPO_DIR  / "ml_training" / "dip_models.pkl",     # legacy / future moves
+    _DATA_DIR  / "dip_models_v3.pkl",
+    _REPO_ROOT / "dip_models_v3.pkl",                  # /app/dip_models_v3.pkl
+    _REPO_DIR  / "dip_models_v3.pkl",                  # legacy
 ]
 _PKL_V3 = next((p for p in _BUNDLE_CANDIDATES if p.exists()), _BUNDLE_CANDIDATES[0])
 
