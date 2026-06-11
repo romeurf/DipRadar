@@ -6303,6 +6303,41 @@ def _handle_command(text: str) -> None:
                 except Exception as _e:
                     info_lines.append(f"⚠️ DIP queue falhou: `{_e}`")
 
+                # ── HOLD: SELL+BUY same-ticker = contradictory → don't churn ─
+                # If a ticker is queued to SELL (e.g. HUBS MOMENTUM stop break)
+                # AND would also be bought from another radar (e.g. DIP alert),
+                # the two signals contradict each other on the same name. Tax
+                # friction + bid/ask + slippage + the conviction signal of
+                # "model still likes this at lower price" all favor HOLD over
+                # churn. Pull both rows out, surface the contradiction, and
+                # recompute the budget against the smaller sell pool.
+                _sell_set = {s["ticker"].upper() for s in sell_actions}
+                _cand_set = {c["ticker"].upper() for c in candidates}
+                _hold_tickers = _sell_set & _cand_set
+                hold_actions: list[dict] = []
+                if _hold_tickers:
+                    for _ht in _hold_tickers:
+                        _sell_row = next(s for s in sell_actions if s["ticker"].upper() == _ht)
+                        _buy_row  = next(c for c in candidates    if c["ticker"].upper() == _ht)
+                        hold_actions.append({
+                            "ticker":       _sell_row["ticker"],
+                            "bucket":       _sell_row.get("bucket", "?"),
+                            "shares":       _sell_row.get("shares", 0),
+                            "value":        _sell_row.get("value", 0.0),
+                            "sell_reason":  _sell_row.get("reason", ""),
+                            "buy_reason":   _buy_row.get("reason", ""),
+                            "would_alloc":  _buy_row.get("suggested", 0.0),
+                        })
+                    sell_actions = [s for s in sell_actions if s["ticker"].upper() not in _hold_tickers]
+                    candidates   = [c for c in candidates   if c["ticker"].upper() not in _hold_tickers]
+                    # Recompute freed_cash + total_budget against filtered sells
+                    if ignore_sells:
+                        freed_cash = 0.0
+                    else:
+                        freed_cash = sum(s["value"] for s in sell_actions)
+                    total_budget = cash_amount + freed_cash
+                    sell_actions_to_show = sell_actions
+
                 # ── Rank by ROI score = ann_alpha × max(0.5, confidence) ───
                 for c in candidates:
                     c["roi_score"] = c["ann_alpha"] * max(0.5, c["confidence"])
@@ -6415,6 +6450,24 @@ def _handle_command(text: str) -> None:
                         lines.append(
                             f"  • `{h['ticker']}`: {h['shares']:g} sh "
                             f"(€{h['value']:.0f}) — _{h['reason']}_"
+                        )
+                    lines.append("")
+
+                # HOLDs from SELL+BUY contradiction (same-ticker, two radars)
+                if hold_actions:
+                    lines.append(
+                        f"⚖️ *HOLDs* ({len(hold_actions)} — sinais contraditórios, "
+                        f"sem churn):"
+                    )
+                    for h in hold_actions:
+                        lines.append(
+                            f"  • `{h['ticker']}` [{h['bucket']}]: "
+                            f"{h['shares']:g} sh (€{h['value']:.0f})"
+                        )
+                        lines.append(f"      SELL: _{h['sell_reason']}_")
+                        lines.append(
+                            f"      BUY would re-enter @ €{h['would_alloc']:.0f}: "
+                            f"_{h['buy_reason']}_"
                         )
                     lines.append("")
 
