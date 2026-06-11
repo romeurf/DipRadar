@@ -855,25 +855,38 @@ def get_catalyst(symbol: str, company_name: str = "") -> dict:
     full_text = " ".join(texts)
 
     import re as _re
-    # Strip URLs from content before snippet extraction. Tavily sometimes
-    # returns content with inline URLs ("...from https://twitter.com/.../
-    # oracle-q4-earnings-call..."); when the keyword ('earnings') hits the
-    # URL slug instead of prose, the 140-char window ends up as URL-encoded
-    # garbage in the alert (`om%2FTheStreet%2Fposts%2F...`). Removing URLs
-    # first keeps only prose text where the keyword match is meaningful.
-    _url_re = _re.compile(r"https?://\S+|www\.\S+", flags=_re.IGNORECASE)
+    # Clean Tavily content before snippet extraction. Two failure modes seen
+    # in production:
+    #   (1) inline URLs ("...from https://twitter.com/.../oracle-q4-earnings
+    #       -call...") — keyword hits the URL slug, snippet becomes
+    #       `om%2FTheStreet%2Fposts%2F...`.
+    #   (2) markdown link syntax `[Earnings]( [Tech]( [Wealth](` — Tavily
+    #       returns content where the body is mostly nav-link text. Even
+    #       after URL stripping, the bracket+paren remnants ('[Tag]( ')
+    #       look like garbage in the alert.
+    # Apply both filters before keyword search and skip results where the
+    # cleaned content is mostly punctuation.
+    _url_re   = _re.compile(r"https?://\S+|www\.\S+", flags=_re.IGNORECASE)
+    _mdlink_re = _re.compile(r"\[([^\]]{1,40})\]\([^)]*\)")  # [text](url) → text
+    _bracket_re = _re.compile(r"\[[^\]]{0,40}\]\(\s*")  # leftover `[Foo]( `
     for keyword, label in _CATALYST_KEYWORDS.items():
         if keyword in full_text:
             snippet = ""
             for r in data.get("results", []):
-                content = _url_re.sub("", r.get("content") or "")
+                content = r.get("content") or ""
+                content = _url_re.sub("", content)
+                content = _mdlink_re.sub(r"\1", content)
+                content = _bracket_re.sub("", content)
+                # Collapse runs of whitespace introduced by the strips
+                content = _re.sub(r"\s+", " ", content)
                 idx = content.lower().find(keyword)
                 if idx != -1:
                     snippet = content[max(0, idx-40):min(len(content), idx+100)].strip()
                     # Defensive: if snippet still looks URL-encoded (>10%
-                    # of chars are % or escape sequences), skip this result
-                    # and let the next iteration find a cleaner one.
-                    if snippet.count("%") > len(snippet) * 0.1:
+                    # `%`) OR is mostly brackets/parens (>15% [()]),
+                    # skip and try the next result.
+                    if (snippet.count("%") > len(snippet) * 0.1
+                            or sum(snippet.count(c) for c in "[]()") > len(snippet) * 0.15):
                         snippet = ""
                         continue
                     break

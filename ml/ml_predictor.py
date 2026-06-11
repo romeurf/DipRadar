@@ -138,13 +138,14 @@ _PKL_V3 = next((p for p in _BUNDLE_CANDIDATES if p.exists()), _BUNDLE_CANDIDATES
 
 # Diagnostic log at module import time so production traces show which
 # bundle path was actually selected. Helps debug NO_MODEL cases where
-# /admin_check_config disagrees with /analisar.
+# /admin_check_config disagrees with /analisar. Logged at WARNING level
+# because Railway often filters INFO logs in production.
 try:
     _resolved = "FOUND" if _PKL_V3.exists() else "MISSING"
     _checked_paths = " | ".join(
         f"{p}={'✓' if p.exists() else '✗'}" for p in _BUNDLE_CANDIDATES
     )
-    logging.info(
+    logging.warning(
         f"[ml_predictor] Bundle path resolved: {_PKL_V3} [{_resolved}] | "
         f"all candidates: {_checked_paths}"
     )

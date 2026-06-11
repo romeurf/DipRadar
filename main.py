@@ -1203,18 +1203,27 @@ def _build_plain_summary(
     Objectivo: qualquer pessoa percebe imediatamente o que está a acontecer
     e o que deve fazer, sem ter de decifrar os números abaixo.
     """
-    # Frase 1 — o que aconteceu
+    # Frase 1 — o que aconteceu (sign-aware: ORCL +1.8% should NOT say
+    # "caiu 1.8%"; the verb has to match the direction).
     abs_change = abs(change)
-    if abs_change >= 10:
-        queda = f"desabou {abs_change:.0f}%"
-    elif abs_change >= 5:
-        queda = f"caiu {abs_change:.0f}%"
+    if change < 0:
+        if abs_change >= 10:
+            move = f"desabou {abs_change:.0f}%"
+        elif abs_change >= 5:
+            move = f"caiu {abs_change:.0f}%"
+        else:
+            move = f"caiu {abs_change:.1f}%"
     else:
-        queda = f"caiu {abs_change:.1f}%"
+        if abs_change >= 10:
+            move = f"disparou {abs_change:.0f}%"
+        elif abs_change >= 5:
+            move = f"subiu {abs_change:.0f}%"
+        else:
+            move = f"subiu {abs_change:.1f}%"
 
     # Sem italic _..._ — o em-dash (—) dentro de italic causa Markdown 400 em alguns stocks.
     # Plain text para a frase 2, bold apenas onde seguro.
-    frase1 = f"*{name}* {queda} hoje."
+    frase1 = f"*{name}* {move} hoje."
 
     # Frase 2 — o que fazer, em linguagem simples, sem repetir o score
     if verdict == "COMPRAR":
