@@ -347,6 +347,219 @@ def _get_snapshot() -> dict:
         etfs=etfs, ppr_current_nav=ppr_current_nav,
     )
 
+# ────────────────────────────────────────────────────────────────────────────
+# Daily Digest infrastructure (Fase E — 2026-06-12)
+# ────────────────────────────────────────────────────────────────────────────
+# User feedback: with 11-14 alerts/day vs only 3-7 positions/month deployable,
+# 98% of alerts become noise. The digest restructures delivery:
+#
+#   Real-time push  →  TRAILING_STOP (always)
+#                      DIP/CORE alerts with score ≥ 75 AND ml_win_prob ≥ 0.65
+#
+#   Daily digest    →  everything else (DIP 50-74, STRUCTURAL, CORE warnings,
+#                      ROTATION suggestions) buffered to disk, consolidated
+#                      and emitted as one ranked message at 21:30 Lisboa.
+#
+# /cash is unchanged — it reads alert_db.csv directly. The digest is a
+# focused daily summary so the user knows the top 5 opportunities to
+# consider in /cash without scrolling through individual Telegram messages.
+
+_DIGEST_BUFFER_FILE = "digest_buffer.json"
+
+# Severity tiers in priority order
+_REAL_TIME_ALERT_TYPES = ("TRAILING_STOP",)
+_DIGEST_SCORE_GATE     = 75.0
+_DIGEST_WIN_PROB_GATE  = 0.65
+
+
+def _alert_severity_filter(
+    alert_type: str,
+    score: float | None = None,
+    win_prob: float | None = None,
+) -> str:
+    """Return 'real_time' or 'digest' for a given alert.
+
+    Trailing stops are always real-time (time-critical exits). DIP and CORE
+    alerts are real-time only when BOTH the rule-based score is high AND the
+    ML model agrees (>=75 AND >=65%). Everything else goes to the digest.
+    """
+    if alert_type in _REAL_TIME_ALERT_TYPES:
+        return "real_time"
+    if alert_type in ("DIP", "CORE_WARNING"):
+        if (score is not None and float(score) >= _DIGEST_SCORE_GATE
+                and win_prob is not None and float(win_prob) >= _DIGEST_WIN_PROB_GATE):
+            return "real_time"
+    return "digest"
+
+
+def _append_to_digest_buffer(entry: dict) -> None:
+    """Atomic-append an entry to the digest buffer JSON file (/data/...)."""
+    try:
+        from state import _load_json, _save_json
+        buf = _load_json(_DIGEST_BUFFER_FILE, default=[]) or []
+        if not isinstance(buf, list):
+            buf = []
+        buf.append(entry)
+        _save_json(_DIGEST_BUFFER_FILE, buf)
+    except Exception as e:
+        logging.warning(f"[digest] buffer append failed: {e}")
+
+
+def _clear_digest_buffer() -> None:
+    """Empty the digest buffer (called after emission)."""
+    try:
+        from state import _save_json
+        _save_json(_DIGEST_BUFFER_FILE, [])
+    except Exception as e:
+        logging.warning(f"[digest] buffer clear failed: {e}")
+
+
+def _emit_alert(
+    text: str,
+    alert_type: str,
+    ticker: str,
+    score: float | None = None,
+    win_prob: float | None = None,
+    pred_alpha_90d: float | None = None,
+    in_portfolio: bool = False,
+    summary: str = "",
+) -> str:
+    """Route an alert through the severity filter.
+
+    Real-time alerts go straight to Telegram. Digest-bound alerts are
+    buffered with metadata for ranking and final emission at 21:30.
+
+    Returns the actual severity decision ('real_time' or 'digest') so
+    callers can adjust state (e.g. mark _alerted_today differently).
+    """
+    severity = _alert_severity_filter(alert_type, score, win_prob)
+    if severity == "real_time":
+        send_telegram(text)
+        return "real_time"
+
+    # Buffer for end-of-day digest
+    entry = {
+        "timestamp":      datetime.now(LISBON_TZ).isoformat(timespec="seconds"),
+        "ticker":         (ticker or "").upper(),
+        "alert_type":     alert_type,
+        "score":          float(score) if score is not None else None,
+        "win_prob":       float(win_prob) if win_prob is not None else None,
+        "pred_alpha_90d": float(pred_alpha_90d) if pred_alpha_90d is not None else None,
+        "in_portfolio":   bool(in_portfolio),
+        "summary":        summary[:200] if summary else "",
+        "full_text":      text[:1000] if text else "",
+    }
+    _append_to_digest_buffer(entry)
+    return "digest"
+
+
+def run_daily_digest() -> int:
+    """21:30 Lisboa — consolidate the day's digest-bound alerts.
+
+    Reads the digest buffer, dedups by ticker (keeping the highest-α entry
+    per ticker), sorts by pred_alpha_90d desc, and emits one Telegram
+    message with the top 5 ranked plus a compact list of the rest.
+
+    The /cash command stays as the primary deployment tool — this digest
+    just surfaces the top opportunities once per day.
+
+    Returns the number of unique tickers in the digest.
+    """
+    try:
+        from state import _load_json
+        buf = _load_json(_DIGEST_BUFFER_FILE, default=[]) or []
+    except Exception as e:
+        logging.warning(f"[digest] load buffer failed: {e}")
+        return 0
+
+    if not buf:
+        logging.info("[digest] empty buffer — nothing to emit")
+        return 0
+
+    # Dedup by ticker: keep the entry with highest pred_alpha_90d
+    by_ticker: dict[str, dict] = {}
+    for entry in buf:
+        t = (entry.get("ticker") or "").upper()
+        if not t:
+            continue
+        if t not in by_ticker:
+            by_ticker[t] = entry
+            continue
+        prev = by_ticker[t]
+        prev_a = prev.get("pred_alpha_90d") or -999
+        curr_a = entry.get("pred_alpha_90d") or -999
+        if curr_a > prev_a:
+            by_ticker[t] = entry
+
+    # Sort by alpha desc (None / negative pushed to the bottom)
+    def _alpha_key(e: dict) -> float:
+        v = e.get("pred_alpha_90d")
+        return float(v) if v is not None else -999.0
+
+    sorted_alerts = sorted(by_ticker.values(), key=_alpha_key, reverse=True)
+    top_5         = sorted_alerts[:5]
+    rest          = sorted_alerts[5:]
+
+    try:
+        from portfolio.portfolio import get_liquidity
+        liquidity = get_liquidity()
+    except Exception:
+        liquidity = None
+
+    # Build message
+    date_str = datetime.now(LISBON_TZ).strftime("%d/%m")
+    lines = [
+        f"📅 *Digest {date_str}* — {len(sorted_alerts)} oportunidades hoje",
+        "",
+    ]
+
+    if top_5:
+        lines.append("🏆 *Top 5 ranked por α esperado*:")
+        for i, e in enumerate(top_5, 1):
+            ticker = e.get("ticker", "?")
+            score  = e.get("score")
+            score_s = f"score {score:.0f}" if score is not None else "score n/d"
+            alpha  = e.get("pred_alpha_90d")
+            ann    = (float(alpha) * (365.0/90.0) * 100.0) if alpha is not None else None
+            ann_s  = f"α={ann:+.1f}%/y" if ann is not None else "α n/d"
+            atype  = e.get("alert_type", "?")
+            tag    = " 📦" if e.get("in_portfolio") else ""
+            lines.append(f"  {i}. *{ticker}*{tag} [{atype}] {score_s} {ann_s}")
+            if e.get("summary"):
+                lines.append(f"     _{e['summary']}_")
+        lines.append("")
+
+    if rest:
+        compact = ", ".join(
+            f"{e['ticker']}({(e.get('score') or 0):.0f})"
+            for e in rest
+        )
+        lines.append(f"🔻 *Outros (não-top)*: {compact}")
+        lines.append("")
+
+    if liquidity is not None:
+        lines.append(f"💰 Liquidez actual: *€{liquidity:.2f}*")
+        lines.append(f"   Próximo passo: `/cash {liquidity:.0f}` para o ranking ROI completo.")
+        lines.append("")
+
+    lines.append(
+        "_Real-time só para sells (trailing stops) e high-conviction "
+        f"(score≥{_DIGEST_SCORE_GATE:.0f}+ML≥{_DIGEST_WIN_PROB_GATE*100:.0f}%). "
+        "Para detalhe: `/analisar TICKER`._"
+    )
+
+    try:
+        send_telegram("\n".join(lines))
+    except Exception as e:
+        logging.error(f"[digest] send failed: {e}")
+        return 0
+
+    n = len(sorted_alerts)
+    _clear_digest_buffer()
+    logging.info(f"[digest] emitted: {len(top_5)} top + {len(rest)} rest ({n} unique tickers)")
+    return n
+
+
 def send_heartbeat() -> None:
     logging.info("A gerar heartbeat de carteira...")
     now_lisbon = datetime.now(LISBON_TZ)
@@ -870,7 +1083,17 @@ def run_structural_dip_intraday_scan() -> int:
                 f"{badge} DIP score: *{score:.0f}/100* | _{category}_\n\n"
                 f"_Dedup: {sym}_dip52w · próxima janela 24h._"
             )
-            send_telegram(msg)
+            # Structural DIPs go to the digest buffer — they're never
+            # individually time-critical. The digest at 21:30 ranks them.
+            _emit_alert(
+                msg,
+                alert_type="STRUCTURAL_DIP",
+                ticker=sym,
+                score=score,
+                pred_alpha_90d=None,  # structural scan doesn't run ML yet
+                in_portfolio=sym in DIRECT_TICKERS,
+                summary=f"Pico 52w {drawdown:+.0f}%, hoje {_change_p:+.1f}%, RSI {rsi_str or '?'}",
+            )
             _alerted_today.add(f"{sym}_dip52w")
             n_sent += 1
         except Exception as e:
@@ -1759,7 +1982,19 @@ def run_scan() -> None:
                             f"DIP score: *{score:.0f}/100* (gate normal: {effective_min_score:.0f})\n\n"
                             f"_Aviso emitido independentemente do DIP gate — o drop vale revisão._"
                         )
-                        send_telegram(_core_msg)
+                        # CORE intraday warnings route through severity filter.
+                        # High-conviction (score≥75 + ML≥65%) push real-time;
+                        # rest accumulate in digest.
+                        _emit_alert(
+                            _core_msg,
+                            alert_type="CORE_WARNING",
+                            ticker=sym,
+                            score=float(score),
+                            win_prob=None,  # CORE warning fires pre-ML in scan
+                            pred_alpha_90d=None,
+                            in_portfolio=sym in DIRECT_TICKERS,
+                            summary=f"Drop intraday {_intraday_drop:+.1f}% em ticker CORE",
+                        )
                         _alerted_today.add(_core_dedup_key)
                         save_alerts(_alerted_today)
                         logging.info(
@@ -2000,7 +2235,31 @@ def run_scan() -> None:
                     "earnings_days": earnings_days, "catalyst": None, "category": category,
                 })
 
-                send_telegram(alert_text)
+                # Route DIP alerts through severity filter. Real-time when
+                # the ML model agrees with the rule-based score (>=75 AND
+                # win_prob>=65%); otherwise buffered to the 21:30 digest.
+                _ml_wp = (
+                    float(ml_result.win_prob)
+                    if (ml_result is not None and ml_result.model_ready
+                        and ml_result.win_prob is not None)
+                    else None
+                )
+                _ml_pa = (
+                    float(ml_result.pred_up)
+                    if (ml_result is not None and ml_result.model_ready
+                        and ml_result.pred_up is not None)
+                    else None
+                )
+                _emit_alert(
+                    alert_text,
+                    alert_type="DIP",
+                    ticker=sym,
+                    score=float(score),
+                    win_prob=_ml_wp,
+                    pred_alpha_90d=_ml_pa,
+                    in_portfolio=sym in DIRECT_TICKERS,
+                    summary=f"DIP score {score:.0f}, ML win_prob {(_ml_wp or 0)*100:.0f}%",
+                )
                 _alerted_today.add(sym)
                 save_alerts(_alerted_today)
 
@@ -2838,6 +3097,19 @@ def main() -> None:
         run_momentum_scan,
         CronTrigger(day_of_week="mon-fri", hour=21, minute=30, timezone=LISBON_TZ),
         id="momentum_scan_us", name="Momentum Scan US 21h30",
+    )
+
+    # ── Daily Digest: 21h30 Lisboa, seg-sex (Fase E) ─────────────────────────
+    # Consolidates all DIP / STRUCTURAL / CORE_WARNING alerts buffered
+    # during the day into one ranked top-5 message. Real-time alerts
+    # (trailing stops + high-conviction DIP/CORE) are unaffected — they
+    # already went out as they fired. /cash also stays unchanged.
+    # Runs at 21:30 right after the EOD scan window so the digest covers
+    # the whole trading day.
+    scheduler.add_job(
+        run_daily_digest,
+        CronTrigger(day_of_week="mon-fri", hour=21, minute=30, timezone=LISBON_TZ),
+        id="daily_digest", name="Daily Digest 21h30",
     )
 
     # ── CoreRadar scan: 22h00 Lisboa (dados EOD US limpos) ────────────────────
