@@ -2321,6 +2321,26 @@ def run_core_scan() -> None:
             logging.info("[core_radar] No CORE opportunities today.")
             return
 
+        # Cross-radar dedup: when the DIP scanner already alerted on a ticker
+        # earlier today (and Option C appended the inline CORE block), the
+        # standalone CORE scan must NOT re-alert the same ticker — that would
+        # produce two Telegram messages for the same event, defeating the
+        # whole point of the inline enrichment. _alerted_today is a set of
+        # plain tickers (no scan_type qualifier) so membership testing here
+        # catches DIP, inline-CORE-enriched-DIP, momentum, etc.
+        global _alerted_today
+        candidates_pre = candidates
+        candidates = [c for c in candidates if c["ticker"] not in _alerted_today]
+        skipped = len(candidates_pre) - len(candidates)
+        if skipped:
+            logging.info(
+                f"[core_radar] Skipping {skipped} CORE candidate(s) already alerted "
+                f"today (deduped against _alerted_today)."
+            )
+        if not candidates:
+            logging.info("[core_radar] All CORE candidates already alerted earlier today — nothing to send.")
+            return
+
         # Hard cap: send at most 5 alerts (sorted by score descending)
         _MAX_ALERTS    = 5
         _MAX_TRADES    = 3   # max auto-trades per day regardless of score
@@ -2356,8 +2376,13 @@ def run_core_scan() -> None:
                 if c["ticker"] in existing_core:
                     msg += "\n\n_⚠️ Já tens posição CORE aberta neste ticker._"
                 send_telegram(msg)
+                # Mark in _alerted_today so manual /admin_run_core retries
+                # don't re-fire the same alert within the day.
+                _alerted_today.add(c["ticker"])
             except Exception as e:
                 logging.warning(f"[core_radar] Alert {c.get('ticker')}: {e}")
+
+        save_alerts(_alerted_today)
 
         # Auto-registration: score >= 80 AND daily trade cap not reached
         for c in top:
