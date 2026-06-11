@@ -859,8 +859,12 @@ def suggest_position_size(
     amount  = max(20.0, min(amount, FLIP_FUND_EUR * 0.40))
     amount  = round(amount, 0)
     pct     = amount / FLIP_FUND_EUR * 100
+    # User-facing label is "orçamento" — Flip Fund concept was deprecated
+    # in Phase 6 (replaced by /cash ROI-ranked queue). The env var
+    # FLIP_FUND_EUR is kept for backward compat as the monthly budget cap;
+    # only the display string was updated.
     explanation = (
-        f"€{amount:.0f} ({pct:.0f}% do Flip Fund)"
+        f"€{amount:.0f} ({pct:.0f}% do orçamento)"
         f" | β={beta_val:.1f}{earn_note}{macro_note}"
     )
     return amount, explanation

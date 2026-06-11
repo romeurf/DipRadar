@@ -854,14 +854,28 @@ def get_catalyst(symbol: str, company_name: str = "") -> dict:
         texts.append((r.get("title") or "").lower())
     full_text = " ".join(texts)
 
+    import re as _re
+    # Strip URLs from content before snippet extraction. Tavily sometimes
+    # returns content with inline URLs ("...from https://twitter.com/.../
+    # oracle-q4-earnings-call..."); when the keyword ('earnings') hits the
+    # URL slug instead of prose, the 140-char window ends up as URL-encoded
+    # garbage in the alert (`om%2FTheStreet%2Fposts%2F...`). Removing URLs
+    # first keeps only prose text where the keyword match is meaningful.
+    _url_re = _re.compile(r"https?://\S+|www\.\S+", flags=_re.IGNORECASE)
     for keyword, label in _CATALYST_KEYWORDS.items():
         if keyword in full_text:
             snippet = ""
             for r in data.get("results", []):
-                content = r.get("content") or ""
+                content = _url_re.sub("", r.get("content") or "")
                 idx = content.lower().find(keyword)
                 if idx != -1:
                     snippet = content[max(0, idx-40):min(len(content), idx+100)].strip()
+                    # Defensive: if snippet still looks URL-encoded (>10%
+                    # of chars are % or escape sequences), skip this result
+                    # and let the next iteration find a cleaner one.
+                    if snippet.count("%") > len(snippet) * 0.1:
+                        snippet = ""
+                        continue
                     break
             return {"found": True, "label": label, "snippet": snippet[:120]}
 

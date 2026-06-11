@@ -136,6 +136,21 @@ _BUNDLE_CANDIDATES = [
 ]
 _PKL_V3 = next((p for p in _BUNDLE_CANDIDATES if p.exists()), _BUNDLE_CANDIDATES[0])
 
+# Diagnostic log at module import time so production traces show which
+# bundle path was actually selected. Helps debug NO_MODEL cases where
+# /admin_check_config disagrees with /analisar.
+try:
+    _resolved = "FOUND" if _PKL_V3.exists() else "MISSING"
+    _checked_paths = " | ".join(
+        f"{p}={'✓' if p.exists() else '✗'}" for p in _BUNDLE_CANDIDATES
+    )
+    logging.info(
+        f"[ml_predictor] Bundle path resolved: {_PKL_V3} [{_resolved}] | "
+        f"all candidates: {_checked_paths}"
+    )
+except Exception:  # never block import on logging
+    pass
+
 # Features esperadas pelo bundle — importadas de ml_features para evitar duplicação.
 # Se o import falhar (ex: em testes isolados), usa lista vazia e o bundle
 # devolve erro explícito (bundle['feature_cols'] é obrigatório após retrain).

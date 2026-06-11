@@ -33,12 +33,6 @@ bot_commands.py — Todos os comandos Telegram do DipRadar.
   /liquidez [+|-VALOR]     → Ver / ajustar saldo disponível
   /allocate <TICKER>       → Sugestão de alocação com sizing e sector check
 
-━━━ FLIP FUND ━━━
-  /flip                    → Log e P&L do Flip Fund
-  /flip add T E S [NOTA]   → Registar entrada (ticker, entry, shares)
-  /flip close ID EXIT      → Fechar trade com preço de saída
-  /flip del ID             → Apagar trade
-
 ━━━ ML E RETREINO ━━━
   /mldata                  → Estatísticas da base de dados ML
   /mldata update           → Forçar update de outcomes
@@ -1332,7 +1326,7 @@ def _handle_admin_check_config() -> None:
     checks = [
         # (env_var, label, obrigatorio, descricao)
         ("MONTHLY_BUDGET_EUR",      "Orcamento mensal",      True,  "Ex: 1050"),
-        ("FLIP_FUND_EUR",           "Capital Flip Fund",     True,  "Ex: 500 — o Tesoureiro usa isto para sizing"),
+        ("FLIP_FUND_EUR",           "Orçamento mensal",      True,  "Ex: 500 — usado para sizing por trade (env var keeps legacy name)"),
         ("TIINGO_API_KEY",          "Tiingo EOD",            False, "Dados EOD (fallback yfinance se ausente)"),
         ("FRED_API_KEY",            "FRED (Fed Reserve)",    False, "Gratis — recession probability mais precisa"),
         ("SECTOR_CONCENTRATION_CAP","Sector cap",            False, "Default 35% — limite de exposicao por sector"),

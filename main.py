@@ -419,7 +419,7 @@ def send_heartbeat() -> None:
     ]
 
     if FLIP_FUND_EUR:
-        lines.append(f"  🎯 *Flip Fund:* €{FLIP_FUND_EUR:,.2f} disponíveis")
+        lines.append(f"  🎯 *Orçamento:* €{FLIP_FUND_EUR:,.2f} disponíveis")
 
     if total > 0:
         concentration_warnings = []
