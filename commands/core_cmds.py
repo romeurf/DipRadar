@@ -113,7 +113,7 @@ def handle_core_close(parts: list[str]) -> None:
                 from utils.chart_generator import generate_trade_card
                 card = generate_trade_card(closed_trade)
                 if card and card.exists():
-                    _send_photo(card.read_bytes(), caption=f"CORE {ticker} — trade card")
+                    _bc._send_photo(card.read_bytes(), caption=f"CORE {ticker} — trade card")
             except Exception as _ce:
                 logging.debug(f"[trade_card] core close card: {_ce}")
         else:

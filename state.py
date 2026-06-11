@@ -109,6 +109,94 @@ def _write(filename: str, data: dict) -> None:
     _save_json(filename, data)
 
 
+def _today_iso() -> str:
+    return date.today().isoformat()
+
+
+# ── PPR (Plano Poupança Reforma) — Telegram-managed ────────────────────────
+# Single source of truth: /data/ppr.json. Migrated from env vars after a
+# €19B sizing bug caused by misconfigured PPR_SHARES / PPR_AVG_COST.
+# Mutated via /ppr set|nav|isin|clear.
+
+_PPR_FILE = "ppr.json"
+_DEFAULT_PPR_ISIN = "PTARMJHM0003"  # Invest Tendências Globais PPR (Banco Invest)
+
+
+def get_ppr() -> dict:
+    """Return {shares, avg_cost, current_nav, nav_updated, isin, nav_source}.
+
+    current_nav: optional manually-updated NAV per unit (€). When set, the
+    snapshot uses it to compute live value + P&L. When None, value falls
+    back to shares × avg_cost (frozen at cost basis, no P&L).
+    """
+    data = _load_json(_PPR_FILE, default={}) or {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        "shares":      float(data.get("shares", 0) or 0),
+        "avg_cost":    float(data.get("avg_cost", 0) or 0),
+        "current_nav": float(data.get("current_nav", 0) or 0) or None,
+        "nav_updated": data.get("nav_updated") or None,
+        "updated":     data.get("updated") or None,
+        "isin":        (data.get("isin") or _DEFAULT_PPR_ISIN).upper().strip(),
+        "nav_source":  data.get("nav_source") or None,
+    }
+
+
+def set_ppr(shares: float, avg_cost: float) -> dict:
+    """Overwrite PPR core holdings. Preserves any current_nav already set."""
+    existing = get_ppr()
+    payload = {
+        "shares":      float(shares),
+        "avg_cost":    float(avg_cost),
+        "current_nav": existing.get("current_nav"),
+        "nav_updated": existing.get("nav_updated"),
+        "updated":     _today_iso(),
+        "isin":        existing.get("isin") or _DEFAULT_PPR_ISIN,
+        "nav_source":  existing.get("nav_source"),
+    }
+    _save_json(_PPR_FILE, payload)
+    return payload
+
+
+def set_ppr_nav(current_nav: float, source: str = "manual") -> dict:
+    """Update just the NAV (price per unit). source: "manual" or scraper id."""
+    existing = get_ppr()
+    payload = {
+        "shares":      existing.get("shares", 0.0),
+        "avg_cost":    existing.get("avg_cost", 0.0),
+        "current_nav": float(current_nav),
+        "nav_updated": _today_iso(),
+        "updated":     existing.get("updated") or _today_iso(),
+        "isin":        existing.get("isin") or _DEFAULT_PPR_ISIN,
+        "nav_source":  source,
+    }
+    _save_json(_PPR_FILE, payload)
+    return payload
+
+
+def set_ppr_isin(isin: str) -> dict:
+    """Change the PPR ISIN (which fund the scraper queries)."""
+    existing = get_ppr()
+    payload = dict(existing)
+    payload["isin"]    = isin.upper().strip()
+    payload["updated"] = _today_iso()
+    _save_json(_PPR_FILE, payload)
+    return payload
+
+
+def clear_ppr() -> None:
+    _save_json(_PPR_FILE, {
+        "shares":      0.0,
+        "avg_cost":    0.0,
+        "current_nav": None,
+        "nav_updated": None,
+        "updated":     _today_iso(),
+        "isin":        _DEFAULT_PPR_ISIN,
+        "nav_source":  None,
+    })
+
+
 # ── Alertas diários ────────────────────────────────────────────────────────
 
 def load_alerts() -> set:

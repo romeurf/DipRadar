@@ -52,4 +52,13 @@ def _register_in_main() -> None:
         main_mod.CoreModelBundle = CoreModelBundle  # type: ignore[attr-defined]
 
 
+def _register_legacy_path() -> None:
+    """Pre-restructure pickles reference ``core_bundle.CoreModelBundle`` at the
+    repo root. After the move into ``core/``, joblib.load fails with
+    ``No module named 'core_bundle'``. Aliasing the legacy import path makes
+    old pickles loadable without retraining."""
+    sys.modules.setdefault("core_bundle", sys.modules[__name__])
+
+
 _register_in_main()
+_register_legacy_path()
