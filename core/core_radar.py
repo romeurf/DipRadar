@@ -933,3 +933,137 @@ def format_core_alert(opp: dict) -> str:
         f"  Alocação sugerida: *€{eur:.0f}*\n"
         f"  _Posição CORE — hold de longo prazo, sem auto-close_"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Option C — inline CORE block to enrich DIP alerts
+#
+# When the DIP scan fires for a ticker that lives in the CORE universe, we want
+# a single consolidated Telegram message — not a DIP alert at 16h plus a CORE
+# alert at 22h for the same event. These three helpers exist for that path:
+#
+#   get_core_universe_set()         — O(1) "is this a CORE ticker?" lookup
+#   score_dip_for_inline_alert(...) — score the CORE thesis ad-hoc for one ticker
+#   build_core_dip_block(...)       — compact CORE block to append to the DIP alert
+#
+# The full scan path (run_core_scan @ 22h) is unchanged. This is purely additive.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def get_core_universe_set() -> set[str]:
+    """Return CORE universe tickers as a set for O(1) membership tests.
+
+    Called once per DIP scan iteration. _load_universe() reads /data/
+    core_universe.json which is tiny — no caching needed."""
+    return {e["ticker"] for e in _load_universe()}
+
+
+def score_dip_for_inline_alert(ticker: str) -> Optional[tuple[float, dict]]:
+    """Score the CORE thesis for a single ticker that just fired a DIP alert.
+
+    Cost: two yfinance calls (one history fetch, one quality metrics fetch
+    inside _score_core_dip). Only invoked when the DIP-alert ticker is also
+    in the CORE universe — typically 0-2 events per day.
+
+    Returns (score, signals) or None if the score gate (45) fails. The gate
+    is lower than the standalone 22h scan (60) because the DIP scanner has
+    already validated the intraday move ≥ DROP_THRESHOLD — a CORE score of
+    45+ on a stock that just dropped 8%+ is informative even if it wouldn't
+    fire as a standalone CORE alert.
+    """
+    entries = {e["ticker"]: e for e in _load_universe()}
+    entry   = entries.get(ticker.upper())
+    if entry is None:
+        return None
+
+    hist = _fetch_hist(ticker)
+    if hist is None or hist.empty:
+        return None
+
+    close  = hist["Close"]
+    volume = hist["Volume"] if "Volume" in hist.columns else None
+    if len(close) < 30:
+        return None
+
+    current_price    = float(close.iloc[-1])
+    ann_yield_static = float(entry.get("annual_yield_pct") or 0.0)
+
+    score, signals = _score_core_dip(
+        close, current_price, ann_yield_static,
+        ticker=ticker, volume=volume,
+    )
+    if score < 45.0:
+        return None
+
+    live_yield    = signals.get("dividend_yield_live")
+    ann_yield     = float(live_yield) if live_yield is not None and live_yield > 0 else ann_yield_static
+    suggested_eur = _suggest_core_allocation()
+
+    signals["annual_yield_pct"] = ann_yield
+    signals["suggested_eur"]    = round(suggested_eur, 0)
+    signals["note"]             = entry.get("note", "")
+    signals["current_price"]    = round(current_price, 4)
+    signals["score"]            = score
+
+    _append_core_alert_db({
+        "ticker":           ticker,
+        "score":            score,
+        "current_price":    current_price,
+        "scan_date":        date.today().isoformat(),
+        "annual_yield_pct": ann_yield,
+        **signals,
+    })
+
+    log.info(
+        f"[core_radar] CORE inline match {ticker} score={score:.0f} "
+        f"yield={ann_yield:.1f}% eur={suggested_eur:.0f} "
+        f"(triggered by DIP scan)"
+    )
+    return score, signals
+
+
+def build_core_dip_block(score: float, signals: dict) -> str:
+    """Compact CORE block to append to an existing DIP alert text.
+
+    The DIP alert already has header, price, score breakdown, narrative.
+    This adds only the CORE-specific layer: MA200w status, live yield,
+    suggested allocation, and the compounder thesis note.
+    """
+    ma200w          = signals.get("ma200w")
+    below_ma200w    = signals.get("below_ma200w", False)
+    near_ma200w     = signals.get("near_ma200w", False)
+    price_vs_ma200w = signals.get("price_vs_ma200w")
+    ann_yield       = signals.get("annual_yield_pct", 0.0)
+    eur             = signals.get("suggested_eur", 500)
+    note            = signals.get("note", "")
+    score_src       = signals.get("score_source", "heuristic")
+    ma_trend        = signals.get("ma200d_trend_60d", 0.0)
+
+    if below_ma200w and price_vs_ma200w is not None and ma200w:
+        ma200w_line = f"MA200 semanal: ${ma200w:.2f} (*{price_vs_ma200w:+.1%}*, abaixo — breakdown técnico)"
+    elif near_ma200w and price_vs_ma200w is not None and ma200w:
+        ma200w_line = f"MA200 semanal: ${ma200w:.2f} (*{price_vs_ma200w:+.1%}*, zona de suporte)"
+    elif ma200w:
+        ma200w_line = f"MA200 semanal: ${ma200w:.2f} (acima da MA200w)"
+    else:
+        ma200w_line = "MA200 semanal: n/d"
+
+    yield_line = f"Yield live: *{ann_yield:.2f}%*" if ann_yield >= 0.5 else ""
+
+    ma_icon  = "✅" if ma_trend > 0.01 else ("⚠️" if ma_trend < 0 else "→")
+    ma_d_line = f"MA200d trend: {ma_trend:+.1%} (60d) {ma_icon}"
+
+    badge = "🤖 ML" if score_src == "ml" else "📐 heuristic"
+
+    note_line = f'_"{note}"_' if note else ""
+
+    lines = [
+        f"\n💎 *CORE radar — match* `score {score:.0f}` {badge}",
+        ma200w_line,
+        ma_d_line,
+        yield_line,
+        f"Suggested: *€{eur:.0f}* (1.5× base, CORE conviction)",
+        note_line,
+        "_Posição CORE — hold longo prazo, sem auto-close_",
+    ]
+    return "\n".join(l for l in lines if l)

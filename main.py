@@ -1720,6 +1720,25 @@ def run_scan() -> None:
                 if sentiment_line:
                     alert_text = alert_text + f"\n{sentiment_line}"
 
+                # ── Option C: enrich DIP alert with CORE block when ticker
+                # is in the CORE universe AND the intraday drop matches the
+                # DIP scanner threshold. Single consolidated Telegram message
+                # in place of separate DIP@16h + CORE@22h notifications for
+                # the same event. ~0-2 hits per day in practice.
+                try:
+                    from core.core_radar import (
+                        get_core_universe_set,
+                        score_dip_for_inline_alert,
+                        build_core_dip_block,
+                    )
+                    if sym in get_core_universe_set() and abs(stock.get("change_pct", 0.0)) >= DROP_THRESHOLD:
+                        _core = score_dip_for_inline_alert(sym)
+                        if _core is not None:
+                            _core_score, _core_signals = _core
+                            alert_text += build_core_dip_block(_core_score, _core_signals)
+                except Exception as _ce:
+                    logging.debug(f"[core_inline] {sym}: {_ce}")
+
                 ranked_entries.append({
                     "symbol": sym, "dip_score": score, "tier": tier,
                     "fundamentals": fund, "earnings_date": get_earnings_date(sym),
