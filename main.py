@@ -2503,6 +2503,18 @@ def main() -> None:
 
     scheduler = BlockingScheduler(timezone=LISBON_TZ)
 
+    # Intraday MOMENTUM stop sweep — defined here so all three scan lambdas
+    # below resolve it cleanly (Python closures defer name lookup, but having
+    # the def first keeps the call sites readable).
+    def _run_active_stops_check():
+        try:
+            from core import conviction_radar
+            n = conviction_radar.check_active_stops(send_telegram, _alerted_today)
+            if n > 0:
+                save_alerts(_alerted_today)
+        except Exception as e:
+            logging.error(f"[conviction] active stops check failed: {e}", exc_info=True)
+
     # ── Heartbeat: 09:00 Lisboa, seg-sex ──────────────────────────────────────
     scheduler.add_job(
         send_heartbeat,
@@ -2518,6 +2530,7 @@ def main() -> None:
             run_scan(),
             check_thesis_degradation(),
             check_recovery_alerts(),
+            _run_active_stops_check(),
         ),
         CronTrigger(day_of_week="mon-fri", hour=17, minute=45, timezone=LISBON_TZ),
         id="scan_intraday", name="Scan US Intraday 17h45",
@@ -2539,6 +2552,7 @@ def main() -> None:
             run_scan(),
             check_thesis_degradation(),
             check_recovery_alerts(),
+            _run_active_stops_check(),
         ),
         CronTrigger(day_of_week="mon-fri", hour="15,16,18,19,20", minute=0, timezone=LISBON_TZ),
         id="scan_hourly_intraday", name="Scan Hourly Intraday (15h,16h,18h,19h,20h)",
@@ -2550,6 +2564,7 @@ def main() -> None:
             run_scan(),
             check_thesis_degradation(),
             check_recovery_alerts(),
+            _run_active_stops_check(),
             send_weekly_dip_scan(),
         ),
         CronTrigger(day_of_week="mon-fri", hour=21, minute=15, timezone=LISBON_TZ),
@@ -2619,6 +2634,7 @@ def main() -> None:
             conviction_radar.run_daily_check(send_telegram)
         except Exception as e:
             logging.error(f"[conviction] daily check failed: {e}", exc_info=True)
+
     scheduler.add_job(
         _run_conviction_monitor,
         CronTrigger(day_of_week="mon-fri", hour=22, minute=5, timezone=LISBON_TZ),

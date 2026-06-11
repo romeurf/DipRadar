@@ -1188,6 +1188,74 @@ def auto_sync_from_portfolio(send_telegram: Optional[Callable[[str], None]] = No
 # Daily monitor — called from main.py cron
 # ─────────────────────────────────────────────────────────────────────────────
 
+def check_active_stops(
+    send_telegram: Callable[[str], None],
+    alerted_today: set,
+) -> int:
+    """Intraday MOMENTUM-stop sweep — called by the hourly scan lambda.
+
+    Only fires HIGH-severity trailing-stop alerts for MOMENTUM positions
+    (not DIP / CORE / med-severity). Dedup is delegated to the caller's
+    `alerted_today` set with key `f"{ticker}_stop"` so a stop break alerts
+    once per day even if the hourly sweep runs five times.
+
+    Distinct from run_daily_check():
+      - run_daily_check (22:05) covers ALL conviction positions and ALL
+        severities; long-form deep-dive output; runs once per day.
+      - check_active_stops (intraday hourly) only the time-critical case:
+        MOMENTUM stop just broke and the user needs to know within ~1h.
+
+    Returns: number of fresh alerts sent (excludes deduped).
+    """
+    positions = load_convictions()
+    if not positions:
+        return 0
+
+    n_sent = 0
+    for pos in positions:
+        if pos.position_type != "MOMENTUM":
+            continue
+        dedup_key = f"{pos.ticker.upper()}_stop"
+        if dedup_key in alerted_today:
+            continue
+        try:
+            ev = evaluate_conviction(pos)
+            high_triggers = [
+                t for t in ev.get("triggers", [])
+                if t.get("severity") == "high"
+                and t.get("kind") == "TRAIL_STOP_CONFIRMED"
+            ]
+            if not high_triggers:
+                continue
+            trig = high_triggers[0]
+            current = ev.get("current_price", 0.0) or 0.0
+            t_high  = ev.get("trailing_high", 0.0) or 0.0
+            pnl_pct = ev.get("pnl_pct", 0.0)
+            dd_peak = (
+                (t_high - current) / t_high * 100
+                if t_high > 0 else 0.0
+            )
+            msg = "\n".join([
+                f"🛑 *TRAILING STOP — {pos.ticker}*  [Dia {pos.days_held}]",
+                f"_Momentum revertido: caiu {dd_peak:.1f}% do pico ${t_high:.2f}._",
+                "",
+                f"Máximo: ${t_high:.2f}  |  Actual: ${current:.2f}  |  P&L total: {pnl_pct:+.1f}%",
+                "",
+                f"_{trig.get('message', '')}_",
+                "",
+                "💡 *Acção:* Avalia fechar a posição via T212. Trailing stop confirmado por RSI/MA20.",
+            ])
+            send_telegram(msg)
+            alerted_today.add(dedup_key)
+            n_sent += 1
+        except Exception as e:
+            logger.error(f"[conviction] check_active_stops {pos.ticker}: {e}")
+            continue
+    if n_sent > 0:
+        logger.info(f"[conviction] check_active_stops: {n_sent} intraday stop alerts sent")
+    return n_sent
+
+
 def run_daily_check(send_telegram: Callable[[str], None]) -> None:
     """Iterate all conviction positions, evaluate, send alerts for high-severity triggers.
 
