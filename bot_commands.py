@@ -6263,6 +6263,7 @@ def _handle_command(text: str) -> None:
                 try:
                     import state as _st
                     from ml.prediction_log import get_recent_predictions_by_ticker
+                    from scanners.alert_db import get_recent_alerts_pred_alpha
 
                     raw_alerts = list(_st.load_alerts())
                     today_alerts = [
@@ -6270,40 +6271,50 @@ def _handle_command(text: str) -> None:
                         if not str(t).upper().startswith("WL_")
                         and "_" not in str(t)
                     ]
-                    # Look up each ticker's most recent prediction (last 7d)
-                    # so DIP alphas reflect the actual model output instead
-                    # of a hardcoded default. Older alerts predating the
-                    # score_raw schema add won't have score_raw but will
-                    # have win_prob, which we convert via a linear mapping
-                    # calibrated against the trainer's threshold table.
+                    # Per-alert α resolution: prefer alert_db.csv (durable,
+                    # migrate_schema archives instead of deleting) and fall
+                    # back to ml_predictions.csv only if missing. Avoids the
+                    # hardcoded-fallback case where every DIP buy gets the
+                    # same α=20.3%/y just because prediction_log was reset
+                    # by a recent FEATURE_COLUMNS schema drift.
+                    recent_alerts_pred = get_recent_alerts_pred_alpha(today_alerts, lookback_days=7)
                     recent_preds = get_recent_predictions_by_ticker(today_alerts, lookback_days=7)
 
                     for ticker in today_alerts:
+                        # Source priority:
+                        #   1. alert_db (pred_alpha_90d + ml_win_prob captured
+                        #      at signal time, durable across schema resets)
+                        #   2. prediction_log (score_raw or win_prob from
+                        #      ml_predictor's per-call log)
+                        #   3. hardcoded fallback 0.05 (truly nothing known)
+                        adb = recent_alerts_pred.get(ticker.upper(), {})
                         pred = recent_preds.get(ticker.upper(), {})
+
+                        adb_alpha = adb.get("pred_alpha_90d")
+                        adb_wp    = adb.get("ml_win_prob")
                         score_raw = pred.get("score_raw")
                         win_prob = pred.get("win_prob")
 
-                        # Resolve alpha_90d:
-                        #   1. score_raw if present (direct model output)
-                        #   2. else estimate from win_prob via linear mapping
-                        #      anchored on ml_predictor's threshold table:
-                        #        win_prob 0.50 → alpha ~0.00 (random)
-                        #        win_prob 0.60 → alpha ~0.05
-                        #        win_prob 0.70 → alpha ~0.10
-                        #        win_prob 0.80 → alpha ~0.15
-                        #      Linear: alpha ≈ (win_prob - 0.50) × 0.5
-                        #   3. else fallback to 0.05 (modest entry threshold)
-                        if score_raw is not None and score_raw > 0:
+                        if adb_alpha is not None and adb_alpha > 0:
+                            pred_alpha_90d = float(adb_alpha)
+                            source = "alert_db.pred_alpha"
+                            confidence = min(1.0, max(0.3, float(adb_wp or 0.6)))
+                        elif score_raw is not None and score_raw > 0:
                             pred_alpha_90d = float(score_raw)
                             source = "score_raw"
                             confidence = min(1.0, max(0.3, (win_prob or 0.6)))
+                        elif adb_wp is not None and adb_wp > 0:
+                            # alert_db has win_prob but no alpha (e.g. low-conf
+                            # alert pre-fix). Estimate alpha linearly.
+                            pred_alpha_90d = max(0.0, (float(adb_wp) - 0.50) * 0.5)
+                            source = f"alert_db.win_prob {adb_wp:.2f}"
+                            confidence = min(1.0, max(0.3, float(adb_wp)))
                         elif win_prob is not None:
                             pred_alpha_90d = max(0.0, (float(win_prob) - 0.50) * 0.5)
                             source = f"win_prob {win_prob:.2f}"
                             confidence = min(1.0, max(0.3, float(win_prob)))
                         else:
-                            # No prediction log entry — alert may predate
-                            # the log schema. Conservative fallback.
+                            # No data — alert pre-dates this fix.
                             pred_alpha_90d = 0.05
                             source = "no log entry — fallback"
                             confidence = 0.4

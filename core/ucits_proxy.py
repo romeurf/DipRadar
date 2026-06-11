@@ -70,12 +70,61 @@ def fetch_proxy_return_pct(
         return None
 
 
+# yfinance accepts UCITS via European exchange suffixes. Try Xetra first
+# (most liquid for iShares EU UCITS), then Amsterdam, then London. Whatever
+# resolves with a real last_price is the user's actual holding in EUR.
+_UCITS_EXCHANGE_SUFFIXES = (".DE", ".AS", ".L", ".MI")
+
+# Resolution cache: once we find the right suffix for a UCITS ticker, reuse
+# it for the rest of the process lifetime. Cleared on Railway redeploy.
+_UCITS_SUFFIX_CACHE: dict[str, str] = {}
+
+
+def _try_direct_ucits_price(ucits_ticker: str) -> Optional[float]:
+    """Try yfinance fast_info with European exchange suffixes.
+
+    Returns the live EUR price if any suffix resolves, None otherwise.
+    Caches the successful suffix for subsequent calls.
+    """
+    try:
+        import yfinance as yf
+    except Exception:
+        return None
+
+    # Cached suffix from a previous resolution this process?
+    cached = _UCITS_SUFFIX_CACHE.get(ucits_ticker.upper())
+    suffixes = (cached,) if cached else _UCITS_EXCHANGE_SUFFIXES
+
+    for suffix in suffixes:
+        sym = f"{ucits_ticker.upper()}{suffix}"
+        try:
+            info = yf.Ticker(sym).fast_info
+            price = getattr(info, "last_price", None)
+            if price and float(price) > 0:
+                _UCITS_SUFFIX_CACHE[ucits_ticker.upper()] = suffix
+                log.debug(f"[ucits_proxy] {ucits_ticker} → {sym} live EUR €{float(price):.2f}")
+                return float(price)
+        except Exception as e:
+            log.debug(f"[ucits_proxy] {sym} fast_info failed: {e}")
+            continue
+
+    return None
+
+
 def estimate_ucits_current_price(
     ucits_ticker: str,
     avg_price_eur: float,
     entry_date_iso: Optional[str] = None,
 ) -> Optional[float]:
-    """Estimate the UCITS's current EUR price using its US proxy's % change.
+    """Estimate the UCITS's current EUR price.
+
+    Resolution order:
+      1. Direct yfinance lookup with .DE / .AS / .L / .MI suffix (real EUR
+         price quoted on European exchange).
+      2. US proxy %-change applied to user's avg_price_eur (drift estimate
+         when direct lookup fails — e.g. for thinly-traded UCITS or yfinance
+         throttling).
+      3. None when no proxy mapping exists.
 
     Args:
       ucits_ticker: e.g., "SEC0"
@@ -83,10 +132,17 @@ def estimate_ucits_current_price(
       entry_date_iso: ISO date of entry, e.g. "2026-05-15". If None or
         unparseable, uses a 30-day lookback as default.
 
-    Returns: estimated current EUR price, or None if proxy data unavailable.
+    Returns: estimated current EUR price, or None if all sources fail.
     """
     if avg_price_eur <= 0:
         return None
+
+    # ── 1. Try direct lookup first (real EUR price) ──────────────────────
+    direct = _try_direct_ucits_price(ucits_ticker)
+    if direct is not None:
+        return direct
+
+    # ── 2. Fall back to US proxy estimation ──────────────────────────────
     proxy = get_us_proxy(ucits_ticker)
     if not proxy:
         return None

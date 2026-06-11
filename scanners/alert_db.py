@@ -75,6 +75,12 @@ _FIELDS = [
     # Portfolio context at signal time — for ML to learn capital-reservation patterns
     "capital_utilization_pct",  # % of paper portfolio already deployed when alert fired
     "n_open_positions",         # number of open paper positions at signal time
+    # ML predictions captured at alert time — survives ml_predictions.csv resets
+    # (prediction_log auto-deletes on FEATURE_COLUMNS schema drift; /cash reads
+    # these instead so the ROI queue keeps per-alert α instead of falling back
+    # to the hardcoded 0.05).
+    "pred_alpha_90d",      # ml_result.pred_up (raw alpha_90d prediction)
+    "ml_win_prob",         # ml_result.win_prob (calibrated probability)
 ]
 
 # Maturidade mínima (dias) para preencher return_90d e rotular
@@ -220,6 +226,8 @@ def log_alert_snapshot(
     sector_etf_change: float | None = None,
     capital_utilization_pct: float | None = None,
     n_open_positions: int | None = None,
+    pred_alpha_90d: float | None = None,
+    ml_win_prob: float | None = None,
 ) -> None:
     """
     Regista um alerta na base de dados ML.
@@ -286,6 +294,14 @@ def log_alert_snapshot(
                 if capital_utilization_pct is not None else ""
             ),
             "n_open_positions": n_open_positions if n_open_positions is not None else "",
+            "pred_alpha_90d":   (
+                round(float(pred_alpha_90d), 4)
+                if pred_alpha_90d is not None else ""
+            ),
+            "ml_win_prob":      (
+                round(float(ml_win_prob), 4)
+                if ml_win_prob is not None else ""
+            ),
         }
         with _DB_PATH.open("a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(
@@ -296,6 +312,58 @@ def log_alert_snapshot(
         logging.info(f"[alert_db] Snapshot gravado: {symbol} | cat={category} | score={score:.0f}")
     except Exception as e:
         logging.warning(f"[alert_db] Erro ao gravar {symbol}: {e}")
+
+
+def get_recent_alerts_pred_alpha(
+    tickers: list[str],
+    lookback_days: int = 7,
+) -> dict[str, dict]:
+    """Return {ticker: {pred_alpha_90d, ml_win_prob, date_iso}} for tickers
+    alerted in the last N days.
+
+    Used by /cash to size DIP allocations from the per-alert α captured at
+    signal time. alert_db.csv has migrate_schema() (archive-and-recreate, not
+    delete-and-recreate), so historical entries survive ml_predictions.csv
+    schema resets — making this the durable source of truth for /cash.
+    """
+    if not _DB_PATH.exists() or not tickers:
+        return {}
+    try:
+        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        wanted = {t.upper() for t in tickers}
+        latest: dict[str, dict] = {}
+        with _DB_PATH.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                sym = (row.get("symbol") or "").upper()
+                if sym not in wanted:
+                    continue
+                date_iso = row.get("date_iso") or ""
+                if date_iso and date_iso < cutoff:
+                    continue
+                # Keep the latest row per symbol (alert_db is append-only, so
+                # row order matches chronological order)
+                try:
+                    pa = float(row.get("pred_alpha_90d") or "")
+                except (TypeError, ValueError):
+                    pa = None
+                try:
+                    wp = float(row.get("ml_win_prob") or "")
+                except (TypeError, ValueError):
+                    wp = None
+                # Skip rows where neither field was populated (pre-fix entries)
+                if pa is None and wp is None:
+                    continue
+                if sym not in latest or date_iso >= latest[sym].get("date_iso", ""):
+                    latest[sym] = {
+                        "pred_alpha_90d": pa,
+                        "ml_win_prob":    wp,
+                        "date_iso":       date_iso,
+                    }
+        return latest
+    except Exception as e:
+        logging.debug(f"[alert_db] get_recent_alerts_pred_alpha failed: {e}")
+        return {}
 
 
 def fill_db_outcomes() -> dict:

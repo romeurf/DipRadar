@@ -1676,6 +1676,20 @@ def run_scan() -> None:
                     sector_etf_change=sector_chg,
                     capital_utilization_pct=_cap_util_pct,
                     n_open_positions=_n_open,
+                    # ml.prediction_log.csv resets on FEATURE_COLUMNS drift —
+                    # log the per-alert α into alert_db (durable migrate_schema)
+                    # so /cash always has the real model output and never
+                    # falls back to the hardcoded 0.05.
+                    pred_alpha_90d=(
+                        float(ml_result.pred_up)
+                        if ml_result.model_ready and ml_result.pred_up is not None
+                        else None
+                    ),
+                    ml_win_prob=(
+                        float(ml_result.win_prob)
+                        if ml_result.model_ready and ml_result.win_prob is not None
+                        else None
+                    ),
                 )
 
                 # Verificar liquidez disponível — o alerta dispara sempre,
