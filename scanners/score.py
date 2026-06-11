@@ -880,11 +880,20 @@ def format_score_breakdown(
     is_preprofit = result.get("is_preprofit", False)
 
     badge = "🔥" if fs >= 80 else ("⭐" if fs >= 55 else "📊")
+    # Confidence display (natural language instead of "× formula"):
+    #   Confidence = data_coverage × quality_conf
+    #   - data_coverage: % of expected fundamental fields populated
+    #   - quality_conf:  100% baseline reduced by red flags (negative ROE
+    #     + low growth, FCF < 0 + PE > 200, etc.)
+    # Show the two component values labelled in plain language so the user
+    # sees what's driving a low confidence without needing to decode math.
+    _qual_penalty = " — penalizada por red flags" if qual_conf < 0.95 else ""
     lines = [
         f"{badge} *Score: {fs:.1f}/100*",
         f"  🏗️  Quality *{q*100:.0f}%*  ·  💰 Value *{v*100:.0f}%*  ·  ⏱️ Timing *{t*100:.0f}%*",
         f"  🎯 Divergência *{d*100:.0f}%* — _{_divergence_label(d)}_",
-        f"  📊 Confiança: *{conf*100:.0f}%* (cobertura: {data_cov*100:.0f}% × qualidade: {qual_conf*100:.0f}%)" + (" ⚠️" if skip else ""),
+        f"  📊 Confiança: *{conf*100:.0f}%*" + (" ⚠️" if skip else ""),
+        f"     _Dados: {data_cov*100:.0f}% completos · Qualidade fundamental: {qual_conf*100:.0f}%{_qual_penalty}_",
     ]
 
     # Flags de dislocation

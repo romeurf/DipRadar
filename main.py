@@ -1250,7 +1250,11 @@ def build_alert(
     name         = fundamentals.get("name", stock.get("name", stock.get("symbol", "N/A")))
     symbol       = stock["symbol"]
     change       = stock["change_pct"]
-    price        = fundamentals.get("price") or stock.get("price", "N/D")
+    price_raw    = fundamentals.get("price") or stock.get("price")
+    try:
+        price = f"{float(price_raw):.2f}" if price_raw not in (None, "") else "N/D"
+    except (TypeError, ValueError):
+        price = "N/D"
     mc_b         = (fundamentals.get("market_cap") or 0) / 1e9
     drawdown     = fundamentals.get("drawdown_from_high")
     drawdown_str = f" | 52w: {drawdown:.0f}%" if drawdown is not None else ""
@@ -1269,6 +1273,40 @@ def build_alert(
             price_ts_str = f" _(às {_ps[11:16]})_"
         except Exception:
             pass
+
+    # Gap-aware intraday change: "Hoje" is vs previous close (Yahoo standard)
+    # but on a gap-and-fade day it hides the real session move. When the
+    # intraday-from-open metric diverges >2pp from vs-previous, surface both
+    # so the user sees the gap context. Both lines show absolute $ delta
+    # alongside the % for direct mental comparison.
+    _intraday    = stock.get("intraday_change_pct")
+    _prev_close  = stock.get("previous_close")
+    _open_price  = stock.get("open_price")
+    _curr_price  = None
+    try:
+        _curr_price = float(price_raw) if price_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        _curr_price = None
+
+    # Append $ delta to the main "Hoje:" line (vs previous close)
+    change_dollar_str = ""
+    try:
+        if _prev_close and _curr_price is not None:
+            _d_close = _curr_price - float(_prev_close)
+            change_dollar_str = f" (${_d_close:+.2f})"
+    except (TypeError, ValueError):
+        pass
+
+    intraday_line = ""
+    try:
+        if _intraday is not None and abs(float(_intraday) - float(change)) > 2.0:
+            _intra_dollar = ""
+            if _open_price and _curr_price is not None:
+                _d_open = _curr_price - float(_open_price)
+                _intra_dollar = f" (${_d_open:+.2f})"
+            intraday_line = f"vs abertura: *{float(_intraday):+.1f}%*{_intra_dollar}\n"
+    except (TypeError, ValueError):
+        pass
 
     badge_str  = score_badge(dip_score)
     score_line = f"{badge_str} Score: {dip_score:.0f}/100"
@@ -1413,7 +1451,8 @@ def build_alert(
         f"{emoji} *{name} ({symbol})*{region_part}{in_portfolio}\n"
         f"{plain_summary}\n"
         f"{sector_cfg.get('label', sector)} | ≈{mc_b:.1f}B\n"
-        f"Hoje: *{change:+.1f}%* — ${price}{price_ts_str}{drawdown_str}{vol_flag}{insider_flag}{short_flag}{rsi_part}{sector_warn}\n"
+        f"Hoje: *{change:+.1f}%*{change_dollar_str} — ${price}{price_ts_str}{drawdown_str}{vol_flag}{insider_flag}{short_flag}{rsi_part}{sector_warn}\n"
+        f"{intraday_line}"
         f"{payout_warn}"
         f"{earn_warn}"
         f"{valuation_block}"
@@ -1487,6 +1526,7 @@ def analyze_ticker(symbol: str) -> str:
 
         price      = fund.get("price") or 0
         change_pct = 0.0
+        intraday_change_pct = None
         try:
             from data.data_feed import get_live_price
             _live = get_live_price(symbol)
@@ -1496,6 +1536,12 @@ def analyze_ticker(symbol: str) -> str:
                 fund["price_sampled_at"] = _live.sampled_at
                 if _live.change_pct is not None:
                     change_pct = _live.change_pct
+                # Capture intraday-from-open (gap-aware): when the session
+                # opens with a big gap vs previous close, "vs ontem" hides
+                # the real intraday move. Show both metrics when they
+                # diverge meaningfully (>2pp).
+                if _live.intraday_change_pct is not None:
+                    intraday_change_pct = _live.intraday_change_pct
         except Exception:
             pass
 
@@ -1520,7 +1566,26 @@ def analyze_ticker(symbol: str) -> str:
             f"trap={score_data.get('is_value_trap')}"
         )
 
-        stock_dict = {"symbol": symbol, "change_pct": change_pct, "region": ""}
+        # Pass previous_close + today's open through to build_alert so it
+        # can show both `Hoje: -1.4% (-$2.60)` and
+        # `vs abertura: -10.8% (-$21.68)` for direct comparison.
+        _prev_close_for_display = None
+        _open_for_display       = None
+        try:
+            if _live is not None:
+                _prev_close_for_display = _live.previous_close
+                _open_for_display       = _live.open_price
+        except NameError:
+            pass
+
+        stock_dict = {
+            "symbol":   symbol,
+            "change_pct": change_pct,
+            "intraday_change_pct": intraday_change_pct,
+            "previous_close": _prev_close_for_display,
+            "open_price":     _open_for_display,
+            "region":   "",
+        }
 
         if score >= 75:
             verdict, emoji_str = "COMPRAR", "🟢"

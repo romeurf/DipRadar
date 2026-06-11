@@ -423,11 +423,13 @@ _LISBON = ZoneInfo("Europe/Lisbon")
 
 @dataclass
 class LivePrice:
-    price:          float
-    previous_close: Optional[float]
-    sampled_at:     str   # ISO datetime in Lisbon tz
-    change_pct:     Optional[float]
-    source:         str   # "fast_info" or "info" or "eod_fallback"
+    price:                 float
+    previous_close:        Optional[float]
+    sampled_at:            str   # ISO datetime in Lisbon tz
+    change_pct:            Optional[float]   # vs previous close (Yahoo standard)
+    source:                str   # "fast_info" or "info" or "eod_fallback"
+    open_price:            Optional[float] = None  # today's session open
+    intraday_change_pct:   Optional[float] = None  # vs today's open (gap-aware)
 
 
 def get_live_price(ticker: str) -> Optional[LivePrice]:
@@ -450,16 +452,22 @@ def get_live_price(ticker: str) -> Optional[LivePrice]:
         fi = yf.Ticker(ticker).fast_info
         last = getattr(fi, "last_price", None)
         prev = getattr(fi, "previous_close", None)
+        open_ = getattr(fi, "open", None)
         if last is not None and float(last) > 0:
             change = None
             if prev and float(prev) > 0:
                 change = (float(last) - float(prev)) / float(prev) * 100.0
+            intraday = None
+            if open_ and float(open_) > 0:
+                intraday = (float(last) - float(open_)) / float(open_) * 100.0
             return LivePrice(
                 price=float(last),
                 previous_close=float(prev) if prev else None,
                 sampled_at=sampled,
                 change_pct=change,
                 source="fast_info",
+                open_price=float(open_) if open_ else None,
+                intraday_change_pct=intraday,
             )
     except Exception as e:
         log.debug(f"[live_price] fast_info falhou para {ticker}: {e}")
@@ -469,16 +477,22 @@ def get_live_price(ticker: str) -> Optional[LivePrice]:
         info = yf.Ticker(ticker).info or {}
         last = info.get("currentPrice") or info.get("regularMarketPrice")
         prev = info.get("previousClose") or info.get("regularMarketPreviousClose")
+        open_ = info.get("regularMarketOpen") or info.get("open")
         if last and float(last) > 0:
             change = None
             if prev and float(prev) > 0:
                 change = (float(last) - float(prev)) / float(prev) * 100.0
+            intraday = None
+            if open_ and float(open_) > 0:
+                intraday = (float(last) - float(open_)) / float(open_) * 100.0
             return LivePrice(
                 price=float(last),
                 previous_close=float(prev) if prev else None,
                 sampled_at=sampled,
                 change_pct=change,
                 source="info",
+                open_price=float(open_) if open_ else None,
+                intraday_change_pct=intraday,
             )
     except Exception as e:
         log.debug(f"[live_price] info falhou para {ticker}: {e}")
