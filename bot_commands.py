@@ -39,12 +39,6 @@ bot_commands.py — Todos os comandos Telegram do DipRadar.
   /flip close ID EXIT      → Fechar trade com preço de saída
   /flip del ID             → Apagar trade
 
-━━━ WATCHLIST ━━━
-  /watchlist               → Estado da watchlist pessoal
-  /watchlist add TICKER    → Adicionar ticker
-  /watchlist rm TICKER     → Remover ticker
-  /watchlist clear         → Limpar watchlist dinâmica
-
 ━━━ ML E RETREINO ━━━
   /mldata                  → Estatísticas da base de dados ML
   /mldata update           → Forçar update de outcomes
@@ -88,10 +82,6 @@ from utils.rate_limiter import is_allowed, rate_status
 from utils.i18n import t, set_language, get_language
 from config import SUPPORTED_LANGUAGES
 from state import (
-    load_dynamic_watchlist,
-    add_to_dynamic_watchlist,
-    remove_from_dynamic_watchlist,
-    save_dynamic_watchlist,
     get_ticker_score_history,
 )
 # Flip log imports removed Phase 6 — Flip Fund deprecated
@@ -3714,14 +3704,13 @@ from commands.themes import (
 
 
 # Misc handlers (mldata, ml_accuracy, performance, paper_performance,
-# health, watchlist) moved to commands/misc.py (Phase 8.5)
+# health) moved to commands/misc.py (Phase 8.5)
 from commands.misc import (
     handle_mldata as _handle_mldata_impl,
     handle_ml_accuracy as _handle_ml_accuracy_impl,
     handle_paper_performance as _handle_paper_performance_impl,
     handle_performance as _handle_performance_impl,
     handle_health as _handle_health_impl,
-    handle_watchlist as _handle_watchlist_impl,
 )
 
 
@@ -3804,11 +3793,6 @@ def _handle_health(parts: list[str]) -> None:
     _handle_health_impl(parts)
 
 
-def _handle_watchlist(parts: list[str]) -> None:
-    _handle_watchlist_impl(parts)
-
-
-
 def _handle_themes() -> None:
     _handle_themes_impl()
 
@@ -3825,9 +3809,7 @@ def send_earnings_alerts(watchlist: list[str] | None = None) -> int:
     earnings_days_fn = _poll_context.get("get_earnings_days") or _cb_earnings_days
     if not earnings_days_fn or not (_poll_context.get("send_fn") or _cb_send_telegram):
         return 0
-    dynamic     = load_dynamic_watchlist()
-    static      = list(watchlist) if watchlist else []
-    all_tickers = list(dict.fromkeys(dynamic + static))
+    all_tickers = list(dict.fromkeys(watchlist)) if watchlist else []
     if not all_tickers:
         return 0
     today_str = datetime.now().date().isoformat()
@@ -3934,11 +3916,6 @@ def _handle_command(text: str) -> None:
                 "`/core_universe`              → View CoreRadar universe\n"
                 "`/core_universe_add TICK`     → Add ticker to CORE universe\n"
                 "`/core_universe_remove TICK`  → Remove from CORE universe\n\n"
-                "*Watchlist*\n"
-                "`/watchlist`                  → View dynamic watchlist\n"
-                "`/watchlist add TICK`         → Add ticker\n"
-                "`/watchlist rm TICK`          → Remove ticker\n"
-                "`/watchlist clear`            → Clear watchlist\n\n"
                 "_← Back: `/help`_"
             )
         elif topic in ("build", "ml", "train", "pipeline"):
@@ -4037,7 +4014,6 @@ def _handle_command(text: str) -> None:
         mins       = rem // 60
         is_open_fn = _poll_context.get("is_market_open")
         market     = "🟢 Aberto" if (is_open_fn and is_open_fn()) else "🔴 Fechado"
-        wl         = load_dynamic_watchlist()
         # Flip log removed Phase 6 — Flip Fund deprecated
         flip_str   = ""
         db_fn      = _poll_context.get("get_db_stats") or _cb_get_db_stats
@@ -4074,7 +4050,7 @@ def _handle_command(text: str) -> None:
         _reply(
             f"*🤖 DipRadar Status*\n"
             f"Uptime: *{hours}h {mins}m* | Mercado: *{market}*\n"
-            f"Watchlist: *{len(wl)} tickers*{flip_str}{db_str}\n"
+            f"{flip_str}{db_str}\n"
             f"ML Model: *{ml_status}*"
             + port_str
             + f"\n_⏰ {datetime.now().strftime('%d/%m/%Y %H:%M')}_\n"
@@ -4219,11 +4195,6 @@ def _handle_command(text: str) -> None:
             _reply(tier3_fn() if tier3_fn else "🔵 *Tier 3* — _Handler não registado._")
         except Exception as e:
             _reply(f"_Erro: {e}_")
-
-    elif cmd == "/watchlist":
-        if not _check_rate(cmd_key): return
-        _handle_watchlist(parts)
-
 
     elif cmd == "/buy":
         if not _check_rate(cmd_key): return

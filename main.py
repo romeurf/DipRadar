@@ -16,7 +16,6 @@ Variáveis opcionais:
   TAVILY_API_KEY
   PORTFOLIO_STRESS_PCT=5
   RECOVERY_TARGET_PCT=15
-  WATCHLIST_SCAN_ENABLED=true
   DEGRADATION_DROP_THRESHOLD=15
 """
 
@@ -76,7 +75,6 @@ from state import (
     record_dip_day, mark_persistent_alerted, expire_missing_streaks,
 )
 from scanners.backtest import backtest_runner, build_backtest_summary
-from scanners.watchlist import run_watchlist_scan, build_watchlist_morning_summary, WATCHLIST
 from scanners.alert_db import log_alert_snapshot, get_db_stats, fill_db_outcomes
 import bot_commands
 from portfolio.position_monitor import run_daily_check
@@ -125,7 +123,6 @@ SCAN_MINUTES      = int(os.environ.get("SCAN_EVERY_MINUTES", "30"))
 MIN_DIP_SCORE     = int(os.environ.get("MIN_DIP_SCORE", "50"))
 STRESS_PCT        = float(os.environ.get("PORTFOLIO_STRESS_PCT", "5"))
 RECOVERY_PCT      = float(os.environ.get("RECOVERY_TARGET_PCT", "15"))
-WATCHLIST_ENABLED = os.environ.get("WATCHLIST_SCAN_ENABLED", "true").lower() == "true"
 DEGRADATION_DROP_THRESHOLD = int(os.environ.get("DEGRADATION_DROP_THRESHOLD", "15"))
 
 LISBON_TZ = pytz.timezone("Europe/Lisbon")
@@ -489,13 +486,6 @@ def send_heartbeat() -> None:
         f"_{'🤖 Modelo ML pronto' if ml_ok else '🤖 ML: modelo não treinado'}_",
         "_Mercado abre às 14h30 Lisboa_",
     ]
-
-    if WATCHLIST_ENABLED and WATCHLIST:
-        try:
-            wl_block = build_watchlist_morning_summary(DIRECT_TICKERS)
-            lines += ["", "─" * 25, "", wl_block]
-        except Exception as e:
-            logging.warning(f"Watchlist morning summary: {e}")
 
     send_telegram("\n".join(lines))
     logging.info("Heartbeat enviado.")
@@ -1902,19 +1892,6 @@ def run_scan() -> None:
         logging.info("Scan concluído.")
 
 
-# ── Watchlist Scan ────────────────────────────────────────────────────────────
-
-def run_watchlist_job() -> None:
-    if not WATCHLIST_ENABLED:
-        return
-    logging.info("A correr watchlist scan...")
-    try:
-        count = run_watchlist_scan(send_telegram, DIRECT_TICKERS)
-        logging.info(f"Watchlist scan: {count} alertas enviados")
-    except Exception as e:
-        logging.error(f"Watchlist scan: {e}")
-
-
 # ── ML Outcomes Job (domingo 08:00) ───────────────────────────────────────────
 
 def run_ml_outcomes_job() -> None:
@@ -2573,7 +2550,6 @@ def main() -> None:
             run_scan(),
             check_thesis_degradation(),
             check_recovery_alerts(),
-            run_watchlist_job(),
             send_weekly_dip_scan(),
         ),
         CronTrigger(day_of_week="mon-fri", hour=21, minute=15, timezone=LISBON_TZ),

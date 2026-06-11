@@ -13,8 +13,6 @@ Funções exportadas:
   add_recovery_position / mark_recovery_alerted / remove_recovery_position
   get_stale_recovery_positions / mark_stale_alerted
   record_dip_day / mark_persistent_alerted / expire_missing_streaks
-  load_dynamic_watchlist / save_dynamic_watchlist
-  add_to_dynamic_watchlist / remove_from_dynamic_watchlist
   load_score_log / save_score_log / append_score_log
   get_ticker_score_history / get_last_score
   (Flip log + daily flip spend tracker removed in Phase 6 — Flip Fund
@@ -642,46 +640,6 @@ def expire_missing_streaks(active_symbols: set) -> None:
     if to_remove:
         _save_streaks(streaks)
         logging.info(f"[state] Streaks expiradas: {to_remove}")
-
-
-# ── Watchlist dinâmica (gerida via /watchlist add|remove) ────────────────────
-#
-# Mantém-se o nome de ficheiro `_dipr_watchlist.json` para preservar o estado
-# já gravado no volume Railway de versões anteriores do bot.
-
-_WATCHLIST_FILE = "_dipr_watchlist.json"
-
-
-def load_dynamic_watchlist() -> list:
-    return _read(_WATCHLIST_FILE).get("tickers", [])
-
-
-def save_dynamic_watchlist(tickers: list) -> None:
-    _write(_WATCHLIST_FILE, {
-        "tickers": list(dict.fromkeys(t.upper() for t in tickers)),
-    })
-
-
-def add_to_dynamic_watchlist(ticker: str) -> bool:
-    """Adiciona ticker. Devolve True se foi adicionado, False se já existia."""
-    tickers = load_dynamic_watchlist()
-    t = ticker.upper().strip()
-    if t in tickers:
-        return False
-    tickers.append(t)
-    save_dynamic_watchlist(tickers)
-    return True
-
-
-def remove_from_dynamic_watchlist(ticker: str) -> bool:
-    """Remove ticker. Devolve True se existia e foi removido, False caso contrário."""
-    tickers = load_dynamic_watchlist()
-    t = ticker.upper().strip()
-    if t not in tickers:
-        return False
-    tickers = [x for x in tickers if x != t]
-    save_dynamic_watchlist(tickers)
-    return True
 
 
 # ── Score log (histórico de scores para /historico e upgrades) ───────────────

@@ -1,5 +1,5 @@
 """commands/misc.py — Smaller info commands: mldata, ml_accuracy, performance,
-paper_performance, health, watchlist.
+paper_performance, health.
 
 Phase 8.5 of the bot_commands.py split. Uses `import bot_commands as _bc`
 for shared state.
@@ -403,58 +403,6 @@ def handle_health(parts: list[str]) -> None:
 
 
 
-# ── /watchlist handler ─────────────────────────────────────────────────────────────
-
-def handle_watchlist(parts: list[str]) -> None:
-    sub = parts[1].lower() if len(parts) > 1 else "list"
-    if sub in ("list", "ls", "show", "ver"):
-        tickers = load_dynamic_watchlist()
-        if not tickers:
-            _bc._reply("*👀 Watchlist dinâmica*\n_Está vazia. Usa `/watchlist add TICKER` para adicionar._")
-            return
-        lines = [f"*👀 Watchlist dinâmica ({len(tickers)} tickers):*", ""]
-        for i, t in enumerate(tickers, 1):
-            lines.append(f"  {i}. `{t}`")
-        lines += ["", "_Remove com `/watchlist rm TICKER` · Limpa com `/watchlist clear`_"]
-        _bc._reply("\n".join(lines))
-    elif sub in ("add", "adicionar", "+"):
-        if len(parts) < 3:
-            _bc._reply("⚠️ Uso: `/watchlist add <TICKER>`\n_Exemplos: `AAPL`, `IEMA.L`, `IS3N.AS`, `ALV.DE`_")
-            return
-        # Preserva sufixo de exchange (ex: .L, .AS, .DE) — não faz split no ponto
-        ticker = parts[2].upper().strip()
-        # Valida: até 15 chars, só letras/números/ponto/hífen (ex: BRK-B, IS3N.AS)
-        ticker_clean = ticker.replace(".", "").replace("-", "").replace("_", "")
-        if len(ticker) > 15 or not ticker_clean.isalnum() or not ticker_clean:
-            _bc._reply(f"⚠️ Ticker inválido: `{ticker}`\n_Exemplos válidos: `AAPL`, `IEMA.L`, `ALV.DE`, `BRK-B`_")
-            return
-        added = add_to_dynamic_watchlist(ticker)
-        if added:
-            _bc._reply(f"✅ *`{ticker}`* adicionado. Total: {len(load_dynamic_watchlist())} tickers.")
-        else:
-            _bc._reply(f"_`{ticker}` já está na watchlist._")
-    elif sub in ("rm", "remove", "remover", "del", "delete", "-"):
-        if len(parts) < 3:
-            _bc._reply("⚠️ Uso: `/watchlist rm <TICKER>`")
-            return
-        ticker  = parts[2].upper().strip()
-        removed = remove_from_dynamic_watchlist(ticker)
-        if removed:
-            _bc._reply(f"🗑️ *`{ticker}`* removido. Restam {len(load_dynamic_watchlist())} tickers.")
-        else:
-            _bc._reply(f"⚠️ `{ticker}` não está na watchlist.")
-    elif sub in ("clear", "limpar", "reset"):
-        count = len(load_dynamic_watchlist())
-        if count == 0:
-            _bc._reply("_A watchlist já está vazia._")
-            return
-        save_dynamic_watchlist([])
-        _bc._reply(f"🧹 Watchlist limpa — {count} ticker(s) removido(s).")
-    else:
-        _bc._reply(
-            f"⚠️ Sub-comando desconhecido: `{sub}`\n"
-            "`/watchlist` · `/watchlist add TICK` · `/watchlist rm TICK` · `/watchlist clear`"
-        )
 # /buy, /sell, /ppr, /etf, /liquidez handlers moved to commands/portfolio_extras.py (Phase 8.4)
 from commands.portfolio_extras import (
     handle_buy as _handle_buy_impl,

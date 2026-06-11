@@ -9,7 +9,6 @@ Configurável via env vars:
     RATE_LIMIT_ANALISAR=3         # override para /analisar (caro)
     RATE_LIMIT_SCAN=1             # override para /scan (muito caro)
     RATE_LIMIT_BACKTEST=2         # override para /backtest
-    RATE_LIMIT_WATCHLIST=10       # override para /watchlist (operações rápidas)
 
 Uso:
     from utils.rate_limiter import is_allowed, rate_status
@@ -41,7 +40,6 @@ _LIMITS: dict[str, int] = {
     "analisar":  _env_int("RATE_LIMIT_ANALISAR",   3),
     "scan":      _env_int("RATE_LIMIT_SCAN",        1),
     "backtest":  _env_int("RATE_LIMIT_BACKTEST",    2),
-    "watchlist": _env_int("RATE_LIMIT_WATCHLIST",  10),
     "carteira":  _env_int("RATE_LIMIT_DEFAULT",  _DEFAULT),
     "status":    _env_int("RATE_LIMIT_DEFAULT",  _DEFAULT),
     "tier3":     _env_int("RATE_LIMIT_DEFAULT",  _DEFAULT),
