@@ -23,24 +23,19 @@ O sistema está estável em produção com 5 radares activos:
 
 **Arquitectura:**
 - Estrutura modular: `core/`, `data/`, `ml/`, `portfolio/`, `scanners/`, `utils/`, `commands/`, `momentum_radar/`, `ml_training/`.
-- `bot_commands.py` em split incremental (Phase 8); ~~~7900 linhas, alvo final < 50KB com lógica em `commands/*.py`.
+- `bot_commands.py` em split incremental (Phase 8); ~7900 linhas, alvo final < 1500 (só dispatcher).
 - Persistência em `/data` (Railway volume) com escrita atómica via `_save_json`.
 - Live price via yfinance `fast_info.last_price` no momento de gerar alertas; RSI re-injecta o tick intraday.
+
+**Allocation engine (`/cash`):**
+- Tax-aware rotation gate (`core/tax_engine.should_rotate`) com IRS Jovem 7% effective rate.
+- Concentration cap 25% soft / 30% hard via `_can_top_up()` — DCA em CORE existentes é gateado por exposição, não filtrado por hold-status.
+- ROI-ranked unified deploy queue: `_annualized_alpha(signal_type)` ordena todos os candidatos (DIP, CORE, MOMENTUM, ROTATION) num único ranking. Cash bucket cresce só quando não há sinais worth deploying.
+- `portfolio_value` calculado live a partir de `get_positions()` + concentração por ticker.
 
 ---
 
 ## Em curso
-
-### Phase 2 — Tax-aware `/cash` + DCA (CRÍTICO antes de 2026-06-24)
-
-Plano completo em `.claude/plans/snappy-tumbling-chipmunk.md`. Próximo inflow €1050 — sem este fix o `/cash` toma decisões mal calibradas:
-
-- **2.1 Rotation gate tax-aware**: novo `tax_engine.should_rotate()` com IRS Jovem 7% effective rate. Hoje usa baseline implícito de 28% → recomenda HOLD demasiado conservador.
-- **2.2 DCA em CORE existentes**: remover filtro `core_held` no `/cash`. Adicionar concentration cap 25% soft / 30% hard. NVO no dip a -15% deveria ser top-up, não exclusão.
-- **2.3 100% deploy + ROI-ranked queue**: substituir os 33%/30%/20% fixos por ranking unificado de annualized expected alpha. Cash bucket ≈ €0 quando há sinais; cresce só genuinamente.
-- **2.4 portfolio_value wiring**: passar valor da carteira a `/cash` e `/monthly_check` para a math de concentração.
-
-Pré-requisito: `scripts/calibrate_rotation_alpha.py` (existe, foi calibrada na sessão `c2e127f`).
 
 ### Phase 8 — Split `bot_commands.py` incremental
 
@@ -68,17 +63,11 @@ Modelo actual com IC ≈ −0.004 (anti-predictivo). Suspeitos:
 
 Plano em `snappy-tumbling-chipmunk.md` Phase 3.
 
-### Phase 1 — Quick wins (não-bloqueantes)
-
-- **1.1 Core score saturation**: `core_radar.py:133` usa clamp linear que satura em `alpha_pred ≥ 0.20`. NVO/GIS/CMG todos em 100 esconde ranking. Trocar por `tanh` compression (~5 linhas).
-- **1.2 DIP `rho_alpha` persistence**: bundle do KEPT_FLOOR retrain salvou `rho_mean=None`. Investigar `_to_dict` no trainer ou alias-on-read.
-
 ### Phase 4 (já completado parcialmente) — Estrutura de pastas
 
 Phase 7 já migrou para `core/`, `data/`, `ml/`, `portfolio/`, `scanners/`, `utils/`, `commands/`, `momentum_radar/`. Falta:
 
 - Limpeza dos imports ainda absolutos para o root antigo.
-- Mover `scripts/` para a raiz (já lá está).
 - Consolidação de duplicação (`get_eod_prices` em `data_feed.py` vs `tiingo_client.py` etc.).
 
 ---
