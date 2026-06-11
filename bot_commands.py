@@ -3737,6 +3737,28 @@ from commands.core_cmds import (
 )
 
 
+# Portfolio handlers (buy, sell, ppr, etf, liquidez, portfolio) — Phase 8.4
+# extracted these to commands/portfolio_extras.py but the import block was
+# never added to bot_commands.py, so every /buy, /sell, /ppr, /etf, /liquidez
+# and /portfolio call NameErrored in production. handle_portfolio itself was
+# orphaned mid-extraction (body stranded inside _handle_liquidez); the proper
+# extraction lives in portfolio_extras now.
+from commands.portfolio_extras import (
+    handle_buy       as _handle_buy_impl,
+    handle_sell      as _handle_sell_impl,
+    handle_ppr       as _handle_ppr_impl,
+    handle_etf       as _handle_etf_impl,
+    handle_liquidez  as _handle_liquidez_impl,
+    handle_portfolio as _handle_portfolio_impl,
+)
+
+
+# Conviction handler — Phase 8.3 extracted but import was also missed.
+from commands.conviction import (
+    handle_conviction as _handle_conviction_impl,
+)
+
+
 def _handle_core(parts: list[str]) -> None:
     _handle_core_impl(parts)
 
@@ -3851,108 +3873,14 @@ def _handle_etf(parts: list[str]) -> None:
 
 def _handle_liquidez(parts: list[str]) -> None:
     _handle_liquidez_impl(parts)
-    liquidity = get_liquidity()
 
-    # ── detalhe de um ticker específico ──────────────────────────────────────────
-    if len(parts) >= 2:
-        symbol = parts[1].upper().strip()
-        pos    = positions.get(symbol)
-        if not pos:
-            _reply(
-                f"⚠️ *{symbol}* não está na carteira activa.\n"
-                "_Usa `/portfolio` para ver todas as posições._"
-            )
-            return
-        is_eur     = symbol in EUR_TICKERS
-        cur        = "€" if is_eur else "$"
-        last_price = pos.get("last_price") or pos["avg_price"]
-        pnl_u      = (last_price - pos["avg_price"]) * pos["shares"]
-        pnl_pct    = (last_price - pos["avg_price"]) / pos["avg_price"] * 100 if pos["avg_price"] else 0
-        em         = "🟢" if pnl_u >= 0 else "🔴"
-        score_str  = f"*{pos['last_score']}/100*" if pos.get("last_score") is not None else "_N/D_"
-        _reply(
-            f"📋 *{symbol}* — {pos.get('name', symbol)}\n\n"
-            f"  📦 Shares: *{pos['shares']}x*\n"
-            f"  💵 Preço médio: *{cur}{pos['avg_price']:.2f}*\n"
-            f"  📈 Preço actual: *{cur}{last_price:.2f}*\n"
-            f"  {em} P&L não realizado: *{cur}{pnl_u:+.2f}* ({pnl_pct:+.1f}%)\n"
-            f"  🏷️ Categoria: _{pos.get('category', 'N/D')}_\n"
-            f"  🎯 Score actual: {score_str}\n"
-            f"  📅 Entrada: {pos.get('entry_date', 'N/D')}\n"
-            f"  🔄 Última actualização: {pos.get('last_update', 'N/D')}"
-            + ("\n  ⚠️ _Tese degradada_" if pos.get("degradation_alerted") else "")
-        )
-        return
 
-    # ── carteira vazia ────────────────────────────────────────────────────────────
-    if not positions:
-        liq_em = "🟢" if liquidity >= 0 else "🔴"
-        _reply(
-            f"📭 *Carteira vazia*\n\n"
-            f"  💵 Liquidez: {liq_em} *€{liquidity:.2f}*\n\n"
-            "_Usa `/buy TICK PREÇO SHARES` para registar a primeira posição._"
-        )
-        return
+def _handle_portfolio(parts: list[str]) -> None:
+    _handle_portfolio_impl(parts)
 
-    # ── obter FX rate EUR/USD ─────────────────────────────────────────────────────
-    eur_usd = _fetch_eur_usd()
-    fx_note = f"_{eur_usd:.4f} EUR/USD_" if eur_usd != 1.0 else "_FX indisponível — totais aproximados_"
 
-    # ── lista completa agrupada por categoria ─────────────────────────────────────
-    total_cost_usd    = 0.0
-    total_current_usd = 0.0
-    lines             = [f"*📊 Carteira Activa — {datetime.now().strftime('%d/%m %H:%M')}*", f"  {fx_note}", ""]
-
-    by_cat: dict[str, list] = {}
-    for sym, pos in positions.items():
-        cat = pos.get("category", "Outras")
-        by_cat.setdefault(cat, []).append((sym, pos))
-
-    for cat, items in sorted(by_cat.items()):
-        lines.append(f"*{cat}*")
-        for sym, pos in sorted(items, key=lambda x: x[0]):
-            is_eur     = sym in EUR_TICKERS
-            cur        = "€" if is_eur else "$"
-            last_price = pos.get("last_price") or pos["avg_price"]
-            cost       = pos["avg_price"] * pos["shares"]
-            current    = last_price * pos["shares"]
-            pnl_u      = current - cost
-            pnl_pct    = pnl_u / cost * 100 if cost else 0
-            em         = "🟢" if pnl_u >= 0 else "🔴"
-            score_str  = f" | 🎯{pos['last_score']}" if pos.get("last_score") is not None else ""
-            degrade    = " ⚠️" if pos.get("degradation_alerted") else ""
-            lines.append(
-                f"  {em} *{sym}*{degrade} — {pos['shares']}x @ {cur}{pos['avg_price']:.2f}"
-                f" → {cur}{last_price:.2f} | *{pnl_pct:+.1f}%*{score_str}"
-            )
-            # converter tudo para USD para o total consolidado
-            fx = eur_usd if is_eur else 1.0
-            total_cost_usd    += cost * fx
-            total_current_usd += current * fx
-        lines.append("")
-
-    total_pnl_usd  = total_current_usd - total_cost_usd
-    total_pnl_pct  = total_pnl_usd / total_cost_usd * 100 if total_cost_usd else 0
-    em_total       = "🟢" if total_pnl_usd >= 0 else "🔴"
-    liq_em         = "🟢" if liquidity >= 0 else "🔴"
-
-    # converter totais para EUR
-    total_cost_eur    = total_cost_usd / eur_usd if eur_usd else total_cost_usd
-    total_current_eur = total_current_usd / eur_usd if eur_usd else total_current_usd
-    total_pnl_eur     = total_pnl_usd / eur_usd if eur_usd else total_pnl_usd
-    grand_total_eur   = total_current_eur + liquidity
-
-    lines += [
-        "─────────────────",
-        f"  📥 Investido:  *€{total_cost_eur:,.0f}* (≈${total_cost_usd:,.0f})",
-        f"  📦 Actual:     *€{total_current_eur:,.0f}* (≈${total_current_usd:,.0f})",
-        f"  {em_total} P&L:       *€{total_pnl_eur:+,.2f}* ({total_pnl_pct:+.1f}%)",
-        f"  {liq_em} Liquidez:  *€{liquidity:.2f}*",
-        f"  💼 Total:      *€{grand_total_eur:,.0f}*",
-        "",
-        "_`/portfolio TICK` para detalhe · `/buy` · `/sell`_",
-    ]
-    _reply("\n".join(lines))
+def _handle_conviction(parts: list[str]) -> None:
+    _handle_conviction_impl(parts)
 
 
 # ── Command router ────────────────────────────────────────────────────────────────
