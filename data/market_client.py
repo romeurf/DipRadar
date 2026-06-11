@@ -882,11 +882,20 @@ def get_catalyst(symbol: str, company_name: str = "") -> dict:
                 idx = content.lower().find(keyword)
                 if idx != -1:
                     snippet = content[max(0, idx-40):min(len(content), idx+100)].strip()
-                    # Defensive: if snippet still looks URL-encoded (>10%
-                    # `%`) OR is mostly brackets/parens (>15% [()]),
-                    # skip and try the next result.
+                    # Defensive filters — skip the snippet and try the next
+                    # result when it looks like (a) URL-encoded garbage,
+                    # (b) markdown nav-link remnants, (c) financial glossary
+                    # definitions instead of actual news. Tavily often returns
+                    # glossary pages where 'earnings' hits 'Earnings Yield =
+                    # Net Income / Market Cap' instead of company news.
+                    looks_like_definition = (
+                        snippet.count("=") >= 2  # equation chars
+                        or snippet.count("**") >= 2  # markdown bold runs
+                        or (snippet.count(":") >= 3 and len(snippet) < 80)  # listy
+                    )
                     if (snippet.count("%") > len(snippet) * 0.1
-                            or sum(snippet.count(c) for c in "[]()") > len(snippet) * 0.15):
+                            or sum(snippet.count(c) for c in "[]()") > len(snippet) * 0.15
+                            or looks_like_definition):
                         snippet = ""
                         continue
                     break

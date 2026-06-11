@@ -1379,9 +1379,21 @@ def build_alert(
         pass
 
     ml_label = ml_result.label if (ml_result is not None) else None
+    # Pass ml_prob so the displayed `Score: X/100` actually reflects the ML
+    # weight. Without it, build_score_breakdown internally hits
+    # score_from_fundamentals with ml_prob=None, ml_weight=1.0, and the
+    # score collapses to the pure rule-based number — ignoring the ML badge
+    # rendered just below. User reported: "os scores parecem-me iguais com
+    # ou sem modelo" (2026-06-12) — exactly because of this.
+    ml_prob_for_score = (
+        ml_result.win_prob
+        if (ml_result is not None and ml_result.model_ready and ml_result.win_prob is not None)
+        else None
+    )
     score_breakdown = build_score_breakdown(
         fundamentals, symbol, earnings_d,
         sector_change=sector_chg,
+        ml_prob=ml_prob_for_score,
         ml_label=ml_label,
     )
 
