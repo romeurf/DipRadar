@@ -379,16 +379,25 @@ def _alert_severity_filter(
 ) -> str:
     """Return 'real_time' or 'digest' for a given alert.
 
-    Trailing stops are always real-time (time-critical exits). DIP and CORE
-    alerts are real-time only when BOTH the rule-based score is high AND the
-    ML model agrees (>=75 AND >=65%). Everything else goes to the digest.
+    User feedback (2026-06-12): zero discrimination is the goal — everything
+    that's NOT a time-critical sell signal goes to the daily digest. The
+    user explicitly wants ONE consolidated notification per day instead of
+    a stream of pushes throughout the trading session.
+
+    Only TRAILING_STOP stays real-time because waiting 8 hours for the
+    digest after a stop confirms means missing additional drawdown. All
+    other alert types (DIP, CORE_WARNING, STRUCTURAL_DIP, future Rotation)
+    funnel into run_daily_digest at 21:30.
+
+    The previous 'high-conviction exception' (score≥75 AND ML≥65% → push
+    real-time) was removed — the user prefers reading the full daily
+    digest and deciding from there, even for genuinely strong signals.
     """
     if alert_type in _REAL_TIME_ALERT_TYPES:
         return "real_time"
-    if alert_type in ("DIP", "CORE_WARNING"):
-        if (score is not None and float(score) >= _DIGEST_SCORE_GATE
-                and win_prob is not None and float(win_prob) >= _DIGEST_WIN_PROB_GATE):
-            return "real_time"
+    # score and win_prob kept in the signature for future tuning + so the
+    # buffer entries still carry them for ranking inside the digest.
+    _ = score, win_prob  # explicit "no longer gates"
     return "digest"
 
 
