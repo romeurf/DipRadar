@@ -447,6 +447,11 @@ def get_live_price(ticker: str) -> Optional[LivePrice]:
     """
     sampled = datetime.now(_LISBON).isoformat(timespec="seconds")
 
+    # Resolve unsuffixed UCITS (SEC0 → SEC0.DE) before any yfinance attempt
+    # so /analisar SEC0 and other generic callers don't 404 on bare symbols.
+    from data.market_client import _resolve_yahoo_symbol
+    ticker = _resolve_yahoo_symbol(ticker)
+
     try:
         import yfinance as yf
         fi = yf.Ticker(ticker).fast_info

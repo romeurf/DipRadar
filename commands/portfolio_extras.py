@@ -501,10 +501,12 @@ def handle_etf(parts: list[str]) -> None:
             pos = etfs[tkr]
             shares = pos["shares"]
             avg    = pos["avg_cost"]
-            # Live price attempt
+            # Live price attempt — resolve unsuffixed UCITS to .DE first to
+            # avoid the "delisted" 404 spam in the logs.
             live = None
             try:
-                _info = _yf.Ticker(tkr).fast_info
+                from data.market_client import _resolve_yahoo_symbol
+                _info = _yf.Ticker(_resolve_yahoo_symbol(tkr)).fast_info
                 _p = getattr(_info, "last_price", None)
                 if _p and float(_p) > 0:
                     live = float(_p)
@@ -568,10 +570,11 @@ def handle_etf(parts: list[str]) -> None:
                 f"_Mais de €500k num único ETF — confirma os valores._"
             )
             return
-        # Try live price for confirmation
+        # Try live price for confirmation (resolve UCITS → .DE first)
         live_str = ""
         try:
-            _info = _yf.Ticker(ticker).fast_info
+            from data.market_client import _resolve_yahoo_symbol
+            _info = _yf.Ticker(_resolve_yahoo_symbol(ticker)).fast_info
             _p = getattr(_info, "last_price", None)
             if _p and float(_p) > 0:
                 live_val = shares * float(_p)

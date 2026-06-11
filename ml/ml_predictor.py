@@ -551,7 +551,15 @@ def ml_score(
         pred_up   = _inverse_transform_up(pred_up_raw)
         pred_down = _inverse_transform_down(pred_down_raw)
     except Exception as e:
-        logging.error(f"[ml_predictor] Erro na inferência v3: {e}")
+        # Detailed log so /analisar callers can see what's blocking inference.
+        # Common causes: feature_cols schema drift between training and the
+        # current ml_features, NaN in a feature the model can't impute,
+        # KeyError on "model_up"/"model_down" if bundle is partial.
+        logging.error(
+            f"[ml_predictor] Inference failed for {symbol or '?'}: "
+            f"{type(e).__name__}: {e}",
+            exc_info=True,
+        )
         return MLResult(model_ready=False, label="ERROR")
 
     # Sector model: se existir modelo treinado para este sector, usa-o
@@ -639,6 +647,12 @@ def ml_score(
 def ml_badge(result: MLResult) -> str:
     """Linha ML em linguagem natural — legível para qualquer investidor."""
     if not result.model_ready:
+        # Differentiate the two not-ready states so the user knows whether
+        # to retrain (NO_MODEL → file missing or load failed) vs investigate
+        # (ERROR → bundle loaded but inference raised — usually feature
+        # schema drift between training and runtime).
+        if getattr(result, "label", None) == "ERROR":
+            return "🤖 _ML carregado mas inferência falhou — ver logs (`/admin_check_config`)_"
         return "🤖 _Modelo não treinado ainda_"
 
     wp   = result.win_prob or 0.0

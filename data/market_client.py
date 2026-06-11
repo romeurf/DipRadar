@@ -12,6 +12,29 @@ import requests
 import yfinance as yf
 from datetime import datetime, date, timezone, timedelta
 
+
+# UCITS tickers that quote on Xetra (.DE suffix) — when a user holds these
+# under the base symbol (SEC0, SXR8, IS3N, ...), yfinance's bare-symbol
+# lookup returns 404. Resolving to the suffixed form upfront kills the
+# repeated "possibly delisted" errors in the logs and gives the snapshot
+# real prices instead of falling through to the US proxy estimate.
+_UCITS_XETRA: set[str] = {"SEC0", "SXR8", "IS3N", "EUNL", "IEMA"}
+
+
+def _resolve_yahoo_symbol(symbol: str) -> str:
+    """Map an unsuffixed UCITS ticker to its Yahoo-resolvable form.
+
+    Examples: SEC0 → SEC0.DE, SXR8 → SXR8.DE, IS3N → IS3N.DE.
+    Symbols that already have an exchange suffix (containing '.') are
+    returned unchanged. US tickers are returned unchanged.
+    """
+    if not symbol or "." in symbol:
+        return symbol
+    upper = symbol.upper().strip()
+    if upper in _UCITS_XETRA:
+        return f"{upper}.DE"
+    return symbol
+
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -258,7 +281,7 @@ def screen_period_dips(
     for sym, meta in candidates.items():
         try:
             time.sleep(1)
-            hist = yf.Ticker(sym).history(period="35d", interval="1d")["Close"].dropna()
+            hist = yf.Ticker(_resolve_yahoo_symbol(sym)).history(period="35d", interval="1d")["Close"].dropna()
             if len(hist) < 6:
                 continue
 
@@ -622,7 +645,7 @@ def get_portfolio_snapshot(holdings, ppr_shares, ppr_avg_cost, usd_eur, etfs=Non
             return price_cache[symbol]
         try:
             time.sleep(2)
-            hist = yf.Ticker(symbol).history(period="35d", interval="1d")["Close"].dropna()
+            hist = yf.Ticker(_resolve_yahoo_symbol(symbol)).history(period="35d", interval="1d")["Close"].dropna()
             if len(hist) < 2:
                 return {}
             r = {
