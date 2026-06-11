@@ -7,6 +7,7 @@ Catalisadores: Tavily Search API (TAVILY_API_KEY)
 import os
 import time
 import logging
+import pandas as pd
 import requests
 import yfinance as yf
 from datetime import datetime, date, timezone, timedelta
@@ -343,11 +344,42 @@ def get_usdeur() -> float:
 
 
 def get_rsi(symbol: str, period: int = 14) -> float | None:
+    """RSI 14-day on daily closes.
+
+    yfinance's history(period="60d", interval="1d") doesn't include today's
+    bar until after the US close (~21h Lisboa). Scans at 15:00-20:00 would
+    otherwise compute RSI over yesterday's close — so a dip that's already
+    bottomed and is recovering today still triggers as oversold. To fix:
+    if fast_info.last_price is available and differs from the most recent
+    bar, append it as a synthetic intraday close before computing RSI. This
+    makes the 15:00-20:00 scans actually reflect today's move.
+    """
     try:
         time.sleep(3)
-        hist = yf.Ticker(symbol).history(period="60d", interval="1d")["Close"]
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period="60d", interval="1d")["Close"]
         if hist is None or len(hist) < period + 1:
             return None
+
+        # Inject today's intraday close if the daily series doesn't have it.
+        # The daily series last index is the most recent daily bar — usually
+        # yesterday during US trading hours (Lisbon 14:30-21:00). After the
+        # close, yfinance backfills today's bar, so the gap closes naturally.
+        try:
+            fi = ticker.fast_info
+            last_intraday = getattr(fi, "last_price", None)
+            if last_intraday and float(last_intraday) > 0:
+                last_eod_close = float(hist.iloc[-1])
+                # Only inject if intraday is meaningfully different (>=0.1%
+                # from EOD close) — protects against weekends/holidays where
+                # last_price echoes the latest EOD bar.
+                if abs(float(last_intraday) - last_eod_close) / last_eod_close >= 0.001:
+                    # Append as a new row with today's date. The exact index
+                    # label doesn't matter for the RSI rolling calc.
+                    hist = pd.concat([hist, pd.Series([float(last_intraday)])])
+        except Exception:
+            pass  # fall back to EOD-only series
+
         delta    = hist.diff().dropna()
         gain     = delta.clip(lower=0)
         loss     = (-delta).clip(lower=0)
