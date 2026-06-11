@@ -811,7 +811,9 @@ def run_structural_dip_intraday_scan() -> int:
         if not sym:
             continue
         try:
-            time.sleep(2)
+            # No explicit sleep here — _yf_info() inside get_fundamentals
+            # already sleeps 10s before the first attempt + 30/50/70s on
+            # retries. Adding our own would just double the per-ticker cost.
             fund = get_fundamentals(sym, min_market_cap=MIN_MARKET_CAP)
             if fund.get("skip"):
                 continue
