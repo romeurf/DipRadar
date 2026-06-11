@@ -44,6 +44,7 @@ import logging
 import os
 from datetime import datetime, date
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import yfinance as yf
 
@@ -58,6 +59,15 @@ from ml.ml_engine import (
 from ml.ml_features import build_features
 
 logger = logging.getLogger(__name__)
+
+# Timestamp consistency: closed_at + last_checked_date must agree on tz so
+# a close at 00:30 Lisbon doesn't end up logged as previous-day UTC while
+# last_checked_date shows today. Single tz throughout the file.
+_LISBON_TZ = ZoneInfo("Europe/Lisbon")
+
+
+def _now_lisbon_iso() -> str:
+    return datetime.now(_LISBON_TZ).isoformat(timespec="seconds")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Thresholds
@@ -281,12 +291,24 @@ def _classify_trigger(
     current_price: float,
     new_win_prob: float,
     feature_row_today: dict | None = None,
+    *,
+    price_history=None,
+    structural_decline: Optional[tuple[bool, str]] = None,
 ) -> str:
     """Avalia triggers por ordem de severidade. Devolve o trigger de maior prioridade.
 
     Δwin_prob = alert_win_prob - new_win_prob:
       positivo → modelo perdeu confiança → deterioração
       negativo → modelo ganhou confiança → melhoria
+
+    Parameters added vs prior signature:
+      price_history       : 1y daily history (already fetched by _monitor_one
+                            step 3). When provided, MOMENTUM uses it for ATR
+                            + RSI/MA20 confirmation instead of two extra
+                            yfinance round-trips (BUG-27).
+      structural_decline  : precomputed (bool, reasons_str) tuple. When
+                            provided, skip re-evaluation (BUG-32). Caller
+                            reuses the same tuple to build the message.
     """
     delta = record.alert_win_prob - new_win_prob
     _pos_type = getattr(record, "position_type", "DIP")
@@ -297,18 +319,42 @@ def _classify_trigger(
         # Com ATR: stock de alta volatilidade (Micron, NOW) tem stop mais largo;
         # stock de baixa volatilidade tem stop mais apertado.
         # Safety net mínima: max(ATR-stop, 8%) para protecção extrema.
-        _trailing_high = max(getattr(record, "trailing_high", 0.0) or 0.0, current_price)
+        _prev_high     = getattr(record, "trailing_high", 0.0) or 0.0
+        _trailing_high = max(_prev_high, current_price)
         record.trailing_high = _trailing_high
+
+        # BUG-26: persist trailing_high IMMEDIATELY after mutation. The full
+        # update_record call in _monitor_one step 7 is many lines away and
+        # any yfinance retry / network failure between here and there would
+        # lose the new peak — next tick would recompute the stop against a
+        # stale (lower) high, deferring or skipping the stop trigger.
+        # Skip the write when nothing actually changed (idempotency).
+        if _trailing_high > _prev_high:
+            try:
+                position_db.update_record(record)
+            except Exception as _th_err:
+                logger.warning(
+                    f"[monitor] {record.ticker}: failed to persist trailing_high "
+                    f"{_trailing_high:.2f} eagerly ({_th_err}) — full record write at "
+                    f"end of tick will retry."
+                )
 
         if _trailing_high > 0 and record.days_held >= 3:
             # ATR-based trailing stop: adapta-se à volatilidade real do stock.
             _fallback_pct = float(os.getenv("MOMENTUM_TRAILING_STOP_PCT", "0.12"))
             _atr_stop_pct = None  # None = ATR não calculado ainda
             _atr_source   = "fallback"
+            # BUG-27: reuse the 1y history already fetched in _monitor_one
+            # step 3 instead of a fresh yfinance round-trip. The last 30
+            # daily bars are enough for a 14-period ATR.
+            _hist_m = None
             try:
-                import yfinance as _yf
                 import pandas as _pd
-                _hist_m = _yf.Ticker(record.ticker).history(period="30d", auto_adjust=True)
+                if price_history is not None and not price_history.empty:
+                    _hist_m = price_history.tail(30)
+                else:
+                    import yfinance as _yf
+                    _hist_m = _yf.Ticker(record.ticker).history(period="30d", auto_adjust=True)
                 if _hist_m is not None and len(_hist_m) >= 10:
                     _h = _hist_m["High"]
                     _l = _hist_m["Low"]
@@ -334,13 +380,15 @@ def _classify_trigger(
             _stop_price = _trailing_high * (1 - _atr_stop_pct)
             if current_price < _stop_price:
                 # Confirmação por indicador: só dispara se momentum realmente reverteu
-                # (evita saídas em pullbacks normais de 1-2 dias)
+                # (evita saídas em pullbacks normais de 1-2 dias).
+                # BUG-27: also reuse the same 30-bar slice (_hist_m) for
+                # the RSI/MA20 confirmation. A second yfinance call here
+                # would duplicate the work and could even race against the
+                # ATR fetch (different bar snapshots if minutes apart).
                 _momentum_reversed = True
                 try:
-                    import yfinance as _yf2
-                    _hc = _yf2.Ticker(record.ticker).history(period="30d", auto_adjust=True)
-                    if _hc is not None and len(_hc) >= 20:
-                        _closes_m = _hc["Close"]
+                    if _hist_m is not None and len(_hist_m) >= 20:
+                        _closes_m = _hist_m["Close"]
                         _ma20 = float(_closes_m.rolling(20).mean().iloc[-1])
                         _rsi_m = _calc_rsi_momentum(_closes_m)
                         _below_ma20 = current_price < _ma20
@@ -391,11 +439,18 @@ def _classify_trigger(
     if _check_early_alpha(record, current_price):
         return TRIGGER_EARLY_ALPHA
 
-    # 2. Deterioração estrutural (multi-critério) — mais severo que deterioração simples
+    # 2. Deterioração estrutural (multi-critério) — mais severo que deterioração simples.
+    # BUG-32: prefer the precomputed tuple from _monitor_one so we don't
+    # recompute the same 4-criterion check moments later when the message
+    # builder needs the reasons string. Fall back to inline computation if
+    # the caller didn't provide it (e.g. unit tests).
     if feature_row_today is not None:
-        is_structural, _ = _detect_structural_decline(
-            record, current_price, new_win_prob, feature_row_today
-        )
+        if structural_decline is not None:
+            is_structural, _ = structural_decline
+        else:
+            is_structural, _ = _detect_structural_decline(
+                record, current_price, new_win_prob, feature_row_today
+            )
         if is_structural:
             return TRIGGER_STRUCTURAL_DECLINE
 
@@ -710,7 +765,26 @@ def _monitor_one(
 
     # ── 4. Classify trigger ───────────────────────────────────────────────────
     # Passa feature_row_today para a detecção de deterioração estrutural.
-    trigger = _classify_trigger(record, current_price, new_win_prob, feature_row_today)
+    # BUG-32: precompute the structural decline result once here so both
+    # _classify_trigger (for the trigger decision) and the alert builder
+    # below (for the reasons string) share the same evaluation. Saves the
+    # second 4-criterion pass and avoids any risk of inconsistency if the
+    # inputs were ever to mutate between calls.
+    _structural_result: Optional[tuple[bool, str]] = None
+    if feature_row_today is not None:
+        try:
+            _structural_result = _detect_structural_decline(
+                record, current_price, new_win_prob, feature_row_today
+            )
+        except Exception as _sd_err:
+            logger.debug(f"[monitor] structural decline {record.ticker}: {_sd_err}")
+            _structural_result = None
+
+    trigger = _classify_trigger(
+        record, current_price, new_win_prob, feature_row_today,
+        price_history=_price_hist,
+        structural_decline=_structural_result,
+    )
     delta   = record.alert_win_prob - new_win_prob
 
     # ── 5. Update record ─────────────────────────────────────────────────────
@@ -739,7 +813,7 @@ def _monitor_one(
             # Moonbag target atingido → fechar os restantes 50%
             record.status       = "TAKE_PROFIT"
             record.close_reason = "MOONBAG_TARGET"
-            record.closed_at    = datetime.utcnow().isoformat()
+            record.closed_at    = _now_lisbon_iso()
             record.close_price  = current_price
         else:
             # Primeiro target → vender 50%, activar moonbag, continuar a monitorizar.
@@ -891,7 +965,7 @@ def _monitor_one(
             ])
         record.status       = "CLOSED"
         record.close_reason = "STOP_LOSS"
-        record.closed_at    = datetime.utcnow().isoformat()
+        record.closed_at    = _now_lisbon_iso()
         record.close_price  = current_price
 
     elif trigger == TRIGGER_EDGE_GONE:
@@ -901,7 +975,7 @@ def _monitor_one(
         msg = _build_edge_gone_alert(record, current_price, _pu)
         record.status       = "CLOSED"
         record.close_reason = "EDGE_GONE"
-        record.closed_at    = datetime.utcnow().isoformat()
+        record.closed_at    = _now_lisbon_iso()
         record.close_price  = current_price
 
     elif trigger == TRIGGER_DIP_TO_MOMENTUM:
@@ -911,9 +985,14 @@ def _monitor_one(
         msg = _build_early_alpha_alert(record, current_price)
 
     elif trigger == TRIGGER_STRUCTURAL_DECLINE:
-        _, reasons_str = _detect_structural_decline(
-            record, current_price, new_win_prob, feature_row_today
-        )
+        # BUG-32: reuse the precomputed result from step 4. Falls back to
+        # a fresh evaluation only if the precompute failed (defensive).
+        if _structural_result is not None:
+            _, reasons_str = _structural_result
+        else:
+            _, reasons_str = _detect_structural_decline(
+                record, current_price, new_win_prob, feature_row_today
+            )
         msg = _build_structural_decline_alert(record, current_price, new_win_prob, reasons_str)
 
     elif trigger == TRIGGER_DETERIORATION:
