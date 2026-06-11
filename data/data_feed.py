@@ -394,6 +394,108 @@ def get_latest_price(ticker: str) -> Optional[float]:
         return None
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Live price (intraday) — para alertas em tempo real
+# ─────────────────────────────────────────────────────────────────────────
+#
+# get_eod_prices() e get_latest_price() devolvem dados End-of-Day — útil
+# para scoring (history de 60d) mas SEMPRE atrasado um dia quando o
+# mercado US está fechado (i.e. scans 09:00-14:30 Lisboa).
+#
+# get_live_price() devolve o tick mais recente via yfinance fast_info.
+# Latência típica: ~15min na free tier. Para um bot de alertas a cada 30min,
+# isto é "tempo real" para efeitos práticos.
+#
+# Uso no momento de construir o alerta:
+#   live = get_live_price(symbol)
+#   if live:
+#       fund["price"] = live.price
+#       fund["price_sampled_at"] = live.sampled_at
+#       # change_day_pct recalculado contra previous_close se disponível
+
+from dataclasses import dataclass
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+
+_LISBON = ZoneInfo("Europe/Lisbon")
+
+
+@dataclass
+class LivePrice:
+    price:          float
+    previous_close: Optional[float]
+    sampled_at:     str   # ISO datetime in Lisbon tz
+    change_pct:     Optional[float]
+    source:         str   # "fast_info" or "info" or "eod_fallback"
+
+
+def get_live_price(ticker: str) -> Optional[LivePrice]:
+    """Fetch the most recent tradeable price + previous close.
+
+    Priority chain:
+      1. yfinance fast_info.last_price (intraday, ~15min delayed free tier)
+      2. yfinance .info["currentPrice"] / regularMarketPrice (same source,
+         different shape — fast_info can fail for some thin tickers)
+      3. EOD close from data_feed (last resort — explicitly stale, source
+         reported as "eod_fallback" so callers can decide whether to display
+         the staleness warning)
+
+    Returns None if all sources fail. Never raises.
+    """
+    sampled = datetime.now(_LISBON).isoformat(timespec="seconds")
+
+    try:
+        import yfinance as yf
+        fi = yf.Ticker(ticker).fast_info
+        last = getattr(fi, "last_price", None)
+        prev = getattr(fi, "previous_close", None)
+        if last is not None and float(last) > 0:
+            change = None
+            if prev and float(prev) > 0:
+                change = (float(last) - float(prev)) / float(prev) * 100.0
+            return LivePrice(
+                price=float(last),
+                previous_close=float(prev) if prev else None,
+                sampled_at=sampled,
+                change_pct=change,
+                source="fast_info",
+            )
+    except Exception as e:
+        log.debug(f"[live_price] fast_info falhou para {ticker}: {e}")
+
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info or {}
+        last = info.get("currentPrice") or info.get("regularMarketPrice")
+        prev = info.get("previousClose") or info.get("regularMarketPreviousClose")
+        if last and float(last) > 0:
+            change = None
+            if prev and float(prev) > 0:
+                change = (float(last) - float(prev)) / float(prev) * 100.0
+            return LivePrice(
+                price=float(last),
+                previous_close=float(prev) if prev else None,
+                sampled_at=sampled,
+                change_pct=change,
+                source="info",
+            )
+    except Exception as e:
+        log.debug(f"[live_price] info falhou para {ticker}: {e}")
+
+    eod = get_latest_price(ticker)
+    if eod and eod > 0:
+        return LivePrice(
+            price=float(eod),
+            previous_close=None,
+            sampled_at=sampled,
+            change_pct=None,
+            source="eod_fallback",
+        )
+
+    return None
+
+
 def is_tiingo_available() -> bool:
     """Verifica se a chave Tiingo está configurada e funcional."""
     if not TIINGO_API_KEY:

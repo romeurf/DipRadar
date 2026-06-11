@@ -580,11 +580,19 @@ def format_momentum_alert(candidate: dict) -> str:
 
     high_str = f"+{abs(high_pct)*100:.1f}% acima do máx 52w" if high_pct >= 0 else f"{high_pct*100:.1f}% abaixo do máx 52w"
 
+    _ps = candidate.get("price_sampled_at")
+    price_ts_str = ""
+    if _ps:
+        try:
+            price_ts_str = f" _(às {_ps[11:16]})_"
+        except Exception:
+            pass
+
     lines = [
         f"🚀 *MOMENTUM — {ticker}*  [Score: {score:.0f}]",
         f"_{sector}_",
         "",
-        f"💰 Preço: ${price:.2f}  |  +{ret_20d*100:.1f}% em 20d  |  {high_str}",
+        f"💰 Preço: ${price:.2f}{price_ts_str}  |  +{ret_20d*100:.1f}% em 20d  |  {high_str}",
         f"📊 Volume: {vol:.1f}× médio  |  RSI: {rsi:.0f}",
     ]
 

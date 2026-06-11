@@ -1146,6 +1146,19 @@ def build_alert(
     region_part  = f" ({stock['region']})" if stock.get("region") else ""
     in_portfolio = " 📦 *Já em carteira*" if symbol in DIRECT_TICKERS else ""
 
+    # Live-price timestamp — when set by run_scan's refresh, show the HH:MM
+    # at which the displayed price was sampled. Makes staleness visible: if
+    # the alert fires at 19:30 but the price was sampled at 19:15, that's
+    # the ~15min yfinance free-tier delay (acceptable). If sampled at 14:30
+    # and alert at 16:00, something's wrong with the scan loop pacing.
+    _ps = fundamentals.get("price_sampled_at")
+    price_ts_str = ""
+    if _ps:
+        try:
+            price_ts_str = f" _(às {_ps[11:16]})_"
+        except Exception:
+            pass
+
     badge_str  = score_badge(dip_score)
     score_line = f"{badge_str} Score: {dip_score:.0f}/100"
 
@@ -1289,7 +1302,7 @@ def build_alert(
         f"{emoji} *{name} ({symbol})*{region_part}{in_portfolio}\n"
         f"{plain_summary}\n"
         f"{sector_cfg.get('label', sector)} | ≈{mc_b:.1f}B\n"
-        f"Hoje: *{change:+.1f}%* — ${price}{drawdown_str}{vol_flag}{insider_flag}{short_flag}{rsi_part}{sector_warn}\n"
+        f"Hoje: *{change:+.1f}%* — ${price}{price_ts_str}{drawdown_str}{vol_flag}{insider_flag}{short_flag}{rsi_part}{sector_warn}\n"
         f"{payout_warn}"
         f"{earn_warn}"
         f"{valuation_block}"
@@ -1364,12 +1377,14 @@ def analyze_ticker(symbol: str) -> str:
         price      = fund.get("price") or 0
         change_pct = 0.0
         try:
-            import yfinance as yf
-            fi = yf.Ticker(symbol).fast_info
-            prev = getattr(fi, "previous_close", None)
-            last = getattr(fi, "last_price", None)
-            if prev and last and prev > 0:
-                change_pct = (last - prev) / prev * 100
+            from data.data_feed import get_live_price
+            _live = get_live_price(symbol)
+            if _live and _live.source != "eod_fallback":
+                price = _live.price
+                fund["price"]            = _live.price
+                fund["price_sampled_at"] = _live.sampled_at
+                if _live.change_pct is not None:
+                    change_pct = _live.change_pct
         except Exception:
             pass
 
@@ -1673,6 +1688,25 @@ def run_scan() -> None:
                 except Exception:
                     pass
                 _no_liquidity = (verdict == "COMPRAR") and (_monthly_budget - _capital_used < 20)
+
+                # ── Live-price refresh at alert moment ─────────────────────────
+                # The scan path uses fund["price"] from yfinance .info (often
+                # stale = previous close when US market is still closed). At
+                # the moment we send the alert we re-fetch a fresh intraday
+                # tick so the user sees a current price + recompute change_pct
+                # against the genuine previous close. Falls back gracefully
+                # to the existing stale price if the live fetch fails.
+                try:
+                    from data.data_feed import get_live_price
+                    _live = get_live_price(sym)
+                    if _live and _live.source != "eod_fallback":
+                        fund["price"]            = _live.price
+                        fund["price_sampled_at"] = _live.sampled_at
+                        fund["price_source"]     = _live.source
+                        if _live.change_pct is not None:
+                            stock["change_pct"] = _live.change_pct
+                except Exception as _lp_err:
+                    logging.debug(f"[live_price] {sym}: {_lp_err}")
 
                 alert_text = build_alert(
                     stock, fund, hist_pe, news,
@@ -2190,6 +2224,17 @@ def run_momentum_scan() -> None:
 
         for c in candidates:
             try:
+                # Live-price refresh at alert moment (same pattern as DIP path).
+                # Momentum scan uses EOD bars to compute reasons but the user
+                # sees the alert at HH:MM with the most recent intraday price.
+                try:
+                    from data.data_feed import get_live_price
+                    _live = get_live_price(c["ticker"])
+                    if _live and _live.source != "eod_fallback":
+                        c["price"]            = _live.price
+                        c["price_sampled_at"] = _live.sampled_at
+                except Exception:
+                    pass
                 msg = format_momentum_alert(c)
                 # Indicar se foi aprovado pelo arbiter
                 if c["ticker"] in approved_tickers:
