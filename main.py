@@ -1519,6 +1519,50 @@ def run_scan() -> None:
                 except Exception:
                     pass
 
+                # ── CORE intraday warning (Fase B) ────────────────────────
+                # Fires INDEPENDENTLY of the DIP score gate when:
+                #   - ticker is one the user actively tracks (DIRECT_TICKERS)
+                #     OR the DIP scorer classified it as HIGH_CONVICTION
+                #   - intraday drop is ≥ 7% (looser than the DIP -8% screener
+                #     gate; -7% on a name the user already cares about is
+                #     worth a heads-up before it gets worse)
+                # Dedup key f"{sym}_core_intraday" is distinct from the plain
+                # `sym` key the DIP path uses, so a single CORE warning + a
+                # later DIP alert for the same ticker still both surface.
+                # The standard DIP-score flow continues below regardless; if
+                # score >= MIN_DIP_SCORE the user gets both signals.
+                _core_dedup_key = f"{sym}_core_intraday"
+                _intraday_drop  = float(stock.get("change_pct") or 0.0)
+                _is_user_core   = (sym in DIRECT_TICKERS) or (category == CAT_HIGH_CONVICTION)
+                if (_is_user_core
+                        and _intraday_drop <= -7.0
+                        and _core_dedup_key not in _alerted_today):
+                    try:
+                        _hold_tag = " 📦 _em carteira_" if sym in DIRECT_TICKERS else ""
+                        _cat_tag  = " 💎 _high-conviction_" if category == CAT_HIGH_CONVICTION else ""
+                        _name     = fund.get("name") or sym
+                        _price    = fund.get("price")
+                        _price_s  = f"${_price:.2f}" if _price else "?"
+                        _drawdown = fund.get("drawdown_from_high")
+                        _dd_s     = f" | 52w: {_drawdown:.0f}%" if _drawdown is not None else ""
+                        _core_msg = (
+                            f"💎 *CORE WARNING — {_name} ({sym})*{_hold_tag}{_cat_tag}\n"
+                            f"_Queda intraday significativa num ticker do teu radar CORE._\n\n"
+                            f"Hoje: *{_intraday_drop:+.1f}%* — {_price_s}{_dd_s}\n"
+                            f"DIP score: *{score:.0f}/100* (gate normal: {effective_min_score:.0f})\n\n"
+                            f"_Aviso emitido independentemente do DIP gate — o drop vale revisão._"
+                        )
+                        send_telegram(_core_msg)
+                        _alerted_today.add(_core_dedup_key)
+                        save_alerts(_alerted_today)
+                        logging.info(
+                            f"[core_intraday] {sym}: warning emitted "
+                            f"(drop={_intraday_drop:.1f}% direct={sym in DIRECT_TICKERS} "
+                            f"high_conv={category == CAT_HIGH_CONVICTION})"
+                        )
+                    except Exception as _cw_err:
+                        logging.warning(f"[core_intraday] {sym}: emit failed: {_cw_err}")
+
                 if score < effective_min_score:
                     _hb_n_rejected += 1
                     append_rejected_log({
