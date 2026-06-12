@@ -3240,6 +3240,12 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
         # to GitHub. Production rebuilds (test_tickers=None) are unaffected.
         is_test = is_test_mode(test_tickers)
 
+        # Flag support per build script:
+        #   DIP      : --force-rebuild  AND  --clear-cache
+        #   Momentum : --force-rebuild  (no --clear-cache)
+        #   CORE     : --force-rebuild  (no --clear-cache)
+        # Adding --clear-cache to CORE/Momentum hard-fails with
+        # "unrecognized arguments". Only the DIP build wipes price_cache.
         def _build_dip():
             nonlocal dip_ds_ok, dip_ds_err
             script = Path(__file__).parent / "scripts" / "build_dip_dataset.py"
@@ -3259,7 +3265,7 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
             out    = resolve_dataset_path("momentum_training.parquet", is_test=is_test)
             cmd    = [sys.executable, str(script), "--start", "1993-01-01", "--out", str(out)]
             if is_test:      cmd += ["--tickers", test_tickers]
-            if force:        cmd += ["--force-rebuild", "--clear-cache"]
+            if force:        cmd += ["--force-rebuild"]
             rc, lines = _run_script_streaming(cmd, "Phase 1 — Momentum dataset")
             if rc == 0:
                 mom_ds_ok = True
@@ -3272,7 +3278,7 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
             out    = resolve_dataset_path("core_training_base.parquet", is_test=is_test)
             cmd    = [sys.executable, str(script), "--start", "1993-01-01", "--out", str(out)]
             if is_test:      cmd += ["--tickers", test_tickers]
-            if force:        cmd += ["--force-rebuild", "--clear-cache"]
+            if force:        cmd += ["--force-rebuild"]
             rc, lines = _run_script_streaming(cmd, "Phase 1 — CORE dataset")
             if rc == 0:
                 core_ds_ok = True
