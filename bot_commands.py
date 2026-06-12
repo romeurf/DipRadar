@@ -6284,18 +6284,48 @@ def _handle_command(text: str) -> None:
                             source = "no log entry — fallback"
                             confidence = 0.4
 
-                        ann_alpha = pred_alpha_90d * (365.0 / 90.0)
+                        # Calibration: if data/dip_alpha_calibration.json
+                        # exists AND is accepted (r²≥0.10, monotonic), look
+                        # up the bucket whose pred range contains our
+                        # pred_alpha_90d and replace with the bucket's
+                        # mean_actual_alpha_90d. This is the "historical
+                        # observation" override the user asked for — α
+                        # reflects what tickers with this model output
+                        # ACTUALLY delivered, not what the model said they
+                        # would. V1: parquet in-sample (synthetic). V2:
+                        # weekly refresh blends real mature alerts.
+                        _calibrated_alpha = pred_alpha_90d
+                        _calib_note       = source
+                        try:
+                            _cd_path = _Path("data/dip_alpha_calibration.json")
+                            if _cd_path.exists():
+                                _cd = _json.loads(_cd_path.read_text())
+                                if _cd.get("accepted"):
+                                    for _b in _cd.get("buckets", []):
+                                        if (pred_alpha_90d >= _b["pred_min"]
+                                                and pred_alpha_90d <= _b["pred_max"]):
+                                            _calibrated_alpha = float(_b["mean_actual_alpha_90d"])
+                                            _calib_note = (
+                                                f"{source} → calibrated bucket "
+                                                f"[{_b['pred_min']:+.3f},{_b['pred_max']:+.3f}]"
+                                            )
+                                            break
+                        except Exception:
+                            pass
+
+                        ann_alpha = _calibrated_alpha * (365.0 / 90.0)
                         candidates.append({
                             "ticker":     ticker,
                             "bucket":     "DIP",
-                            "reason":     f"DIP alert ({source})",
+                            "reason":     f"DIP alert ({_calib_note})",
                             "suggested":  DIP_BASE_ALLOC,
                             "ann_alpha":  ann_alpha,
                             "confidence": confidence,
                             "extra":      {
-                                "pred_alpha_90d": pred_alpha_90d,
-                                "win_prob":       win_prob,
-                                "score":          adb.get("score"),
+                                "pred_alpha_90d":    pred_alpha_90d,
+                                "calibrated_alpha":  _calibrated_alpha,
+                                "win_prob":          win_prob,
+                                "score":             adb.get("score"),
                             },
                         })
                 except Exception as _e:
