@@ -61,7 +61,13 @@ _MIN_SPREAD_FOR_ACCEPT = 0.04  # second acceptance path: monotonic AND ≥4pp sp
                                # between top and bottom bucket means
 
 
-# Map target column to its horizon in days (for annualization later)
+# Map target column to the TRAINING horizon in days (what the model actually
+# learned to predict). The DISPLAY horizon (what /cash shows the user) is
+# always 90d — user feedback: '60d pode ser pouco dar hold'. When the model
+# trained on a shorter horizon, we extrapolate linearly: 90d_alpha = X_alpha
+# × (90 / training_horizon). This assumes alpha grows linearly over the
+# extrapolation window — fine for the typical 60→90d gap; less defensible
+# for longer extrapolations.
 _HORIZON_BY_COLUMN = {
     "alpha_90d":           90,
     "alpha_90d_rank":      90,
@@ -70,6 +76,7 @@ _HORIZON_BY_COLUMN = {
     "alpha_60d":           60,
     "alpha_60d_rank":      60,
 }
+_DISPLAY_HORIZON_DAYS = 90
 
 
 def _ensure_data_dir() -> None:
@@ -183,6 +190,14 @@ def _bucket_calibration(
     if len(edges) - 1 < 3:
         log.warning("Too few unique quantile bins — predictions may be degenerate")
 
+    horizon_days = _HORIZON_BY_COLUMN.get(target_col, 90)
+    # Linear extrapolation factor: training_horizon → display_horizon.
+    # When training is 60d and display is 90d → factor 1.5.
+    # When training already matches display → factor 1.0 (no-op).
+    _scale = _DISPLAY_HORIZON_DAYS / float(horizon_days)
+    log.info(f"Horizon scale: training={horizon_days}d → display={_DISPLAY_HORIZON_DAYS}d "
+             f"(factor ×{_scale:.3f})")
+
     buckets = []
     for i in range(len(edges) - 1):
         lo = edges[i]
@@ -195,19 +210,27 @@ def _bucket_calibration(
         n = int(in_bucket.sum())
         if n < min_samples_per_bucket:
             log.warning(f"Bucket [{lo:.4f}, {hi:.4f}] has only {n} samples — including anyway")
-        mean_actual = float(actual[in_bucket].mean()) if n > 0 else float("nan")
-        median_actual = float(np.median(actual[in_bucket])) if n > 0 else float("nan")
+        # Compute means at the training horizon, then scale to display.
+        mean_train  = float(actual[in_bucket].mean())   if n > 0 else float("nan")
+        median_train = float(np.median(actual[in_bucket])) if n > 0 else float("nan")
+        mean_display = mean_train  * _scale
+        median_display = median_train * _scale
         buckets.append({
-            "pred_min":         round(float(lo), 6),
-            "pred_max":         round(float(hi), 6),
-            "mean_actual_alpha_90d":   round(mean_actual, 6),
-            "median_actual_alpha_90d": round(median_actual, 6),
-            "n_samples":        n,
-            "n_real":           0,             # V2 will track real-alert count
-            "n_synthetic":      n,             # V1 all-synthetic
+            "pred_min":                       round(float(lo), 6),
+            "pred_max":                       round(float(hi), 6),
+            # Display horizon (90d) — what /cash actually consumes
+            "mean_actual_alpha_90d":          round(mean_display, 6),
+            "median_actual_alpha_90d":        round(median_display, 6),
+            # Training horizon (raw, for audit) — preserves what the model saw
+            "mean_actual_alpha_training":     round(mean_train, 6),
+            "median_actual_alpha_training":   round(median_train, 6),
+            "n_samples":                      n,
+            "n_real":                         0,    # V2 will track real-alert count
+            "n_synthetic":                    n,    # V1 all-synthetic
         })
 
-    # Check monotonicity (higher pred should map to higher actual)
+    # Check monotonicity using the display (90d) values — same shape as
+    # training values since extrapolation is linear, just different scale.
     means = [b["mean_actual_alpha_90d"] for b in buckets if not np.isnan(b["mean_actual_alpha_90d"])]
     is_monotonic = all(means[i] <= means[i+1] + 0.01 for i in range(len(means)-1))
     log.info(f"Buckets monotonic: {is_monotonic}")
@@ -219,12 +242,15 @@ def _bucket_calibration(
     spread = max(means) - min(means) if len(means) >= 2 else 0.0
     log.info(f"Spread top-bottom buckets: {spread:.4f}")
 
-    # Compute pseudo-R² as overall variance explained by bucket means
+    # Compute pseudo-R² as variance explained by bucket means. Use the
+    # TRAINING-horizon means (raw values that match `actual`'s scale) — the
+    # 90d-extrapolated values are just `× _scale` of the training values
+    # and would give an artificially deflated r² if compared to 60d actuals.
     overall_mean = float(actual.mean())
     bucket_pred_by_sample = np.zeros_like(actual)
     for b in buckets:
         in_b = (pred >= b["pred_min"]) & (pred <= b["pred_max"])
-        bucket_pred_by_sample[in_b] = b["mean_actual_alpha_90d"]
+        bucket_pred_by_sample[in_b] = b["mean_actual_alpha_training"]
     ss_res = float(((actual - bucket_pred_by_sample) ** 2).sum())
     ss_tot = float(((actual - overall_mean) ** 2).sum())
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-9 else 0.0
@@ -240,8 +266,8 @@ def _bucket_calibration(
         else ("monotonic+spread" if accepted_by_spread else "rejected")
     )
 
-    horizon_days = _HORIZON_BY_COLUMN.get(target_col, 90)
-    log.info(f"Target horizon: {horizon_days}d (column={target_col})")
+    log.info(f"Training horizon: {horizon_days}d (column={target_col})")
+    log.info(f"Display horizon (after extrap): {_DISPLAY_HORIZON_DAYS}d")
 
     return {
         "method":             "buckets_by_prediction",
@@ -251,7 +277,12 @@ def _bucket_calibration(
         "is_monotonic":       is_monotonic,
         "accepted":           accepted,
         "accepted_by":        accept_reason,
-        "horizon_days":       horizon_days,
+        # Display horizon (what /cash uses for annualization) — always 90d
+        # post user feedback '60d pode ser pouco dar hold'.
+        "horizon_days":            _DISPLAY_HORIZON_DAYS,
+        # Training horizon (what the model actually learned) — for audit
+        "training_horizon_days":   horizon_days,
+        "extrap_factor":           round(_scale, 4),
         "n_samples_total":    int(len(pred)),
         "n_real":             0,
         "n_synthetic":        int(len(pred)),
@@ -261,12 +292,23 @@ def _bucket_calibration(
         "min_spread_accept":  _MIN_SPREAD_FOR_ACCEPT,
         "parquet_source":     str(_PARQUET_PATH.name),
         "target_column":      target_col,
+        # TODO marker for next DIP retrain — see notice below
+        "retrain_target_recommendation": "alpha_90d",
         "warning":            (
             "V1 calibration uses IN-SAMPLE predictions on the training parquet — "
             "model is overfit to these rows, so r_squared is optimistic. V2 will "
             "incorporate mature alerts from alert_db.csv with declining synthetic "
             "weight as real samples accumulate. Refresh weekly via "
             "scripts/refresh_dip_alpha_calibration.py (next iteration)."
+        ),
+        "retrain_note":       (
+            "If you retrain the DIP model: set DIP_PRIMARY_TARGET=alpha_90d in "
+            "build_dip_dataset.py so the parquet has alpha_90d as the target. "
+            "The current bundle was trained on alpha_60d, so this calibration "
+            f"applies a linear extrapolation factor ×{_scale:.3f} to express α "
+            f"at the {_DISPLAY_HORIZON_DAYS}d horizon. After retraining with "
+            "alpha_90d, the extrap_factor will become 1.0 (no transformation) "
+            "and predictions will match the user's actual hold horizon directly."
         ),
     }
 

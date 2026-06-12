@@ -6175,18 +6175,33 @@ def _handle_command(text: str) -> None:
                 # Dynamic allocation: conviction-weighted sizing instead of
                 # flat per-bucket constants. The conviction signal combines
                 # ML win_prob, rule-based score, and annualized α — each
-                # contributes 0-1, averaged. Curve `conviction^1.5` maps to
-                # allocation fraction of `total_budget`:
-                #   conviction 0.0 → 5% floor (tracking position)
-                #   conviction 0.5 → 17%
-                #   conviction 0.8 → 30%
-                #   conviction 1.0 → 40% (concentration cap reduces)
-                # User feedback (2026-06-12): hardcoded €150/€200/€250 didn't
-                # respond to exceptional signals. With dynamic sizing, a
-                # super-conviction DIP (score 90 + ML 80% + α 35%/y) gets
-                # 30%+ of the budget instead of a flat €150.
+                # contributes 0-1, averaged. Curve `conviction^EXP` × range
+                # maps to allocation fraction of `total_budget`.
+                #
+                # User feedback (2026-06-12, second round): with the first
+                # iteration (power 1.5, ceiling 0.40), a 'super dip' (score
+                # 85+, ML 75%+, α 30%+/y, conviction ≈ 0.60) deployed only
+                # ~€253 of a €1050 budget. User said 'pouquissimo'.
+                #
+                # Tuned to:
+                #   FLOOR   = 5%  (tracking position even on weak signals)
+                #   CEILING = 60% (was 40%)
+                #   EXP     = 1.2 (was 1.5 — less concave at high conviction
+                #                  so super dips climb faster)
+                #
+                # Now:
+                #   conviction 0.30 (mediocre)    → 18% → €189
+                #   conviction 0.50 (decent)      → 31% → €325
+                #   conviction 0.60 (super dip)   → 40% → €416
+                #   conviction 0.75 (exceptional) → 51% → €538
+                #   conviction 0.90 (rare regime) → 60% → €630
+                #
+                # Concentration cap (30% of portfolio_value, NOT of budget)
+                # still applies via _can_top_up — protects against pouring
+                # into already-concentrated tickers regardless of curve.
                 _ALLOC_FLOOR_PCT   = 0.05
-                _ALLOC_CEILING_PCT = 0.40
+                _ALLOC_CEILING_PCT = 0.60
+                _ALLOC_EXPONENT    = 1.2
 
                 def _compute_conviction(win_prob, score, ann_alpha):
                     """Composite conviction 0..1 from three signals.
