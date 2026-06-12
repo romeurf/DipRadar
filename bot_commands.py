@@ -4443,10 +4443,14 @@ def _handle_command(text: str) -> None:
         else:
             _reply(
                 "🔍 *Fill missing tickers*\n\n"
-                "Uso: `/admin_fill_missing <model>`\n"
+                "Uso: `/admin_fill_missing <model> [--force-tickers T1,T2]`\n"
                 "  • `dip`      — completa `ml_training_base.parquet`\n"
                 "  • `core`     — completa `core_training_base.parquet`\n"
                 "  • `momentum` — completa `momentum_training.parquet`\n\n"
+                "`--force-tickers T1,T2` apaga `/data/price_cache/<T>.parquet` "
+                "para cada ticker nomeado e força a retentativa, mesmo que já "
+                "esteja no parquet. Útil para tickers que falharam por cache "
+                "corrompido ou erro transitório yfinance.\n\n"
                 "_Útil quando um `/admin_overnight` parou a meio e quer-se acabar "
                 "só o que falta, sem refazer tudo._"
             )
@@ -4455,6 +4459,20 @@ def _handle_command(text: str) -> None:
         if model not in ("dip", "core", "momentum"):
             _reply(f"⚠️ Modelo inválido `{model}`. Usa: `dip`, `core`, `momentum`.")
             return
+
+        # Parse --force-tickers — tickers to wipe from price_cache and force
+        # back into the missing list even if they already have rows. Designed
+        # for retrying tickers that yfinance failed on with a poisoned cache
+        # (e.g. MMC on 2026-06-13: two attempts, two "no price data" without
+        # ever producing a real fetch).
+        force_tickers: set[str] = set()
+        for i, p in enumerate(parts):
+            if p.lower() == "--force-tickers" and i + 1 < len(parts):
+                for t in parts[i + 1].split(","):
+                    t = t.strip().upper()
+                    if t:
+                        force_tickers.add(t)
+                break
 
         # Per-model configuration
         def _load_universe_for(m: str) -> set[str]:
@@ -4548,7 +4566,31 @@ def _handle_command(text: str) -> None:
             if not universe:
                 _reply(f"⚠️ Universo {model} vazio — impossível determinar missing.")
                 return
-            missing = sorted(universe - existing_tickers)
+
+            # Wipe price_cache for forced tickers BEFORE computing missing —
+            # so the build subprocess does a real network fetch instead of
+            # reading a possibly-empty cached parquet from a previous fail.
+            # _fetch_one_ticker writes per-ticker files named "<safe>.parquet"
+            # where safe = ticker.replace("^","_idx_").replace("/","_").
+            wiped: list[str] = []
+            if force_tickers:
+                cache_dir = _dd / "price_cache"
+                for t in sorted(force_tickers):
+                    safe = t.replace("^", "_idx_").replace("/", "_")
+                    fp = cache_dir / f"{safe}.parquet"
+                    if fp.exists():
+                        try:
+                            fp.unlink()
+                            wiped.append(t)
+                        except Exception as e:
+                            logging.warning(f"[fill_missing] could not wipe cache for {t}: {e}")
+
+            # Force-tickers are added to the missing set even if already in
+            # the parquet — the build subprocess will re-fetch them and the
+            # merge dedup by (ticker, alert_date) keeps the existing rows
+            # intact if the retry succeeds on the same dates (no data loss).
+            missing_set = (universe - existing_tickers) | force_tickers
+            missing = sorted(missing_set)
 
             if not missing:
                 _reply(
@@ -4558,11 +4600,19 @@ def _handle_command(text: str) -> None:
                 )
                 return
 
+            force_str = ""
+            if force_tickers:
+                force_str = (
+                    f"\n  *Force-retry*: {', '.join(sorted(force_tickers))} "
+                    f"(cache wiped: {len(wiped)})"
+                )
+
             _reply(
                 f"🔍 *Fill missing — {model.upper()}*\n\n"
                 f"  No parquet: *{len(existing_tickers)}* tickers ({len(_df):,} rows)\n"
                 f"  Universo: *{len(universe)}* tickers\n"
-                f"  *{len(missing)} em falta* — vou processar agora.\n\n"
+                f"  *{len(missing)} em falta* — vou processar agora."
+                f"{force_str}\n\n"
                 f"_Tickers: {', '.join(missing[:20])}{'...' if len(missing) > 20 else ''}_\n\n"
                 f"⏳ Estimativa: ~{max(5, len(missing)*2)} min. Notificação quando terminar."
             )
