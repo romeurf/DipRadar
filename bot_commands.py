@@ -6243,19 +6243,34 @@ def _handle_command(text: str) -> None:
                 # is the honest choice given the data.
                 if not skip_rotation and rotation_top3:
                     n_picks = len(rotation_top3)
-                    equal_size = ROT_BASE_ALLOC * 3.0 / n_picks if n_picks > 0 else 0.0
+                    # ROTATION uses Kelly per pick (not equal_size anymore).
+                    # win_prob estimated from rotation_score (60 ≈ 55%,
+                    # 80 ≈ 75%) since rotation has no per-pick ML.
                     for r in rotation_top3:
                         ann_alpha = _annualized_alpha(
                             "ROTATION", score=r["score"]
                         )
+                        _rot_score = float(r["score"])
+                        _rot_winp  = max(0.5, min(0.85, 0.5 + (_rot_score - 50.0) / 100.0))
+                        _rot_kelly = _kelly_full(
+                            win_prob=_rot_winp,
+                            alpha=ann_alpha / (365.0 / 90.0),  # back to 90d alpha for Kelly
+                            downside=_DEFAULT_DOWNSIDE_FALLBACK,
+                            budget=total_budget,
+                        )
                         candidates.append({
                             "ticker":     r["ucits"],
                             "bucket":     "ROTATION",
-                            "reason":     f"rotation top-{rotation_top3.index(r)+1} score {r['score']:.0f} (equal alloc)",
-                            "suggested":  equal_size,
+                            "reason":     f"rotation top-{rotation_top3.index(r)+1} score {r['score']:.0f}",
+                            "suggested":  _rot_kelly,
                             "ann_alpha":  ann_alpha,
                             "confidence": 1.0,
-                            "extra":      {"us_proxy": r["us_ticker"], "score": r["score"]},
+                            "extra":      {
+                                "us_proxy":     r["us_ticker"],
+                                "score":        r["score"],
+                                "win_prob_est": _rot_winp,
+                                "kelly_alloc":  _rot_kelly,
+                            },
                         })
 
                 # ── Core picks: all (including held — concentration cap gates) ─
