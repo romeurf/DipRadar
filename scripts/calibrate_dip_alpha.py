@@ -53,8 +53,27 @@ log = logging.getLogger("calibrate_dip")
 # pattern state.py uses for its JSON files.
 _DATA_DIR     = Path("/data") if Path("/data").exists() else (_ROOT / "data")
 _OUTPUT_PATH  = _DATA_DIR / "dip_alpha_calibration.json"
-_PARQUET_PATH = _ROOT / "ml_training_base.parquet"
-_BUNDLE_PATH  = _ROOT / "ml_training" / "dip_models.pkl"
+
+# Parquet path resolution: PREFER /data/ (Railway volume — has the latest
+# 211k-row retrained dataset) over /app/ (repo seed — only ~37k rows from
+# the original commit). Same logic for the bundle. Without this, the
+# calibration silently runs on the 6× smaller seed and learns the wrong
+# distribution.
+def _resolve_data_path(filename: str, ml_training_subdir: bool = False) -> Path:
+    """Prefer /data/ when it has the file, fall back to /app/ seed."""
+    # /data/ml_training_base.parquet OR /data/ml_training/dip_models.pkl
+    if ml_training_subdir:
+        data_path = _DATA_DIR / "ml_training" / filename
+        repo_path = _ROOT / "ml_training" / filename
+    else:
+        data_path = _DATA_DIR / filename
+        repo_path = _ROOT / filename
+    if data_path.exists():
+        return data_path
+    return repo_path
+
+_PARQUET_PATH = _resolve_data_path("ml_training_base.parquet")
+_BUNDLE_PATH  = _resolve_data_path("dip_models.pkl", ml_training_subdir=True)
 
 _MIN_R_SQUARED_ACCEPT = 0.10   # one acceptance path: high explained variance
 _MIN_SPREAD_FOR_ACCEPT = 0.04  # second acceptance path: monotonic AND ≥4pp spread
