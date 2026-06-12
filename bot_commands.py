@@ -4333,13 +4333,29 @@ def _handle_command(text: str) -> None:
                     return set()
                 try:
                     data = _json.loads(_uni_file.read_text(encoding="utf-8"))
+
+                    def _coerce_ticker(item) -> str:
+                        # core_universe.json's "tickers" list contains DICTS
+                        # like {"ticker": "MSFT", "annual_yield_pct": 0.7, ...}.
+                        # Before 2026-06-13 the loader did str(item).upper(),
+                        # which stringified the dict and produced garbage
+                        # entries like "{'TICKER': 'MSFT', ...}" — none of
+                        # which match the parquet's actual ticker symbols, so
+                        # /admin_fill_missing core reported every ticker as
+                        # missing and queued a 230-ticker rebuild. Handle
+                        # dict, plain string, and string-keyed dict shapes.
+                        if isinstance(item, dict):
+                            t = item.get("ticker") or item.get("symbol") or ""
+                            return str(t).upper()
+                        return str(item).upper()
+
                     if isinstance(data, dict):
                         # may be {"tickers": [...]} or {ticker: {...}}
                         if "tickers" in data and isinstance(data["tickers"], list):
-                            return {str(t).upper() for t in data["tickers"]}
+                            return {_coerce_ticker(t) for t in data["tickers"] if _coerce_ticker(t)}
                         return {str(t).upper() for t in data.keys()}
                     if isinstance(data, list):
-                        return {str(t).upper() for t in data}
+                        return {_coerce_ticker(t) for t in data if _coerce_ticker(t)}
                 except Exception:
                     return set()
             return set()
