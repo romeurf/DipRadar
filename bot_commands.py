@@ -6296,6 +6296,10 @@ def _handle_command(text: str) -> None:
                         # weekly refresh blends real mature alerts.
                         _calibrated_alpha = pred_alpha_90d
                         _calib_note       = source
+                        # Horizon for annualization — model may have been
+                        # trained on alpha_60d or alpha_90d; calibration JSON
+                        # tells us which. Defaults to 90 if no JSON found.
+                        _horizon_days     = 90
                         try:
                             # Prefer Railway volume /data/ (persists across
                             # deploys), fallback to repo data/ for local dev.
@@ -6305,6 +6309,11 @@ def _handle_command(text: str) -> None:
                             ):
                                 if _try.exists():
                                     _cd = _json.loads(_try.read_text())
+                                    # Even when not 'accepted', if horizon_days
+                                    # is set we want to use it for honest
+                                    # annualization (the model was actually
+                                    # trained on this horizon).
+                                    _horizon_days = int(_cd.get("horizon_days") or 90)
                                     if _cd.get("accepted"):
                                         for _b in _cd.get("buckets", []):
                                             if (pred_alpha_90d >= _b["pred_min"]
@@ -6319,7 +6328,7 @@ def _handle_command(text: str) -> None:
                         except Exception:
                             pass
 
-                        ann_alpha = _calibrated_alpha * (365.0 / 90.0)
+                        ann_alpha = _calibrated_alpha * (365.0 / float(_horizon_days))
                         candidates.append({
                             "ticker":     ticker,
                             "bucket":     "DIP",

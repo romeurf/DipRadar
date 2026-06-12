@@ -56,7 +56,20 @@ _OUTPUT_PATH  = _DATA_DIR / "dip_alpha_calibration.json"
 _PARQUET_PATH = _ROOT / "ml_training_base.parquet"
 _BUNDLE_PATH  = _ROOT / "ml_training" / "dip_models.pkl"
 
-_MIN_R_SQUARED_ACCEPT = 0.10   # buckets accepted if alpha rises monotonically
+_MIN_R_SQUARED_ACCEPT = 0.10   # one acceptance path: high explained variance
+_MIN_SPREAD_FOR_ACCEPT = 0.04  # second acceptance path: monotonic AND ≥4pp spread
+                               # between top and bottom bucket means
+
+
+# Map target column to its horizon in days (for annualization later)
+_HORIZON_BY_COLUMN = {
+    "alpha_90d":           90,
+    "alpha_90d_rank":      90,
+    "forward_return_90d":  90,
+    "return_90d":          90,
+    "alpha_60d":           60,
+    "alpha_60d_rank":      60,
+}
 
 
 def _ensure_data_dir() -> None:
@@ -199,6 +212,13 @@ def _bucket_calibration(
     is_monotonic = all(means[i] <= means[i+1] + 0.01 for i in range(len(means)-1))
     log.info(f"Buckets monotonic: {is_monotonic}")
 
+    # Spread between top and bottom bucket means — a separate signal of
+    # discrimination quality. With huge within-bucket variance (5k+ samples),
+    # r² can be low even when the model genuinely discriminates between low-
+    # and high-α regimes. Accepting on monotonic+spread covers this case.
+    spread = max(means) - min(means) if len(means) >= 2 else 0.0
+    log.info(f"Spread top-bottom buckets: {spread:.4f}")
+
     # Compute pseudo-R² as overall variance explained by bucket means
     overall_mean = float(actual.mean())
     bucket_pred_by_sample = np.zeros_like(actual)
@@ -209,18 +229,36 @@ def _bucket_calibration(
     ss_tot = float(((actual - overall_mean) ** 2).sum())
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-9 else 0.0
 
+    # Acceptance: either path qualifies
+    # (a) classic: r² ≥ MIN_R_SQUARED + monotonic
+    # (b) low-r² OK: monotonic + meaningful spread (≥ MIN_SPREAD)
+    accepted_by_r2 = (r2 >= _MIN_R_SQUARED_ACCEPT) and is_monotonic
+    accepted_by_spread = is_monotonic and (spread >= _MIN_SPREAD_FOR_ACCEPT)
+    accepted = accepted_by_r2 or accepted_by_spread
+    accept_reason = (
+        "r²+monotonic" if accepted_by_r2
+        else ("monotonic+spread" if accepted_by_spread else "rejected")
+    )
+
+    horizon_days = _HORIZON_BY_COLUMN.get(target_col, 90)
+    log.info(f"Target horizon: {horizon_days}d (column={target_col})")
+
     return {
         "method":             "buckets_by_prediction",
         "buckets":            buckets,
         "r_squared":          round(r2, 4),
+        "spread_top_bottom":  round(spread, 4),
         "is_monotonic":       is_monotonic,
-        "accepted":           r2 >= _MIN_R_SQUARED_ACCEPT and is_monotonic,
+        "accepted":           accepted,
+        "accepted_by":        accept_reason,
+        "horizon_days":       horizon_days,
         "n_samples_total":    int(len(pred)),
         "n_real":             0,
         "n_synthetic":        int(len(pred)),
         "version":            "v1_parquet_in_sample",
         "calibrated_on":      date.today().isoformat(),
         "min_r_squared_accept": _MIN_R_SQUARED_ACCEPT,
+        "min_spread_accept":  _MIN_SPREAD_FOR_ACCEPT,
         "parquet_source":     str(_PARQUET_PATH.name),
         "target_column":      target_col,
         "warning":            (
