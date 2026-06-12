@@ -6297,19 +6297,25 @@ def _handle_command(text: str) -> None:
                         _calibrated_alpha = pred_alpha_90d
                         _calib_note       = source
                         try:
-                            _cd_path = _Path("data/dip_alpha_calibration.json")
-                            if _cd_path.exists():
-                                _cd = _json.loads(_cd_path.read_text())
-                                if _cd.get("accepted"):
-                                    for _b in _cd.get("buckets", []):
-                                        if (pred_alpha_90d >= _b["pred_min"]
-                                                and pred_alpha_90d <= _b["pred_max"]):
-                                            _calibrated_alpha = float(_b["mean_actual_alpha_90d"])
-                                            _calib_note = (
-                                                f"{source} → calibrated bucket "
-                                                f"[{_b['pred_min']:+.3f},{_b['pred_max']:+.3f}]"
-                                            )
-                                            break
+                            # Prefer Railway volume /data/ (persists across
+                            # deploys), fallback to repo data/ for local dev.
+                            for _try in (
+                                _Path("/data/dip_alpha_calibration.json"),
+                                _Path("data/dip_alpha_calibration.json"),
+                            ):
+                                if _try.exists():
+                                    _cd = _json.loads(_try.read_text())
+                                    if _cd.get("accepted"):
+                                        for _b in _cd.get("buckets", []):
+                                            if (pred_alpha_90d >= _b["pred_min"]
+                                                    and pred_alpha_90d <= _b["pred_max"]):
+                                                _calibrated_alpha = float(_b["mean_actual_alpha_90d"])
+                                                _calib_note = (
+                                                    f"{source} → calibrated bucket "
+                                                    f"[{_b['pred_min']:+.3f},{_b['pred_max']:+.3f}]"
+                                                )
+                                                break
+                                    break
                         except Exception:
                             pass
 
@@ -7663,6 +7669,74 @@ def _handle_command(text: str) -> None:
                 _self._pipeline_proc   = None
             except Exception as e:
                 _reply(f"Kill failed: {e}")
+
+    elif cmd in ("/admin_calibrate_dip", "/calibrate_dip"):
+        # Run scripts/calibrate_dip_alpha.py via subprocess (the user can't
+        # SSH into Railway, so this is the only entry point). Streams the
+        # output line-by-line into a single message so the user sees the
+        # buckets table and the final r²/monotonicity/accepted flags.
+        import subprocess as _subp
+        import threading as _thr
+        from pathlib import Path as _P
+
+        _script = _P(__file__).parent / "scripts" / "calibrate_dip_alpha.py"
+        if not _script.exists():
+            _reply(f"⚠️ Script não encontrado: `{_script}`")
+        else:
+            _reply(
+                "🧪 *DIP α calibration — V1 (parquet, in-sample)*\n"
+                "_A correr `scripts/calibrate_dip_alpha.py`... pode demorar 1-3 min._"
+            )
+
+            def _run_calib():
+                try:
+                    proc = _subp.Popen(
+                        ["python", str(_script)],
+                        stdout=_subp.PIPE,
+                        stderr=_subp.STDOUT,
+                        text=True,
+                        bufsize=1,
+                    )
+                    captured: list[str] = []
+                    if proc.stdout is not None:
+                        for line in proc.stdout:
+                            captured.append(line.rstrip())
+                            if len(captured) > 200:
+                                captured = captured[-200:]
+                    rc = proc.wait()
+                    tail = "\n".join(captured[-40:])
+                    status = "✅" if rc == 0 else "❌"
+                    # Read the resulting JSON for a clean summary
+                    summary = ""
+                    try:
+                        import json as _json
+                        _cd = _P("/data") if _P("/data").exists() else _P("/tmp")
+                        _alt = _P(__file__).parent / "data"
+                        for _candidate in (_cd / "dip_alpha_calibration.json",
+                                           _alt / "dip_alpha_calibration.json"):
+                            if _candidate.exists():
+                                _cf = _json.loads(_candidate.read_text())
+                                summary = (
+                                    f"\n\n📊 *Resultado*: r²=*{_cf.get('r_squared', 0):.3f}* "
+                                    f"| monotonic=*{_cf.get('is_monotonic', False)}* "
+                                    f"| accepted=*{_cf.get('accepted', False)}*\n"
+                                    f"  n_total={_cf.get('n_samples_total', 0)} "
+                                    f"(real={_cf.get('n_real', 0)}, "
+                                    f"synthetic={_cf.get('n_synthetic', 0)})\n"
+                                    f"  version=`{_cf.get('version', '?')}`\n"
+                                    f"  Buckets: {len(_cf.get('buckets', []))}"
+                                )
+                                break
+                    except Exception:
+                        pass
+                    _reply(
+                        f"{status} *Calibração terminou (exit={rc})*\n\n"
+                        f"```\n{tail[-3000:]}\n```{summary}"
+                    )
+                except Exception as e:
+                    _reply(f"❌ Erro a correr calibração: `{e}`")
+
+            _thr.Thread(target=_run_calib, daemon=True, name="dip-calib").start()
 
     elif cmd in ("/admin_clear_alerts", "/clear_alerts_now"):
         # Manual trigger for the daily dedup reset. Useful when stale

@@ -505,9 +505,14 @@ def run_daily_digest() -> int:
         v = e.get("pred_alpha_90d")
         return float(v) if v is not None else -999.0
 
+    # Top-3 (not top-5) to match the per-bucket cap applied in /cash (201998f).
+    # User reasoning: with 5 radars × top-3 cap each, the €1050 monthly budget
+    # already constrains execution to ~3 real moves. Showing 5 here would be
+    # inconsistent and create false sense of capacity. Top-3 = 1 action per
+    # radar max, matches the budget reality.
     sorted_alerts = sorted(by_ticker.values(), key=_alpha_key, reverse=True)
-    top_5         = sorted_alerts[:5]
-    rest          = sorted_alerts[5:]
+    top_3         = sorted_alerts[:3]
+    rest          = sorted_alerts[3:]
 
     try:
         from portfolio.portfolio import get_liquidity
@@ -522,9 +527,9 @@ def run_daily_digest() -> int:
         "",
     ]
 
-    if top_5:
-        lines.append("🏆 *Top 5 ranked por α esperado*:")
-        for i, e in enumerate(top_5, 1):
+    if top_3:
+        lines.append("🏆 *Top 3 ranked por α esperado*:")
+        for i, e in enumerate(top_3, 1):
             ticker = e.get("ticker", "?")
             score  = e.get("score")
             score_s = f"score {score:.0f}" if score is not None else "score n/d"
@@ -565,7 +570,7 @@ def run_daily_digest() -> int:
 
     n = len(sorted_alerts)
     _clear_digest_buffer()
-    logging.info(f"[digest] emitted: {len(top_5)} top + {len(rest)} rest ({n} unique tickers)")
+    logging.info(f"[digest] emitted: {len(top_3)} top + {len(rest)} rest ({n} unique tickers)")
     return n
 
 

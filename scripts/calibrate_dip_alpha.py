@@ -48,7 +48,11 @@ logging.basicConfig(
 log = logging.getLogger("calibrate_dip")
 
 
-_OUTPUT_PATH = _ROOT / "data" / "dip_alpha_calibration.json"
+# Output: prefer Railway volume /data/ (persists across deploys), fallback
+# to /app/data/ for local dev. The /data/ vs /app/data split is the same
+# pattern state.py uses for its JSON files.
+_DATA_DIR     = Path("/data") if Path("/data").exists() else (_ROOT / "data")
+_OUTPUT_PATH  = _DATA_DIR / "dip_alpha_calibration.json"
 _PARQUET_PATH = _ROOT / "ml_training_base.parquet"
 _BUNDLE_PATH  = _ROOT / "ml_training" / "dip_models.pkl"
 
