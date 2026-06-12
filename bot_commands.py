@@ -1854,7 +1854,7 @@ def _handle_admin_momentum_dataset(parts: list[str]) -> None:
         + (" *(force rebuild)*" if force_rebuild else "") +
         f"\n"
         + (f"Tickers: {ticker_val}\n" if is_test else "") +
-        f"Output: /data/momentum\\_training.parquet\n"
+        f"Output: {'/data/test/' if is_test else '/data/'}momentum\\_training.parquet\n"
         f"Duração: {dur_str}\n"
         f"Podes continuar a usar o bot."
     )
@@ -1862,18 +1862,20 @@ def _handle_admin_momentum_dataset(parts: list[str]) -> None:
     def _run():
         import subprocess, sys, shutil
         from pathlib import Path
+        from utils.dataset_paths import resolve_dataset_path, is_test_mode
         try:
             script   = Path(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py"
-            data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
-            out_path = data_dir / "momentum_training.parquet"
-            # Se /data/ não tem o parquet (deploy novo), semear a partir do repo
-            if not out_path.exists() and not force_rebuild:
+            is_test  = is_test_mode(ticker_val)
+            out_path = resolve_dataset_path("momentum_training.parquet", is_test=is_test)
+            # Seed a partir do repo só em produção. Em test mode, parquet vazio
+            # é o estado correcto — não queremos arrastar contexto de produção.
+            if not is_test and not out_path.exists() and not force_rebuild:
                 repo_seed = Path(__file__).parent / "momentum_radar" / "momentum_training.parquet"
                 if repo_seed.exists():
                     shutil.copy2(str(repo_seed), str(out_path))
                     logging.info(f"[momentum_dataset] Seed de {repo_seed} → {out_path}")
             cmd      = [sys.executable, str(script), "--start", start_val, "--out", str(out_path)]
-            if ticker_val:
+            if is_test:
                 cmd += ["--tickers", ticker_val]
             if force_rebuild:
                 cmd += ["--force-rebuild"]
@@ -1885,12 +1887,15 @@ def _handle_admin_momentum_dataset(parts: list[str]) -> None:
                 try:
                     import pandas as pd
                     df = pd.read_parquet(out_path)
-                    # Copiar para repo para rastreio em git
-                    repo_pq = Path(__file__).parent / "momentum_radar" / "momentum_training.parquet"
-                    try:
-                        shutil.copy2(str(out_path), str(repo_pq))
-                    except Exception as _cp:
-                        logging.warning(f"[momentum_dataset] cópia repo: {_cp}")
+                    # Copiar para repo SÓ em produção. Em test mode, copiar o
+                    # smoke-test parquet para o repo envenenaria o seed de
+                    # deploys futuros — exactamente o que aconteceu antes deste fix.
+                    if not is_test:
+                        repo_pq = Path(__file__).parent / "momentum_radar" / "momentum_training.parquet"
+                        try:
+                            shutil.copy2(str(out_path), str(repo_pq))
+                        except Exception as _cp:
+                            logging.warning(f"[momentum_dataset] cópia repo: {_cp}")
                     n_rows    = len(df)
                     n_tickers = df["ticker"].nunique() if "ticker" in df.columns else "?"
                     n_sectors = df["sector"].nunique() if "sector" in df.columns else "?"
@@ -2084,7 +2089,7 @@ def _handle_admin_dip_dataset(parts: list[str]) -> None:
         + (" *(force rebuild)*" if force_rebuild else "") +
         f"\n"
         + (f"Tickers: {ticker_val}\n" if is_test else "") +
-        f"Output: /data/ml\\_training\\_base.parquet\n"
+        f"Output: {'/data/test/' if is_test else '/data/'}ml\\_training\\_base.parquet\n"
         + ("Fundamentais: não\n" if no_fund else "") +
         f"Duração: {dur_str}\n"
         f"Podes continuar a usar o bot."
@@ -2093,18 +2098,20 @@ def _handle_admin_dip_dataset(parts: list[str]) -> None:
     def _run():
         import subprocess, sys, shutil
         from pathlib import Path
+        from utils.dataset_paths import resolve_dataset_path, is_test_mode
         try:
             script   = Path(__file__).parent / "scripts" / "build_dip_dataset.py"
-            data_dir = Path("/data") if Path("/data").exists() else Path("/tmp")
-            out_path = data_dir / "ml_training_base.parquet"
-            # Se /data/ não tem o parquet (deploy novo), semear a partir do repo
-            if not out_path.exists() and not force_rebuild:
+            is_test  = is_test_mode(ticker_val)
+            out_path = resolve_dataset_path("ml_training_base.parquet", is_test=is_test)
+            # Seed a partir do repo só em produção. Em test mode, parquet vazio
+            # é o estado correcto — não queremos arrastar contexto de produção.
+            if not is_test and not out_path.exists() and not force_rebuild:
                 repo_seed = Path(__file__).parent / "ml_training_base.parquet"
                 if repo_seed.exists():
                     shutil.copy2(str(repo_seed), str(out_path))
                     logging.info(f"[dip_dataset] Seed de {repo_seed} → {out_path}")
             cmd      = [sys.executable, str(script), "--start", start_val, "--out", str(out_path)]
-            if ticker_val:
+            if is_test:
                 cmd += ["--tickers", ticker_val]
             if no_fund:
                 cmd += ["--no-fundamentals"]
@@ -2123,12 +2130,15 @@ def _handle_admin_dip_dataset(parts: list[str]) -> None:
                 try:
                     import pandas as pd
                     df = pd.read_parquet(out_path)
-                    # Copiar para repo para rastreio em git
-                    repo_pq = Path(__file__).parent / "ml_training_base.parquet"
-                    try:
-                        shutil.copy2(str(out_path), str(repo_pq))
-                    except Exception as _cp:
-                        logging.warning(f"[dip_dataset] cópia repo: {_cp}")
+                    # Copiar para repo SÓ em produção. Em test mode, copiar o
+                    # smoke-test parquet para o repo envenenaria o seed de
+                    # deploys futuros — exactamente o que aconteceu antes deste fix.
+                    if not is_test:
+                        repo_pq = Path(__file__).parent / "ml_training_base.parquet"
+                        try:
+                            shutil.copy2(str(out_path), str(repo_pq))
+                        except Exception as _cp:
+                            logging.warning(f"[dip_dataset] cópia repo: {_cp}")
                     n_rows    = len(df)
                     n_tickers = df["ticker"].nunique() if "ticker" in df.columns else "?"
                     n_sectors = df["sector"].nunique() if "sector" in df.columns else "?"
@@ -2247,13 +2257,16 @@ def _handle_admin_build_core_dataset(parts: list[str]) -> None:
     def _run():
         import subprocess, sys, re as _re
         from pathlib import Path as _P
+        from utils.dataset_paths import production_dataset_path
 
         global _pipeline_log
         _pipeline_log.clear()
         _plog("CoreML dataset build iniciado")
 
-        data_dir = _P("/data") if _P("/data").exists() else _P("/tmp")
-        out_path = data_dir / "core_training_base.parquet"
+        # Standalone /admin_build_core_dataset is always a full production
+        # build — there is no --test surface here. Test mode goes through
+        # /admin_run_pipeline --test which uses resolve_dataset_path(...).
+        out_path = production_dataset_path("core_training_base.parquet")
         script   = _P(__file__).parent / "scripts" / "build_core_dataset.py"
 
         cmd = [sys.executable, str(script), "--out", str(out_path), "--start", "1993-01-01"]
@@ -3219,12 +3232,20 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
         core_ds_ok  = not want_dataset or not want_core
         dip_ds_err  = mom_ds_err = core_ds_err = ""
 
+        from utils.dataset_paths import resolve_dataset_path, is_test_mode
+        # `test_tickers` carries the `--test T1,T2` value through the whole
+        # pipeline. When set, every parquet write goes to /data/test/ instead
+        # of /data/, and the retrain/github-sync paths below skip persistence
+        # so a smoke test cannot promote a 2-ticker model or push test data
+        # to GitHub. Production rebuilds (test_tickers=None) are unaffected.
+        is_test = is_test_mode(test_tickers)
+
         def _build_dip():
             nonlocal dip_ds_ok, dip_ds_err
             script = Path(__file__).parent / "scripts" / "build_dip_dataset.py"
-            out    = data_dir / "ml_training_base.parquet"
+            out    = resolve_dataset_path("ml_training_base.parquet", is_test=is_test)
             cmd    = [sys.executable, str(script), "--start", "1993-01-01", "--out", str(out)]
-            if test_tickers: cmd += ["--tickers", test_tickers]
+            if is_test:      cmd += ["--tickers", test_tickers]
             if force:        cmd += ["--force-rebuild", "--clear-cache"]
             rc, lines = _run_script_streaming(cmd, "Phase 1 — DIP dataset")
             if rc == 0:
@@ -3235,9 +3256,9 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
         def _build_momentum():
             nonlocal mom_ds_ok, mom_ds_err
             script = Path(__file__).parent / "momentum_radar" / "scripts" / "build_dataset.py"
-            out    = data_dir / "momentum_training.parquet"
+            out    = resolve_dataset_path("momentum_training.parquet", is_test=is_test)
             cmd    = [sys.executable, str(script), "--start", "1993-01-01", "--out", str(out)]
-            if test_tickers: cmd += ["--tickers", test_tickers]
+            if is_test:      cmd += ["--tickers", test_tickers]
             if force:        cmd += ["--force-rebuild", "--clear-cache"]
             rc, lines = _run_script_streaming(cmd, "Phase 1 — Momentum dataset")
             if rc == 0:
@@ -3248,9 +3269,9 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
         def _build_core():
             nonlocal core_ds_ok, core_ds_err
             script = Path(__file__).parent / "scripts" / "build_core_dataset.py"
-            out    = data_dir / "core_training_base.parquet"
+            out    = resolve_dataset_path("core_training_base.parquet", is_test=is_test)
             cmd    = [sys.executable, str(script), "--start", "1993-01-01", "--out", str(out)]
-            if test_tickers: cmd += ["--tickers", test_tickers]
+            if is_test:      cmd += ["--tickers", test_tickers]
             if force:        cmd += ["--force-rebuild", "--clear-cache"]
             rc, lines = _run_script_streaming(cmd, "Phase 1 — CORE dataset")
             if rc == 0:
@@ -3294,6 +3315,23 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
             elapsed = round(_t.time() - start_wall)
             _plog("Phase 2 — skipped (--dataset only)")
             _reply(f"Pipeline complete (dataset only). Elapsed: {elapsed}s")
+            _retrain_running = False
+            return
+
+        # Test mode: smoke test verified dataset builds finish. Don't retrain
+        # — a 2-ticker model is useless and the retrain path reads from the
+        # production parquet (run_monthly_retrain has no test-path knob), so
+        # letting it run would either error out or train on stale production
+        # data and (worse) promote it. Stop here cleanly.
+        if is_test:
+            elapsed = round(_t.time() - start_wall)
+            _plog("Phase 2 — skipped (test mode: datasets built in /data/test/, retrain not run)")
+            _reply(
+                f"Smoke test OK in {elapsed}s.\n"
+                f"Parquets written to /data/test/ (production untouched).\n"
+                f"Phase 2 retrain skipped — a 2-ticker model is useless. "
+                f"Re-run without `--test` for a real retrain."
+            )
             _retrain_running = False
             return
 
