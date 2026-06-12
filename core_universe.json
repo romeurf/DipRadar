@@ -4,7 +4,7 @@
     "philosophy": "Companies worth owning forever: high ROIC, durable competitive advantage, strong capital allocation. Not a screener — these are the baseline quality compounders CoreRadar monitors permanently.",
     "generated": "2026-05-25",
     "source": "Curated baseline v2. Auto-refreshed by scripts/refresh_core_universe.py (quality screen: gross_margin >= 35%, ROIC >= 15%, market_cap >= 5B).",
-    "count": 300,
+    "count": 230,
     "eu_note": "EU tickers removed. Phase 2 when EU markets are implemented."
   },
   "overrides": {
@@ -26,7 +26,6 @@
     {"ticker": "WDAY",  "annual_yield_pct": 0.0,  "note": "HCM + financial cloud, enterprise mission-critical"},
     {"ticker": "CDNS",  "annual_yield_pct": 0.0,  "note": "EDA software duopoly — every chip uses Cadence or Synopsys"},
     {"ticker": "SNPS",  "annual_yield_pct": 0.0,  "note": "EDA software duopoly, simulation + verification"},
-    {"ticker": "ANSS",  "annual_yield_pct": 0.0,  "note": "simulation software, physics + engineering moat"},
     {"ticker": "ROP",   "annual_yield_pct": 0.6,  "note": "vertical market software compounder, Roper model"},
     {"ticker": "IT",    "annual_yield_pct": 0.0,  "note": "Gartner — research + advisory subscription, near-monopoly"},
     {"ticker": "EPAM",  "annual_yield_pct": 0.0,  "note": "IT services high margin, engineering talent moat"},
@@ -78,7 +77,6 @@
     {"ticker": "CI",    "annual_yield_pct": 1.8,  "note": "health insurance + Evernorth PBM"},
     {"ticker": "HUM",   "annual_yield_pct": 1.0,  "note": "Medicare Advantage specialist, CenterWell clinics"},
     {"ticker": "MCK",   "annual_yield_pct": 0.5,  "note": "drug distribution oligopoly, Dividend Aristocrat"},
-    {"ticker": "CTLT",  "annual_yield_pct": 0.0,  "note": "CDMO services, drug manufacturing outsourcing"},
 
     {"ticker": "V",     "annual_yield_pct": 0.7,  "note": "payment network, durable moat"},
     {"ticker": "MA",    "annual_yield_pct": 0.5,  "note": "payment network, global growth"},
@@ -159,7 +157,7 @@
     {"ticker": "VRSK",  "annual_yield_pct": 0.6,  "note": "Verisk — insurance data analytics, near-monopoly"},
     {"ticker": "AXON",  "annual_yield_pct": 0.0,  "note": "Taser + body cameras + evidence cloud, public safety"},
     {"ticker": "TDG",   "annual_yield_pct": 0.0,  "note": "TransDigm — aviation aftermarket, pricing power"},
-    {"ticker": "MOOG",  "annual_yield_pct": 0.7,  "note": "precision motion control, aerospace + defense"},
+    {"ticker": "MOG-A", "annual_yield_pct": 0.7,  "note": "Moog Inc Class A — precision motion control, aerospace + defense (NYSE: MOG-A)"},
     {"ticker": "WSO",   "annual_yield_pct": 2.2,  "note": "Watsco — HVAC distribution, fragmented market rollup"},
     {"ticker": "POOL",  "annual_yield_pct": 1.2,  "note": "pool products distribution, seasonal but sticky"},
     {"ticker": "SWK",   "annual_yield_pct": 3.5,  "note": "Stanley Black & Decker, Dividend King"},
@@ -199,18 +197,13 @@
     {"ticker": "ADP",   "annual_yield_pct": 2.1,  "note": "payroll + HR software, 50 years growing dividend"},
     {"ticker": "PAYX",  "annual_yield_pct": 3.0,  "note": "Paychex — payroll for SMB, sticky recurring revenue"},
     {"ticker": "EFX",   "annual_yield_pct": 0.6,  "note": "Equifax — credit bureau + workforce data"},
-    {"ticker": "EXPN",  "annual_yield_pct": 1.1,  "note": "Experian — global credit data, US ADR"},
     {"ticker": "TRU",   "annual_yield_pct": 0.7,  "note": "TransUnion — credit bureau + risk analytics"},
-    {"ticker": "DNB",   "annual_yield_pct": 0.0,  "note": "Dun & Bradstreet — B2B data + analytics"},
     {"ticker": "BRZE",  "annual_yield_pct": 0.0,  "note": "Braze — customer engagement platform, high NRR"},
     {"ticker": "PCTY",  "annual_yield_pct": 0.0,  "note": "Paylocity — payroll SaaS, mid-market HR"},
-    {"ticker": "SMAR",  "annual_yield_pct": 0.0,  "note": "Smartsheet — collaborative work management"},
-    {"ticker": "COUP",  "annual_yield_pct": 0.0,  "note": "Coupa Software — procurement BSM platform"},
 
     {"ticker": "CVX",   "annual_yield_pct": 4.2,  "note": "Chevron — integrated energy, Dividend Aristocrat, strong FCF"},
     {"ticker": "XOM",   "annual_yield_pct": 3.5,  "note": "ExxonMobil — largest US energy, Guyana + Permian growth"},
     {"ticker": "EOG",   "annual_yield_pct": 3.0,  "note": "EOG Resources — premium shale, low-cost operator"},
-    {"ticker": "PXD",   "annual_yield_pct": 5.5,  "note": "Pioneer Natural Resources — Permian Basin purity play"},
 
     {"ticker": "NEE",   "annual_yield_pct": 3.2,  "note": "NextEra — largest US utility + wind/solar leader"},
     {"ticker": "D",     "annual_yield_pct": 4.8,  "note": "Dominion Energy — regulated utility, Virginia growth"},
@@ -242,7 +235,7 @@
     {"ticker": "CMCSA", "annual_yield_pct": 3.0,  "note": "Comcast — cable infrastructure + NBCUniversal + Sky"},
     {"ticker": "CHTR",  "annual_yield_pct": 0.0,  "note": "Charter — cable broadband, natural monopoly + MVNO"},
     {"ticker": "SPOT",  "annual_yield_pct": 0.0,  "note": "Spotify — audio streaming leader, podcast + creator"},
-    {"ticker": "LGF-A", "annual_yield_pct": 0.0,  "note": "Lionsgate — content studio + Starz streaming"},
+    {"ticker": "LION",  "annual_yield_pct": 0.0,  "note": "Lionsgate Studios — content + IP library (post-Starz spin-off May 2024, NYSE: LION)"},
 
     {"ticker": "KEYS",  "annual_yield_pct": 0.4,  "note": "Keysight — test + measurement, electronic design"},
     {"ticker": "TER",   "annual_yield_pct": 0.4,  "note": "Teradyne — semiconductor test, robotics option"},

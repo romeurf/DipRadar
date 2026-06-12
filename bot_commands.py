@@ -4358,8 +4358,13 @@ def _handle_command(text: str) -> None:
                 "parquet_name": "core_training_base.parquet",
                 "script":       _P(__file__).parent / "scripts" / "build_core_dataset.py",
                 "extra_args":   ["--start", "1993-01-01"],
-                "dedup_keys":   ["ticker", "date"],
-                "date_col":     "date",
+                # build_core_dataset.py writes rows keyed by (ticker, alert_date).
+                # Using "date" here (pre-2026-06-13 bug) made the dedup filter
+                # fall back to ["ticker"] alone — merging would have collapsed
+                # the 63k-row parquet to 1 row per ticker. Aligned with the
+                # actual schema so the merge keeps every episode.
+                "dedup_keys":   ["ticker", "alert_date"],
+                "date_col":     "alert_date",
                 "retrain_hint": "/admin_overnight --no-purge --core-only",
             },
             "momentum": {
