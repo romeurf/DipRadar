@@ -63,17 +63,47 @@ def _ensure_data_dir() -> None:
     _OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
-def _load_parquet() -> "pd.DataFrame":
+_TARGET_CANDIDATES = (
+    "alpha_90d",            # canonical (build_dip_dataset.py current schema)
+    "alpha_90d_rank",       # used internally by calibration.py
+    "forward_return_90d",   # raw return without SPY subtraction
+    "return_90d",           # alias
+    "alpha_60d",            # fallback horizon
+    "alpha_60d_rank",
+)
+
+
+def _load_parquet() -> tuple["pd.DataFrame", str]:
+    """Load parquet + resolve which column is the target.
+
+    The repo schema is meant to write alpha_90d but older parquets / renamed
+    schemas might have a different column. Try a sequence of candidates and
+    return the dataframe + the resolved target name. If none match, dump all
+    columns so the user can see what the actual target is called.
+    """
     import pandas as pd
     if not _PARQUET_PATH.exists():
         log.error(f"Parquet not found at {_PARQUET_PATH}")
         sys.exit(1)
     df = pd.read_parquet(_PARQUET_PATH)
     log.info(f"Loaded parquet: {df.shape[0]} rows × {df.shape[1]} columns")
-    if "alpha_90d" not in df.columns:
-        log.error("Parquet missing 'alpha_90d' target column — cannot calibrate")
-        sys.exit(1)
-    return df
+
+    for candidate in _TARGET_CANDIDATES:
+        if candidate in df.columns:
+            valid = df[candidate].notna().sum()
+            log.info(f"Target column resolved: '{candidate}' ({valid}/{len(df)} non-null)")
+            if valid < 100:
+                log.warning(f"Target '{candidate}' has only {valid} non-null values — trying next")
+                continue
+            return df, candidate
+
+    # None matched — diagnostic dump
+    log.error("Parquet has no recognized α target column. Tried: " + ", ".join(_TARGET_CANDIDATES))
+    log.error("Full column list (sorted):")
+    for c in sorted(df.columns.tolist()):
+        log.error(f"  {c}")
+    log.error("Pick the right column name and add it to _TARGET_CANDIDATES at the top of this script.")
+    sys.exit(1)
 
 
 def _load_bundle():
@@ -120,6 +150,7 @@ def _bucket_calibration(
     actual: np.ndarray,
     n_buckets: int = 7,
     min_samples_per_bucket: int = 30,
+    target_col: str = "alpha_90d",
 ) -> dict:
     """Compute per-bucket mean(actual) sorted by pred.
 
@@ -191,6 +222,7 @@ def _bucket_calibration(
         "calibrated_on":      date.today().isoformat(),
         "min_r_squared_accept": _MIN_R_SQUARED_ACCEPT,
         "parquet_source":     str(_PARQUET_PATH.name),
+        "target_column":      target_col,
         "warning":            (
             "V1 calibration uses IN-SAMPLE predictions on the training parquet — "
             "model is overfit to these rows, so r_squared is optimistic. V2 will "
@@ -210,16 +242,18 @@ def main() -> None:
     args = parser.parse_args()
 
     _ensure_data_dir()
-    df     = _load_parquet()
+    df, target_col = _load_parquet()
     bundle = _load_bundle()
 
     pred   = _predict_on_parquet(df, bundle)
-    actual = df["alpha_90d"].fillna(0.0).values
+    actual = df[target_col].fillna(0.0).values
+    log.info(f"Using '{target_col}' as α target")
 
     calib = _bucket_calibration(
         pred, actual,
         n_buckets=args.buckets,
         min_samples_per_bucket=args.min_samples_per_bucket,
+        target_col=target_col,
     )
 
     log.info("=" * 60)
