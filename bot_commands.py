@@ -139,12 +139,19 @@ def _run_script_streaming(
     _pipeline_phase = phase_label
     _plog(f"{phase_label}: starting")
 
-    # Patterns that are useful to surface; everything else is debug noise
+    # Patterns that are useful to surface; everything else is debug noise.
+    # 2026-06-12 expansion: added per-ticker lifecycle markers ("processing",
+    # "done", "failed", "timeout", "abandoned") so a stalled build is
+    # diagnosable from the Telegram log alone — the last "processing X"
+    # without a matching "done X" identifies the hanging ticker.
     _PROGRESS_RE  = _re.compile(r"\[(\d+)/(\d+)\]")          # [42/780] AAPL
     _LEVEL_RE     = _re.compile(r"\b(INFO|WARNING|ERROR|CRITICAL)\b")
     _SUMMARY_KEYS = ("dataset", "rows", "tickers", "samples", "promoted", "failed",
                      "complete", "done", "skip", "merge", "alpha", "episodes",
-                     "IC=", "rho", "elapsed", "error", "exception")
+                     "IC=", "rho", "elapsed", "error", "exception",
+                     # per-ticker lifecycle — helps spot stalls in real time
+                     "processing", "timeout", "abandoned", "no price data",
+                     "no data")
 
     def _is_interesting(line: str) -> bool:
         ll = line.lower()

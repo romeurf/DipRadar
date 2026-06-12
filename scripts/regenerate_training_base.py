@@ -49,6 +49,12 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+# Install a default HTTP timeout on requests.Session — protects yfinance,
+# Tiingo and any other requests-based call from stalling indefinitely. This
+# import is imported by build_dip_dataset.py, build_core_dataset.py and the
+# momentum build, so all three runs get the protection automatically.
+import utils.http_timeout  # noqa: F401 — installs on import
+
 # yfinance é importado dentro de funções para permitir testes sem rede
 
 log = logging.getLogger("regen")
@@ -256,6 +262,14 @@ def _fetch_batch(
         df = _fetch_one_ticker(ticker, cache_dir, start=start)
         if df is None or df.empty:
             failed += 1
+            # Surface the ticker name so a "failed=N" summary is debuggable.
+            # Otherwise downstream we'd just know the count and have to diff
+            # caches by hand to figure out which tickers (delistings, renames,
+            # yfinance suffix issues like .L for London listings) were skipped.
+            log.warning(
+                f"  [{i+1:>4}/{n}] {ticker}: no price data "
+                f"(delisted / renamed / yfinance miss)"
+            )
             continue
         result[ticker] = df
         if was_cached:

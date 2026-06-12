@@ -377,6 +377,38 @@ def _process_one_ticker(
     cache_dir: Path,
     today: pd.Timestamp,
 ) -> list[dict]:
+    """Thin wrapper around _process_one_ticker_impl. Logs entry/exit so a
+    stalled thread is identifiable: the last "processing X" line without a
+    matching "done X" is the ticker that hung. Also surfaces per-ticker
+    duration to spot the slow outliers."""
+    import time as _time
+    log.info(f"  processing {ticker}")
+    t0 = _time.time()
+    try:
+        rows = _process_one_ticker_impl(
+            ticker, price_cache, spy_hist, sector_etf_cache,
+            core_tickers, core_yields, add_fundamentals, cache_dir, today,
+        )
+        log.info(f"  done {ticker}: {len(rows)} episodes ({_time.time() - t0:.1f}s)")
+        return rows
+    except Exception as e:
+        log.warning(
+            f"  failed {ticker}: {type(e).__name__}: {e} ({_time.time() - t0:.1f}s)"
+        )
+        raise
+
+
+def _process_one_ticker_impl(
+    ticker: str,
+    price_cache: dict[str, pd.DataFrame],
+    spy_hist: Optional[pd.DataFrame],
+    sector_etf_cache: dict[str, pd.DataFrame],
+    core_tickers: set[str],
+    core_yields: dict[str, float],
+    add_fundamentals: bool,
+    cache_dir: Path,
+    today: pd.Timestamp,
+) -> list[dict]:
     """Process one ticker: fetch per-ticker signals and generate MA200w episode rows."""
     import yfinance as _yf
 
