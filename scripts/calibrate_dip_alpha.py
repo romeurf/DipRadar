@@ -210,20 +210,47 @@ def _bucket_calibration(
         n = int(in_bucket.sum())
         if n < min_samples_per_bucket:
             log.warning(f"Bucket [{lo:.4f}, {hi:.4f}] has only {n} samples — including anyway")
-        # Compute means at the training horizon, then scale to display.
-        mean_train  = float(actual[in_bucket].mean())   if n > 0 else float("nan")
-        median_train = float(np.median(actual[in_bucket])) if n > 0 else float("nan")
-        mean_display = mean_train  * _scale
+        # Compute mean + percentiles at the training horizon, then scale
+        # everything linearly to the display horizon. Percentiles are what
+        # power the Kelly Criterion downside estimate — we look at the 5th
+        # percentile of actual outcomes to get a realistic "bad case" tail
+        # without resorting to a hand-tuned downside constant.
+        if n > 0:
+            samples_in    = actual[in_bucket]
+            mean_train    = float(samples_in.mean())
+            median_train  = float(np.median(samples_in))
+            q05_train     = float(np.quantile(samples_in, 0.05))
+            q25_train     = float(np.quantile(samples_in, 0.25))
+            std_train     = float(samples_in.std())
+        else:
+            mean_train = median_train = q05_train = q25_train = std_train = float("nan")
+
+        # Linear scale to display horizon
+        mean_display   = mean_train  * _scale
         median_display = median_train * _scale
+        q05_display    = q05_train * _scale
+        q25_display    = q25_train * _scale
+        std_display    = std_train * _scale
+
+        # Downside estimate for Kelly: gap between mean and 5th percentile
+        # in the DISPLAY horizon. abs() to handle negative-mean buckets.
+        downside_q05 = abs(mean_display - q05_display) if not (np.isnan(mean_display) or np.isnan(q05_display)) else float("nan")
+
         buckets.append({
             "pred_min":                       round(float(lo), 6),
             "pred_max":                       round(float(hi), 6),
             # Display horizon (90d) — what /cash actually consumes
             "mean_actual_alpha_90d":          round(mean_display, 6),
             "median_actual_alpha_90d":        round(median_display, 6),
+            "q05_alpha_90d":                  round(q05_display, 6),
+            "q25_alpha_90d":                  round(q25_display, 6),
+            "std_alpha_90d":                  round(std_display, 6),
+            # Downside for Kelly Criterion: gap mean → 5th percentile (tail)
+            "downside_q05_90d":               round(downside_q05, 6),
             # Training horizon (raw, for audit) — preserves what the model saw
             "mean_actual_alpha_training":     round(mean_train, 6),
             "median_actual_alpha_training":   round(median_train, 6),
+            "q05_alpha_training":             round(q05_train, 6),
             "n_samples":                      n,
             "n_real":                         0,    # V2 will track real-alert count
             "n_synthetic":                    n,    # V1 all-synthetic

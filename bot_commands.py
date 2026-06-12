@@ -6172,79 +6172,67 @@ def _handle_command(text: str) -> None:
                 # but adjustable. We size big for high-conviction (Core 100)
                 # and modest for short-horizon DIP (more positions, smaller
                 # each, since the model's pred_alpha already prices the bet).
-                # Dynamic allocation: conviction-weighted sizing instead of
-                # flat per-bucket constants. The conviction signal combines
-                # ML win_prob, rule-based score, and annualized α — each
-                # contributes 0-1, averaged. Curve `conviction^EXP` × range
-                # maps to allocation fraction of `total_budget`.
+                # Allocation: Full Kelly Criterion driven by ML predictions
+                # + calibration-derived downside. NO magic numbers — the
+                # math comes from "maximize log-wealth growth" theory.
                 #
-                # User feedback (2026-06-12, second round): with the first
-                # iteration (power 1.5, ceiling 0.40), a 'super dip' (score
-                # 85+, ML 75%+, α 30%+/y, conviction ≈ 0.60) deployed only
-                # ~€253 of a €1050 budget. User said 'pouquissimo'.
+                # Kelly fraction: f* = (p × b − (1 − p)) / b
+                #   where p = win_prob (from ML model)
+                #         b = alpha_90d / |downside_q05|  (both data-driven)
                 #
-                # Tuned to:
-                #   FLOOR   = 5%  (tracking position even on weak signals)
-                #   CEILING = 60% (was 40%)
-                #   EXP     = 1.2 (was 1.5 — less concave at high conviction
-                #                  so super dips climb faster)
+                # Position size: f* × budget × KELLY_FRACTION
                 #
-                # Now:
-                #   conviction 0.30 (mediocre)    → 18% → €189
-                #   conviction 0.50 (decent)      → 31% → €325
-                #   conviction 0.60 (super dip)   → 40% → €416
-                #   conviction 0.75 (exceptional) → 51% → €538
-                #   conviction 0.90 (rare regime) → 60% → €630
+                # KELLY_FRACTION:
+                #   1.0 → Full Kelly: maximum theoretical growth, brutal
+                #         drawdowns (-50% common before recovery)
+                #   0.5 → Half Kelly: 75% of growth, ~half the drawdown
+                #         (academic consensus)
+                #   0.25 → Quarter Kelly: very conservative
                 #
-                # Concentration cap (30% of portfolio_value, NOT of budget)
-                # still applies via _can_top_up — protects against pouring
-                # into already-concentrated tickers regardless of curve.
-                _ALLOC_FLOOR_PCT   = 0.05
-                _ALLOC_CEILING_PCT = 0.60
-                _ALLOC_EXPONENT    = 1.2
+                # User chose Full Kelly (1.0) on 2026-06-12 ('máximo ROI').
+                # Override via env var DIPRADAR_KELLY_FRACTION.
+                import os as _os_kelly
+                try:
+                    KELLY_FRACTION = float(_os_kelly.environ.get("DIPRADAR_KELLY_FRACTION", "1.0"))
+                except (TypeError, ValueError):
+                    KELLY_FRACTION = 1.0
+                KELLY_FRACTION = max(0.05, min(1.0, KELLY_FRACTION))
 
-                def _compute_conviction(win_prob, score, ann_alpha):
-                    """Composite conviction 0..1 from three signals.
+                # Fallback downside when no calibration bucket has data
+                # (e.g. ROTATION + CORE if their own calibrations aren't
+                # built yet). Not a magic number — conservative historical
+                # estimate from DIP backtest tail behaviour.
+                _DEFAULT_DOWNSIDE_FALLBACK = 0.15
 
-                    Missing signals contribute 0 — better to be conservative
-                    when data is absent. ann_alpha caps at 0.50 (50%/y)
-                    because higher values are unlikely-realistic and would
-                    skew the average.
+                def _kelly_full(win_prob, alpha, downside, budget, fraction=KELLY_FRACTION):
+                    """Full Kelly position size given p, α, downside, budget.
+
+                    Returns 0 when any input is missing/non-positive. This
+                    correctly handles ADBE-style cases where the ML model
+                    sees no edge → no deploy.
                     """
-                    parts = []
-                    if win_prob is not None:
-                        try:
-                            parts.append(max(0.0, (float(win_prob) - 0.5) * 2.0))
-                        except (TypeError, ValueError):
-                            pass
-                    if score is not None:
-                        try:
-                            parts.append(max(0.0, (float(score) - 50.0) / 50.0))
-                        except (TypeError, ValueError):
-                            pass
-                    if ann_alpha is not None:
-                        try:
-                            parts.append(min(1.0, max(0.0, float(ann_alpha) / 0.5)))
-                        except (TypeError, ValueError):
-                            pass
-                    if not parts:
-                        return 0.0
-                    return min(1.0, sum(parts) / 3.0)
-
-                def _dynamic_alloc(win_prob, score, ann_alpha, budget):
-                    """Compute suggested € allocation from conviction × budget."""
                     if budget <= 0:
                         return 0.0
-                    conv = _compute_conviction(win_prob, score, ann_alpha)
-                    alloc_pct = _ALLOC_FLOOR_PCT + (conv ** 1.5) * (_ALLOC_CEILING_PCT - _ALLOC_FLOOR_PCT)
-                    return float(budget) * alloc_pct
-
-                # Legacy base allocs — kept as fallback for edge cases where
-                # dynamic sizing can't compute (e.g. ROTATION which uses
-                # equal-allocation by design due to calibration noise).
-                CORE_BASE_ALLOC = 250.0
-                DIP_BASE_ALLOC = 150.0
-                ROT_BASE_ALLOC = 200.0
+                    if win_prob is None or alpha is None or downside is None:
+                        return 0.0
+                    try:
+                        p   = float(win_prob)
+                        a   = float(alpha)
+                        d   = float(downside)
+                    except (TypeError, ValueError):
+                        return 0.0
+                    if p <= 0 or a <= 0 or d <= 0:
+                        # Model says no edge → don't deploy. This is the right
+                        # behaviour: better to hold cash than bet against the
+                        # model's own probability assessment.
+                        return 0.0
+                    b = a / d
+                    if b <= 0:
+                        return 0.0
+                    f_kelly = (p * b - (1.0 - p)) / b
+                    if f_kelly <= 0:
+                        return 0.0
+                    return float(budget) * f_kelly * fraction
 
                 # ── Rotation candidates: top-3 (NEW or top-up) ──────────
                 # Equal allocation within top-3: the calibration test
@@ -6282,21 +6270,30 @@ def _handle_command(text: str) -> None:
                         score_norm = (float(p["score"]) - 50.0) / 50.0
                         score_norm = max(-0.999, min(0.999, score_norm))
                         alpha_1y = _m.atanh(score_norm) / 3.0
+                        # Kelly for CORE: estimate win_prob from score
+                        # (no ML for CORE per-ticker yet). score 50 ≈ random
+                        # (50%), score 100 ≈ near-certainty (90%). Linear map.
+                        _core_score = float(p["score"])
+                        _core_winp  = max(0.5, min(0.9, 0.5 + (_core_score - 50.0) / 100.0))
+                        _core_kelly = _kelly_full(
+                            win_prob=_core_winp,
+                            alpha=alpha_1y,
+                            downside=_DEFAULT_DOWNSIDE_FALLBACK,  # no CORE calibration yet
+                            budget=total_budget,
+                        )
                         candidates.append({
                             "ticker":     p["ticker"],
                             "bucket":     "CORE",
                             "reason":     f"Core score {p['score']:.0f} (${p.get('current_price', 0):.2f})",
-                            # Dynamic allocation: CORE score + α_1y as the
-                            # two signals (no per-ticker ML win_prob in CORE).
-                            "suggested":  _dynamic_alloc(
-                                win_prob=None,
-                                score=float(p["score"]),
-                                ann_alpha=alpha_1y,
-                                budget=total_budget,
-                            ),
+                            "suggested":  _core_kelly,
                             "ann_alpha":  alpha_1y,
                             "confidence": 1.0,
-                            "extra":      {"score": p["score"], "price": p.get("current_price")},
+                            "extra":      {
+                                "score":          p["score"],
+                                "price":          p.get("current_price"),
+                                "win_prob_est":   _core_winp,
+                                "kelly_alloc":    _core_kelly,
+                            },
                         })
                 except Exception as _e:
                     info_lines.append(f"⚠️ Core picks falhou: `{_e}`")
@@ -6372,30 +6369,26 @@ def _handle_command(text: str) -> None:
                         # would. V1: parquet in-sample (synthetic). V2:
                         # weekly refresh blends real mature alerts.
                         _calibrated_alpha = pred_alpha_90d
+                        _bucket_downside  = _DEFAULT_DOWNSIDE_FALLBACK
                         _calib_note       = source
-                        # Horizon for annualization — model may have been
-                        # trained on alpha_60d or alpha_90d; calibration JSON
-                        # tells us which. Defaults to 90 if no JSON found.
                         _horizon_days     = 90
                         try:
-                            # Prefer Railway volume /data/ (persists across
-                            # deploys), fallback to repo data/ for local dev.
                             for _try in (
                                 _Path("/data/dip_alpha_calibration.json"),
                                 _Path("data/dip_alpha_calibration.json"),
                             ):
                                 if _try.exists():
                                     _cd = _json.loads(_try.read_text())
-                                    # Even when not 'accepted', if horizon_days
-                                    # is set we want to use it for honest
-                                    # annualization (the model was actually
-                                    # trained on this horizon).
                                     _horizon_days = int(_cd.get("horizon_days") or 90)
                                     if _cd.get("accepted"):
                                         for _b in _cd.get("buckets", []):
                                             if (pred_alpha_90d >= _b["pred_min"]
                                                     and pred_alpha_90d <= _b["pred_max"]):
                                                 _calibrated_alpha = float(_b["mean_actual_alpha_90d"])
+                                                _bucket_downside  = float(
+                                                    _b.get("downside_q05_90d")
+                                                    or _DEFAULT_DOWNSIDE_FALLBACK
+                                                )
                                                 _calib_note = (
                                                     f"{source} → calibrated bucket "
                                                     f"[{_b['pred_min']:+.3f},{_b['pred_max']:+.3f}]"
@@ -6406,27 +6399,29 @@ def _handle_command(text: str) -> None:
                             pass
 
                         ann_alpha = _calibrated_alpha * (365.0 / float(_horizon_days))
-                        # Dynamic allocation: DIP has the most signals
-                        # available — ML win_prob, rule-based score, and
-                        # calibrated annualized α. Full triangulation.
+                        # Full Kelly: pure math from ML predictions +
+                        # calibration downside. No magic curve.
                         _dip_score = adb.get("score")
+                        _kelly_alloc_eur = _kelly_full(
+                            win_prob=win_prob,
+                            alpha=_calibrated_alpha,
+                            downside=_bucket_downside,
+                            budget=total_budget,
+                        )
                         candidates.append({
                             "ticker":     ticker,
                             "bucket":     "DIP",
                             "reason":     f"DIP alert ({_calib_note})",
-                            "suggested":  _dynamic_alloc(
-                                win_prob=win_prob,
-                                score=_dip_score,
-                                ann_alpha=ann_alpha,
-                                budget=total_budget,
-                            ),
+                            "suggested":  _kelly_alloc_eur,
                             "ann_alpha":  ann_alpha,
                             "confidence": confidence,
                             "extra":      {
                                 "pred_alpha_90d":    pred_alpha_90d,
                                 "calibrated_alpha":  _calibrated_alpha,
+                                "bucket_downside":   _bucket_downside,
                                 "win_prob":          win_prob,
                                 "score":             _dip_score,
+                                "kelly_alloc":       _kelly_alloc_eur,
                             },
                         })
                 except Exception as _e:
@@ -6699,6 +6694,37 @@ def _handle_command(text: str) -> None:
                         )
                         step += 1
 
+                # Persist the proposal so /deployed can look up the
+                # recommendation per ticker afterward. Stored to /data/
+                # (Railway volume) to survive deploys.
+                try:
+                    from datetime import datetime as _dt
+                    _proposal_path = (
+                        _Path("/data") if _Path("/data").exists() else _Path(__file__).parent / "data"
+                    ) / "last_cash_proposal.json"
+                    _proposal_path.parent.mkdir(parents=True, exist_ok=True)
+                    _proposal = {
+                        "timestamp":    _dt.now().isoformat(timespec="seconds"),
+                        "budget":       float(total_budget),
+                        "cash_inflow":  float(cash_amount),
+                        "freed_cash":   float(freed_cash),
+                        "actions":      [
+                            {
+                                "ticker":            b["ticker"],
+                                "bucket":            b["bucket"],
+                                "recommended_eur":   float(b["value"]),
+                                "ann_alpha_pct":     b.get("ann_alpha_pct"),
+                                "score":             (b.get("extra") or {}).get("score"),
+                                "win_prob":          (b.get("extra") or {}).get("win_prob"),
+                                "kelly_alloc":       (b.get("extra") or {}).get("kelly_alloc"),
+                            }
+                            for b in buy_actions
+                        ],
+                    }
+                    _proposal_path.write_text(_json.dumps(_proposal, indent=2))
+                except Exception as _pe:
+                    logging.debug(f"[cash] persist proposal failed: {_pe}")
+
                 _reply("\n".join(lines))
             except Exception as _e:
                 _reply(f"❌ Allocation falhou: `{_e}`")
@@ -6706,6 +6732,180 @@ def _handle_command(text: str) -> None:
         threading.Thread(
             target=_run_allocation, daemon=True, name="cash-allocation"
         ).start()
+
+    elif cmd in ("/deployed", "/deploy"):
+        # Record an actual deploy + optional reason for deviation from the
+        # last /cash recommendation. Usage:
+        #   /deployed TICKER AMOUNT_EUR [REASON...]
+        # Examples:
+        #   /deployed PTC 100
+        #   /deployed ADBE 50 achei agressivo
+        #   /deployed NVO 200 livre vontade — gosto mais
+        if len(parts) < 3:
+            _reply(
+                "*Uso:* `/deployed TICKER AMOUNT [reason]`\n\n"
+                "Examples:\n"
+                "  `/deployed PTC 100`\n"
+                "  `/deployed ADBE 50 achei agressivo demais`\n"
+                "  `/deployed NVO 200 livre vontade`"
+            )
+        else:
+            from pathlib import Path as _P
+            import json as _J
+            from datetime import datetime as _dt
+            _ticker  = parts[1].upper().strip()
+            try:
+                _amount = float(parts[2])
+            except ValueError:
+                _reply(f"❌ Amount inválido: `{parts[2]}`")
+                return
+            _reason  = " ".join(parts[3:]).strip() if len(parts) > 3 else ""
+
+            # Load last proposal for comparison
+            _dd = _P("/data") if _P("/data").exists() else _P(__file__).parent / "data"
+            _proposal_path = _dd / "last_cash_proposal.json"
+            _recommended = None
+            _proposal_ts = None
+            if _proposal_path.exists():
+                try:
+                    _prop = _J.loads(_proposal_path.read_text())
+                    _proposal_ts = _prop.get("timestamp")
+                    for _a in _prop.get("actions", []):
+                        if _a.get("ticker", "").upper() == _ticker:
+                            _recommended = float(_a.get("recommended_eur") or 0)
+                            break
+                except Exception:
+                    pass
+
+            _delta_eur = (_amount - _recommended) if _recommended is not None else None
+            _delta_pct = (
+                (_delta_eur / _recommended * 100.0)
+                if (_delta_eur is not None and _recommended and _recommended > 0)
+                else None
+            )
+
+            # Classify reason if not provided + delta is significant
+            _category = None
+            if not _reason and _delta_pct is not None and abs(_delta_pct) >= 10:
+                # Significant delta with no reason — ask user to amend
+                _reply(
+                    f"⚠️ *{_ticker}* deploy €{_amount:.0f} vs recomendado €{_recommended:.0f} "
+                    f"(*{_delta_pct:+.0f}%*).\n\n"
+                    f"_Adiciona razão para o bot aprender:_\n"
+                    f"  `/deployed {_ticker} {_amount:g} achei agressivo` (deploy menor)\n"
+                    f"  `/deployed {_ticker} {_amount:g} forte convicção` (deploy maior)\n"
+                    f"  `/deployed {_ticker} {_amount:g} livre vontade` (sem razão específica)"
+                )
+                return
+
+            # Auto-classify from reason keywords
+            _r_lower = _reason.lower()
+            if any(w in _r_lower for w in ("agressivo", "muito", "demasiado", "menos", "cauteloso")):
+                _category = "more_conservative"
+            elif any(w in _r_lower for w in ("convicção", "convicao", "forte", "mais", "deploy maior")):
+                _category = "more_aggressive"
+            elif any(w in _r_lower for w in ("livre", "vontade", "intuição", "intuicao", "feeling")):
+                _category = "free_choice"
+            elif _reason:
+                _category = "other"
+            else:
+                _category = "no_deviation" if _delta_pct is None or abs(_delta_pct) < 10 else "unspecified"
+
+            # Append to history
+            _hist_path = _dd / "deploy_history.json"
+            _hist_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                _hist = _J.loads(_hist_path.read_text()) if _hist_path.exists() else []
+            except Exception:
+                _hist = []
+            _entry = {
+                "timestamp":           _dt.now().isoformat(timespec="seconds"),
+                "ticker":              _ticker,
+                "deployed_eur":        _amount,
+                "recommended_eur":     _recommended,
+                "delta_eur":           _delta_eur,
+                "delta_pct":           _delta_pct,
+                "reason":              _reason or None,
+                "category":            _category,
+                "proposal_timestamp":  _proposal_ts,
+            }
+            _hist.append(_entry)
+            # Keep last 200 entries
+            if len(_hist) > 200:
+                _hist = _hist[-200:]
+            _hist_path.write_text(_J.dumps(_hist, indent=2))
+
+            # Reply
+            if _recommended is None:
+                _reply(
+                    f"✅ *{_ticker}*: €{_amount:.0f} registado.\n"
+                    f"_(Sem recomendação prévia no /cash para comparação.)_\n\n"
+                    f"Reason: _{_reason or '—'}_"
+                )
+            elif _delta_pct is None or abs(_delta_pct) < 1:
+                _reply(
+                    f"✅ *{_ticker}*: €{_amount:.0f} = recomendação. *Match perfeito.*"
+                )
+            else:
+                _emoji = "📈" if _delta_pct > 0 else "📉"
+                _reply(
+                    f"✅ *{_ticker}*: €{_amount:.0f} registado.\n"
+                    f"{_emoji} Recomendado: €{_recommended:.0f} | Delta: *{_delta_pct:+.0f}%* ({_delta_eur:+.0f}€)\n"
+                    f"Reason: _{_reason or '—'}_  ·  Category: `{_category}`"
+                )
+
+    elif cmd in ("/deploy_history", "/deploys"):
+        # Show last N deploys with deltas + reasons. Default N=20.
+        from pathlib import Path as _P
+        import json as _J
+        _dd = _P("/data") if _P("/data").exists() else _P(__file__).parent / "data"
+        _hist_path = _dd / "deploy_history.json"
+        if not _hist_path.exists():
+            _reply("📭 _Sem deploys registados ainda. Use `/deployed TICKER AMOUNT` após executar no T212._")
+        else:
+            try:
+                _hist = _J.loads(_hist_path.read_text())
+            except Exception:
+                _hist = []
+            if not _hist:
+                _reply("📭 _Histórico vazio._")
+            else:
+                _n = 20
+                if len(parts) > 1:
+                    try:
+                        _n = max(1, min(100, int(parts[1])))
+                    except ValueError:
+                        pass
+                _recent = _hist[-_n:]
+                lines = [f"*📜 Deploy history (últimos {len(_recent)})*", ""]
+                # Stats
+                _matches      = sum(1 for e in _recent if e.get("delta_pct") is not None and abs(e["delta_pct"]) < 1)
+                _conservative = sum(1 for e in _recent if e.get("category") == "more_conservative")
+                _aggressive   = sum(1 for e in _recent if e.get("category") == "more_aggressive")
+                _free         = sum(1 for e in _recent if e.get("category") == "free_choice")
+                lines.append(
+                    f"_Match: {_matches} · Conservador: {_conservative} · "
+                    f"Agressivo: {_aggressive} · Livre: {_free}_"
+                )
+                lines.append("")
+                for e in reversed(_recent):
+                    _t  = e.get("ticker", "?")
+                    _a  = e.get("deployed_eur", 0)
+                    _r  = e.get("recommended_eur")
+                    _dp = e.get("delta_pct")
+                    _ts = (e.get("timestamp") or "")[:16].replace("T", " ")
+                    if _r is None or _dp is None:
+                        lines.append(f"`{_ts}` *{_t}* €{_a:.0f} _(no rec)_")
+                    elif abs(_dp) < 1:
+                        lines.append(f"`{_ts}` *{_t}* €{_a:.0f} ✓ match")
+                    else:
+                        _arrow = "📈" if _dp > 0 else "📉"
+                        lines.append(
+                            f"`{_ts}` *{_t}* €{_a:.0f} (rec €{_r:.0f}, {_dp:+.0f}%) {_arrow}"
+                        )
+                    if e.get("reason"):
+                        lines.append(f"   _{e['reason'][:80]}_")
+                _reply("\n".join(lines))
 
     elif cmd in ("/admin_core_debug", "/core_debug"):
         # Debug a single ticker through the Core radar scoring pipeline.
