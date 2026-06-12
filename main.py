@@ -3037,6 +3037,29 @@ def main() -> None:
         except Exception as e:
             logging.error(f"[conviction] active stops check failed: {e}", exc_info=True)
 
+    # ── Daily alert dedup reset: 06:00 Lisboa (before any scan) ───────────────
+    # /data/alerted_today.json had no automatic clear job — clear_alerts was
+    # registered as a callback for bot_commands but nothing scheduled it.
+    # Result: tickers accumulated indefinitely across days/weeks. /cash's
+    # DIP queue picked up stale entries from sessions ago (matching the
+    # 'no log entry — fallback' pattern for alerts that predated the
+    # pred_alpha_90d schema fix). Clearing daily at 06:00 means every
+    # trading day starts with a fresh dedup set.
+    def _run_daily_alert_reset():
+        global _alerted_today
+        try:
+            clear_alerts()
+            _alerted_today = set()
+            logging.info("[scheduler] daily alert dedup reset complete")
+        except Exception as e:
+            logging.error(f"[scheduler] alert reset failed: {e}", exc_info=True)
+
+    scheduler.add_job(
+        _run_daily_alert_reset,
+        CronTrigger(hour=6, minute=0, timezone=LISBON_TZ),
+        id="alerted_today_reset", name="Alerted-today reset 06h00",
+    )
+
     # ── Heartbeat: 09:00 Lisboa, seg-sex ──────────────────────────────────────
     scheduler.add_job(
         send_heartbeat,

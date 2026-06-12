@@ -7634,6 +7634,24 @@ def _handle_command(text: str) -> None:
             except Exception as e:
                 _reply(f"Kill failed: {e}")
 
+    elif cmd in ("/admin_clear_alerts", "/clear_alerts_now"):
+        # Manual trigger for the daily dedup reset. Useful when stale
+        # tickers from previous sessions are clogging the /cash DIP queue
+        # (e.g. entries that pre-date the alert_db pred_alpha_90d schema
+        # fix and now appear with 'no log entry — fallback' α=20.3%/y).
+        if _cb_clear_alerts is None:
+            _reply("⚠️ clear_alerts callback not wired — restart bot.")
+        else:
+            try:
+                _cb_clear_alerts()
+                _reply(
+                    "🧹 *Alerted-today set limpo manualmente.*\n"
+                    "_Próximos scans podem re-alertar tickers que tinham sido suprimidos hoje. "
+                    "O auto-reset diário corre às 06:00 Lisboa._"
+                )
+            except Exception as e:
+                _reply(f"❌ Erro a limpar: `{e}`")
+
     elif cmd in ("/admin_clear_price_cache", "/clear_price_cache"):
         from pathlib import Path as _P
         _dd = _P("/data") if _P("/data").exists() else _P("/tmp")
