@@ -1,6 +1,6 @@
 # DipRadar — CORE DRIP Ledger (Dividend Reinvestment Audit Trail)
 
-**Generated:** 2026-06-04T05:35:24Z  
+**Generated:** 2026-06-12T14:33:30Z  
 **Portfolio base:** €10,000  
 **Total positions:** 0  
 **Total DRIP events:** 0  
