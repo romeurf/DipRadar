@@ -462,15 +462,24 @@ def _emit_alert(
     return "digest"
 
 
-def run_daily_digest() -> int:
-    """21:30 Lisboa — consolidate the day's digest-bound alerts.
+def run_daily_digest(clear_after: bool = True, label: str = "Digest") -> int:
+    """Consolidate the digest-bound alerts.
+
+    Parameters
+    ----------
+    clear_after : bool
+        True for the 21:30 evening run (clear buffer after emit).
+        False for the 17:45 midday run and the /digest on-demand command
+        (peek, don't clear — keep accumulating for the evening run).
+    label : str
+        Title prefix in the message ("Digest", "Midday digest", ...).
 
     Reads the digest buffer, dedups by ticker (keeping the highest-α entry
     per ticker), sorts by pred_alpha_90d desc, and emits one Telegram
-    message with the top 5 ranked plus a compact list of the rest.
+    message with the top 3 ranked plus a compact list of the rest.
 
     The /cash command stays as the primary deployment tool — this digest
-    just surfaces the top opportunities once per day.
+    just surfaces the top opportunities.
 
     Returns the number of unique tickers in the digest.
     """
@@ -522,8 +531,10 @@ def run_daily_digest() -> int:
 
     # Build message
     date_str = datetime.now(LISBON_TZ).strftime("%d/%m")
+    time_str = datetime.now(LISBON_TZ).strftime("%H:%M")
+    header_note = "" if clear_after else f" _(snapshot às {time_str}, buffer mantido)_"
     lines = [
-        f"📅 *Digest {date_str}* — {len(sorted_alerts)} oportunidades hoje",
+        f"📅 *{label} {date_str}* — {len(sorted_alerts)} oportunidades{header_note}",
         "",
     ]
 
@@ -569,8 +580,11 @@ def run_daily_digest() -> int:
         return 0
 
     n = len(sorted_alerts)
-    _clear_digest_buffer()
-    logging.info(f"[digest] emitted: {len(top_3)} top + {len(rest)} rest ({n} unique tickers)")
+    if clear_after:
+        _clear_digest_buffer()
+        logging.info(f"[digest] emitted (cleared): {len(top_3)} top + {len(rest)} rest ({n} tickers)")
+    else:
+        logging.info(f"[digest] emitted (peek, buffer kept): {len(top_3)} top + {len(rest)} rest ({n} tickers)")
     return n
 
 
@@ -3016,6 +3030,8 @@ def main() -> None:
             clear_alerts(),
             globals().update(_alerted_today=set()),
         ),
+        # On-demand digest peek (no clear) for /digest command
+        run_digest_fn=lambda: run_daily_digest(clear_after=False, label="Digest on-demand"),
         # Callbacks necessários para comandos do bot
         get_db_stats=get_db_stats,
         fill_db_outcomes=fill_db_outcomes,
@@ -3139,15 +3155,21 @@ def main() -> None:
         id="momentum_scan_us", name="Momentum Scan US 21h30",
     )
 
-    # ── Daily Digest: 21h30 Lisboa, seg-sex (Fase E) ─────────────────────────
-    # Consolidates all DIP / STRUCTURAL / CORE_WARNING alerts buffered
-    # during the day into one ranked top-5 message. Real-time alerts
-    # (trailing stops + high-conviction DIP/CORE) are unaffected — they
-    # already went out as they fired. /cash also stays unchanged.
-    # Runs at 21:30 right after the EOD scan window so the digest covers
-    # the whole trading day.
+    # ── Midday Digest: 17h45 Lisboa, seg-sex (peek, no clear) ─────────────────
+    # Emits a snapshot of what's buffered so far — about 3h into the US
+    # session, giving the user a chance to see DIPs/STRUCTURAL/CORE alerts
+    # that fired in the first half of the day. Buffer is NOT cleared so
+    # the 21:30 evening digest still consolidates the whole day.
     scheduler.add_job(
-        run_daily_digest,
+        lambda: run_daily_digest(clear_after=False, label="Midday digest"),
+        CronTrigger(day_of_week="mon-fri", hour=17, minute=45, timezone=LISBON_TZ),
+        id="midday_digest", name="Midday Digest 17h45",
+    )
+
+    # ── Evening Digest: 21h30 Lisboa, seg-sex (clear after) ───────────────────
+    # Final consolidation of the day. Clears the buffer ready for tomorrow.
+    scheduler.add_job(
+        lambda: run_daily_digest(clear_after=True, label="Digest"),
         CronTrigger(day_of_week="mon-fri", hour=21, minute=30, timezone=LISBON_TZ),
         id="daily_digest", name="Daily Digest 21h30",
     )

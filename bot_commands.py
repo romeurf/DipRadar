@@ -7670,6 +7670,26 @@ def _handle_command(text: str) -> None:
             except Exception as e:
                 _reply(f"Kill failed: {e}")
 
+    elif cmd in ("/digest", "/digest_now"):
+        # On-demand digest peek — emits the current buffer without clearing,
+        # so the user can check 'what's queued right now' anytime during the
+        # session without affecting the scheduled 17:45 midday or 21:30
+        # evening digests.
+        _run_digest = _poll_context.get("run_digest_fn")
+        if _run_digest is None:
+            _reply("⚠️ run_digest_fn não configurada — verifica setup().")
+        else:
+            try:
+                n = _run_digest()
+                if n == 0:
+                    _reply(
+                        "📭 *Buffer vazio* — sem oportunidades acumuladas hoje.\n"
+                        "_O próximo scan adiciona alertas. Digest auto às 17:45 e 21:30._"
+                    )
+                # If n > 0, run_digest_fn already sent the message
+            except Exception as e:
+                _reply(f"❌ Erro a emitir digest: `{e}`")
+
     elif cmd in ("/admin_calibrate_dip", "/calibrate_dip"):
         # Run scripts/calibrate_dip_alpha.py via subprocess (the user can't
         # SSH into Railway, so this is the only entry point). Streams the
