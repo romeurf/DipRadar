@@ -7263,14 +7263,30 @@ def _handle_command(text: str) -> None:
             for name, sz, ct in entries[:12]:
                 lines.append(f"• `{name}`: {_fmt(sz)} ({ct:,} files)")
 
-            # Big parquets
+            # Big parquets — nomes têm de bater certo com os do build pipeline.
+            # Antes de 2026-06-12 estavam aqui "core_dataset.parquet" e
+            # "momentum_dataset.parquet" que NÃO existem; só o DIP aparecia.
             lines.append("")
             lines.append("*Key parquets:*")
-            for name in ("ml_training_base.parquet", "core_dataset.parquet",
-                         "momentum_dataset.parquet"):
+            for name in ("ml_training_base.parquet",
+                         "core_training_base.parquet",
+                         "momentum_training.parquet"):
                 fp = _dd / name
                 if fp.exists():
                     lines.append(f"• `{name}`: {_fmt(fp.stat().st_size)}")
+                else:
+                    lines.append(f"• `{name}`: _ausente_")
+            # Test-mode artefacts em /data/test/ — útil para confirmar isolamento.
+            test_dir = _dd / "test"
+            if test_dir.exists():
+                lines.append("")
+                lines.append("*Test parquets (sandbox):*")
+                for name in ("ml_training_base.parquet",
+                             "core_training_base.parquet",
+                             "momentum_training.parquet"):
+                    fp = test_dir / name
+                    if fp.exists():
+                        lines.append(f"• `test/{name}`: {_fmt(fp.stat().st_size)}")
 
             # Warning if free space getting tight
             if free < 500 * 1024**2:  # <500 MB
