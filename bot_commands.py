@@ -6172,9 +6172,64 @@ def _handle_command(text: str) -> None:
                 # but adjustable. We size big for high-conviction (Core 100)
                 # and modest for short-horizon DIP (more positions, smaller
                 # each, since the model's pred_alpha already prices the bet).
+                # Dynamic allocation: conviction-weighted sizing instead of
+                # flat per-bucket constants. The conviction signal combines
+                # ML win_prob, rule-based score, and annualized α — each
+                # contributes 0-1, averaged. Curve `conviction^1.5` maps to
+                # allocation fraction of `total_budget`:
+                #   conviction 0.0 → 5% floor (tracking position)
+                #   conviction 0.5 → 17%
+                #   conviction 0.8 → 30%
+                #   conviction 1.0 → 40% (concentration cap reduces)
+                # User feedback (2026-06-12): hardcoded €150/€200/€250 didn't
+                # respond to exceptional signals. With dynamic sizing, a
+                # super-conviction DIP (score 90 + ML 80% + α 35%/y) gets
+                # 30%+ of the budget instead of a flat €150.
+                _ALLOC_FLOOR_PCT   = 0.05
+                _ALLOC_CEILING_PCT = 0.40
+
+                def _compute_conviction(win_prob, score, ann_alpha):
+                    """Composite conviction 0..1 from three signals.
+
+                    Missing signals contribute 0 — better to be conservative
+                    when data is absent. ann_alpha caps at 0.50 (50%/y)
+                    because higher values are unlikely-realistic and would
+                    skew the average.
+                    """
+                    parts = []
+                    if win_prob is not None:
+                        try:
+                            parts.append(max(0.0, (float(win_prob) - 0.5) * 2.0))
+                        except (TypeError, ValueError):
+                            pass
+                    if score is not None:
+                        try:
+                            parts.append(max(0.0, (float(score) - 50.0) / 50.0))
+                        except (TypeError, ValueError):
+                            pass
+                    if ann_alpha is not None:
+                        try:
+                            parts.append(min(1.0, max(0.0, float(ann_alpha) / 0.5)))
+                        except (TypeError, ValueError):
+                            pass
+                    if not parts:
+                        return 0.0
+                    return min(1.0, sum(parts) / 3.0)
+
+                def _dynamic_alloc(win_prob, score, ann_alpha, budget):
+                    """Compute suggested € allocation from conviction × budget."""
+                    if budget <= 0:
+                        return 0.0
+                    conv = _compute_conviction(win_prob, score, ann_alpha)
+                    alloc_pct = _ALLOC_FLOOR_PCT + (conv ** 1.5) * (_ALLOC_CEILING_PCT - _ALLOC_FLOOR_PCT)
+                    return float(budget) * alloc_pct
+
+                # Legacy base allocs — kept as fallback for edge cases where
+                # dynamic sizing can't compute (e.g. ROTATION which uses
+                # equal-allocation by design due to calibration noise).
                 CORE_BASE_ALLOC = 250.0
                 DIP_BASE_ALLOC = 150.0
-                ROT_BASE_ALLOC = 200.0  # only used if no calibration
+                ROT_BASE_ALLOC = 200.0
 
                 # ── Rotation candidates: top-3 (NEW or top-up) ──────────
                 # Equal allocation within top-3: the calibration test
@@ -6216,7 +6271,14 @@ def _handle_command(text: str) -> None:
                             "ticker":     p["ticker"],
                             "bucket":     "CORE",
                             "reason":     f"Core score {p['score']:.0f} (${p.get('current_price', 0):.2f})",
-                            "suggested":  float(p.get("suggested_eur", CORE_BASE_ALLOC)) or CORE_BASE_ALLOC,
+                            # Dynamic allocation: CORE score + α_1y as the
+                            # two signals (no per-ticker ML win_prob in CORE).
+                            "suggested":  _dynamic_alloc(
+                                win_prob=None,
+                                score=float(p["score"]),
+                                ann_alpha=alpha_1y,
+                                budget=total_budget,
+                            ),
                             "ann_alpha":  alpha_1y,
                             "confidence": 1.0,
                             "extra":      {"score": p["score"], "price": p.get("current_price")},
@@ -6329,18 +6391,27 @@ def _handle_command(text: str) -> None:
                             pass
 
                         ann_alpha = _calibrated_alpha * (365.0 / float(_horizon_days))
+                        # Dynamic allocation: DIP has the most signals
+                        # available — ML win_prob, rule-based score, and
+                        # calibrated annualized α. Full triangulation.
+                        _dip_score = adb.get("score")
                         candidates.append({
                             "ticker":     ticker,
                             "bucket":     "DIP",
                             "reason":     f"DIP alert ({_calib_note})",
-                            "suggested":  DIP_BASE_ALLOC,
+                            "suggested":  _dynamic_alloc(
+                                win_prob=win_prob,
+                                score=_dip_score,
+                                ann_alpha=ann_alpha,
+                                budget=total_budget,
+                            ),
                             "ann_alpha":  ann_alpha,
                             "confidence": confidence,
                             "extra":      {
                                 "pred_alpha_90d":    pred_alpha_90d,
                                 "calibrated_alpha":  _calibrated_alpha,
                                 "win_prob":          win_prob,
-                                "score":             adb.get("score"),
+                                "score":             _dip_score,
                             },
                         })
                 except Exception as _e:
