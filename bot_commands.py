@@ -1624,6 +1624,142 @@ def _handle_admin_regen_parquet(parts: list[str]) -> None:
     threading.Thread(target=_run, daemon=True, name="regen-parquet").start()
 
 
+# ── /admin_dataset_stats ────────────────────────────────────────────────────
+
+def _handle_admin_dataset_stats(parts: list[str]) -> None:
+    """/admin_dataset_stats <model>   → per-ticker stats + universe diff
+
+    Reads /data/<dataset>.parquet and reports:
+      - total rows, total unique tickers, date range
+      - tickers in universe but ABSENT from parquet  (the gap)
+      - tickers in parquet but NOT in universe       (orphans / stale)
+      - thinnest 5 tickers (fewest rows)             (likely IPO-recent or broken)
+
+    Models: dip, core, momentum.
+
+    Built 2026-06-13 to answer "which of MMC/MOG-A actually entered the
+    parquet after /admin_fill_missing core?" — the fill flow reports
+    aggregate counts but not which specific tickers landed.
+    """
+    if len(parts) < 2:
+        _reply(
+            "📊 *Dataset stats — uso*\n\n"
+            "`/admin_dataset_stats <model>`\n"
+            "  • `dip`      — `ml_training_base.parquet`\n"
+            "  • `core`     — `core_training_base.parquet`\n"
+            "  • `momentum` — `momentum_training.parquet`\n\n"
+            "_Mostra: rows totais, tickers no parquet, diff vs universo, "
+            "tickers mais finos (poucas linhas = candidatos a investigar)._"
+        )
+        return
+
+    model = parts[1].lower().strip()
+    if model not in ("dip", "core", "momentum"):
+        _reply(f"⚠️ Modelo inválido `{model}`. Usa: `dip`, `core`, `momentum`.")
+        return
+
+    cfg_by_model = {
+        "dip":      ("ml_training_base.parquet",    "alert_date"),
+        "core":     ("core_training_base.parquet",  "alert_date"),
+        "momentum": ("momentum_training.parquet",   "date"),
+    }
+    parquet_name, date_col = cfg_by_model[model]
+
+    try:
+        from pathlib import Path as _P
+        import pandas as _pd
+
+        dd = _P("/data") if _P("/data").exists() else _P("/tmp")
+        parquet = dd / parquet_name
+        if not parquet.exists():
+            _reply(f"⚠️ `{parquet_name}` não existe em `{dd}`.")
+            return
+
+        df = _pd.read_parquet(parquet)
+        if "ticker" not in df.columns:
+            _reply(f"⚠️ `{parquet_name}` não tem coluna `ticker` — schema inesperado.")
+            return
+
+        parquet_tickers = set(df["ticker"].astype(str).str.upper().unique())
+
+        # Universe lookup — reuse the same loader logic as fill_missing.
+        # CORE reads core_universe.json (dicts). DIP/Momentum read via
+        # core.universe.get_ml_universe(). Both produce a set of strings.
+        universe: set[str] = set()
+        try:
+            if model in ("dip", "momentum"):
+                from core.universe import get_ml_universe
+                universe = {str(t).upper() for t in get_ml_universe() if t}
+            else:  # core
+                import json as _json
+                uni_file = _P(__file__).parent / "core_universe.json"
+                if uni_file.exists():
+                    data = _json.loads(uni_file.read_text(encoding="utf-8"))
+                    if isinstance(data, dict) and "tickers" in data:
+                        for item in data["tickers"]:
+                            t = item.get("ticker") if isinstance(item, dict) else item
+                            if t:
+                                universe.add(str(t).upper())
+        except Exception as e:
+            logging.warning(f"[admin_dataset_stats] universe load: {e}")
+
+        missing = sorted(universe - parquet_tickers) if universe else []
+        orphan  = sorted(parquet_tickers - universe) if universe else []
+
+        # Thinnest tickers — likely insufficient history for the model's
+        # signal threshold (e.g. MA200w needs ~5 years of bars for CORE).
+        counts = df.groupby("ticker").size().sort_values()
+        thinnest = counts.head(5)
+
+        # Date range
+        date_str = ""
+        if date_col in df.columns:
+            try:
+                d_min = _pd.to_datetime(df[date_col]).min()
+                d_max = _pd.to_datetime(df[date_col]).max()
+                date_str = f"{d_min.date()} → {d_max.date()}"
+            except Exception:
+                date_str = "(unparseable)"
+
+        lines: list[str] = []
+        lines.append(f"📊 *Dataset stats — {model.upper()}*")
+        lines.append("")
+        lines.append(f"  Rows: *{len(df):,}*")
+        lines.append(f"  Tickers no parquet: *{len(parquet_tickers)}*")
+        if universe:
+            lines.append(f"  Universo: *{len(universe)}*")
+        if date_str:
+            lines.append(f"  Date range ({date_col}): `{date_str}`")
+        lines.append("")
+
+        if universe:
+            lines.append(f"*Em falta no parquet* ({len(missing)}):")
+            if not missing:
+                lines.append("  _(nenhum — parquet completo vs universo)_")
+            else:
+                lines.append(f"  `{', '.join(missing[:30])}`"
+                             + (f"\n  _...e mais {len(missing)-30}_" if len(missing) > 30 else ""))
+            lines.append("")
+
+            lines.append(f"*Orfãos no parquet* ({len(orphan)}, no parquet mas não no universo):")
+            if not orphan:
+                lines.append("  _(nenhum)_")
+            else:
+                lines.append(f"  `{', '.join(orphan[:30])}`"
+                             + (f"\n  _...e mais {len(orphan)-30}_" if len(orphan) > 30 else ""))
+            lines.append("")
+
+        lines.append("*Top 5 mais finos* (poucas linhas — candidatos a investigar):")
+        for t, n in thinnest.items():
+            lines.append(f"  `{t}`: {int(n)} rows")
+
+        _reply("\n".join(lines))
+
+    except Exception as e:
+        logging.error(f"[admin_dataset_stats] {e}", exc_info=True)
+        _reply(f"❌ Erro: `{_md_safe(e) if '_md_safe' in dir() else e}`")
+
+
 # ── /admin_disk ─────────────────────────────────────────────────────────────────
 
 def _handle_admin_disk(parts: list[str]) -> None:
@@ -4006,6 +4142,7 @@ def _handle_command(text: str) -> None:
                 "`/admin_regen_status`         → Last parquet regen result\n\n"
                 "*Disk & cache*\n"
                 "`/admin_disk`                 → Disk usage breakdown (/data/)\n"
+                "`/admin_dataset_stats <m>`    → Parquet ↔ universo diff (dip|core|momentum)\n"
                 "`/admin_clear_price_cache`    → Clear price cache\n"
                 "`/admin_check_config`         → Verify model bundles + config\n\n"
                 "*Bundles & charts*\n"
@@ -8200,6 +8337,9 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_disk":
         _handle_admin_disk(parts)
+
+    elif cmd == "/admin_dataset_stats":
+        _handle_admin_dataset_stats(parts)
 
     elif cmd == "/admin_regen_status":
         from pathlib import Path as _P
