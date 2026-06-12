@@ -640,8 +640,12 @@ def send_heartbeat() -> None:
         f"  📊 PPR: €{snapshot['ppr_value']:,.2f}",
     ]
 
-    if FLIP_FUND_EUR:
-        lines.append(f"  🎯 *Orçamento:* €{FLIP_FUND_EUR:,.2f} disponíveis")
+    # 'Orçamento' line removed (2026-06-12) — FLIP_FUND_EUR is the env var
+    # name kept for backward compat as the monthly budget cap used inside
+    # suggest_position_size, but showing it here as "disponíveis" was
+    # misleading: the real available capital is dynamic (current liquidity
+    # + freed cash from /cash sells). The heartbeat now leaves the deploy
+    # math to /cash, which has all the live inputs.
 
     if total > 0:
         concentration_warnings = []
@@ -660,12 +664,11 @@ def send_heartbeat() -> None:
                 concentration_warnings.append(
                     f"  ⚠️ *{sym}*: {weight:.1f}% — posição pesada, monitorizar"
                 )
-        eunl_val = next((p["value_eur"] for p in snapshot["positions"] if "EUNL" in p["symbol"]), 0)
-        core_pct = (eunl_val + snapshot["ppr_value"]) / total * 100
-        if core_pct < 35:
-            concentration_warnings.append(
-                f"  ⚠️ *Core (EUNL+PPR)*: {core_pct:.1f}% — abaixo do mínimo de 35%"
-            )
+        # 'Core (EUNL+PPR)' warning removed (2026-06-12). The 35% minimum
+        # was hardcoded against an old asset allocation model. The user's
+        # actual CORE bucket is 8 compounders (NVO, MSFT, ADBE, ADP, ...),
+        # not EUNL+PPR — different concepts using the same word. The per-
+        # ticker concentration checks above still cover real over-exposure.
         if concentration_warnings:
             lines += ["", "*🚨 Alertas de concentração:*"] + concentration_warnings
 

@@ -351,13 +351,19 @@ def get_recent_alerts_pred_alpha(
                     wp = float(row.get("ml_win_prob") or "")
                 except (TypeError, ValueError):
                     wp = None
-                # Skip rows where neither field was populated (pre-fix entries)
-                if pa is None and wp is None:
+                try:
+                    sc = float(row.get("score") or "")
+                except (TypeError, ValueError):
+                    sc = None
+                # Skip rows where none of these fields are populated
+                # (pre-fix entries that have nothing useful to surface).
+                if pa is None and wp is None and sc is None:
                     continue
                 if sym not in latest or date_iso >= latest[sym].get("date_iso", ""):
                     latest[sym] = {
                         "pred_alpha_90d": pa,
                         "ml_win_prob":    wp,
+                        "score":          sc,
                         "date_iso":       date_iso,
                     }
         return latest

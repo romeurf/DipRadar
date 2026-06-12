@@ -6292,7 +6292,11 @@ def _handle_command(text: str) -> None:
                             "suggested":  DIP_BASE_ALLOC,
                             "ann_alpha":  ann_alpha,
                             "confidence": confidence,
-                            "extra":      {"pred_alpha_90d": pred_alpha_90d, "win_prob": win_prob},
+                            "extra":      {
+                                "pred_alpha_90d": pred_alpha_90d,
+                                "win_prob":       win_prob,
+                                "score":          adb.get("score"),
+                            },
                         })
                 except Exception as _e:
                     info_lines.append(f"⚠️ DIP queue falhou: `{_e}`")
@@ -6338,6 +6342,23 @@ def _handle_command(text: str) -> None:
 
                 # Drop signals with confidence < 0.3 (per plan)
                 candidates = [c for c in candidates if c["confidence"] >= 0.3]
+
+                # Cap top 3 per bucket BEFORE the unified ranking — user
+                # feedback (2026-06-12): showing 8 DIP candidates is noise,
+                # they want max top-3 per radar to keep the proposal
+                # actionable. ROTATION already returns 3 by design; this
+                # caps DIP and CORE (which can each produce 5+ candidates
+                # on volatile days).
+                _PER_BUCKET_CAP = 3
+                _by_bucket: dict[str, list[dict]] = {}
+                for c in candidates:
+                    _by_bucket.setdefault(c["bucket"], []).append(c)
+                _capped: list[dict] = []
+                for bucket, group in _by_bucket.items():
+                    group.sort(key=lambda x: -x["roi_score"])
+                    _capped.extend(group[:_PER_BUCKET_CAP])
+                candidates = _capped
+
                 candidates.sort(key=lambda c: -c["roi_score"])
 
                 # ── Deploy top-down respecting concentration cap ───────
@@ -6371,6 +6392,7 @@ def _handle_command(text: str) -> None:
                         "reason": reason,
                         "value":  final_alloc,
                         "ann_alpha_pct": c["ann_alpha"] * 100,
+                        "extra":  c.get("extra") or {},
                     })
                     ranked_deploys.append({
                         "ticker":   c["ticker"],
@@ -6429,7 +6451,7 @@ def _handle_command(text: str) -> None:
                         pnl_str = f"({s['current_pnl_pct']:+.1f}%)" if s['current_pnl_pct'] != 0 else ""
                         lines.append(
                             f"  • `{s['ticker']}` [{s['bucket']}]: "
-                            f"{s['shares']:g} sh → €{s['value']:.0f} {pnl_str}"
+                            f"{s['shares']:g} → €{s['value']:.0f} {pnl_str}"
                         )
                         lines.append(f"      _{s['reason']}_")
                     lines.append("")
@@ -6471,7 +6493,7 @@ def _handle_command(text: str) -> None:
                     for w in exit_warnings_list:
                         lines.append(
                             f"  • `{w['ticker']}` [{w['bucket']}]: "
-                            f"{w['shares']:g} sh ({w['current_pnl_pct']:+.1f}%) — _{w['reason']}_"
+                            f"{w['shares']:g} ({w['current_pnl_pct']:+.1f}%) — _{w['reason']}_"
                         )
                     lines.append("")
 
@@ -6494,18 +6516,33 @@ def _handle_command(text: str) -> None:
                             f" • α={b.get('ann_alpha_pct', 0):.1f}%/y"
                             if b.get("ann_alpha_pct") else ""
                         )
+                        # Surface the score that drove the candidate into
+                        # the queue — was missing per user feedback. Pulled
+                        # from extra (rotation/core write it directly; DIP
+                        # now also writes via alert_db lookup).
+                        _bscore = (b.get("extra") or {}).get("score")
+                        score_tag = f" score *{float(_bscore):.0f}*" if _bscore is not None else ""
                         lines.append(
-                            f"  • `{b['ticker']}` [{b['bucket']}]: "
+                            f"  • `{b['ticker']}` [{b['bucket']}]{score_tag}: "
                             f"€{b['value']:.0f}{ann_str}"
                         )
                         lines.append(f"      _{b['reason']}_")
                     lines.append("")
 
-                # Cash bucket
-                lines.append(f"📥 *Cash bucket*: €{cash_bucket:,.2f}")
+                # Cash bucket — explicit before/after summary so the user
+                # sees exactly what stays liquid post-execution (was
+                # ambiguous in the previous format).
+                _deployed_total = sum(b["value"] for b in buy_actions)
+                lines.append("📥 *Pós-execução*:")
+                lines.append(
+                    f"   Deployed em {len(buy_actions)} compras: *€{_deployed_total:,.0f}*"
+                )
+                lines.append(
+                    f"   Cash que fica em T212: *€{cash_bucket:,.2f}*"
+                )
                 if cash_bucket > 0:
                     lines.append(
-                        f"   _Mantém em T212 @ 2.2%/ano = €{cash_bucket * 0.022:.2f}/ano. "
+                        f"   _T212 @ 2.2%/ano = €{cash_bucket * 0.022:.2f}/ano. "
                         f"Dry powder para próximos Core/DIP signals._"
                     )
                 lines.append("")
