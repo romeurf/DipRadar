@@ -20,7 +20,7 @@ from sklearn.preprocessing import StandardScaler
 
 def add_crosssection_rank(
     df: pd.DataFrame,
-    raw_col: str = "alpha_60d",
+    raw_col: str = "alpha_90d",
     date_col: str = "alert_date",
 ) -> pd.DataFrame:
     """Rank percentílico cross-section por data.
@@ -112,7 +112,7 @@ def fit_ensemble_full(
     model_configs: dict,
     champion_models: list[str],
     champion_weights: dict[str, float],
-    target_col: str = "alpha_60d_rank",
+    target_col: str = "alpha_90d_rank",
     half_life_days: int = 365,
     date_col: str = "alert_date",
 ) -> tuple[dict, dict, dict, IsotonicRegression, np.ndarray]:

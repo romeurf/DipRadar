@@ -28,13 +28,11 @@ HORIZON_DAYS: int = 90                      # janela para close_90d / alpha_90d
 # populated (build_dip_dataset.py writes both since this change).
 import os as _os
 PRIMARY_TARGET: str = _os.getenv("DIP_PRIMARY_TARGET", "alpha_90d")
-# NOTE (2026-06-12): the current bundle on /app/ml_training/dip_models.pkl
-# was trained on alpha_60d (the parquet had only that target). The /cash
-# DIP queue uses dip_alpha_calibration.json to linearly extrapolate 60d → 90d
-# for display. Next retrain MUST set DIP_PRIMARY_TARGET=alpha_90d AND ensure
-# build_dip_dataset.py writes alpha_90d into the parquet — that removes the
-# extrapolation step (extrap_factor in calibration JSON becomes 1.0).
-RISK_TARGET: str = "max_drawdown_60d"       # drawdown máximo nos primeiros 60d
+# Risk target uniformized to 90d (2026-06-12) — was 60d, but user's hold
+# horizon is 90d+ and mixing horizons across alpha/risk targets caused
+# constant confusion in display annualization + Kelly downside math.
+# Single horizon everywhere = no mental tax.
+RISK_TARGET: str = "max_drawdown_90d"
 
 # Threshold do calibrador: P(alpha_90d > CALIBRATOR_THRESHOLD)
 CALIBRATOR_THRESHOLD: float = 0.06         # 6% de alpha — alinhado com _SCORE_HIGH em ml_predictor

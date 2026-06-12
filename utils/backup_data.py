@@ -75,6 +75,19 @@ _BACKUP_PATTERNS: list[str] = [
     "ml_report.json",
     "/data/ml_report.json",
     "/data/ml_floor_rho_alpha.json",
+    # Training parquets — irreplaceable without 1-2h regen. ADDED 2026-06-12
+    # after a test-mode pipeline run wiped /data/ml_training_base.parquet
+    # and we discovered backups DIDN'T include them despite the docstring
+    # claiming they did.
+    "/data/ml_training_base.parquet",
+    "/data/core_training_base.parquet",
+    "/data/momentum_training.parquet",
+    "/data/dip_alpha_calibration.json",
+    "/data/core_alpha_calibration.json",
+    "/data/rotation_alpha_calibration.json",
+    # Calibration + admin metadata
+    "/data/last_cash_proposal.json",
+    "/data/deploy_history.json",
 ]
 
 

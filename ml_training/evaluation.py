@@ -16,8 +16,8 @@ Uso no loop walk-forward:
       ...
       fold_results.append({
           'ic_overall': information_coefficient(y_test, preds),
-          'ic_sector':  ic_by_sector(test_df, 'pred', 'alpha_60d_rank').to_dict('index'),
-          'ic_regime':  ic_by_regime(test_df, 'pred', 'alpha_60d_rank').to_dict('index'),
+          'ic_sector':  ic_by_sector(test_df, 'pred', 'alpha_90d_rank').to_dict('index'),
+          'ic_regime':  ic_by_regime(test_df, 'pred', 'alpha_90d_rank').to_dict('index'),
       })
 
   report = full_fold_report(fold_results)

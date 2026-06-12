@@ -1011,14 +1011,15 @@ def regenerate(
             log.warning(f"[compute] features derivadas falhou: {e}")
 
     # ── Limpar colunas — só ficam metadados + features actuais + targets ─────
-    # Remove colunas legadas (alpha_60d, features antigas com schema diferente)
-    # para garantir que o output é limpo e não contém lixo de versões anteriores.
+    # Remove colunas legadas para garantir que o output é limpo e não contém
+    # lixo de versões anteriores. All targets uniformized to 90d (2026-06-12).
     try:
         from ml_training.config import FEATURE_COLS, PRIMARY_TARGET
         _META_COLS   = ["ticker", "symbol", "alert_date", "sector", "price",
                         "market_cap", "market_cap_b", "_source"]
-        _TARGET_COLS = [PRIMARY_TARGET, "alpha_60d", "close_90d", "spy_close_90d",
-                        "max_drawdown_60d", "max_drawdown_20d", "max_return_60d",
+        _TARGET_COLS = [PRIMARY_TARGET, "close_90d", "spy_close_90d",
+                        "max_drawdown_90d", "max_drawdown_20d", "max_return_90d",
+                        "alpha_90d_rank",
                         "return_3m", "return_6m", "label_win", "label_further_drop"]
         _keep = set(_META_COLS) | set(FEATURE_COLS) | set(_TARGET_COLS)
         _drop = [c for c in df.columns if c not in _keep]

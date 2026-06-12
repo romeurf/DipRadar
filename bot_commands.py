@@ -1251,11 +1251,11 @@ def _handle_admin_features(parts: list[str]) -> None:
         "",
     ]
 
-    # Targets (always show first if present)
+    # Targets (always show first if present). 60d removed 2026-06-12 (uniformized 90d).
     target_cols = ["alpha_30d", "alpha_90d", "alpha_180d",
-                   "alpha_1y", "alpha_2y",
+                   "alpha_1y", "alpha_2y", "alpha_3y",
                    "forward_return_30d", "forward_return_90d", "forward_return_180d",
-                   "max_drawdown_60d", "max_drawdown_90d"]
+                   "max_drawdown_90d"]
     targets_present = [c for c in target_cols if c in df.columns]
 
     # Features

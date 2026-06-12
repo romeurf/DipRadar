@@ -9,7 +9,7 @@ Duas responsabilidades:
 Uso:
   from ml_training.diagnostics import dataset_health_check, check_survivorship_bias
 
-  dataset_health_check(df, fold_results, target_col='alpha_60d_rank')
+  dataset_health_check(df, fold_results, target_col='alpha_90d_rank')
   check_survivorship_bias(current_tickers, historical_tickers)
 """
 

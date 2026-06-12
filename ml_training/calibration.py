@@ -71,7 +71,7 @@ class DualHeadCalibrator:
         ----------
         oof_upside_scores   : scores raw do model_up (OOF, sem leakage)
         oof_downside_scores : scores raw do model_down (OOF, sem leakage)
-        y_upside_rank       : coluna alpha_60d_rank [0, 1] — label para upside
+        y_upside_rank       : coluna alpha_90d_rank [0, 1] — label para upside
         y_downside_rank     : coluna max_drawdown_20d_rank [0, 1] — label para downside
         """
         oof_up   = np.asarray(oof_upside_scores,   dtype=np.float64).ravel()
@@ -101,7 +101,7 @@ class DualHeadCalibrator:
         """
         Retorna (p_upside, p_downside) — arrays [0, 1].
 
-        p_upside  = probabilidade de estar no top 30% de alpha_60d
+        p_upside  = probabilidade de estar no top 30% de alpha_90d
         p_downside = probabilidade de ter drawdown grave (pior 30%)
         """
         if not self._fitted:

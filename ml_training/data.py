@@ -57,17 +57,19 @@ def load_base_dataset(parquet_path: Path) -> pd.DataFrame:
         for col in missing_cols:
             df[col] = _FALLBACK.get(col, 0.0)
     # Drop extra columns not in FEATURE_COLS or known metadata/target cols
+    # All targets uniformized to 90d (2026-06-12). Old 60d targets
+    # (alpha_60d, close_60d, max_return_60d, max_drawdown_60d, alpha_60d_rank)
+    # removed to eliminate the dual-horizon confusion. max_drawdown_20d kept
+    # because it's the short-window risk feature used during entry timing,
+    # not a hold-horizon target.
     meta_cols = {"ticker", "symbol", "alert_date", "alpha_90d", "label_win", "sector",
                  "return_3m", "return_6m", "spy_return_ref", "outcome_label", "price",
                  "market_cap", "market_cap_b", "_source", "source",
-                 "alpha_60d", "close_60d", "close_90d", "spy_close_60d", "spy_close_90d",
-                 # Sector-relative alpha target (added when PRIMARY_TARGET =
-                 # "alpha_vs_sector_90d"). Listing in meta_cols ensures it
-                 # isn't accidentally treated as a feature.
+                 "close_90d", "spy_close_90d",
                  "alpha_vs_sector_90d", "sector_etf_close_90d",
                  "alpha_vs_sector_90d_rank",
-                 "max_return_60d", "max_drawdown_60d", "max_drawdown_20d", "max_drawdown_90d",
-                 "alpha_60d_rank", "alpha_90d_rank", "label_upside_10_90d",
+                 "max_return_90d", "max_drawdown_90d", "max_drawdown_20d",
+                 "alpha_90d_rank", "label_upside_10_90d",
                  "label_downside_15_20d", "month_of_year"}
     keep = set(FEATURE_COLS) | meta_cols
     extra = [c for c in df.columns if c not in keep]
@@ -82,31 +84,29 @@ def load_base_dataset(parquet_path: Path) -> pd.DataFrame:
 def _build_targets(alert_date: pd.Timestamp, entry_price: float, future_closes: pd.Series, horizon: int = HORIZON_DAYS) -> dict:
     if entry_price <= 0 or len(future_closes) < 5:
         return {
-            "max_return_60d": float("nan"),
-            "max_drawdown_60d": float("nan"),
+            "max_return_90d":   float("nan"),
+            "max_drawdown_90d": float("nan"),
             "max_drawdown_20d": float("nan"),
-            "close_90d": float("nan"),
+            "close_90d":        float("nan"),
         }
     if isinstance(future_closes.index, pd.DatetimeIndex):
-        fwd_60 = future_closes[(future_closes.index > alert_date) & (future_closes.index <= alert_date + pd.Timedelta(days=horizon))]
         fwd_20 = future_closes[(future_closes.index > alert_date) & (future_closes.index <= alert_date + pd.Timedelta(days=20))]
         fwd_90 = future_closes[(future_closes.index > alert_date) & (future_closes.index <= alert_date + pd.Timedelta(days=90))]
     else:
-        fwd_60 = future_closes
         fwd_20 = future_closes.iloc[:20]
         fwd_90 = future_closes.iloc[:90]
-    if len(fwd_60) < 5:
+    if len(fwd_90) < 5:
         return {
-            "max_return_60d": float("nan"),
-            "max_drawdown_60d": float("nan"),
+            "max_return_90d":   float("nan"),
+            "max_drawdown_90d": float("nan"),
             "max_drawdown_20d": float("nan"),
-            "close_90d": float("nan"),
+            "close_90d":        float("nan"),
         }
     return {
-        "max_return_60d": float(fwd_60.max() / entry_price - 1.0),
-        "max_drawdown_60d": float(fwd_60.min() / entry_price - 1.0),
+        "max_return_90d":   float(fwd_90.max() / entry_price - 1.0),
+        "max_drawdown_90d": float(fwd_90.min() / entry_price - 1.0),
         "max_drawdown_20d": float(fwd_20.min() / entry_price - 1.0) if len(fwd_20) >= 3 else float("nan"),
-        "close_90d": float(fwd_90.iloc[-1] / entry_price - 1.0) if len(fwd_90) >= 5 else float("nan"),
+        "close_90d":        float(fwd_90.iloc[-1] / entry_price - 1.0) if len(fwd_90) >= 5 else float("nan"),
     }
 
 
@@ -178,7 +178,7 @@ def spy_close_return_forward(spy_hist: Optional[pd.DataFrame], alert_date: pd.Ti
     return float(fwd["Close"].iloc[-1] / spy_entry - 1.0)
 
 
-def add_cross_sectional_rank(df: pd.DataFrame, target_col: str = "alpha_60d", rank_col: str = "alpha_60d_rank", window_days: int = 20) -> pd.DataFrame:
+def add_cross_sectional_rank(df: pd.DataFrame, target_col: str = "alpha_90d", rank_col: str = "alpha_90d_rank", window_days: int = 20) -> pd.DataFrame:
     df = df.copy()
     df[rank_col] = float("nan")
     valid_mask = df[target_col].notna() & np.isfinite(df[target_col].astype(float))
@@ -289,52 +289,39 @@ def build_dataset(base_df: pd.DataFrame, price_cache: dict[str, pd.DataFrame], e
             continue
         future_closes = ohlcv[(ohlcv.index > alert_date) & (ohlcv.index <= alert_date + pd.Timedelta(days=90))]["Close"]
         tgt = _build_targets(alert_date, entry_price, future_closes, horizon_days)
-        if math.isnan(tgt["max_return_60d"]):
+        if math.isnan(tgt["max_return_90d"]):
             skipped["no_target"] += 1
             continue
-        max_ret = tgt["max_return_60d"]
-        max_draw = tgt["max_drawdown_60d"]
+        max_ret_90 = tgt["max_return_90d"]
+        max_draw_90 = tgt["max_drawdown_90d"]
         max_draw_20d = tgt["max_drawdown_20d"]
         close_90d = tgt["close_90d"]
-        future_close_slice = ohlcv[(ohlcv.index > alert_date) & (ohlcv.index <= alert_date + pd.Timedelta(days=horizon_days))]["Close"]
-        entry_px = float(hist["Close"].iloc[-1])
-        if len(future_close_slice) >= 5 and entry_px > 0:
-            close_60d = float(future_close_slice.iloc[-1] / entry_px - 1.0)
-            if not np.isfinite(close_60d) or abs(close_60d) > 2.0:
-                skipped["no_target"] += 1
-                continue
-        else:
-            close_60d = max_ret
-        spy_close_60d = spy_close_return_forward(spy_hist, alert_date, horizon_days)
+        if not np.isfinite(close_90d):
+            skipped["no_target"] += 1
+            continue
         spy_close_90d = spy_close_return_forward(spy_hist, alert_date, 90)
-        if not np.isfinite(spy_close_60d) or abs(spy_close_60d) > 2.0:
+        if not np.isfinite(spy_close_90d) or abs(spy_close_90d) > 2.0:
             skipped["no_spy_target"] += 1
             continue
-        alpha_60d = math.log1p(close_60d) - math.log1p(spy_close_60d) if (close_60d > -1.0 and spy_close_60d > -1.0) else close_60d - spy_close_60d
-        alpha_90d = math.log1p(close_90d) - math.log1p(spy_close_90d) if (np.isfinite(close_90d) and np.isfinite(spy_close_90d) and close_90d > -1.0 and spy_close_90d > -1.0) else float("nan")
+        alpha_90d = math.log1p(close_90d) - math.log1p(spy_close_90d) if (close_90d > -1.0 and spy_close_90d > -1.0) else close_90d - spy_close_90d
         rec = {
             "ticker": ticker,
             "alert_date": alert_date,
             "sector": sector,
             **{c: fv[c] for c in FEATURE_COLS if c in fv},
-            "max_return_60d": max_ret,
-            "max_drawdown_60d": max_draw,
+            "max_return_90d":   max_ret_90,
+            "max_drawdown_90d": max_draw_90,
             "max_drawdown_20d": max_draw_20d,
-            "close_60d": close_60d,
-            "close_90d": close_90d,
-            "spy_close_60d": spy_close_60d,
-            "spy_close_90d": spy_close_90d,
-            "alpha_60d": alpha_60d,
-            "alpha_90d": alpha_90d,
-            "label_upside_10_90d": float(close_90d >= 0.10) if np.isfinite(close_90d) else float("nan"),
+            "close_90d":        close_90d,
+            "spy_close_90d":    spy_close_90d,
+            "alpha_90d":        alpha_90d,
+            "label_upside_10_90d":   float(close_90d >= 0.10) if np.isfinite(close_90d) else float("nan"),
             "label_downside_15_20d": float(max_draw_20d <= -0.15) if np.isfinite(max_draw_20d) else float("nan"),
         }
         rows.append(rec)
     df_out = pd.DataFrame(rows)
     if not df_out.empty:
-        df_out = add_cross_sectional_rank(df_out, target_col="alpha_60d", rank_col="alpha_60d_rank")
-        if "alpha_90d" in df_out.columns:
-            df_out = add_cross_sectional_rank(df_out, target_col="alpha_90d", rank_col="alpha_90d_rank")
+        df_out = add_cross_sectional_rank(df_out, target_col="alpha_90d", rank_col="alpha_90d_rank")
         # Also rank the sector-relative target if present (build_dip_dataset.py
         # writes alpha_vs_sector_90d alongside alpha_90d). The rank flavour is
         # picked up automatically by the trainer when use_rank_target_train=True.

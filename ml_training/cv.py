@@ -310,7 +310,7 @@ def walk_forward_cv(
     df: pd.DataFrame,
     model_configs: dict,
     feature_cols_map: dict[str, list[str]],
-    target_col: str = "alpha_60d",
+    target_col: str = "alpha_90d",
     n_folds: int = N_FOLDS,
     purge_days: int = PURGE_DAYS,
     topk_frac: float = TOPK_FRAC,
@@ -330,7 +330,7 @@ def walk_forward_cv(
     df               : DataFrame com features + target_col + date_col
     model_configs    : {name: {'factory': callable, 'feats': list[str]}}
     feature_cols_map : {name: list[str]} — normalmente {n: cfg['feats'] for n, cfg in model_configs.items()}
-    target_col       : coluna alvo (default 'alpha_60d')
+    target_col       : coluna alvo (default 'alpha_90d')
     n_folds          : número de folds
     purge_days       : dias de purga entre train e test
     topk_frac        : fracção top-K para topk_alpha
