@@ -240,7 +240,20 @@ def run_walk_forward_cv(
         name: np.full(len(df_v31), np.nan) for name in model_configs
     }
 
+    # Heartbeat: announce how many folds + models we'll iterate so the user
+    # can mentally project total work. Without this, a 4h run shows only
+    # leaked [coverage] warnings as proxy for liveness — fragile, and lost
+    # entirely if the zero-coverage feature is fixed.
+    import time as _time
+    _cv_t0 = _time.time()
+    log.info(
+        f"[cv] walk-forward starting: {len(fold_specs)} folds x "
+        f"{len(model_configs)} models = {len(fold_specs) * len(model_configs)} fits "
+        f"(target={train_target}, n_total={len(df_v31)})"
+    )
+
     for k, train_end, purge_end, test_end in fold_specs:
+        _fold_t0 = _time.time()
         tr_mask = df_v31["alert_date"] <= train_end
         te_mask = (df_v31["alert_date"] > purge_end) & (df_v31["alert_date"] <= test_end)
         df_tr = df_v31[tr_mask]
@@ -248,6 +261,16 @@ def run_walk_forward_cv(
         if len(df_tr) < min_train or len(df_te) < min_test:
             log.info(f"Fold {k}: insuficiente (tr={len(df_tr)}, te={len(df_te)}) — saltar")
             continue
+
+        # Heartbeat at fold boundary — INFO level so it's visible in Railway
+        # logs and (when run via _run_script_streaming) passes the orchestrator
+        # filter via _LEVEL_RE. Includes ELAPSED so user can project ETA.
+        _elapsed_min = (_time.time() - _cv_t0) / 60.0
+        log.info(
+            f"[cv] fold {k}/{len(fold_specs)} starting | "
+            f"train={len(df_tr):,} test={len(df_te):,} | "
+            f"elapsed {_elapsed_min:.1f}min"
+        )
 
         # Training Y: winsorize qualquer target (rank [0,1] é no-op após clip).
         y_alpha_tr = winsorize(df_tr[train_target].values.astype(float))
@@ -299,9 +322,31 @@ def run_walk_forward_cv(
                 rho_down=rho_down,
                 pnl=pnl,
             ))
-        log.info(f"Fold {k:2d} OK — n_train={len(df_tr)} n_test={len(df_te)}")
 
-    log.info("Walk-forward CV concluído.")
+        # Per-fold heartbeat with metrics + ETA. The previous one-liner
+        # ("Fold k OK") didn't carry useful signal. Now we surface the best
+        # model's rho_alpha for this fold and a wall-clock ETA so the user
+        # can see both that the trainer is alive AND making progress.
+        _fold_dur = _time.time() - _fold_t0
+        _best_rho_this_fold = max(
+            (r[-1].get("rho_alpha", float("nan"))
+             for r in results.values() if r and isinstance(r[-1], dict)),
+            default=float("nan"),
+        )
+        # Avoid division by zero on the first fold.
+        _folds_done = sum(1 for r in results.values() if r) // max(len(model_configs), 1) or 1
+        _avg_per_fold = (_time.time() - _cv_t0) / _folds_done
+        _eta_min = _avg_per_fold * (len(fold_specs) - _folds_done) / 60.0
+        log.info(
+            f"[cv] fold {k}/{len(fold_specs)} OK | dur {_fold_dur:.0f}s | "
+            f"best ρα={_best_rho_this_fold:+.4f} | ETA {_eta_min:.0f}min"
+        )
+
+    log.info(
+        f"[cv] walk-forward concluído em "
+        f"{(_time.time() - _cv_t0) / 60.0:.1f}min "
+        f"({len(fold_specs)} folds x {len(model_configs)} models)"
+    )
     return results, oof_pred, fold_specs
 
 
@@ -877,6 +922,7 @@ def run_training(
         )
 
     # Walk-forward CV
+    log.info("[phase 1/4] walk-forward CV starting")
     log.info(
         f"[run_training] CV: {n_folds} folds | purge={purge_days}d | "
         f"min_train={min_train} min_test={min_test}"
@@ -931,6 +977,7 @@ def run_training(
             f"excluded (non-shared feats): {excluded_for_features}"
         )
 
+    log.info("[phase 2/4] ensemble candidate selection starting")
     ensemble_names: list[str] = []
     ensemble_weights: dict[str, float] = {}
     try:
@@ -1078,6 +1125,7 @@ def run_training(
         f"[run_training] Calibrator: brier_oof={brier:.4f} | n_oof={n_oof}"
     )
 
+    log.info("[phase 3/4] champion full-fit starting")
     # Treino full do champion (single ou ensemble)
     if use_ensemble:
         champ_alpha, champ_down, feats_used, n_train = train_full_ensemble(
@@ -1161,10 +1209,12 @@ def run_training(
     #   4. Retrain no dataset completo para produção
     # ScaledRidge tem baixo overfit (solução analítica, sem hiperparâmetros de
     # árvore), pelo que o hold-out IC é proxy fiável do IC real em produção.
+    log.info("[phase 4/4] sector models starting")
     from ml_training.models import build_sector_model_configs
     _sector_cfgs   = build_sector_model_configs(feats_used)
     _sector_models: dict = {}
     _MIN_SECTOR_ROWS = 150
+    log.info(f"[sector] {len(_sector_cfgs)} sectors to evaluate")
     # Normalizar aliases de sector antes do treino (yfinance antigo usava "Financials"
     # em vez de "Financial Services"; SECTOR_ETF só tem "Financial Services").
     _SECTOR_ALIASES = {"Financials": "Financial Services", "Materials": "Basic Materials"}

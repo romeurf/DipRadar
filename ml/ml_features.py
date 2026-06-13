@@ -90,7 +90,10 @@ FEATURE_COLUMNS: list[str] = [
     # the parquet schema for backward compat; trainer ignores them.
     # Earnings quality + sell-side view
     "earnings_beat_rate",
-    "analyst_rating",
+    # analyst_rating REMOVED 2026-06-13 — 0% coverage in the 2026-06-13
+    # rebuilt parquet (yfinance recommendationMean stopped populating
+    # broadly). The trainer logged ~50 [coverage]/[impute] warnings per
+    # retrain for this single feature with no signal contribution.
     # Dip maturity
     "days_below_ma200",
     "decline_deceleration",
@@ -193,7 +196,8 @@ _FALLBACK: dict[str, float] = {
     # Columns retained in some legacy parquets as NaN; trainer no longer
     # references them.
     "earnings_beat_rate": 0.50,        # 50% — neutro (random)
-    "analyst_rating": 2.5,             # entre Buy e Hold — neutro
+    # analyst_rating fallback no longer needed — feature removed from
+    # FEATURE_COLUMNS on 2026-06-13 (0% coverage in current parquet).
     "short_interest_pct": 0.05,        # 5% — typical short interest
     # Sector-conditioned features (v4.2)
     "rsi_sector_adjusted": 0.0,       # 0 = RSI na norma do sector (sem sinal de oversold)
