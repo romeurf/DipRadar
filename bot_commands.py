@@ -3461,7 +3461,7 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
         # Phase 2 — Retrains (sequential — CPU-bound, resource intensive)
         # ─────────────────────────────────────────────────────────────────────
         if not want_retrain:
-            elapsed = round(_t.time() - start_wall)
+            elapsed = round(_t.time() - _pipeline_start)
             _plog("Phase 2 — skipped (--dataset only)")
             _reply(f"Pipeline complete (dataset only). Elapsed: {elapsed}s")
             _retrain_running = False
@@ -3473,7 +3473,7 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
         # letting it run would either error out or train on stale production
         # data and (worse) promote it. Stop here cleanly.
         if is_test:
-            elapsed = round(_t.time() - start_wall)
+            elapsed = round(_t.time() - _pipeline_start)
             _plog("Phase 2 — skipped (test mode: datasets built in /data/test/, retrain not run)")
             _reply(
                 f"Smoke test OK in {elapsed}s.\n"
@@ -3490,7 +3490,7 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
         # When CORE ML training is added, wire it here.
 
         if not train_dip and not train_mom:
-            elapsed = round(_t.time() - start_wall)
+            elapsed = round(_t.time() - _pipeline_start)
             _reply(
                 "Phase 2 — nothing to retrain "
                 "(datasets failed or only CORE was selected — CORE uses rule-based scoring, no ML retrain).\n"
@@ -3562,7 +3562,7 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
             logging.warning(f"[run_pipeline] chart publish: {e}")
 
         # ── final summary ─────────────────────────────────────────────────────
-        elapsed = round(_t.time() - start_wall)
+        elapsed = round(_t.time() - _pipeline_start)
         summary = [f"Pipeline complete in {elapsed}s", ""]
 
         def _dec_line(model: str, result: dict) -> str:

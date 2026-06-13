@@ -23,7 +23,7 @@ from typing import Optional, Any
 import numpy as np
 import pandas as pd
 
-from ml_training.config import HORIZON_DAYS, N_FOLDS, PURGE_DAYS
+from ml_training.config import HORIZON_DAYS, N_FOLDS, PURGE_DAYS, RISK_TARGET
 from ml_training.cv import (
     apply_missed_alpha_boost,
     build_walk_forward_folds,
@@ -257,8 +257,8 @@ def run_walk_forward_cv(
                 f"Colunas: {list(df_te.columns)[:10]}..."
             )
         y_alpha_te = df_te[train_target].values
-        y_down_tr  = winsorize(df_tr["max_drawdown_60d"].values)
-        y_down_te  = df_te["max_drawdown_60d"].values
+        y_down_tr  = winsorize(df_tr[RISK_TARGET].values)
+        y_down_te  = df_te[RISK_TARGET].values
 
         # Usar train_end (não max_date do dataset global) para que o sample mais
         # recente do fold tenha peso 1.0. max_date global punha amostras de folds
@@ -582,7 +582,7 @@ def train_full_champion(
     _means_full   = _compute_col_means(df_v31, feats, _champ_probe)
     X_full        = _prepare_X(df_v31, feats, _means_full, _champ_probe)
     y_alpha_full  = winsorize(df_v31[train_target].values.astype(float))
-    y_down_full   = winsorize(df_v31["max_drawdown_60d"].values)
+    y_down_full   = winsorize(df_v31[RISK_TARGET].values)
     sw_full       = _weights_with_boost(
         temporal_weights(df_v31["alert_date"], max_date),
         df_v31,
@@ -647,7 +647,7 @@ def train_full_ensemble(
     _means_ens    = _compute_col_means(df_v31, feats, _ens_probe)
     X_full        = _prepare_X(df_v31, feats, _means_ens, _ens_probe)
     y_alpha_full  = winsorize(df_v31[train_target].values.astype(float))
-    y_down_full   = winsorize(df_v31["max_drawdown_60d"].values)
+    y_down_full   = winsorize(df_v31[RISK_TARGET].values)
     sw_full       = _weights_with_boost(
         temporal_weights(df_v31["alert_date"], max_date),
         df_v31,
@@ -752,7 +752,7 @@ def run_training(
     input_parquet : Path
         Parquet com features + targets já computados. Esquema esperado:
         - Colunas FEATURE_COLUMNS (ml_features.py)
-        - Targets: ``alpha_90d``, ``max_drawdown_60d``
+        - Targets: ``alpha_90d``, ``max_drawdown_90d`` (RISK_TARGET)
         - Metadados: ``alert_date``, ``ticker``, ``sector``
     output_bundle : Path | None
         Onde escrever o ``dip_models.pkl``. ``None`` = não escreve.
@@ -841,12 +841,12 @@ def run_training(
     df = df[df[_active_target].notna()].reset_index(drop=True)
     log.info(f"[run_training] Target '{_active_target}' resolvido: {len(df)}/{n_pre}")
 
-    if "max_drawdown_60d" not in df.columns:
+    if RISK_TARGET not in df.columns:
         # Zeros no target de risco inverte o modelo (aprende que nunca há perdas).
         # O parquet deve ser regenerado com /admin_regen_parquet antes do retrain.
         raise ValueError(
-            "Coluna 'max_drawdown_60d' ausente no parquet. "
-            "Corre /admin_regen_parquet para reconstruir o dataset com targets correctos."
+            f"Coluna '{RISK_TARGET}' ausente no parquet. "
+            f"Corre /admin_regen_parquet para reconstruir o dataset com targets correctos."
         )
 
     # Robustness: target rank cross-section + sector-neutral
