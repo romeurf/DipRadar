@@ -3733,17 +3733,36 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
 
         def _dec_line(model: str, result: dict) -> str:
             dec = result.get("decision", "ERROR")
-            err = result.get("error", "")
+            # gate_and_promote_v3 stores the explanation in "reason", the
+            # exception path in monthly_retrain.run_monthly_retrain stores it
+            # in "reason" too, while the outer try/except in this orchestrator
+            # stores it in "error". Read both so we never show "FAILED —" with
+            # an empty trailing string (which happened on 2026-06-13 when
+            # KEPT_FLOOR fell into the else-branch with reason= but error=).
+            err = result.get("error") or result.get("reason", "")
             if dec == "PROMOTED":
-                rho = result.get("rho_alpha_mean") or result.get("ic_ensemble")
+                rho = (result.get("rho_alpha_mean")
+                       or result.get("candidate_rho_alpha")
+                       or result.get("ic_ensemble"))
                 metric = f"metric={rho:.4f}" if isinstance(rho, float) else ""
                 return f"  {model}: PROMOTED {metric}"
             elif dec == "KEPT":
                 return f"  {model}: kept (candidate did not beat production)"
+            elif dec == "KEPT_FLOOR":
+                # candidate ρ_α below absolute floor — distinct from KEPT.
+                # gate_and_promote_v3 writes the numbers into result["reason"],
+                # e.g. "candidate ρ_α 0.0545 < floor 0.0800".
+                cand = result.get("candidate_rho_alpha")
+                floor = result.get("floor_rho_alpha")
+                if isinstance(cand, float) and isinstance(floor, float):
+                    return f"  {model}: kept (below floor — ρ={cand:.4f} < {floor:.4f})"
+                return f"  {model}: kept (below floor) — {err[:80]}"
             elif dec == "PENDING":
                 return f"  {model}: saved as pending (manual review needed)"
+            elif dec == "DRY-RUN":
+                return f"  {model}: dry-run completed (no model persisted)"
             else:
-                return f"  {model}: FAILED — {err[:80]}"
+                return f"  {model}: FAILED — {err[:120]}"
 
         if train_dip: summary.append(_dec_line("DIP",      dip_result))
         if train_mom: summary.append(_dec_line("Momentum", mom_result))
