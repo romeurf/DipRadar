@@ -240,13 +240,15 @@ def run_walk_forward_cv(
         name: np.full(len(df_v31), np.nan) for name in model_configs
     }
 
-    # Heartbeat: announce how many folds + models we'll iterate so the user
-    # can mentally project total work. Without this, a 4h run shows only
-    # leaked [coverage] warnings as proxy for liveness — fragile, and lost
-    # entirely if the zero-coverage feature is fixed.
+    # Heartbeat at WARNING level so Railway runtime logs surface it even
+    # when basicConfig didn't reach this logger (which happens because
+    # the bot's main.py runs after this module is first imported). The
+    # bot_commands orchestrator additionally installs a logging handler
+    # that routes [phase] / [cv] / [sector] markers to the Telegram
+    # pipeline log so /admin_pipeline_status mirrors progress live.
     import time as _time
     _cv_t0 = _time.time()
-    log.info(
+    log.warning(
         f"[cv] walk-forward starting: {len(fold_specs)} folds x "
         f"{len(model_configs)} models = {len(fold_specs) * len(model_configs)} fits "
         f"(target={train_target}, n_total={len(df_v31)})"
@@ -262,11 +264,8 @@ def run_walk_forward_cv(
             log.info(f"Fold {k}: insuficiente (tr={len(df_tr)}, te={len(df_te)}) — saltar")
             continue
 
-        # Heartbeat at fold boundary — INFO level so it's visible in Railway
-        # logs and (when run via _run_script_streaming) passes the orchestrator
-        # filter via _LEVEL_RE. Includes ELAPSED so user can project ETA.
         _elapsed_min = (_time.time() - _cv_t0) / 60.0
-        log.info(
+        log.warning(
             f"[cv] fold {k}/{len(fold_specs)} starting | "
             f"train={len(df_tr):,} test={len(df_te):,} | "
             f"elapsed {_elapsed_min:.1f}min"
@@ -337,12 +336,12 @@ def run_walk_forward_cv(
         _folds_done = sum(1 for r in results.values() if r) // max(len(model_configs), 1) or 1
         _avg_per_fold = (_time.time() - _cv_t0) / _folds_done
         _eta_min = _avg_per_fold * (len(fold_specs) - _folds_done) / 60.0
-        log.info(
+        log.warning(
             f"[cv] fold {k}/{len(fold_specs)} OK | dur {_fold_dur:.0f}s | "
             f"best ρα={_best_rho_this_fold:+.4f} | ETA {_eta_min:.0f}min"
         )
 
-    log.info(
+    log.warning(
         f"[cv] walk-forward concluído em "
         f"{(_time.time() - _cv_t0) / 60.0:.1f}min "
         f"({len(fold_specs)} folds x {len(model_configs)} models)"
@@ -922,8 +921,8 @@ def run_training(
         )
 
     # Walk-forward CV
-    log.info("[phase 1/4] walk-forward CV starting")
-    log.info(
+    log.warning("[phase 1/4] walk-forward CV starting")
+    log.warning(
         f"[run_training] CV: {n_folds} folds | purge={purge_days}d | "
         f"min_train={min_train} min_test={min_test}"
     )
@@ -977,19 +976,26 @@ def run_training(
             f"excluded (non-shared feats): {excluded_for_features}"
         )
 
-    log.info("[phase 2/4] ensemble candidate selection starting")
+    log.warning("[phase 2/4] ensemble candidate selection starting")
     ensemble_names: list[str] = []
     ensemble_weights: dict[str, float] = {}
     try:
         from ml_training.cv_robust import build_champion_ensemble
         cv_df_all = _make_cv_df(results)
         cv_df = cv_df_all[cv_df_all["model"].isin(eligible_models)].copy()
+        log.warning(
+            f"[phase 2/4] build_champion_ensemble: {len(eligible_models)} eligible | "
+            f"ic_threshold={ensemble_ic_threshold} top_n={ensemble_top_n}"
+        )
         ensemble_names, ensemble_weights = build_champion_ensemble(
             cv_df,
             n_folds=n_folds,
             ic_threshold=ensemble_ic_threshold,
             ic_min_floor=ensemble_ic_min_floor,
             top_n=ensemble_top_n,
+        )
+        log.warning(
+            f"[phase 2/4] ensemble selected: {ensemble_names}"
         )
         log.info(
             f"[run_training] Ensemble candidato: members={ensemble_names} | "
@@ -1125,7 +1131,10 @@ def run_training(
         f"[run_training] Calibrator: brier_oof={brier:.4f} | n_oof={n_oof}"
     )
 
-    log.info("[phase 3/4] champion full-fit starting")
+    log.warning(
+        f"[phase 3/4] champion full-fit starting | use_ensemble={use_ensemble} | "
+        f"members={ensemble_names if use_ensemble else [single_champion_name]}"
+    )
     # Treino full do champion (single ou ensemble)
     if use_ensemble:
         champ_alpha, champ_down, feats_used, n_train = train_full_ensemble(
@@ -1209,12 +1218,12 @@ def run_training(
     #   4. Retrain no dataset completo para produção
     # ScaledRidge tem baixo overfit (solução analítica, sem hiperparâmetros de
     # árvore), pelo que o hold-out IC é proxy fiável do IC real em produção.
-    log.info("[phase 4/4] sector models starting")
+    log.warning("[phase 4/4] sector models starting")
     from ml_training.models import build_sector_model_configs
     _sector_cfgs   = build_sector_model_configs(feats_used)
     _sector_models: dict = {}
     _MIN_SECTOR_ROWS = 150
-    log.info(f"[sector] {len(_sector_cfgs)} sectors to evaluate")
+    log.warning(f"[sector] {len(_sector_cfgs)} sectors to evaluate: {list(_sector_cfgs.keys())}")
     # Normalizar aliases de sector antes do treino (yfinance antigo usava "Financials"
     # em vez de "Financial Services"; SECTOR_ETF só tem "Financial Services").
     _SECTOR_ALIASES = {"Financials": "Financial Services", "Materials": "Basic Materials"}
@@ -1222,7 +1231,10 @@ def run_training(
     _MIN_SECTOR_VAL  = 30    # mínimo de rows no conjunto de validação
     _IC_REJECT_FLOOR = -0.02 # rejeitar sector model se IC hold-out < este valor
 
-    for _sector_name, _scfg in _sector_cfgs.items():
+    for _sector_idx, (_sector_name, _scfg) in enumerate(_sector_cfgs.items(), start=1):
+        log.warning(
+            f"[sector] [{_sector_idx}/{len(_sector_cfgs)}] {_sector_name}: starting"
+        )
         _mask   = df["sector"] == _sector_name
         _df_sec = df[_mask].sort_values("alert_date").reset_index(drop=True)
         if len(_df_sec) < _MIN_SECTOR_ROWS:
@@ -1367,11 +1379,21 @@ def run_training(
     }
     report["robustness"]["single_best_rho_alpha"]  = float(single_champion_row["rho_alpha_mean"])
 
-    # Persist
+    # Persist — granular logging per artefact so a hang during pickle
+    # serialization or JSON write is identifiable. Today's 2026-06-13 run
+    # went silent for 2h36m somewhere in the post-CV path; without this
+    # we cannot tell apart "save_bundle hanging" from "save_report hanging"
+    # from "comparison_detail hanging".
+    log.warning("[persist] saving artefacts starting")
     if output_bundle is not None:
+        log.warning(f"[persist] save_bundle -> {output_bundle}")
         save_bundle(bundle, Path(output_bundle))
+        log.warning(f"[persist] save_bundle OK ({Path(output_bundle).stat().st_size / 1024 / 1024:.1f} MB)")
     if output_report is not None:
+        log.warning(f"[persist] save_report -> {output_report}")
         save_report(report, Path(output_report))
+        log.warning(f"[persist] save_report OK")
+    log.warning("[persist] all artefacts persisted")
 
     return {
         "bundle":          bundle,

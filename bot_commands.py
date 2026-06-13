@@ -3820,17 +3820,43 @@ def _handle_admin_run_pipeline(parts: list[str]) -> None:
 
         if train_dip:
             _plog("Phase 2 — DIP retrain: starting")
+            # Install a logging handler that mirrors trainer heartbeats
+            # ([phase X/4], [cv] fold N/M, [sector], [persist], [retrain])
+            # into the Telegram pipeline log buffer so /admin_pipeline_status
+            # shows live progress. Without this, the orchestrator goes silent
+            # for hours while run_monthly_retrain() blocks — exactly what
+            # happened during the 2026-06-13 hang where the trainer stalled
+            # silently after 16:00 with no Telegram-side visibility.
+            class _HeartbeatHandler(logging.Handler):
+                _MARKERS = ("[phase", "[cv]", "[sector]", "[persist]", "[retrain]",
+                            "[gating]", "[input]", "[run_training]")
+                def emit(self, record):
+                    try:
+                        msg = record.getMessage()
+                        if any(msg.lstrip().startswith(m) for m in self._MARKERS):
+                            _plog(msg[:200])
+                    except Exception:
+                        pass
+            _hb = _HeartbeatHandler(level=logging.WARNING)
+            _hb.setFormatter(logging.Formatter("%(message)s"))
+            _train_logger = logging.getLogger("ml_training.train")
+            _retrain_logger = logging.getLogger("ml.monthly_retrain")
+            _train_logger.addHandler(_hb)
+            _retrain_logger.addHandler(_hb)
             try:
                 from ml.monthly_retrain import run_monthly_retrain
                 dip_result = run_monthly_retrain() or {}
                 dec = dip_result.get("decision", "?")
-                rho = dip_result.get("rho_alpha_mean")
+                rho = dip_result.get("rho_alpha_mean") or dip_result.get("candidate_rho_alpha")
                 rho_str = f" | rho_alpha={rho:.4f}" if isinstance(rho, float) else ""
                 _plog(f"Phase 2 — DIP retrain: {dec}{rho_str}")
             except Exception as e:
                 dip_result = {"decision": "ERROR", "error": str(e)}
                 _plog(f"Phase 2 — DIP retrain: exception — {e}")
                 logging.error(f"[run_pipeline] DIP retrain: {e}", exc_info=True)
+            finally:
+                _train_logger.removeHandler(_hb)
+                _retrain_logger.removeHandler(_hb)
 
         if train_mom:
             _plog("Phase 2 — Momentum retrain: starting")

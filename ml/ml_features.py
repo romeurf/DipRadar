@@ -83,7 +83,11 @@ FEATURE_COLUMNS: list[str] = [
     "consecutive_red_days",
     "ma_200d_ratio",
     "price_vs_52w_percentile",
-    "peg_ratio",
+    # peg_ratio REMOVED 2026-06-13 — 0% coverage in the 2026-06-13 rebuilt
+    # parquet (depends on forward_pe + earnings_growth, both frequently NaN).
+    # Was the second dead feature surfaced by /admin_inspect_candidate after
+    # analyst_rating was removed. Same noise pattern: warning per fit, no
+    # signal contribution.
     # SEC Filings features (Form 4 insider buys/sells/amounts, 8-K material
     # events, earnings call tone) REMOVED — pipeline produced too many false
     # zeros and the technical setup is the dominant signal. Columns stay in
@@ -173,7 +177,7 @@ _FALLBACK: dict[str, float] = {
     "sector_relative_6m": 0.0,
     "beta_90d": 1.0,
     "vol_of_vol": 0.01,
-    "peg_ratio": 2.0,
+    # peg_ratio fallback no longer needed — feature removed 2026-06-13.
     "relative_drop": 0.0,
     "month_of_year": 6.0,
     "sector_alert_count_7d": 0.0,
