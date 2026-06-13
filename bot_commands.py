@@ -1780,6 +1780,28 @@ def _handle_admin_inspect_candidate(parts: list[str]) -> None:
             except Exception:
                 pass
 
+    # Feature coverage audit — features in feature_cols but absent from
+    # feature_stats are effectively 0%-coverage. ml_training/train.py only
+    # writes feature_stats entries for columns with >5 non-null values, so
+    # anything missing from feature_stats is a "dead feature": dropped in
+    # the trainer's [coverage] warning loop and contributing only noise.
+    # Surface this so the user knows which features to remove from
+    # FEATURE_COLUMNS before the next retrain.
+    feature_cols = data.get("feature_cols") if isinstance(data.get("feature_cols"), list) else []
+    feature_stats_dict = data.get("feature_stats") if isinstance(data.get("feature_stats"), dict) else {}
+    if feature_cols:
+        dead = [c for c in feature_cols if c not in feature_stats_dict]
+        lines.append("")
+        lines.append(f"*Feature coverage* ({len(feature_cols)} declared):")
+        lines.append(f"  with ≥5 valid samples: *{len(feature_stats_dict)}*")
+        lines.append(f"  dead (≤5 samples): *{len(dead)}*")
+        if dead:
+            # Telegram message size cap — show first 30, summarise rest.
+            shown = ", ".join(dead[:30])
+            lines.append(f"  `{shown}`")
+            if len(dead) > 30:
+                lines.append(f"  _...e mais {len(dead) - 30}_")
+
     # All top-level keys for quick discovery of anything I missed
     lines.append("")
     lines.append(f"*All top-level keys* ({len(data)}):")
@@ -1788,6 +1810,128 @@ def _handle_admin_inspect_candidate(parts: list[str]) -> None:
     lines.append(f"  `{keys_str}`" + (f"\n  _...e mais {len(keys_sorted) - 30}_" if len(keys_sorted) > 30 else ""))
 
     _reply("\n".join(lines))
+
+
+# ── /admin_promote_candidate ───────────────────────────────────────────────
+
+def _handle_admin_promote_candidate(parts: list[str]) -> None:
+    """/admin_promote_candidate <model> [--confirm]
+
+    Manually promote a candidate bundle to production. Used when:
+      - gating returned KEPT_FLOOR for a reason that has since been
+        addressed (e.g. wrong target env var)
+      - cold start scenario where prod bundle is from a stale seed and
+        we want to deploy a new candidate without rerunning the gating
+      - emergency recovery after an aborted retrain
+
+    Without --confirm: dry-run, prints what WOULD happen, files untouched.
+    With --confirm: archives current production bundle/report to
+    /data/archive/ then atomically replaces production with candidate.
+
+    Safety: read + atomic-replace only. Refuses if candidate is missing.
+    Never deletes — old production is always archived first.
+    """
+    if len(parts) < 2:
+        _reply(
+            "📦 *Promote candidate manualmente*\n\n"
+            "Uso: `/admin_promote_candidate <model> [--confirm]`\n"
+            "  • `dip` — só DIP suportado por agora\n\n"
+            "Sem `--confirm`: dry-run (mostra o que ia fazer)\n"
+            "Com `--confirm`: archiva produção actual e promove candidato\n\n"
+            "_Útil quando o gating recusou um candidato por motivo "
+            "que já foi corrigido (env var, floor, etc)._"
+        )
+        return
+
+    model = parts[1].lower().strip()
+    if model != "dip":
+        _reply(f"⚠️ `{model}` não suportado. Só DIP por agora.")
+        return
+
+    confirm = "--confirm" in parts
+
+    from pathlib import Path as _P
+    import shutil
+    from datetime import datetime as _dt
+
+    dd = _P("/data") if _P("/data").exists() else _P("/tmp")
+    archive_dir = dd / "archive"
+    cand_bundle = dd / "candidate" / "dip_models.pkl"
+    cand_report = dd / "candidate" / "ml_report.json"
+    prod_bundle = dd / "dip_models.pkl"
+    prod_report = dd / "ml_report.json"
+
+    if not cand_bundle.exists():
+        _reply(
+            f"⚠️ Candidate bundle não existe: `{cand_bundle}`\n\n"
+            f"_Verifica primeiro com `/admin_inspect_candidate dip`._"
+        )
+        return
+
+    cand_size_mb = cand_bundle.stat().st_size / (1024 * 1024)
+    prod_exists = prod_bundle.exists()
+    prod_size_mb = prod_bundle.stat().st_size / (1024 * 1024) if prod_exists else 0
+
+    if not confirm:
+        lines = ["📦 *Promote candidate — DRY-RUN*", ""]
+        lines.append(f"  Candidate: `{cand_bundle}` ({cand_size_mb:.1f} MB)")
+        lines.append(f"  Candidate report: `{cand_report}` ({'✓' if cand_report.exists() else '✗ ausente'})")
+        lines.append("")
+        if prod_exists:
+            lines.append(f"  Production actual: `{prod_bundle.name}` ({prod_size_mb:.1f} MB)")
+            lines.append(f"  → ia ser arquivado em `/data/archive/dip_models_<timestamp>.pkl`")
+        else:
+            lines.append(f"  Production: *ausente* (cold start)")
+        lines.append("")
+        lines.append(f"_Re-corre com `--confirm` para promover de verdade._")
+        lines.append(f"_Para reverter: copy `/data/archive/dip_models_<timestamp>.pkl` → `/data/dip_models.pkl`_")
+        _reply("\n".join(lines))
+        return
+
+    # Confirmed: do the actual promotion
+    try:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        ts = _dt.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+        # Archive existing production (if any)
+        archived_files: list[str] = []
+        if prod_exists:
+            arch_bundle = archive_dir / f"dip_models_{ts}.pkl"
+            shutil.copy2(prod_bundle, arch_bundle)
+            archived_files.append(arch_bundle.name)
+        if prod_report.exists():
+            arch_report = archive_dir / f"ml_report_{ts}.json"
+            shutil.copy2(prod_report, arch_report)
+            archived_files.append(arch_report.name)
+
+        # Atomic replace via .tmp + .replace()
+        tmp_bundle = prod_bundle.with_suffix(".pkl.tmp")
+        shutil.copy2(cand_bundle, tmp_bundle)
+        tmp_bundle.replace(prod_bundle)
+
+        if cand_report.exists():
+            tmp_report = prod_report.with_suffix(".json.tmp")
+            shutil.copy2(cand_report, tmp_report)
+            tmp_report.replace(prod_report)
+
+        msg = [
+            "✅ *Promoted DIP candidate → production*",
+            "",
+            f"  Bundle: `{prod_bundle.name}` ({cand_size_mb:.1f} MB)",
+            f"  Archive timestamp: `{ts}`",
+        ]
+        if archived_files:
+            msg.append(f"  Arquivados: `{', '.join(archived_files)}`")
+        msg.append("")
+        msg.append(
+            "⚠️ _Em produção o `ml_predictor` pode ter o bundle antigo em "
+            "memória. Para garantir reload imediato, redeploy do serviço "
+            "Railway (env var change ou push trivial)._"
+        )
+        _reply("\n".join(msg))
+    except Exception as e:
+        logging.error(f"[admin_promote_candidate] {e}", exc_info=True)
+        _reply(f"❌ Promote failed: `{_md_safe(e)}`")
 
 
 # ── /admin_dataset_stats ────────────────────────────────────────────────────
@@ -4329,6 +4473,7 @@ def _handle_command(text: str) -> None:
                 "`/admin_disk`                 → Disk usage breakdown (/data/)\n"
                 "`/admin_dataset_stats <m>`    → Parquet ↔ universo diff (dip|core|momentum)\n"
                 "`/admin_inspect_candidate <m>`→ Show candidate report metrics (read-only)\n"
+                "`/admin_promote_candidate <m>`→ Manually promote candidate → production\n"
                 "`/admin_clear_price_cache`    → Clear price cache\n"
                 "`/admin_check_config`         → Verify model bundles + config\n\n"
                 "*Bundles & charts*\n"
@@ -8579,6 +8724,9 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_inspect_candidate":
         _handle_admin_inspect_candidate(parts)
+
+    elif cmd == "/admin_promote_candidate":
+        _handle_admin_promote_candidate(parts)
 
     elif cmd == "/admin_regen_status":
         from pathlib import Path as _P
