@@ -1708,19 +1708,42 @@ def _handle_admin_inspect_candidate(parts: list[str]) -> None:
         lines.append(f"  Bundle: ✗ `{bundle_path.name}` ausente")
     lines.append("")
 
-    # Decision-critical metrics — the gating reads these
-    lines.append("*Decision metrics* (gating reads):")
+    # Decision-critical metrics — the gating reads `metrics.rho_alpha_mean`
+    # nested under data["metrics"], not at the top level (see
+    # ml_training/bundle.py:metrics_from_report). Surface both top-level
+    # and nested so future schema drift is also visible.
+    lines.append("*Decision metrics* (gating reads `data[\"metrics\"]`):")
+    metrics_dict = data.get("metrics") if isinstance(data.get("metrics"), dict) else {}
     for k in (
         "rho_alpha_mean", "rho_alpha_std",
         "rho_down_mean",  "rho_down_std",
         "topk_pnl_mean",  "topk_pnl_std",
         "brier_oof",      "ic_ensemble",
-        "calibrator_threshold",
+        "win_rate_alpha", "calibrator_threshold",
     ):
-        if k in data:
-            v = data[k]
-            mark = " ⚠️" if (v is None or (isinstance(v, float) and (v != v))) else ""  # None or NaN
-            lines.append(f"  `{k}`: {v}{mark}")
+        # Check nested data["metrics"] first (correct location), then top-level
+        v = metrics_dict.get(k, data.get(k, "<missing>"))
+        if v == "<missing>":
+            continue
+        mark = " ⚠️" if (v is None or (isinstance(v, float) and (v != v))) else ""
+        lines.append(f"  `{k}`: {v}{mark}")
+
+    # Comparison section: what the gating actually saw side-by-side
+    if isinstance(data.get("comparison"), (dict, list)):
+        comp = data["comparison"]
+        lines.append("")
+        lines.append("*Comparison* (candidate vs production):")
+        if isinstance(comp, list):
+            # summary_df.to_dict(orient="records") — list of per-model rows
+            lines.append(f"  _list of {len(comp)} rows; showing first 3_")
+            for row in comp[:3]:
+                if isinstance(row, dict):
+                    model_name = row.get("model", "?")
+                    rho = row.get("rho_alpha_mean", "?")
+                    lines.append(f"    `{model_name}`: rho_alpha={rho}")
+        else:
+            for k, v in list(comp.items())[:10]:
+                lines.append(f"  `{k}`: {v}")
 
     # Robustness section
     if "robustness" in data and isinstance(data["robustness"], dict):
