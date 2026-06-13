@@ -97,7 +97,7 @@
     {"ticker": "GS",    "annual_yield_pct": 2.0,  "note": "investment banking + asset management leader"},
     {"ticker": "MS",    "annual_yield_pct": 3.5,  "note": "wealth management + institutional securities"},
     {"ticker": "AMP",   "annual_yield_pct": 1.5,  "note": "financial planning + asset management, RIA network"},
-    {"ticker": "MMC",   "annual_yield_pct": 1.4,  "note": "insurance brokerage + consulting, Marsh + Mercer"},
+    {"ticker": "MRSH",  "annual_yield_pct": 1.4,  "note": "Marsh McLennan — insurance brokerage + consulting, Marsh + Mercer (NYSE: MRSH; ex-MMC, T212 ground-truth)"},
     {"ticker": "AJG",   "annual_yield_pct": 1.2,  "note": "insurance brokerage, mid-market specialist"},
     {"ticker": "AON",   "annual_yield_pct": 0.8,  "note": "insurance + reinsurance broker, global scale"},
     {"ticker": "WTW",   "annual_yield_pct": 1.3,  "note": "insurance brokerage + HR consulting"},
