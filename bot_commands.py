@@ -1624,6 +1624,149 @@ def _handle_admin_regen_parquet(parts: list[str]) -> None:
     threading.Thread(target=_run, daemon=True, name="regen-parquet").start()
 
 
+# ── /admin_inspect_candidate ────────────────────────────────────────────────
+
+def _handle_admin_inspect_candidate(parts: list[str]) -> None:
+    """/admin_inspect_candidate <model>  → show key metrics from candidate report
+
+    Reads /data/candidate/ml_report.json (DIP) or the equivalent for other
+    models and surfaces the metrics the gating function relies on:
+      - rho_alpha_mean (decision-critical; FAILED if null/NaN)
+      - rho_alpha_std, rho_down_mean, topk_pnl_mean
+      - calibrator_threshold, n_samples
+      - ensemble metrics if present
+      - top 5 feature importance entries
+
+    Built 2026-06-13 to diagnose a DIP retrain that completed in 4h7m but
+    returned "FAILED — " with empty error string. The actual reason
+    (stored in result["reason"]) was hidden because the _dec_line printer
+    reads result["error"] only. This command exposes the candidate report
+    directly so the user can see whether rho_alpha_mean is null, NaN, or
+    just below the floor.
+    """
+    if len(parts) < 2:
+        _reply(
+            "📊 *Inspect candidate report*\n\n"
+            "Uso: `/admin_inspect_candidate <model>`\n"
+            "  • `dip`      — `/data/candidate/ml_report.json`\n"
+            "  • `core`     — não tem candidate (rule-based)\n"
+            "  • `momentum` — `/data/momentum_candidate_report.json` (se aplicável)\n\n"
+            "_Mostra rho_alpha_mean + métricas de gating, top features, "
+            "stats do bundle. Diagnóstico para `DIP: FAILED` sem mensagem._"
+        )
+        return
+
+    model = parts[1].lower().strip()
+
+    from pathlib import Path as _P
+    import json as _json
+    from datetime import datetime as _dt
+
+    dd = _P("/data") if _P("/data").exists() else _P("/tmp")
+
+    if model == "dip":
+        report_path = dd / "candidate" / "ml_report.json"
+        bundle_path = dd / "candidate" / "dip_models.pkl"
+    elif model == "momentum":
+        report_path = dd / "momentum_report.json"
+        bundle_path = dd / "momentum_model.pkl"
+    elif model == "core":
+        _reply("ℹ️ CORE usa scoring rule-based — não tem candidate report nem retrain bundle.")
+        return
+    else:
+        _reply(f"⚠️ Modelo inválido: `{model}`. Usa: `dip`, `momentum`.")
+        return
+
+    if not report_path.exists():
+        _reply(
+            f"⚠️ `{report_path}` não existe.\n\n"
+            f"_Possíveis causas: candidate nunca foi treinado, ou o trainer "
+            f"crashou antes de escrever o report._"
+        )
+        return
+
+    try:
+        data = _json.loads(report_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        _reply(f"❌ Erro a ler JSON: `{_md_safe(e)}`")
+        return
+
+    lines: list[str] = []
+    lines.append(f"📊 *Candidate report — {model.upper()}*")
+    lines.append("")
+
+    # File stats
+    stat = report_path.stat()
+    size_kb = stat.st_size / 1024
+    mtime = _dt.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    lines.append(f"  Path: `{report_path}`")
+    lines.append(f"  Size: {size_kb:.1f} KB | mtime: {mtime}")
+    if bundle_path.exists():
+        b_size_mb = bundle_path.stat().st_size / (1024 * 1024)
+        lines.append(f"  Bundle: ✓ `{bundle_path.name}` ({b_size_mb:.1f} MB)")
+    else:
+        lines.append(f"  Bundle: ✗ `{bundle_path.name}` ausente")
+    lines.append("")
+
+    # Decision-critical metrics — the gating reads these
+    lines.append("*Decision metrics* (gating reads):")
+    for k in (
+        "rho_alpha_mean", "rho_alpha_std",
+        "rho_down_mean",  "rho_down_std",
+        "topk_pnl_mean",  "topk_pnl_std",
+        "brier_oof",      "ic_ensemble",
+        "calibrator_threshold",
+    ):
+        if k in data:
+            v = data[k]
+            mark = " ⚠️" if (v is None or (isinstance(v, float) and (v != v))) else ""  # None or NaN
+            lines.append(f"  `{k}`: {v}{mark}")
+
+    # Robustness section
+    if "robustness" in data and isinstance(data["robustness"], dict):
+        lines.append("")
+        lines.append("*Robustness:*")
+        for k, v in list(data["robustness"].items())[:10]:
+            lines.append(f"  `{k}`: {v}")
+
+    # Dataset / sample stats
+    sample_keys = [k for k in ("n_samples", "n_samples_total", "n_folds", "n_train",
+                                "elapsed_s", "training_horizon_days", "primary_target")
+                   if k in data]
+    if sample_keys:
+        lines.append("")
+        lines.append("*Dataset / run stats:*")
+        for k in sample_keys:
+            lines.append(f"  `{k}`: {data[k]}")
+
+    # Feature importance top 5
+    if "feature_importance" in data:
+        fi = data["feature_importance"]
+        if isinstance(fi, dict) and fi:
+            try:
+                top5 = sorted(
+                    ((k, v) for k, v in fi.items() if v is not None),
+                    key=lambda x: float(x[1]) if x[1] is not None else 0.0,
+                    reverse=True,
+                )[:5]
+                if top5:
+                    lines.append("")
+                    lines.append("*Top 5 features:*")
+                    for k, v in top5:
+                        lines.append(f"  `{k}`: {v}")
+            except Exception:
+                pass
+
+    # All top-level keys for quick discovery of anything I missed
+    lines.append("")
+    lines.append(f"*All top-level keys* ({len(data)}):")
+    keys_sorted = sorted(data.keys())
+    keys_str = ", ".join(keys_sorted[:30])
+    lines.append(f"  `{keys_str}`" + (f"\n  _...e mais {len(keys_sorted) - 30}_" if len(keys_sorted) > 30 else ""))
+
+    _reply("\n".join(lines))
+
+
 # ── /admin_dataset_stats ────────────────────────────────────────────────────
 
 def _handle_admin_dataset_stats(parts: list[str]) -> None:
@@ -4143,6 +4286,7 @@ def _handle_command(text: str) -> None:
                 "*Disk & cache*\n"
                 "`/admin_disk`                 → Disk usage breakdown (/data/)\n"
                 "`/admin_dataset_stats <m>`    → Parquet ↔ universo diff (dip|core|momentum)\n"
+                "`/admin_inspect_candidate <m>`→ Show candidate report metrics (read-only)\n"
                 "`/admin_clear_price_cache`    → Clear price cache\n"
                 "`/admin_check_config`         → Verify model bundles + config\n\n"
                 "*Bundles & charts*\n"
@@ -8390,6 +8534,9 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_dataset_stats":
         _handle_admin_dataset_stats(parts)
+
+    elif cmd == "/admin_inspect_candidate":
+        _handle_admin_inspect_candidate(parts)
 
     elif cmd == "/admin_regen_status":
         from pathlib import Path as _P
