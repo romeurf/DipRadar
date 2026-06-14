@@ -7129,6 +7129,17 @@ def _handle_command(text: str) -> None:
                         _bucket_downside  = _DEFAULT_DOWNSIDE_FALLBACK
                         _calib_note       = source
                         _horizon_days     = 90
+                        # 2026-06-14: when accepted=False but buckets are
+                        # monotonic with non-trivial spread (≥1.5pp), we
+                        # bypass Kelly Full and use ranking-based tier
+                        # allocation. Reason: per-bucket q05 over 90d for
+                        # 30 years of data sits at -25% to -30% (real
+                        # historical crashes), which gives b = α / |q05| ≈
+                        # 0.03 — Kelly Full demands p > 97% for positive
+                        # allocation, which no model achieves. Tier alloc
+                        # keeps the model's ranking signal usable while
+                        # avoiding the Kelly trap.
+                        _use_ranking_bypass = False
                         try:
                             for _try in (
                                 _Path("/data/dip_alpha_calibration.json"),
@@ -7137,8 +7148,10 @@ def _handle_command(text: str) -> None:
                                 if _try.exists():
                                     _cd = _json.loads(_try.read_text())
                                     _horizon_days = int(_cd.get("horizon_days") or 90)
+                                    _buckets = _cd.get("buckets") or []
                                     if _cd.get("accepted"):
-                                        for _b in _cd.get("buckets", []):
+                                        # Standard path: bucket lookup + Kelly Full
+                                        for _b in _buckets:
                                             if (pred_alpha_90d >= _b["pred_min"]
                                                     and pred_alpha_90d <= _b["pred_max"]):
                                                 _calibrated_alpha = float(_b["mean_actual_alpha_90d"])
@@ -7151,20 +7164,63 @@ def _handle_command(text: str) -> None:
                                                     f"[{_b['pred_min']:+.3f},{_b['pred_max']:+.3f}]"
                                                 )
                                                 break
+                                    elif _buckets and _cd.get("is_monotonic"):
+                                        # Ranking-based bypass: use bucket mean
+                                        # as alpha, skip signals in negative
+                                        # buckets, use tier-based suggested €.
+                                        _matched = False
+                                        for _b in _buckets:
+                                            if (pred_alpha_90d >= _b["pred_min"]
+                                                    and pred_alpha_90d <= _b["pred_max"]):
+                                                _bm = float(_b.get("mean_actual_alpha_90d") or 0.0)
+                                                if _bm > 0:
+                                                    _calibrated_alpha = _bm
+                                                    _calib_note = (
+                                                        f"{source} → ranking bypass "
+                                                        f"bucket [{_b['pred_min']:+.3f},{_b['pred_max']:+.3f}] "
+                                                        f"μ={_bm:+.4f}"
+                                                    )
+                                                    _use_ranking_bypass = True
+                                                else:
+                                                    # Negative-α bucket: skip this signal
+                                                    _calibrated_alpha = -1.0  # sentinel
+                                                    _calib_note = (
+                                                        f"{source} → bucket μ={_bm:+.4f} ≤ 0, SKIP"
+                                                    )
+                                                _matched = True
+                                                break
+                                        if not _matched:
+                                            # pred outside all bucket ranges — accept the raw
+                                            pass
                                     break
                         except Exception:
                             pass
 
+                        # Skip signals that fell into negative-α buckets
+                        if _calibrated_alpha < 0:
+                            info_lines.append(
+                                f"⏭️ `{ticker}` DIP skipped — {_calib_note}"
+                            )
+                            continue
+
                         ann_alpha = _calibrated_alpha * (365.0 / float(_horizon_days))
-                        # Full Kelly: pure math from ML predictions +
-                        # calibration downside. No magic curve.
                         _dip_score = adb.get("score")
-                        _kelly_alloc_eur = _kelly_full(
-                            win_prob=win_prob,
-                            alpha=_calibrated_alpha,
-                            downside=_bucket_downside,
-                            budget=total_budget,
-                        )
+                        if _use_ranking_bypass:
+                            # Tier-based: 10% of budget per positive-bucket
+                            # signal. Concentration cap (25% soft / 30% hard)
+                            # downstream prevents over-allocation per ticker.
+                            # ROI ranking against CORE/Rotation candidates
+                            # determines actual deploy order.
+                            _kelly_alloc_eur = total_budget * 0.10
+                        else:
+                            # Full Kelly: pure math from ML predictions +
+                            # calibration downside. No magic curve.
+                            _kelly_alloc_eur = _kelly_full(
+                                win_prob=win_prob,
+                                alpha=_calibrated_alpha,
+                                downside=_bucket_downside,
+                                budget=total_budget,
+                            )
                         candidates.append({
                             "ticker":     ticker,
                             "bucket":     "DIP",
