@@ -6582,7 +6582,13 @@ def _handle_command(text: str) -> None:
             _reply(f"❌ `{parts[1]}` não é um número válido.")
             return
 
-        skip_rotation = "--no-rot" in parts or "--skip-rotation" in parts
+        # 2026-06-14: ROTATION temporarily disabled by default. Rotation
+        # alpha calibration produces CV r² = 0.007 (essentially zero
+        # out-of-sample predictive power). User decision: focus deploy
+        # on CORE + DIP (which have measurable signal — IC 0.119 and
+        # rho_alpha 0.063 respectively) until rotation can be made
+        # reliable. Pass `--rot` to re-enable rotation explicitly.
+        skip_rotation = "--rot" not in parts
         ignore_sells  = "--no-sells" in parts
 
         _reply(
