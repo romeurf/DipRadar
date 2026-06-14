@@ -8646,8 +8646,10 @@ def _handle_command(text: str) -> None:
             _reply(f"⚠️ Script não encontrado: `{_script}`")
         else:
             _reply(
-                "🧪 *DIP α calibration — V1 (parquet, in-sample)*\n"
-                "_A correr `scripts/calibrate_dip_alpha.py`... pode demorar 1-3 min._"
+                "🧪 *DIP α calibration — V2 (OOF preds from trainer)*\n"
+                "_A correr `scripts/calibrate_dip_alpha.py`... pode demorar 1-3 min._\n"
+                "_Lê `/data/dip_oof_predictions.parquet` (honest out-of-fold). "
+                "Fallback automático para in-sample se OOF ausente._"
             )
 
             def _run_calib():

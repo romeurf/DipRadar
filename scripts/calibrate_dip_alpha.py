@@ -74,6 +74,7 @@ def _resolve_data_path(filename: str, ml_training_subdir: bool = False) -> Path:
 
 _PARQUET_PATH = _resolve_data_path("ml_training_base.parquet")
 _BUNDLE_PATH  = _resolve_data_path("dip_models.pkl", ml_training_subdir=True)
+_OOF_PATH     = _resolve_data_path("dip_oof_predictions.parquet")
 
 _MIN_R_SQUARED_ACCEPT = 0.10   # one acceptance path: high explained variance
 _MIN_SPREAD_FOR_ACCEPT = 0.04  # second acceptance path: monotonic AND ≥4pp spread
@@ -143,6 +144,57 @@ def _load_parquet() -> tuple["pd.DataFrame", str]:
         log.error(f"  {c}")
     log.error("Pick the right column name and add it to _TARGET_CANDIDATES at the top of this script.")
     sys.exit(1)
+
+
+def _load_oof_predictions() -> "Optional[tuple[pd.DataFrame, str]]":
+    """Load /data/dip_oof_predictions.parquet written by the DIP trainer at
+    ml_training/train.py:1094-1115 after each retrain. Returns (df, target_col)
+    where df has columns: alert_date, ticker, sector, actual, oof_pred.
+
+    These predictions are honest out-of-fold — each sample's oof_pred was made
+    by a model that did NOT see it during training (purged K-fold). Calibration
+    on these is the correct path. The fallback to in-sample _predict_on_parquet()
+    is only invoked if the OOF parquet doesn't exist (e.g. legacy bundle from
+    before the 2026-06-13 trainer change).
+
+    Returns None if the file is missing — caller falls back to in-sample.
+    """
+    import pandas as pd
+    if not _OOF_PATH.exists():
+        log.warning(
+            f"[oof] {_OOF_PATH} not found — falling back to in-sample predict. "
+            f"r² will be optimistically inflated. Re-run DIP retrain to populate."
+        )
+        return None
+    try:
+        df = pd.read_parquet(_OOF_PATH)
+    except Exception as e:
+        log.warning(f"[oof] read failed: {e} — falling back to in-sample")
+        return None
+    if "oof_pred" not in df.columns or "actual" not in df.columns:
+        log.warning(
+            f"[oof] {_OOF_PATH} missing required columns "
+            f"(needs oof_pred + actual, got {list(df.columns)}) — falling back."
+        )
+        return None
+    # Drop any rows where either side is null (folds that didn't predict that
+    # sample, or rows where the target was never resolved).
+    df = df.dropna(subset=["oof_pred", "actual"]).reset_index(drop=True)
+    if len(df) < 100:
+        log.warning(f"[oof] only {len(df)} usable rows after dropna — falling back")
+        return None
+    # The persisted oof_pred is on whatever target the trainer was using.
+    # We use a synthetic "target_col" name to satisfy the calibrator's signature
+    # — actual values are already resolved in the `actual` column.
+    target_col = getattr(df, "attrs", {}).get("target_col", "actual") if hasattr(df, "attrs") else "actual"
+    if not target_col or target_col == "actual":
+        target_col = "alpha_90d"  # what the trainer's PRIMARY_TARGET defaults to
+    log.info(
+        f"[oof] loaded {len(df):,} OOF predictions from {_OOF_PATH.name} "
+        f"(target={target_col}, mean_pred={df['oof_pred'].mean():+.4f}, "
+        f"mean_actual={df['actual'].mean():+.4f})"
+    )
+    return df, target_col
 
 
 def _load_bundle():
@@ -368,12 +420,35 @@ def main() -> None:
     args = parser.parse_args()
 
     _ensure_data_dir()
-    df, target_col = _load_parquet()
-    bundle = _load_bundle()
 
-    pred   = _predict_on_parquet(df, bundle)
-    actual = df[target_col].fillna(0.0).values
-    log.info(f"Using '{target_col}' as α target")
+    # Primary path: OOF predictions persisted by the trainer. These are
+    # out-of-fold (each sample's prediction was made by a model that did
+    # NOT see it during training), so r² and bucket means are honest.
+    # Fallback to in-sample only if the OOF parquet is missing.
+    _oof = _load_oof_predictions()
+    if _oof is not None:
+        _oof_df, target_col = _oof
+        pred = _oof_df["oof_pred"].values.astype(float)
+        actual = _oof_df["actual"].values.astype(float)
+        oof_method = "purged_kfold_OOF_from_train"
+        log.info(
+            f"[calibrate] using OOF predictions ({len(pred):,} samples, "
+            f"target={target_col}) — honest calibration"
+        )
+    else:
+        # Fallback: in-sample predict over the full parquet. r² will be
+        # over-optimistic — known footgun. See docs/bucket_alpha_calibration.md
+        # for the OOF requirement.
+        df, target_col = _load_parquet()
+        bundle = _load_bundle()
+        pred = _predict_on_parquet(df, bundle)
+        actual = df[target_col].fillna(0.0).values
+        oof_method = "in_sample_FALLBACK"
+        log.warning(
+            "[calibrate] using IN-SAMPLE predict — r² will be inflated. "
+            "Re-run DIP retrain so dip_oof_predictions.parquet is populated."
+        )
+    log.info(f"Using '{target_col}' as α target | oof_method={oof_method}")
 
     calib = _bucket_calibration(
         pred, actual,
@@ -382,9 +457,14 @@ def main() -> None:
         target_col=target_col,
     )
 
+    # Record the calibration source so downstream consumers (predictor,
+    # /admin_check_config) can tell honest OOF apart from in-sample fallback.
+    calib["oof_method"] = oof_method
+
     log.info("=" * 60)
     log.info(f"Calibration result: r²={calib['r_squared']:.4f}  "
-             f"monotonic={calib['is_monotonic']}  accepted={calib['accepted']}")
+             f"monotonic={calib['is_monotonic']}  accepted={calib['accepted']}  "
+             f"oof_method={oof_method}")
     log.info("Buckets (pred range → mean actual alpha_90d):")
     for b in calib["buckets"]:
         log.info(f"  [{b['pred_min']:+.4f}, {b['pred_max']:+.4f}] → "
