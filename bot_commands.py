@@ -7051,9 +7051,16 @@ def _handle_command(text: str) -> None:
                         })
 
                 # ── Core picks: all (including held — concentration cap gates) ─
+                # 2026-06-15: lowered min_score from 70.0 to 60.0 to align with
+                # /core_picks (default 60). CORE model IC=0.119 gives meaningful
+                # signal in the 60-70 range — restricting to ≥70 was a vestige
+                # from before the model was retrained and excluded ~7 valid
+                # picks per scan (AZO, SNPS, CPRT, ULTA, REGN, WSO, DIS on
+                # 2026-06-15). The ROI-ranked queue + concentration cap
+                # downstream still gate deployment per ticker.
                 try:
                     from core.core_radar import scan_core_universe
-                    core_opps = scan_core_universe(min_score=70.0)
+                    core_opps = scan_core_universe(min_score=60.0)
                     for p in core_opps:
                         # Convert score back to alpha estimate for ranking.
                         # Score uses tanh(alpha × 3) × 50 + 50, so inverse:
