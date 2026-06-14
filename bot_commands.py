@@ -1624,6 +1624,132 @@ def _handle_admin_regen_parquet(parts: list[str]) -> None:
     threading.Thread(target=_run, daemon=True, name="regen-parquet").start()
 
 
+# ── /admin_inspect_dip_calibration ──────────────────────────────────────────
+
+def _handle_admin_inspect_dip_calibration(parts: list[str]) -> None:
+    """/admin_inspect_dip_calibration → show per-bucket calibration details
+
+    Reads /data/dip_alpha_calibration.json (written by calibrate_dip_alpha.py)
+    and surfaces:
+      - top-level: r², monotonic, accepted, n_total, oof_method, version
+      - per bucket: pred_range, mean_actual_alpha_90d, q05/q25/q50/q75/q95,
+        n_samples
+      - downside_q05 (= |q05|) used for Kelly Criterion sizing
+
+    Built 2026-06-14 to decide whether the model's bucket-level downsides
+    are tight enough for Kelly Full to produce positive allocations, or
+    if we need to bypass Kelly with a ranking-based deploy.
+    """
+    from pathlib import Path as _P
+    import json as _json
+    from datetime import datetime as _dt
+
+    dd = _P("/data") if _P("/data").exists() else _P("/tmp")
+    calib_path = dd / "dip_alpha_calibration.json"
+
+    if not calib_path.exists():
+        _reply(
+            f"⚠️ `{calib_path}` não existe.\n\n"
+            f"_Corre `/admin_calibrate_dip` primeiro._"
+        )
+        return
+
+    try:
+        data = _json.loads(calib_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        _reply(f"❌ Erro a ler JSON: `{_md_safe(e)}`")
+        return
+
+    lines: list[str] = []
+    lines.append("🎯 *DIP α calibration — bucket inspection*")
+    lines.append("")
+    lines.append(f"  Path: `{calib_path}`")
+
+    stat = calib_path.stat()
+    mtime = _dt.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    lines.append(f"  Size: {stat.st_size / 1024:.1f} KB | mtime: {mtime}")
+    lines.append("")
+
+    # Top-level summary
+    lines.append("*Summary:*")
+    for k in ("r_squared", "is_monotonic", "accepted", "spread_top_bottom",
+              "n_total", "oof_method", "version", "training_horizon_days",
+              "extrap_factor"):
+        if k in data:
+            v = data[k]
+            if isinstance(v, float):
+                v = f"{v:.4f}"
+            lines.append(f"  `{k}`: {v}")
+    lines.append("")
+
+    # Per-bucket detail with q05 highlighted (this is the Kelly input)
+    buckets = data.get("buckets") or []
+    if not buckets:
+        lines.append("_(no buckets in JSON)_")
+        _reply("\n".join(lines))
+        return
+
+    lines.append(f"*Per bucket* (n={len(buckets)}):")
+    lines.append("")
+    for i, b in enumerate(buckets, start=1):
+        pred_min = b.get("pred_min", 0.0)
+        pred_max = b.get("pred_max", 0.0)
+        mean = b.get("mean_actual_alpha_90d", 0.0)
+        median = b.get("median_actual_alpha_90d", 0.0)
+        q05 = b.get("q05_actual_alpha_90d") or b.get("q05") or b.get("q05_alpha_90d")
+        q25 = b.get("q25_actual_alpha_90d") or b.get("q25")
+        q75 = b.get("q75_actual_alpha_90d") or b.get("q75")
+        n = b.get("n_samples", 0)
+        downside = b.get("downside_q05")
+
+        lines.append(f"*Bucket {i}* — pred [{pred_min:+.4f}, {pred_max:+.4f}]")
+        lines.append(f"  n={n:,} | mean={mean:+.4f} | median={median:+.4f}")
+        if q05 is not None:
+            lines.append(f"  q05={q05:+.4f} (=Kelly downside)")
+        if q25 is not None and q75 is not None:
+            lines.append(f"  q25={q25:+.4f} | q75={q75:+.4f}")
+        if downside is not None:
+            lines.append(f"  downside_q05_used={downside:.4f}")
+
+        # Kelly preview — what does the math say for this bucket?
+        if q05 is not None and mean > 0:
+            try:
+                downside_abs = abs(float(q05))
+                if downside_abs > 0:
+                    b_ratio = float(mean) / downside_abs
+                    # Kelly Full with assumed win_prob from win_rate or 0.5
+                    p = float(data.get("win_rate_alpha") or 0.5)
+                    f_kelly = (p * b_ratio - (1 - p)) / b_ratio if b_ratio > 0 else 0.0
+                    f_kelly_pct = max(0.0, f_kelly) * 100
+                    lines.append(
+                        f"  Kelly preview (p={p:.2f}): "
+                        f"f*={f_kelly_pct:.1f}% of capital"
+                    )
+            except Exception:
+                pass
+        lines.append("")
+
+    # Key takeaway: total Kelly capacity across positive buckets
+    pos_kelly_pct = 0.0
+    for b in buckets:
+        mean = b.get("mean_actual_alpha_90d", 0.0)
+        q05 = b.get("q05_actual_alpha_90d") or b.get("q05") or b.get("q05_alpha_90d")
+        if q05 is not None and mean > 0:
+            downside_abs = abs(float(q05))
+            if downside_abs > 0:
+                b_ratio = float(mean) / downside_abs
+                p = float(data.get("win_rate_alpha") or 0.5)
+                f_kelly = (p * b_ratio - (1 - p)) / b_ratio
+                pos_kelly_pct += max(0.0, f_kelly) * 100
+    if pos_kelly_pct > 0:
+        lines.append(f"*Total Kelly capacity (positive buckets)*: {pos_kelly_pct:.1f}% of budget")
+    else:
+        lines.append("⚠️ *Total Kelly capacity = 0* — model's downside swamps alpha at every bucket")
+        lines.append("_Recommendation: use ranking-based deploy (bypass Kelly)._")
+
+    _reply("\n".join(lines))
+
+
 # ── /admin_inspect_candidate ────────────────────────────────────────────────
 
 def _handle_admin_inspect_candidate(parts: list[str]) -> None:
@@ -8752,6 +8878,9 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_inspect_candidate":
         _handle_admin_inspect_candidate(parts)
+
+    elif cmd == "/admin_inspect_dip_calibration":
+        _handle_admin_inspect_dip_calibration(parts)
 
     elif cmd == "/admin_promote_candidate":
         _handle_admin_promote_candidate(parts)
