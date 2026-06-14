@@ -6984,41 +6984,48 @@ def _handle_command(text: str) -> None:
                 # Score-weighted sizing would be adding noise — equal
                 # is the honest choice given the data.
                 if not skip_rotation and rotation_top3:
-                    n_picks = len(rotation_top3)
-                    # ROTATION is a portfolio strategy (top-3 ETFs by combined
-                    # momentum + sector signals), not individual stock picking.
-                    # The 3 picks together form the rotation allocation, so
-                    # default to equal-share split across them — matches the
-                    # "sells funded buys" mental model when there are
-                    # corresponding sells, and gives sensible diversification
-                    # when there aren't.
-                    _rot_share_per_pick = total_budget / max(1, n_picks)
+                    # ROTATION quality threshold: score < 50 = no expected
+                    # edge over market (50 = neutral). Skip picks below this
+                    # threshold — they don't deserve allocation even if
+                    # they're top-3 of the universe. If all 3 fail the
+                    # threshold, rotation deploys nothing and the freed cash
+                    # flows to CORE/DIP via ROI ranking.
+                    ROTATION_MIN_SCORE = 50.0
+                    valid_rotation = [
+                        r for r in rotation_top3
+                        if float(r["score"]) >= ROTATION_MIN_SCORE
+                    ]
+                    # Surface skipped picks for transparency.
                     for r in rotation_top3:
+                        if float(r["score"]) < ROTATION_MIN_SCORE:
+                            info_lines.append(
+                                f"⏭️ `{r['ucits']}` ROTATION skipped — "
+                                f"score {r['score']:.1f} < {ROTATION_MIN_SCORE:.0f} "
+                                f"(no expected edge)"
+                            )
+
+                    # Equal share among VALID picks (could be 0, 1, 2, or 3).
+                    # Portfolio strategy: top picks share the rotation budget.
+                    _n_valid_rot = max(1, len(valid_rotation))
+                    _rot_share_per_pick = total_budget / _n_valid_rot
+
+                    for r in valid_rotation:
                         ann_alpha = _annualized_alpha(
                             "ROTATION", score=r["score"]
                         )
                         _rot_score = float(r["score"])
                         _rot_winp  = max(0.5, min(0.85, 0.5 + (_rot_score - 50.0) / 100.0))
-                        # Try Kelly first (would work if rotation had a proper
-                        # per-pick calibration with realistic downside).
                         _rot_kelly = _kelly_full(
                             win_prob=_rot_winp,
                             alpha=ann_alpha / (365.0 / 90.0),
                             downside=_DEFAULT_DOWNSIDE_FALLBACK,
                             budget=total_budget,
                         )
-                        # Bypass: every top-3 pick gets equal share of budget.
-                        # Concentration cap (25%/30% of portfolio) downstream
-                        # enforces per-ticker limit. ROI ranking determines
-                        # deploy order across radars.
+                        # Bypass when Kelly returns 0: equal share among
+                        # valid picks. No artificial alpha floor — score >= 50
+                        # already filters out negative-edge picks.
                         if _rot_kelly <= 0:
                             _rot_kelly = _rot_share_per_pick
-                        # Floor ann_alpha for ROI ranking — even score 50
-                        # rotation picks should make it into the queue with
-                        # some positive expected alpha (they're top-3 of a
-                        # ranking universe, not random picks).
-                        if ann_alpha < 0.03:
-                            ann_alpha = 0.03
                         candidates.append({
                             "ticker":     r["ucits"],
                             "bucket":     "ROTATION",
