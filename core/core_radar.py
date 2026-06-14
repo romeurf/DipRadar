@@ -26,7 +26,13 @@ from typing import Optional
 
 log = logging.getLogger("core_radar")
 
-_REPO_DIR      = Path(__file__).parent
+# 2026-06-14: was `Path(__file__).parent` which resolved to `core/`, not
+# the repo root — so _UNIVERSE_FILE looked for `core/core_universe.json`
+# instead of `core_universe.json`. _load_universe() returned [] silently,
+# scan_core_universe iterated zero tickers, /core_picks always said
+# "Nenhum ticker", and /cash never proposed any CORE buy. The single dot
+# was hiding the entire universe from production for who knows how long.
+_REPO_DIR      = Path(__file__).parent.parent
 _UNIVERSE_FILE = _REPO_DIR / "core_universe.json"
 _DATA_DIR      = Path("/data") if Path("/data").exists() else _REPO_DIR
 _MODEL_PATH    = _DATA_DIR / "core_us_model.pkl"
