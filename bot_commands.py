@@ -7008,8 +7008,12 @@ def _handle_command(text: str) -> None:
                         # suggested; ROI ranking + concentration cap downstream
                         # still gate actual deploy.
                         if _rot_kelly <= 0 and ann_alpha > 0:
-                            _rot_kelly = total_budget * min(
-                                0.30, max(0.05, 0.30 * ann_alpha / 0.10)
+                            # No artificial cap here — concentration cap
+                            # per portfolio (25%/30%) is enforced downstream
+                            # in _can_top_up(). Suggested scales linearly:
+                            # 100% of budget for 10%/year alpha, 5% floor.
+                            _rot_kelly = total_budget * max(
+                                0.05, ann_alpha / 0.10
                             )
                         candidates.append({
                             "ticker":     r["ucits"],
@@ -7054,8 +7058,11 @@ def _handle_command(text: str) -> None:
                         # estimates than DIP (score 80 → ~0.23) so most
                         # picks hit the 30% cap; weaker ones get scaled down.
                         if _core_kelly <= 0 and alpha_1y > 0:
-                            _core_kelly = total_budget * min(
-                                0.30, max(0.05, 0.30 * alpha_1y / 0.10)
+                            # Same: no cap here, portfolio concentration cap
+                            # downstream protects per-ticker. 100% of budget
+                            # for 10%/year, 5% floor.
+                            _core_kelly = total_budget * max(
+                                0.05, alpha_1y / 0.10
                             )
                         candidates.append({
                             "ticker":     p["ticker"],
@@ -7225,12 +7232,13 @@ def _handle_command(text: str) -> None:
                         ann_alpha = _calibrated_alpha * (365.0 / float(_horizon_days))
                         _dip_score = adb.get("score")
                         if _use_ranking_bypass:
-                            # Scale-by-alpha tier: 30% for 10%/year alpha
-                            # signal, 30% cap, 5% floor. DIP top-bucket
-                            # typically has annualized α ≈ 3.5% → scaled to
-                            # ~10.5% of budget. Lower buckets scale down.
-                            _kelly_alloc_eur = total_budget * min(
-                                0.30, max(0.05, 0.30 * ann_alpha / 0.10)
+                            # No cap on suggested: portfolio concentration
+                            # cap downstream (_can_top_up) enforces per-ticker
+                            # limits. 100% of budget for 10%/year alpha,
+                            # 5% floor. DIP top bucket α ≈ 3.5%/year →
+                            # ~35% of budget suggested.
+                            _kelly_alloc_eur = total_budget * max(
+                                0.05, ann_alpha / 0.10
                             )
                         else:
                             # Full Kelly: pure math from ML predictions +
