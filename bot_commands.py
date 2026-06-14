@@ -7000,6 +7000,14 @@ def _handle_command(text: str) -> None:
                             downside=_DEFAULT_DOWNSIDE_FALLBACK,
                             budget=total_budget,
                         )
+                        # Ranking-bypass fallback: when Kelly Full returns 0
+                        # for a positive-alpha signal (15% default downside
+                        # over-conservative vs typical ETF alphas), use a
+                        # flat 10% tier so the candidate enters the ROI queue.
+                        # Concentration cap (25% soft / 30% hard) prevents
+                        # over-allocation per ticker downstream.
+                        if _rot_kelly <= 0 and ann_alpha > 0:
+                            _rot_kelly = total_budget * 0.10
                         candidates.append({
                             "ticker":     r["ucits"],
                             "bucket":     "ROTATION",
@@ -7038,6 +7046,14 @@ def _handle_command(text: str) -> None:
                             downside=_DEFAULT_DOWNSIDE_FALLBACK,  # no CORE calibration yet
                             budget=total_budget,
                         )
+                        # Same ranking-bypass fallback as ROTATION/DIP: when
+                        # Kelly Full returns 0 for a positive-alpha signal
+                        # because the 15% default downside swamps a modest
+                        # alpha, use a flat 10% tier so the candidate enters
+                        # the ROI queue. Concentration cap downstream prevents
+                        # over-allocation.
+                        if _core_kelly <= 0 and alpha_1y > 0:
+                            _core_kelly = total_budget * 0.10
                         candidates.append({
                             "ticker":     p["ticker"],
                             "bucket":     "CORE",
