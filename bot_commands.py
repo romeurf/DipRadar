@@ -7000,14 +7000,17 @@ def _handle_command(text: str) -> None:
                             downside=_DEFAULT_DOWNSIDE_FALLBACK,
                             budget=total_budget,
                         )
-                        # Ranking-bypass fallback: when Kelly Full returns 0
-                        # for a positive-alpha signal (15% default downside
-                        # over-conservative vs typical ETF alphas), use a
-                        # flat 10% tier so the candidate enters the ROI queue.
-                        # Concentration cap (25% soft / 30% hard) prevents
-                        # over-allocation per ticker downstream.
+                        # Ranking-bypass fallback (2026-06-14): when Kelly Full
+                        # returns 0 for a positive-alpha signal, scale suggested
+                        # by ann_alpha. 30% benchmark for 10%/year alpha, 30%
+                        # hard cap (= concentration cap), 5% floor for any
+                        # positive signal. Stronger signals get bigger
+                        # suggested; ROI ranking + concentration cap downstream
+                        # still gate actual deploy.
                         if _rot_kelly <= 0 and ann_alpha > 0:
-                            _rot_kelly = total_budget * 0.10
+                            _rot_kelly = total_budget * min(
+                                0.30, max(0.05, 0.30 * ann_alpha / 0.10)
+                            )
                         candidates.append({
                             "ticker":     r["ucits"],
                             "bucket":     "ROTATION",
@@ -7046,14 +7049,14 @@ def _handle_command(text: str) -> None:
                             downside=_DEFAULT_DOWNSIDE_FALLBACK,  # no CORE calibration yet
                             budget=total_budget,
                         )
-                        # Same ranking-bypass fallback as ROTATION/DIP: when
-                        # Kelly Full returns 0 for a positive-alpha signal
-                        # because the 15% default downside swamps a modest
-                        # alpha, use a flat 10% tier so the candidate enters
-                        # the ROI queue. Concentration cap downstream prevents
-                        # over-allocation.
+                        # Same scale-by-alpha fallback as ROTATION when Kelly
+                        # collapses to 0. CORE typically has higher alpha
+                        # estimates than DIP (score 80 → ~0.23) so most
+                        # picks hit the 30% cap; weaker ones get scaled down.
                         if _core_kelly <= 0 and alpha_1y > 0:
-                            _core_kelly = total_budget * 0.10
+                            _core_kelly = total_budget * min(
+                                0.30, max(0.05, 0.30 * alpha_1y / 0.10)
+                            )
                         candidates.append({
                             "ticker":     p["ticker"],
                             "bucket":     "CORE",
@@ -7222,12 +7225,13 @@ def _handle_command(text: str) -> None:
                         ann_alpha = _calibrated_alpha * (365.0 / float(_horizon_days))
                         _dip_score = adb.get("score")
                         if _use_ranking_bypass:
-                            # Tier-based: 10% of budget per positive-bucket
-                            # signal. Concentration cap (25% soft / 30% hard)
-                            # downstream prevents over-allocation per ticker.
-                            # ROI ranking against CORE/Rotation candidates
-                            # determines actual deploy order.
-                            _kelly_alloc_eur = total_budget * 0.10
+                            # Scale-by-alpha tier: 30% for 10%/year alpha
+                            # signal, 30% cap, 5% floor. DIP top-bucket
+                            # typically has annualized α ≈ 3.5% → scaled to
+                            # ~10.5% of budget. Lower buckets scale down.
+                            _kelly_alloc_eur = total_budget * min(
+                                0.30, max(0.05, 0.30 * ann_alpha / 0.10)
+                            )
                         else:
                             # Full Kelly: pure math from ML predictions +
                             # calibration downside. No magic curve.
