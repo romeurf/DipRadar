@@ -7004,12 +7004,17 @@ def _handle_command(text: str) -> None:
                                 f"(no expected edge)"
                             )
 
-                    # Equal share among VALID picks (could be 0, 1, 2, or 3).
-                    # Portfolio strategy: top picks share the rotation budget.
+                    # Equal share among valid picks. Score-weighted would be
+                    # over-confident given rotation calibration's CV r² = 0.007
+                    # (essentially no out-of-sample predictive power between
+                    # adjacent scores). The threshold ≥50 already filters
+                    # negative-edge picks; within the valid set, scores are
+                    # rank-consistent but magnitude differences are noise.
                     _n_valid_rot = max(1, len(valid_rotation))
-                    _rot_share_per_pick = total_budget / _n_valid_rot
+                    _rot_share = total_budget / _n_valid_rot
 
                     for r in valid_rotation:
+                        _share = _rot_share
                         ann_alpha = _annualized_alpha(
                             "ROTATION", score=r["score"]
                         )
@@ -7021,11 +7026,9 @@ def _handle_command(text: str) -> None:
                             downside=_DEFAULT_DOWNSIDE_FALLBACK,
                             budget=total_budget,
                         )
-                        # Bypass when Kelly returns 0: equal share among
-                        # valid picks. No artificial alpha floor — score >= 50
-                        # already filters out negative-edge picks.
+                        # Bypass when Kelly returns 0: use score-weighted share.
                         if _rot_kelly <= 0:
-                            _rot_kelly = _rot_share_per_pick
+                            _rot_kelly = _share
                         candidates.append({
                             "ticker":     r["ucits"],
                             "bucket":     "ROTATION",
