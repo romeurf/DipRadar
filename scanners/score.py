@@ -724,8 +724,17 @@ def calculate_score(
             f"preprofit={is_preprofit} qd={qd_val:.3f} (missing: {missing})"
         )
 
-    # ML weight
-    ml_weight = 1.0 if ml_prob is None else float(np.clip(ml_prob, 0.0, 1.0))
+    # ML weight. 2026-06-15: DIPRADAR_USE_ML_SCORE=0 (default) disables ML
+    # influence on the score — ml_weight becomes 1.0 (neutral multiplier).
+    # User decision: DIP model rho_alpha=0.063 is too weak to dominate scoring
+    # of high-conviction quality compounders in deep drawdown (e.g. NVO 11/100
+    # with 71% ROE + 4% yield + -44% from high). When env var = 1, original
+    # behavior restored.
+    import os as _os_ml
+    if _os_ml.environ.get("DIPRADAR_USE_ML_SCORE", "0") != "1":
+        ml_weight = 1.0
+    else:
+        ml_weight = 1.0 if ml_prob is None else float(np.clip(ml_prob, 0.0, 1.0))
 
     try:
         divergence = _compute_divergence(features)

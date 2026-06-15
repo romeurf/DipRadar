@@ -160,7 +160,15 @@ def _ml_score(signals: dict, annual_yield_pct: float) -> float | None:
 
     Quality gate: if the bundle's CV IC is below _MIN_CV_IC_FOR_USE, predictions
     aren't predictive enough → return None so the caller falls back to rule-based.
+
+    Global ML disable: set env var DIPRADAR_USE_ML_SCORE=0 (default) to skip
+    ML entirely and force rule-based scoring across all radars. This is the
+    2026-06-15 user decision while ML signal is weak (DIP rho_alpha=0.063,
+    CORE bucket calibration has U-shape pattern not strictly monotonic).
     """
+    import os as _os
+    if _os.environ.get("DIPRADAR_USE_ML_SCORE", "0") != "1":
+        return None
     bundle = _load_core_model()
     if bundle is None:
         return None
