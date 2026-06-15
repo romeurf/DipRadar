@@ -7121,12 +7121,26 @@ def _handle_command(text: str) -> None:
                         # estimates than DIP (score 80 → ~0.23) so most
                         # picks hit the 30% cap; weaker ones get scaled down.
                         if _core_kelly <= 0 and alpha_1y > 0:
-                            # Same: no cap here, portfolio concentration cap
-                            # downstream protects per-ticker. 100% of budget
-                            # for 10%/year, 5% floor.
-                            _core_kelly = total_budget * max(
-                                0.05, alpha_1y / 0.10
-                            )
+                            if _core_cd_accepted:
+                                # Calibration accepted → Kelly has empirical α
+                                # AND empirical downside_q05. Returning 0 means
+                                # the bucket's worst-case loss swamps expected
+                                # return. Respect the model — no artificial
+                                # fallback. Surface to user so they know why
+                                # this candidate isn't deploying.
+                                info_lines.append(
+                                    f"⏭️ `{p['ticker']}` CORE Kelly=0 — calibrated "
+                                    f"bucket downside_q05 swamps α (model says skip)"
+                                )
+                                _core_kelly = 0  # explicit, deploy loop skips
+                            else:
+                                # No calibration → downside unknown. Use
+                                # alpha-scaled fallback without cap; let
+                                # portfolio concentration cap handle per-ticker
+                                # limits downstream.
+                                _core_kelly = total_budget * max(
+                                    0.05, alpha_1y / 0.10
+                                )
                         candidates.append({
                             "ticker":     p["ticker"],
                             "bucket":     "CORE",
@@ -7301,11 +7315,10 @@ def _handle_command(text: str) -> None:
                         ann_alpha = _calibrated_alpha * (365.0 / float(_horizon_days))
                         _dip_score = adb.get("score")
                         if _use_ranking_bypass:
-                            # No cap on suggested: portfolio concentration
-                            # cap downstream (_can_top_up) enforces per-ticker
-                            # limits. 100% of budget for 10%/year alpha,
-                            # 5% floor. DIP top bucket α ≈ 3.5%/year →
-                            # ~35% of budget suggested.
+                            # Scale-by-alpha, no cap. DIP calibration not
+                            # accepted (r²=0.005) — fallback handles the
+                            # not-trustworthy-downside case. Portfolio
+                            # concentration cap downstream still applies.
                             _kelly_alloc_eur = total_budget * max(
                                 0.05, ann_alpha / 0.10
                             )
