@@ -314,6 +314,49 @@ def log_alert_snapshot(
         logging.warning(f"[alert_db] Erro ao gravar {symbol}: {e}")
 
 
+def get_recent_alert_tickers(lookback_days: int = 3) -> list[str]:
+    """Return unique tickers alerted in the last N days, regardless of
+    alerted_today.json state. Useful when:
+      - It's Monday morning and alerted_today.json has been reset at 06:00
+        but you want to include last Friday's DIP signals in /cash deploy.
+      - You want to verify what tickers were alerted recently without
+        relying on the in-memory dedup set.
+
+    Reads alert_db.csv directly (the durable source — migrate_schema
+    archives instead of deleting). Returns unique tickers, most recent
+    first (caller can take [:N] if needed).
+    """
+    if not _DB_PATH.exists():
+        return []
+    try:
+        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        # Order matters: alert_db is append-only chronological, so we
+        # iterate then dedup, preserving most-recent-first ordering.
+        rows: list[tuple[str, str]] = []
+        with _DB_PATH.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                date_iso = row.get("date_iso") or ""
+                if date_iso and date_iso < cutoff:
+                    continue
+                sym = (row.get("symbol") or "").upper()
+                if not sym or sym.startswith("WL_") or "_" in sym:
+                    continue
+                rows.append((date_iso, sym))
+        # Sort by date desc, dedup keeping first occurrence.
+        rows.sort(key=lambda r: r[0], reverse=True)
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for _d, _s in rows:
+            if _s in seen:
+                continue
+            seen.add(_s)
+            ordered.append(_s)
+        return ordered
+    except Exception:
+        return []
+
+
 def get_recent_alerts_pred_alpha(
     tickers: list[str],
     lookback_days: int = 7,

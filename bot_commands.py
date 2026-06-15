@@ -7181,9 +7181,22 @@ def _handle_command(text: str) -> None:
                 try:
                     import state as _st
                     from ml.prediction_log import get_recent_predictions_by_ticker
-                    from scanners.alert_db import get_recent_alerts_pred_alpha
+                    from scanners.alert_db import (
+                        get_recent_alerts_pred_alpha,
+                        get_recent_alert_tickers,
+                    )
 
-                    raw_alerts = list(_st.load_alerts())
+                    # 2026-06-15: include alerts from the last 3 days, not
+                    # just today's (alerted_today.json) set. alerted_today
+                    # resets at 06:00 Lisboa daily — by Monday morning,
+                    # Friday's DIP signals are gone from the in-memory set.
+                    # alert_db.csv survives (migrate_schema archives instead
+                    # of deletes), so it's the durable source for "what was
+                    # alerted recently". 3-day window covers Fri→Mon plus
+                    # any Sat/Sun manual triggers.
+                    today_set = list(_st.load_alerts())
+                    recent_set = get_recent_alert_tickers(lookback_days=3)
+                    raw_alerts = list({*today_set, *recent_set})
                     today_alerts = [
                         t for t in raw_alerts
                         if not str(t).upper().startswith("WL_")
