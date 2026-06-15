@@ -9158,6 +9158,24 @@ def _handle_command(text: str) -> None:
     elif cmd == "/admin_inspect_dip_calibration":
         _handle_admin_inspect_dip_calibration(parts)
 
+    elif cmd in ("/regime", "/market_regime", "/admin_regime"):
+        # Compute and display the current market regime score + components.
+        # This is the Manager Layer surfacing — gives a 0-100 view of
+        # whether the market is FROTHY (hold cash), NEUTRAL (deploy
+        # normally), or PANIC (deploy aggressively).
+        _reply("📡 *A computar market regime...* _(~10-30s)_")
+
+        def _run_regime():
+            try:
+                from core.market_regime import compute_regime, format_regime_summary
+                regime = compute_regime()
+                _reply(format_regime_summary(regime))
+            except Exception as e:
+                logging.error(f"[regime] {e}", exc_info=True)
+                _reply(f"❌ Regime computation failed: `{_md_safe(e)}`")
+
+        threading.Thread(target=_run_regime, daemon=True, name="regime").start()
+
     elif cmd == "/admin_promote_candidate":
         _handle_admin_promote_candidate(parts)
 
