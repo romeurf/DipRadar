@@ -485,8 +485,19 @@ def _score_core_dip(
     ret_20d = float(close.iloc[-1] / close.iloc[-21] - 1)
     signals["return_20d"] = round(ret_20d, 4)
 
-    if ret_20d >= _ENTRY_RETURN_20D:
-        return 0.0, signals  # não é um dip
+    # Dip qualifier (relaxed 2026-06-15): a CORE entry qualifies as EITHER
+    #   (a) tactical dip — return_20d ≤ -5%  (recent drop catching momentum)
+    #   (b) strategic deep value — dd_from_52w_high ≤ -25%  (already-drawn-
+    #       -down quality compounder that has stabilized; NVO at -44% from
+    #       high with return_20d = -4% would otherwise be filtered out
+    #       even though it's exactly the contrarian buy our user wants).
+    # Compute the 52w drawdown early so the check can use it.
+    _high_52w_early = float(close.rolling(min(252, n)).max().iloc[-1])
+    _dd_52w_early = (current_price / _high_52w_early - 1) if _high_52w_early > 0 else 0.0
+    _is_tactical_dip = ret_20d < _ENTRY_RETURN_20D
+    _is_deep_value   = _dd_52w_early < -0.25
+    if not (_is_tactical_dip or _is_deep_value):
+        return 0.0, signals  # nem tactical nem deep value — não qualifica
 
     # ── MA200 diária (tendência de médio prazo) ────────────────────────────
     ma_p   = min(200, n - 1)
