@@ -7519,6 +7519,42 @@ def _handle_command(text: str) -> None:
                 lines.append(f"   *TOTAL budget*:   €{total_budget:,.2f}")
                 lines.append("")
 
+                # Market regime context — informs deploy aggressiveness.
+                # Fetched lazily (separate try block — non-critical).
+                try:
+                    from core.market_regime import compute_regime
+                    _regime = compute_regime()
+                    _r_score = _regime.get("regime_score", 50.0)
+                    _r_label = _regime.get("regime_label", "?")
+                    _r_target = _regime.get("cash_target_pct", 20)
+                    _r_badge = {"FROTHY": "🟦", "NEUTRAL": "🟨", "PANIC": "🟥"}.get(_r_label, "⚪")
+                    # Quality_dd component is the relevant signal for this
+                    # user's strategy (DCA into quality compounders).
+                    _qdd = _regime.get("components", {}).get("quality_dd", {})
+                    _qdd_score = _qdd.get("score", 0)
+                    _qdd_n80 = _qdd.get("n_picks_80plus", 0)
+                    lines.append(
+                        f"{_r_badge} *Market Regime*: {_r_label} ({_r_score:.0f}/100) | "
+                        f"cash target {_r_target}% | quality_dd {_qdd_score:.0f}/100 ({_qdd_n80} picks ≥80)"
+                    )
+                    # Plain-language hint
+                    if _r_label == "FROTHY":
+                        lines.append(
+                            "   _💡 broad market caro — considera deploy parcial, hold buffer_"
+                        )
+                    elif _r_label == "PANIC":
+                        lines.append(
+                            "   _💡 generational buy zone — deploy agressivo, incl. deferred cash_"
+                        )
+                    else:  # NEUTRAL
+                        if _qdd_score >= 60:
+                            lines.append(
+                                "   _💡 broad market neutral mas quality em rotação — picks específicas em saldos_"
+                            )
+                    lines.append("")
+                except Exception as _re:
+                    logging.debug(f"[cash] regime fetch failed: {_re}")
+
                 # SELLs section
                 if sell_actions_to_show:
                     lines.append(f"🔻 *SELLs recomendados* ({len(sell_actions_to_show)}):")
@@ -9157,6 +9193,74 @@ def _handle_command(text: str) -> None:
 
     elif cmd == "/admin_inspect_dip_calibration":
         _handle_admin_inspect_dip_calibration(parts)
+
+    elif cmd in ("/cash_status", "/cash_advisor"):
+        # Compact advisor: regime + portfolio context + concrete action.
+        # Does NOT propose specific buys (that's /cash). Just answers:
+        # "given today's market + my portfolio, should I deploy / hold / wait?"
+        _reply("📡 *A computar cash advisor...* _(~10-30s)_")
+
+        def _run_status():
+            try:
+                from core.market_regime import compute_regime
+                from portfolio.portfolio import get_positions
+
+                regime = compute_regime()
+                r_score = regime.get("regime_score", 50.0)
+                r_label = regime.get("regime_label", "?")
+                r_target = regime.get("cash_target_pct", 20)
+                qdd = regime.get("components", {}).get("quality_dd", {})
+
+                # Portfolio cash position estimate
+                positions = get_positions()
+                portfolio_value = sum(
+                    float(p.get("value_eur") or p.get("cost_eur") or 0)
+                    for p in positions.values()
+                )
+
+                badge = {"FROTHY": "🟦", "NEUTRAL": "🟨", "PANIC": "🟥"}.get(r_label, "⚪")
+                lines = [
+                    f"{badge} *Cash Advisor*",
+                    "",
+                    f"  Market regime: *{r_label}* ({r_score:.0f}/100)",
+                    f"  Quality_dd:    {qdd.get('score', 0):.0f}/100 ({qdd.get('n_picks_80plus', 0)} picks ≥80)",
+                    f"  Portfolio:     €{portfolio_value:,.0f} live value",
+                    f"  Cash target:   {r_target}% of portfolio",
+                    "",
+                ]
+
+                # Concrete action recommendation
+                if r_label == "PANIC":
+                    lines.append("🟥 *Action*: deploy AGGRESSIVELY.")
+                    lines.append("  - Use full monthly inflow + any deferred cash")
+                    lines.append("  - Consider tapping non-essential reserves if super opp signal fires")
+                    lines.append("  - /cash <amount> with full available cash")
+                elif r_label == "FROTHY":
+                    qdd_score = qdd.get("score", 0)
+                    if qdd_score >= 60:
+                        lines.append("🟨 *Action*: deploy SELECTIVELY in quality.")
+                        lines.append("  - Broad market overpriced BUT quality compounders in rotation")
+                        lines.append("  - /cash deploys to /core_picks specifically, NOT to broad ETFs")
+                        lines.append("  - Concentration cap protects from broad crash")
+                    else:
+                        lines.append("🟦 *Action*: HOLD significant cash.")
+                        lines.append(f"  - Target {r_target}% portfolio cash")
+                        lines.append("  - Deploy only highest-conviction signals (score ≥ 85)")
+                        lines.append("  - Defer monthly inflow if quality_dd stays low")
+                else:  # NEUTRAL
+                    lines.append("🟨 *Action*: deploy NORMALLY.")
+                    lines.append(f"  - Target {r_target}% portfolio cash buffer")
+                    lines.append("  - /cash <amount> with standard concentration caps")
+                    lines.append("  - Watch for regime shifts week-to-week")
+
+                lines.append("")
+                lines.append(f"_Run `/cash <€amount>` for specific allocations._")
+                _reply("\n".join(lines))
+            except Exception as e:
+                logging.error(f"[cash_status] {e}", exc_info=True)
+                _reply(f"❌ Advisor failed: `{_md_safe(e)}`")
+
+        threading.Thread(target=_run_status, daemon=True, name="cash-status").start()
 
     elif cmd in ("/regime", "/market_regime", "/admin_regime"):
         # Compute and display the current market regime score + components.
