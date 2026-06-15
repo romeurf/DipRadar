@@ -8127,7 +8127,21 @@ def _handle_command(text: str) -> None:
             lines.append("*Key parquets:*")
             for name in ("ml_training_base.parquet",
                          "core_training_base.parquet",
-                         "momentum_training.parquet"):
+                         "momentum_training.parquet",
+                         "dip_oof_predictions.parquet",
+                         "core_oof_predictions.parquet"):
+                fp = _dd / name
+                if fp.exists():
+                    lines.append(f"• `{name}`: {_fmt(fp.stat().st_size)}")
+                else:
+                    lines.append(f"• `{name}`: _ausente_")
+
+            # Calibration JSONs — small but load-bearing for /cash sizing.
+            lines.append("")
+            lines.append("*Calibration JSONs:*")
+            for name in ("dip_alpha_calibration.json",
+                         "core_alpha_calibration.json",
+                         "rotation_alpha_calibration.json"):
                 fp = _dd / name
                 if fp.exists():
                     lines.append(f"• `{name}`: {_fmt(fp.stat().st_size)}")
