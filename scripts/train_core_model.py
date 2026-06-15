@@ -220,20 +220,30 @@ def _cross_validate_with_ic(
     dates: pd.Series,
     model_factory,
     label: str,
-) -> tuple[float, float, float]:
-    """Purged blocked CV, returning (mean_ic, mean_rmse, mean_r2)."""
+) -> tuple[float, float, float, np.ndarray]:
+    """Purged blocked CV, returning (mean_ic, mean_rmse, mean_r2, oof_preds).
+
+    oof_preds is a (n_samples,) array filled with each sample's prediction
+    from the fold where it was in the validation set. NaN where a sample
+    was never in a val set (shouldn't happen with continuous K-fold but
+    handled for safety). Used by scripts/calibrate_core_alpha.py to fit
+    the bucket calibration on honest out-of-fold predictions instead of
+    biased in-sample re-fit.
+    """
     folds = _purged_block_cv_indices(dates, n_splits=5, embargo_days=30)
     ics, rmses, r2s = [], [], []
+    oof_preds = np.full(len(X), np.nan, dtype=float)
     for fold_i, (tr, va) in enumerate(folds, 1):
-        ic, rmse, r2, _ = _fit_score(model_factory, X[tr], y[tr], X[va], y[va])
+        ic, rmse, r2, preds = _fit_score(model_factory, X[tr], y[tr], X[va], y[va])
         ics.append(ic); rmses.append(rmse); r2s.append(r2)
+        oof_preds[va] = preds
         log.info(
             f"  [{label}] fold {fold_i}: IC={ic:+.4f} RMSE={rmse:.4f} R²={r2:+.3f} "
             f"(n_tr={len(tr)} n_va={len(va)})"
         )
     if not ics:
-        return 0.0, 0.0, 0.0
-    return float(np.mean(ics)), float(np.mean(rmses)), float(np.mean(r2s))
+        return 0.0, 0.0, 0.0, oof_preds
+    return float(np.mean(ics)), float(np.mean(rmses)), float(np.mean(r2s)), oof_preds
 
 
 def train(parquet_path: Path, dry_run: bool = False) -> CoreModelBundle:
@@ -267,11 +277,11 @@ def train(parquet_path: Path, dry_run: bool = False) -> CoreModelBundle:
 
     log.info(f"Purged-blocked CV (5 folds, 30d embargo) on {len(X)} rows...")
     log.info("---- GBR ----")
-    gbr_ic, gbr_rmse, gbr_r2 = _cross_validate_with_ic(
+    gbr_ic, gbr_rmse, gbr_r2, gbr_oof = _cross_validate_with_ic(
         X_scaled, y, df["alert_date"], _gbr_factory, "GBR")
     log.info(f"GBR CV mean: IC={gbr_ic:+.4f} RMSE={gbr_rmse:.4f} R²={gbr_r2:+.3f}")
     log.info("---- Ridge ----")
-    ridge_ic, ridge_rmse, ridge_r2 = _cross_validate_with_ic(
+    ridge_ic, ridge_rmse, ridge_r2, ridge_oof = _cross_validate_with_ic(
         X_scaled, y, df["alert_date"], _ridge_factory, "Ridge")
     log.info(f"Ridge CV mean: IC={ridge_ic:+.4f} RMSE={ridge_rmse:.4f} R²={ridge_r2:+.3f}")
 
@@ -281,11 +291,35 @@ def train(parquet_path: Path, dry_run: bool = False) -> CoreModelBundle:
         champion_name = "GBR"
         final_factory = _gbr_factory
         cv_ic, cv_rmse, cv_r2 = gbr_ic, gbr_rmse, gbr_r2
+        champion_oof = gbr_oof
     else:
         champion_name = "Ridge"
         final_factory = _ridge_factory
         cv_ic, cv_rmse, cv_r2 = ridge_ic, ridge_rmse, ridge_r2
+        champion_oof = ridge_oof
     log.info(f"Champion: {champion_name} | CV IC={cv_ic:+.4f} RMSE={cv_rmse:.4f} R²={cv_r2:+.3f}")
+
+    # Persist OOF predictions for downstream bucket calibration. Mirrors the
+    # DIP trainer pattern at ml_training/train.py:1094-1115. Without this,
+    # /admin_calibrate_core would have to fall back to in-sample predictions
+    # over the same parquet — biased r² inflation that misleads sizing.
+    try:
+        _oof_df = pd.DataFrame({
+            "alert_date": pd.to_datetime(df["alert_date"]).values,
+            "ticker":     df["ticker"].astype(str).values,
+            "sector":     df.get("sector", pd.Series([""] * len(df))).astype(str).values,
+            "actual":     y,
+            "oof_pred":   champion_oof,
+        })
+        _oof_df = _oof_df.dropna(subset=["oof_pred", "actual"]).reset_index(drop=True)
+        _oof_path = parquet_path.parent / "core_oof_predictions.parquet"
+        _oof_df.to_parquet(_oof_path, index=False)
+        log.info(
+            f"OOF predictions persisted: {_oof_path.name} "
+            f"({len(_oof_df):,} rows, champion={champion_name})"
+        )
+    except Exception as _oof_e:
+        log.warning(f"OOF predictions persist failed (non-fatal): {_oof_e}")
 
     if cv_ic < 0.04:
         log.warning(

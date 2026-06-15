@@ -7061,23 +7061,59 @@ def _handle_command(text: str) -> None:
                 try:
                     from core.core_radar import scan_core_universe
                     core_opps = scan_core_universe(min_score=60.0)
+
+                    # 2026-06-15: Load CORE bucket calibration if available.
+                    # When accepted, the per-bucket downside_q05 + empirical
+                    # mean_actual_alpha_1y replace the theoretical atanh α
+                    # and DEFAULT_DOWNSIDE_FALLBACK, giving Kelly Full real
+                    # data instead of synthetic values.
+                    _core_cd: dict = {}
+                    _core_cd_accepted = False
+                    try:
+                        for _try in (
+                            _Path("/data/core_alpha_calibration.json"),
+                            _Path("data/core_alpha_calibration.json"),
+                        ):
+                            if _try.exists():
+                                _core_cd = _json.loads(_try.read_text())
+                                _core_cd_accepted = bool(_core_cd.get("accepted", False))
+                                break
+                    except Exception:
+                        pass
+
                     for p in core_opps:
-                        # Convert score back to alpha estimate for ranking.
-                        # Score uses tanh(alpha × 3) × 50 + 50, so inverse:
-                        # alpha = atanh((score - 50) / 50) / 3
                         import math as _m
-                        score_norm = (float(p["score"]) - 50.0) / 50.0
-                        score_norm = max(-0.999, min(0.999, score_norm))
-                        alpha_1y = _m.atanh(score_norm) / 3.0
-                        # Kelly for CORE: estimate win_prob from score
-                        # (no ML for CORE per-ticker yet). score 50 ≈ random
-                        # (50%), score 100 ≈ near-certainty (90%). Linear map.
                         _core_score = float(p["score"])
+                        # Theoretical α from score (atanh inversion of the
+                        # score = tanh(α × 3) × 50 + 50 formula in core_radar).
+                        score_norm = (_core_score - 50.0) / 50.0
+                        score_norm = max(-0.999, min(0.999, score_norm))
+                        alpha_1y_theoretical = _m.atanh(score_norm) / 3.0
+                        # Default: use theoretical α + fallback downside (existing
+                        # behaviour pre-calibration).
+                        alpha_1y = alpha_1y_theoretical
+                        _core_downside = _DEFAULT_DOWNSIDE_FALLBACK
+                        _core_calib_note = "theoretical α"
+                        # If calibration accepted: look up the bucket whose
+                        # pred range contains alpha_1y_theoretical, replace
+                        # α with the bucket's empirical mean + downside.
+                        if _core_cd_accepted and _core_cd.get("buckets"):
+                            for _b in _core_cd["buckets"]:
+                                _lo = float(_b.get("pred_min", -1e9))
+                                _hi = float(_b.get("pred_max", 1e9))
+                                if _lo <= alpha_1y_theoretical <= _hi:
+                                    alpha_1y = float(_b.get("mean_actual_alpha_1y") or alpha_1y_theoretical)
+                                    _core_downside = float(_b.get("downside_q05") or _DEFAULT_DOWNSIDE_FALLBACK)
+                                    _core_calib_note = (
+                                        f"calibrated bucket [{_lo:+.3f},{_hi:+.3f}] "
+                                        f"μ={alpha_1y:+.4f}"
+                                    )
+                                    break
                         _core_winp  = max(0.5, min(0.9, 0.5 + (_core_score - 50.0) / 100.0))
                         _core_kelly = _kelly_full(
                             win_prob=_core_winp,
                             alpha=alpha_1y,
-                            downside=_DEFAULT_DOWNSIDE_FALLBACK,  # no CORE calibration yet
+                            downside=_core_downside,
                             budget=total_budget,
                         )
                         # Same scale-by-alpha fallback as ROTATION when Kelly
@@ -7094,15 +7130,21 @@ def _handle_command(text: str) -> None:
                         candidates.append({
                             "ticker":     p["ticker"],
                             "bucket":     "CORE",
-                            "reason":     f"Core score {p['score']:.0f} (${p.get('current_price', 0):.2f})",
+                            "reason":     (
+                                f"Core score {p['score']:.0f} "
+                                f"(${p.get('current_price', 0):.2f}) — {_core_calib_note}"
+                            ),
                             "suggested":  _core_kelly,
                             "ann_alpha":  alpha_1y,
                             "confidence": 1.0,
                             "extra":      {
-                                "score":          p["score"],
-                                "price":          p.get("current_price"),
-                                "win_prob_est":   _core_winp,
-                                "kelly_alloc":    _core_kelly,
+                                "score":             p["score"],
+                                "price":             p.get("current_price"),
+                                "win_prob_est":      _core_winp,
+                                "kelly_alloc":       _core_kelly,
+                                "calibrated_alpha":  alpha_1y,
+                                "downside":          _core_downside,
+                                "calib_note":        _core_calib_note,
                             },
                         })
                 except Exception as _e:
@@ -8938,6 +8980,76 @@ def _handle_command(text: str) -> None:
                     _reply(f"❌ Erro a correr calibração: `{e}`")
 
             _thr.Thread(target=_run_calib, daemon=True, name="dip-calib").start()
+
+    elif cmd in ("/admin_calibrate_core", "/calibrate_core"):
+        # Mirror of /admin_calibrate_dip for the CORE radar. Requires
+        # /data/core_oof_predictions.parquet which is populated by the
+        # CORE trainer (commit 2026-06-15+). If absent, the script
+        # logs an error and exits — user needs to run
+        # /admin_train_core_model first.
+        import subprocess as _subp
+        import threading as _thr
+        from pathlib import Path as _P
+
+        _script = _P(__file__).parent / "scripts" / "calibrate_core_alpha.py"
+        if not _script.exists():
+            _reply(f"⚠️ Script não encontrado: `{_script}`")
+        else:
+            _reply(
+                "🧪 *CORE α calibration — V2 (OOF preds from trainer)*\n"
+                "_A correr `scripts/calibrate_core_alpha.py`... ~30s._\n"
+                "_Lê `/data/core_oof_predictions.parquet` (honest OOF). "
+                "Sai com erro se OOF ausente — re-corre `/admin_train_core_model` primeiro._"
+            )
+
+            def _run_core_calib():
+                try:
+                    proc = _subp.Popen(
+                        ["python", str(_script)],
+                        stdout=_subp.PIPE,
+                        stderr=_subp.STDOUT,
+                        text=True,
+                        bufsize=1,
+                    )
+                    captured: list[str] = []
+                    if proc.stdout is not None:
+                        for line in proc.stdout:
+                            captured.append(line.rstrip())
+                            if len(captured) > 200:
+                                captured = captured[-200:]
+                    rc = proc.wait()
+                    tail = "\n".join(captured[-40:])
+                    status = "✅" if rc == 0 else "❌"
+                    summary = ""
+                    try:
+                        import json as _json
+                        _cd = _P("/data") if _P("/data").exists() else _P("/tmp")
+                        _alt = _P(__file__).parent / "data"
+                        for _candidate in (_cd / "core_alpha_calibration.json",
+                                           _alt / "core_alpha_calibration.json"):
+                            if _candidate.exists():
+                                _cf = _json.loads(_candidate.read_text())
+                                summary = (
+                                    f"\n\n📊 *Resultado*: r²=*{_cf.get('r_squared', 0):.3f}* "
+                                    f"| monotonic=*{_cf.get('is_monotonic', False)}* "
+                                    f"| accepted=*{_cf.get('accepted', False)}*\n"
+                                    f"  n_total={_cf.get('n_total', 0)} "
+                                    f"| spread={_cf.get('spread_top_bottom', 0):+.4f}\n"
+                                    f"  version=`{_cf.get('version', '?')}` "
+                                    f"oof_method=`{_cf.get('oof_method', '?')}`\n"
+                                    f"  Buckets: {len(_cf.get('buckets', []))}"
+                                )
+                                break
+                    except Exception:
+                        pass
+                    _reply(
+                        f"{status} *Calibração CORE terminou (exit={rc})*\n\n"
+                        f"```\n{tail[-3000:]}\n```{summary}"
+                    )
+                except Exception as e:
+                    _reply(f"❌ Erro a correr calibração CORE: `{e}`")
+
+            _thr.Thread(target=_run_core_calib, daemon=True, name="core-calib").start()
 
     elif cmd in ("/admin_clear_alerts", "/clear_alerts_now"):
         # Manual trigger for the daily dedup reset. Useful when stale
