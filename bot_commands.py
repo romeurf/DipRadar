@@ -7751,16 +7751,87 @@ def _handle_command(text: str) -> None:
             _proposal_path = _dd / "last_cash_proposal.json"
             _recommended = None
             _proposal_ts = None
+            _top_picks = []
+            _user_pick_score = None
+            _user_pick_alpha = None
+            _user_pick_bucket = None
             if _proposal_path.exists():
                 try:
                     _prop = _J.loads(_proposal_path.read_text())
                     _proposal_ts = _prop.get("timestamp")
-                    for _a in _prop.get("actions", []):
+                    _actions = _prop.get("actions", []) or []
+                    for _a in _actions:
                         if _a.get("ticker", "").upper() == _ticker:
-                            _recommended = float(_a.get("recommended_eur") or 0)
+                            _recommended      = float(_a.get("recommended_eur") or 0)
+                            _user_pick_score  = _a.get("score")
+                            _user_pick_alpha  = _a.get("ann_alpha_pct")
+                            _user_pick_bucket = _a.get("bucket")
                             break
+                    # System top 3 by score (fallback to recommended_eur if score missing)
+                    _sorted_actions = sorted(
+                        _actions,
+                        key=lambda x: (
+                            float(x.get("score") or 0),
+                            float(x.get("recommended_eur") or 0),
+                        ),
+                        reverse=True,
+                    )[:3]
+                    _top_picks = [
+                        {
+                            "ticker":           a.get("ticker"),
+                            "score":            a.get("score"),
+                            "ann_alpha_pct":    a.get("ann_alpha_pct"),
+                            "recommended_eur":  a.get("recommended_eur"),
+                            "bucket":           a.get("bucket"),
+                        }
+                        for a in _sorted_actions
+                    ]
                 except Exception:
                     pass
+
+            # Fetch live prices at deploy time for forward-return tracking
+            # (user's pick + system top 3). One batch call to yfinance.
+            _initial_price = None
+            _all_tickers = {_ticker}
+            for _tp in _top_picks:
+                if _tp.get("ticker"):
+                    _all_tickers.add(_tp["ticker"].upper())
+            _prices_at_deploy = {}
+            try:
+                import yfinance as _yf
+                if len(_all_tickers) == 1:
+                    _info = _yf.Ticker(_ticker).fast_info
+                    _p = (
+                        getattr(_info, "last_price", None)
+                        or getattr(_info, "regular_market_price", None)
+                    )
+                    if _p:
+                        _prices_at_deploy[_ticker] = float(_p)
+                else:
+                    _data = _yf.download(
+                        list(_all_tickers),
+                        period="5d",
+                        progress=False,
+                        auto_adjust=True,
+                        threads=True,
+                    )
+                    if "Close" in _data.columns.get_level_values(0):
+                        _closes = _data["Close"]
+                        for _t in _all_tickers:
+                            try:
+                                if _t in _closes.columns:
+                                    _series = _closes[_t].dropna()
+                                    if len(_series) > 0:
+                                        _prices_at_deploy[_t] = float(_series.iloc[-1])
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+            _initial_price = _prices_at_deploy.get(_ticker)
+            # Attach initial_price to each system top pick entry
+            for _tp in _top_picks:
+                _tp_t = (_tp.get("ticker") or "").upper()
+                _tp["initial_price"] = _prices_at_deploy.get(_tp_t)
 
             _delta_eur = (_amount - _recommended) if _recommended is not None else None
             _delta_pct = (
@@ -7813,6 +7884,12 @@ def _handle_command(text: str) -> None:
                 "reason":              _reason or None,
                 "category":            _category,
                 "proposal_timestamp":  _proposal_ts,
+                # Decision-time snapshot for user-vs-system comparison
+                "user_pick_score":     _user_pick_score,
+                "user_pick_alpha_pct": _user_pick_alpha,
+                "user_pick_bucket":    _user_pick_bucket,
+                "system_top_picks":    _top_picks,
+                "initial_price":       _initial_price,
             }
             _hist.append(_entry)
             # Keep last 200 entries
@@ -7891,6 +7968,183 @@ def _handle_command(text: str) -> None:
                     if e.get("reason"):
                         lines.append(f"   _{e['reason'][:80]}_")
                 _reply("\n".join(lines))
+
+    elif cmd in ("/deploy_track", "/deploy_analysis"):
+        # User-vs-system comparison: for each historical deploy, show the
+        # user's pick (ticker, score, amount, current return since deploy)
+        # next to the system's top pick at the time (ticker, score, current
+        # return since deploy). Aggregates: how often the user's choice has
+        # outperformed the system's top pick. Live prices via yfinance.
+        from pathlib import Path as _P
+        import json as _J
+        from datetime import datetime as _dt2
+        _dd = _P("/data") if _P("/data").exists() else _P(__file__).parent / "data"
+        _hist_path = _dd / "deploy_history.json"
+        if not _hist_path.exists():
+            _reply("📭 _Sem deploys registados. Use `/deployed TICKER AMOUNT`._")
+            return
+        try:
+            _hist = _J.loads(_hist_path.read_text())
+        except Exception:
+            _hist = []
+        if not _hist:
+            _reply("📭 _Histórico vazio._")
+            return
+
+        _n = 10
+        if len(parts) > 1:
+            try:
+                _n = max(1, min(50, int(parts[1])))
+            except ValueError:
+                pass
+        _recent = _hist[-_n:]
+
+        # Collect unique tickers needed (user picks + system top picks)
+        _tickers_needed = set()
+        for e in _recent:
+            if e.get("ticker"):
+                _tickers_needed.add(e["ticker"].upper())
+            for tp in (e.get("system_top_picks") or []):
+                if tp.get("ticker"):
+                    _tickers_needed.add(tp["ticker"].upper())
+        _tickers_needed.discard("")
+
+        _reply(f"📊 _A computar forward returns para {len(_tickers_needed)} tickers..._")
+
+        # Batch fetch current prices via yfinance
+        _prices_now = {}
+        try:
+            import yfinance as _yf
+            if _tickers_needed:
+                _data = _yf.download(
+                    list(_tickers_needed),
+                    period="5d",
+                    progress=False,
+                    auto_adjust=True,
+                    threads=True,
+                )
+                if "Close" in _data.columns.get_level_values(0):
+                    _closes = _data["Close"]
+                    for _t in _tickers_needed:
+                        try:
+                            if _t in _closes.columns:
+                                _series = _closes[_t].dropna()
+                                if len(_series) > 0:
+                                    _prices_now[_t] = float(_series.iloc[-1])
+                            elif len(_tickers_needed) == 1:
+                                _series = _closes.dropna()
+                                if len(_series) > 0:
+                                    _prices_now[_t] = float(_series.iloc[-1])
+                        except Exception:
+                            pass
+        except Exception as _pe:
+            logging.debug(f"[deploy_track] price fetch failed: {_pe}")
+
+        def _ret_pct(initial, current):
+            if initial is None or current is None or initial <= 0:
+                return None
+            return (current - initial) / initial * 100.0
+
+        lines = [f"*📊 Deploy track (últimos {len(_recent)})*", ""]
+
+        # Aggregate stats
+        _user_wins = 0
+        _system_wins = 0
+        _comparable = 0
+        _sum_user_alpha = 0.0  # user return - system top pick return
+
+        for e in reversed(_recent):
+            _ts   = (e.get("timestamp") or "")[:10]
+            _ut   = e.get("ticker", "?")
+            _ueur = e.get("deployed_eur", 0)
+            _us   = e.get("user_pick_score")
+            _uip  = e.get("initial_price")
+            _u_now = _prices_now.get(_ut.upper()) if _ut else None
+            _u_ret = _ret_pct(_uip, _u_now)
+
+            # System top pick — pick the highest-scored entry whose ticker
+            # differs from user's; if all are the user's, use top.
+            _tops = e.get("system_top_picks") or []
+            _stp = None
+            for tp in _tops:
+                if (tp.get("ticker") or "").upper() != _ut.upper():
+                    _stp = tp
+                    break
+            if _stp is None and _tops:
+                _stp = _tops[0]
+
+            _s_line = ""
+            _s_ret = None
+            if _stp:
+                _st  = _stp.get("ticker") or "?"
+                _ss  = _stp.get("score")
+                _seur = _stp.get("recommended_eur")
+                _sip = _stp.get("initial_price")
+                _s_now = _prices_now.get(_st.upper()) if _st else None
+                _s_ret = _ret_pct(_sip, _s_now)
+                _s_ret_str = f"{_s_ret:+.1f}%" if _s_ret is not None else "n/a"
+                _s_line = (
+                    f"   🤖 sys top: *{_st}* score "
+                    f"{(_ss if _ss is not None else 0):.0f} "
+                    f"(rec €{(_seur or 0):.0f}) → {_s_ret_str}"
+                )
+                # Alpha: user return - system top return (when both known)
+                if _u_ret is not None and _s_ret is not None:
+                    _alpha = _u_ret - _s_ret
+                    if _alpha > 0:
+                        _user_wins += 1
+                    elif _alpha < 0:
+                        _system_wins += 1
+                    _comparable += 1
+                    _sum_user_alpha += _alpha
+                    _s_line += f"  |  α user vs sys: *{_alpha:+.1f}pp*"
+
+            # User line
+            _u_score_str = f"{_us:.0f}" if _us is not None else "?"
+            _u_ret_str = f"{_u_ret:+.1f}%" if _u_ret is not None else "n/a"
+            lines.append(
+                f"`{_ts}` 👤 *{_ut}* €{_ueur:.0f} score {_u_score_str} → {_u_ret_str}"
+            )
+            if _s_line:
+                lines.append(_s_line)
+
+            if e.get("reason"):
+                lines.append(f"   _{e['reason'][:80]}_")
+            lines.append("")
+
+        # Aggregate footer
+        _u_rets = []
+        for e in _recent:
+            _ut = e.get("ticker", "").upper()
+            _uip = e.get("initial_price")
+            _un = _prices_now.get(_ut)
+            _r = _ret_pct(_uip, _un)
+            if _r is not None:
+                _u_rets.append(_r)
+        if _u_rets:
+            lines.append(
+                f"_Média retorno user picks: {sum(_u_rets)/len(_u_rets):+.1f}% "
+                f"({len(_u_rets)}/{len(_recent)} com initial_price)_"
+            )
+        if _comparable > 0:
+            _avg_alpha = _sum_user_alpha / _comparable
+            _verdict = (
+                "👤 user à frente"  if _avg_alpha > 0.5 else
+                "🤖 sistema à frente" if _avg_alpha < -0.5 else
+                "≈ empate"
+            )
+            lines.append(
+                f"_User vs sys top: {_user_wins}W-{_system_wins}L "
+                f"({_comparable}/{len(_recent)} comparáveis) · "
+                f"α médio *{_avg_alpha:+.1f}pp* · {_verdict}_"
+            )
+        else:
+            lines.append(
+                "_Sem entradas comparáveis ainda (precisa initial_price em user pick + sys top)._ "
+                "Novos `/deployed` enriquecem o track."
+            )
+
+        _reply("\n".join(lines))
 
     elif cmd in ("/admin_core_debug", "/core_debug"):
         # Debug a single ticker through the Core radar scoring pipeline.
