@@ -7136,14 +7136,14 @@ def _handle_command(text: str) -> None:
                         if _core_kelly <= 0 and alpha_1y > 0:
                             if _core_cd_accepted:
                                 # Calibration accepted → Kelly has empirical α
-                                # AND empirical downside_q05. Returning 0 means
-                                # the bucket's worst-case loss swamps expected
-                                # return. Respect the model — no artificial
-                                # fallback. Surface to user so they know why
-                                # this candidate isn't deploying.
+                                # AND empirical downside. Returning 0 means
+                                # the bucket's q25 still swamps α at this
+                                # win_prob. Surface bucket + numbers so user
+                                # can see exactly which bucket failed.
                                 info_lines.append(
-                                    f"⏭️ `{p['ticker']}` CORE Kelly=0 — calibrated "
-                                    f"bucket downside_q05 swamps α (model says skip)"
+                                    f"⏭️ `{p['ticker']}` CORE score {_core_score:.0f} "
+                                    f"Kelly=0 — α={alpha_1y:+.4f} d25={_core_downside:.3f} "
+                                    f"p={_core_winp:.2f} b={alpha_1y/_core_downside:.2f}"
                                 )
                                 _core_kelly = 0  # explicit, deploy loop skips
                             else:
