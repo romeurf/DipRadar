@@ -7097,16 +7097,29 @@ def _handle_command(text: str) -> None:
                         # If calibration accepted: look up the bucket whose
                         # pred range contains alpha_1y_theoretical, replace
                         # α with the bucket's empirical mean + downside.
+                        # 2026-06-15: switched from q05 to q25 as Kelly
+                        # downside. q05 is "5% worst case" — too conservative
+                        # for a 5+ year DCA hold horizon, where 1-year crash
+                        # extremes mean-revert. q25 ("25% worst case") still
+                        # uses empirical bucket data but reflects a typical
+                        # bad outcome rather than a tail event.
                         if _core_cd_accepted and _core_cd.get("buckets"):
                             for _b in _core_cd["buckets"]:
                                 _lo = float(_b.get("pred_min", -1e9))
                                 _hi = float(_b.get("pred_max", 1e9))
                                 if _lo <= alpha_1y_theoretical <= _hi:
                                     alpha_1y = float(_b.get("mean_actual_alpha_1y") or alpha_1y_theoretical)
-                                    _core_downside = float(_b.get("downside_q05") or _DEFAULT_DOWNSIDE_FALLBACK)
+                                    _q25 = _b.get("q25_actual_alpha_1y")
+                                    if _q25 is not None:
+                                        _core_downside = max(0.001, abs(float(_q25)))
+                                    else:
+                                        # Fallback to q05 if q25 absent (legacy JSON).
+                                        _core_downside = float(
+                                            _b.get("downside_q05") or _DEFAULT_DOWNSIDE_FALLBACK
+                                        )
                                     _core_calib_note = (
                                         f"calibrated bucket [{_lo:+.3f},{_hi:+.3f}] "
-                                        f"μ={alpha_1y:+.4f}"
+                                        f"μ={alpha_1y:+.4f} d25={_core_downside:.3f}"
                                     )
                                     break
                         _core_winp  = max(0.5, min(0.9, 0.5 + (_core_score - 50.0) / 100.0))
