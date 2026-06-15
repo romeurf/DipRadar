@@ -632,8 +632,13 @@ def _score_core_dip(
     elif rsi < _RSI_MAX:
         score += 2.0
 
-    # Drawdown from 52w high (max 5 pts)
-    score += min(abs(dd_52w) * 20, 5.0)
+    # Drawdown from 52w high (max 20 pts — 2026-06-15 increased from 5)
+    # Was: min(abs(dd) * 20, 5) → -44% NVO only gained 5pp vs -10% TMO at
+    # 2pp. The 5-point cap meant deep value compounders (Buffett-style
+    # contrarian entries) got nearly no extra credit for being severely
+    # mispriced. New formula gives meaningful weight: -25% = 5pts,
+    # -50% = 10pts, -75% = 15pts (saturates around -100% at 20pts).
+    score += min(abs(dd_52w) * 20, 20.0)
 
     # Momentum still negative in last 5d — small penalty
     if ret_5d < -0.03:
@@ -678,7 +683,16 @@ def _score_core_dip(
         elif fcf_yield_q >= _FCF_YIELD_OK:
             score += 3.0
         elif fcf_yield_q < 0:
-            score -= 6.0    # burning cash in a dip = danger
+            # 2026-06-15: respect investment_phase. NVO's -6.2% FCF yield
+            # is NOT deterioration — it's GLP-1 capacity buildout (rev+24%,
+            # gm 83%, roe 71%, all healthy). The detector at line 575 has
+            # already flagged this case; only penalize if NOT in
+            # investment phase (true deterioration with no offsetting
+            # growth + margin + roe). Same heuristic the ML path uses.
+            if signals.get("is_investment_phase"):
+                score += 0.0  # neutral — capex-driven negative FCF is OK
+            else:
+                score -= 6.0  # genuine FCF burn — danger sign
 
     if analyst_up is not None:
         if analyst_up >= 0.20:
