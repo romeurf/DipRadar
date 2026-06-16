@@ -205,7 +205,10 @@
       "Bash(git commit -m 'feat: Full Kelly allocation + /deployed feedback loop' -m 'Two architectural changes per user direction \\(2026-06-12\\): *)",
       "Bash(git commit -m 'fix\\(calibration\\): prefer /data/ parquet \\(211k rows\\) over /app/ seed \\(37k\\)' -m 'User'\\\\''s /admin_check_config \\(2026-06-12\\) shows: *)",
       "Bash(git commit -m 'fix\\(/cash\\): replace removed ROT_BASE_ALLOC with Kelly for rotation picks' -m 'User report \\(2026-06-12\\): *)",
-      "Bash(git commit -m 'refactor: uniformize on 90d horizon + add parquets to daily backup' -m 'User direction \\(2026-06-12\\): *)"
+      "Bash(git commit -m 'refactor: uniformize on 90d horizon + add parquets to daily backup' -m 'User direction \\(2026-06-12\\): *)",
+      "Bash(python -m py_compile utils/news_headlines.py)",
+      "Bash(awk '/elif cmd in \\\\\\(\"\\\\/cash\", \"\\\\/allocation\"/{found=1; start=NR} found && /^    elif cmd / && NR > start+5 {print NR; exit}' bot_commands.py)",
+      "Bash(python -m py_compile main.py bot_commands.py core/composite_score.py utils/news_headlines.py)"
     ],
     "additionalDirectories": [
       "c:\\Users\\Romeu\\OneDrive\\Documentos\\GitHub\\DipRadar"

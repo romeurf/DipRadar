@@ -7710,6 +7710,29 @@ def _handle_command(text: str) -> None:
                 except Exception as _pe:
                     logging.debug(f"[cash] persist proposal failed: {_pe}")
 
+                # Persist watchdog state so the daily cron knows how much
+                # cash is parked since the last /cash run. The watchdog
+                # pushes a notification when a new qualifier emerges and
+                # held_cash_eur > 0 — "you have €X waiting, here's where it
+                # could go right now."
+                try:
+                    _deployed_eur = sum(float(b.get("value") or 0) for b in buy_actions)
+                    _held_cash_eur = max(0.0, float(total_budget) - _deployed_eur)
+                    _ws_path = (
+                        _Path("/data") if _Path("/data").exists() else _Path(__file__).parent / "data"
+                    ) / "watchdog_state.json"
+                    _ws_state = {
+                        "timestamp":         _dt.now().isoformat(timespec="seconds"),
+                        "total_budget":      float(total_budget),
+                        "deployed_eur":      float(_deployed_eur),
+                        "held_cash_eur":     float(_held_cash_eur),
+                        "deployed_tickers":  [b["ticker"] for b in buy_actions],
+                        "notified_tickers":  [],  # cron fills this in to avoid spam
+                    }
+                    _ws_path.write_text(_json.dumps(_ws_state, indent=2))
+                except Exception as _we:
+                    logging.debug(f"[cash] persist watchdog_state failed: {_we}")
+
                 _reply("\n".join(lines))
             except Exception as _e:
                 _reply(f"❌ Allocation falhou: `{_e}`")
@@ -9515,6 +9538,155 @@ def _handle_command(text: str) -> None:
                 _reply(f"❌ Advisor failed: `{_md_safe(e)}`")
 
         threading.Thread(target=_run_status, daemon=True, name="cash-status").start()
+
+    elif cmd in ("/scan_now", "/watchdog", "/scan"):
+        # Manual trigger for the watchdog/screener pipeline. Same logic as
+        # the daily cron, but on-demand. Use case: you saw news/movement
+        # and want to see which qualifiers are out there right now without
+        # waiting for the next /cash run.
+        # Output: top qualifiers (z > threshold) with composite z breakdown,
+        # softmax-suggested allocations, recent headlines, and a list of
+        # below-threshold tickers that are within striking distance.
+        _reply("🔄 *Scan manual* — _a varrer universo CORE + DIP (~30-60s)..._")
+
+        def _run_scan():
+            try:
+                from pathlib import Path as _P
+                import json as _J
+                from datetime import datetime as _dt
+                from core.composite_score import (
+                    build_universe_stats, composite_from_signals, softmax_sizing,
+                )
+                from core.core_radar import scan_core_universe
+                from utils.news_headlines import fetch_headlines, format_headlines_for_telegram
+
+                _dd = _P("/data") if _P("/data").exists() else _P(__file__).parent / "data"
+
+                # Load held-cash state if exists
+                _watchdog_state_path = _dd / "watchdog_state.json"
+                _held_cash = 0.0
+                _last_cash_ts = None
+                if _watchdog_state_path.exists():
+                    try:
+                        _ws = _J.loads(_watchdog_state_path.read_text())
+                        _held_cash = float(_ws.get("held_cash_eur") or 0.0)
+                        _last_cash_ts = _ws.get("timestamp")
+                    except Exception:
+                        pass
+
+                # Universe stats (cached daily)
+                stats = build_universe_stats()
+                if not stats:
+                    _reply("⚠️ _Universe stats vazio — universo CORE não respondeu_")
+                    return
+
+                # Get CORE opps (no min_score filter — let composite z decide)
+                opps = scan_core_universe(min_score=0.0)
+                if not opps:
+                    _reply("⚠️ _Scan CORE devolveu 0 oportunidades_")
+                    return
+
+                # Compute composite z for each as CORE candidate
+                scored = []
+                for opp in opps:
+                    cb = composite_from_signals(
+                        opp["ticker"], opp, horizon="CORE", stats=stats,
+                    )
+                    scored.append((opp, cb))
+
+                # Sort by composite z desc
+                scored.sort(key=lambda x: -x[1].composite_z)
+
+                # Softmax sizing for held cash (if any) or hypothetical €1000
+                _budget = _held_cash if _held_cash > 100 else 1000.0
+                _allocs, _skipped = softmax_sizing(
+                    [(o["ticker"], cb.composite_z) for o, cb in scored],
+                    budget_eur=_budget,
+                    threshold_z=0.3,
+                    min_alloc_eur=100.0,
+                )
+
+                # Regime context
+                try:
+                    from core.market_regime import compute_regime
+                    _regime = compute_regime()
+                    _r_label = _regime.get("regime_label", "?")
+                    _r_score = _regime.get("regime_score", 50.0)
+                except Exception:
+                    _r_label = "?"
+                    _r_score = 50.0
+                _badge = {"FROTHY": "🟦", "NEUTRAL": "🟨", "PANIC": "🟥"}.get(_r_label, "⚪")
+
+                _ts_now = _dt.now().strftime("%Y-%m-%d %H:%M")
+                lines = [
+                    f"🔄 *Scan manual* — `{_ts_now}`",
+                    f"{_badge} Regime: *{_r_label}* ({_r_score:.0f}/100)",
+                ]
+                if _held_cash > 0:
+                    _last_str = (_last_cash_ts or "?")[:10]
+                    lines.append(f"💰 Cash retido: *€{_held_cash:,.0f}* (do /cash de {_last_str})")
+                else:
+                    lines.append(f"💡 Budget hipotético: €{_budget:.0f} (não tens cash retido)")
+                lines.append("")
+
+                if not _allocs:
+                    lines.append("⚪ *Nenhum qualifier* — todos abaixo de z=0.3")
+                    lines.append("")
+                    lines.append("_Top 5 abaixo do threshold (proximidade):_")
+                    for opp, cb in scored[:5]:
+                        lines.append(
+                            f"  `{opp['ticker']:<6}` z=*{cb.composite_z:+.2f}*  "
+                            f"q={cb.quality_z:+.1f} dd={cb.dd_z:+.1f} v={cb.valuation_z:+.1f}"
+                        )
+                else:
+                    lines.append(f"📈 *Qualifiers* (z > 0.3 e alocação ≥ €100):")
+                    lines.append("")
+                    # Show each qualifier with breakdown + headlines
+                    for opp, cb in scored:
+                        if opp["ticker"] not in _allocs:
+                            continue
+                        _eur = _allocs[opp["ticker"]]
+                        _ticker = opp["ticker"]
+                        _dd_52w = float(opp.get("dd_from_52w_high") or 0.0)
+                        lines.append(
+                            f"*{_ticker}* z=*{cb.composite_z:+.2f}*  "
+                            f"→ €{_eur:.0f}"
+                        )
+                        lines.append(
+                            f"  ├ quality_z {cb.quality_z:+.1f}  "
+                            f"dd_z {cb.dd_z:+.1f}  val_z {cb.valuation_z:+.1f}"
+                        )
+                        lines.append(
+                            f"  └ DD 52w: {_dd_52w*100:+.0f}%  "
+                            f"|  score CORE: {opp.get('score', 0):.0f}"
+                        )
+                        # Headlines (top 2 to keep telegram message compact)
+                        _hl = fetch_headlines(_ticker, max_results=2)
+                        if _hl:
+                            lines.append(format_headlines_for_telegram(_hl, max_results=2, indent="  "))
+                        lines.append("")
+
+                # Show 3 closest below-threshold for context
+                _below = [(o, cb) for o, cb in scored if o["ticker"] not in _allocs and cb.composite_z > -0.5][:3]
+                if _below:
+                    lines.append("_Próximos do threshold (z entre -0.5 e 0.3):_")
+                    for opp, cb in _below:
+                        lines.append(
+                            f"  `{opp['ticker']:<6}` z=*{cb.composite_z:+.2f}*  "
+                            f"(falta {0.3 - cb.composite_z:+.2f})"
+                        )
+
+                lines.append("")
+                lines.append(
+                    f"_Próximo cron auto: amanhã 17:00 Lisboa._"
+                )
+
+                _reply("\n".join(lines))
+            except Exception as e:
+                logging.error(f"[scan_now] {e}", exc_info=True)
+                _reply(f"❌ Scan failed: `{_md_safe(e)}`")
+
+        threading.Thread(target=_run_scan, daemon=True, name="scan-now").start()
 
     elif cmd in ("/regime", "/market_regime", "/admin_regime"):
         # Compute and display the current market regime score + components.

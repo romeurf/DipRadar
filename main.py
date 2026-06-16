@@ -1879,12 +1879,338 @@ def analyze_ticker(symbol: str) -> str:
         )
 
         header = f"🔍 *Análise on-demand — {symbol}*\n_Pedido via /analisar — {datetime.now(LISBON_TZ).strftime('%d/%m %H:%M')}_\n\n"
-        return header + alert_text
+        appendix = _build_allocation_appendix(symbol)
+        return header + alert_text + appendix
 
     except Exception as e:
         logging.error(f"analyze_ticker({symbol}): {e}", exc_info=True)
         return f"❌ *Erro ao analisar {symbol}*\n_`{e}`_"
 
+
+def _build_allocation_appendix(symbol: str) -> str:
+    """Compose a screener allocation-context section appended to /analisar.
+
+    Shows composite z-score breakdown, held-cash from last /cash, current
+    portfolio position + concentration headroom, ranking vs the current
+    queue (universe scan), and suggested sizing if user forced a deploy
+    right now. Returns empty string on any failure so /analisar still
+    works if this is broken.
+    """
+    try:
+        import json as _J
+        from pathlib import Path as _P
+        from core.composite_score import (
+            build_universe_stats, composite_for_ticker, softmax_sizing,
+        )
+
+        stats = build_universe_stats()
+        if not stats:
+            return ""
+
+        cb = composite_for_ticker(symbol, horizon="CORE", stats=stats)
+        if cb is None:
+            return (
+                "\n\n─────────────────────────\n"
+                "💰 *Allocation context*\n"
+                "_Composite z indisponível — sem fundamentals ou price hist._"
+            )
+
+        # Held cash from last /cash run
+        _dd = _P("/data") if _P("/data").exists() else _P(__file__).parent / "data"
+        _watchdog_state_path = _dd / "watchdog_state.json"
+        held_cash = 0.0
+        last_cash_ts = None
+        if _watchdog_state_path.exists():
+            try:
+                ws = _J.loads(_watchdog_state_path.read_text())
+                held_cash = float(ws.get("held_cash_eur") or 0.0)
+                last_cash_ts = ws.get("timestamp")
+            except Exception:
+                pass
+
+        # Portfolio context
+        try:
+            from portfolio.portfolio import get_positions
+            positions = get_positions() or {}
+        except Exception:
+            positions = {}
+        portfolio_value = sum(
+            float(p.get("value_eur") or p.get("cost_eur") or 0)
+            for p in positions.values()
+        )
+        ticker_pos = positions.get(symbol, {}) if isinstance(positions, dict) else {}
+        current_pos_eur = float(
+            ticker_pos.get("value_eur") or ticker_pos.get("cost_eur") or 0
+        )
+        current_pct = (current_pos_eur / portfolio_value) if portfolio_value > 0 else 0.0
+        cap_eur = portfolio_value * 0.30 if portfolio_value > 0 else 0.0
+        headroom = max(0.0, cap_eur - current_pos_eur) if portfolio_value > 0 else float("inf")
+
+        # Ranking vs current universe — quick scan top 5
+        try:
+            from core.core_radar import scan_core_universe
+            opps = scan_core_universe(min_score=0.0)
+        except Exception:
+            opps = []
+
+        ranked = []
+        if opps:
+            try:
+                from core.composite_score import composite_from_signals as _cfs
+                for o in opps:
+                    _cb = _cfs(o["ticker"], o, horizon="CORE", stats=stats)
+                    ranked.append((o["ticker"], _cb.composite_z))
+                ranked.sort(key=lambda x: -x[1])
+            except Exception:
+                ranked = []
+
+        # Sizing if forced deploy with held_cash (or hypothetical €1000)
+        budget = held_cash if held_cash >= 100 else 1000.0
+        rank_position = None
+        suggested_eur = None
+        if ranked:
+            for i, (t, _z) in enumerate(ranked):
+                if t == symbol:
+                    rank_position = i + 1
+                    break
+            allocs, _skipped = softmax_sizing(
+                ranked,
+                budget_eur=budget,
+                threshold_z=0.3,
+                min_alloc_eur=100.0,
+                concentration_cap_pct=0.30,
+                portfolio_value_eur=portfolio_value,
+                current_positions_eur={
+                    t: float((p.get("value_eur") or p.get("cost_eur") or 0))
+                    for t, p in positions.items() if isinstance(p, dict)
+                },
+            )
+            suggested_eur = allocs.get(symbol)
+
+        lines = ["\n\n─────────────────────────"]
+        lines.append("💰 *Allocation context (screener)*")
+        lines.append("")
+        lines.append(
+            f"Composite z: *{cb.composite_z:+.2f}*"
+            f"  (q {cb.quality_z:+.1f} · dd {cb.dd_z:+.1f} · val {cb.valuation_z:+.1f})"
+        )
+        if rank_position is not None:
+            lines.append(
+                f"Ranking actual: *#{rank_position}* de {len(ranked)} (CORE universe)"
+            )
+
+        # Portfolio + held cash + headroom
+        if portfolio_value > 0:
+            lines.append(
+                f"Posição actual: €{current_pos_eur:,.0f} "
+                f"({current_pct*100:.1f}% portfolio)"
+            )
+            if headroom == float("inf"):
+                lines.append("Headroom cap 30%: ilimitado (sem portfolio_value)")
+            else:
+                lines.append(f"Headroom até cap 30%: €{headroom:,.0f}")
+        if held_cash > 0:
+            _ts_short = (last_cash_ts or "?")[:10]
+            lines.append(f"Cash retido (último /cash {_ts_short}): *€{held_cash:,.0f}*")
+
+        # Suggested sizing
+        if suggested_eur is not None:
+            lines.append("")
+            lines.append(
+                f"💡 *Se forças deploy agora*: €{suggested_eur:.0f}"
+            )
+            lines.append(
+                f"   `/deployed {symbol} {suggested_eur:.0f} livre vontade`"
+            )
+        elif cb.composite_z < 0.3:
+            lines.append("")
+            lines.append(
+                f"⚠️ Below threshold (z<0.3) — sistema sugere *NÃO deploy* agora."
+            )
+        elif portfolio_value > 0 and current_pct >= 0.30:
+            lines.append("")
+            lines.append(
+                f"🚫 Concentration cap 30% atingida — sem headroom para top-up."
+            )
+
+        return "\n".join(lines)
+    except Exception as e:
+        logging.warning(f"_build_allocation_appendix({symbol}): {e}")
+        return ""
+
+
+# ── Cash watchdog ─────────────────────────────────────────────────────────────
+
+def run_watchdog_scan() -> None:
+    """Daily watchdog: notify when held cash has new screener qualifiers.
+
+    Triggered by APScheduler cron at 18:00 Lisbon (after US open settles).
+    Pipeline:
+      1. Read /data/watchdog_state.json. If held_cash_eur <= 100€, exit silently.
+      2. Walk CORE universe, compute composite z-score per ticker.
+      3. Find qualifiers (z > 0.3) NOT in deployed_tickers and NOT in notified_tickers.
+      4. If found, send Telegram push: top 3 with breakdown + headlines + suggested
+         allocation softmaxed over the held cash.
+      5. Append notified tickers to state so we don't spam the same name twice.
+         Reset notified_tickers when held_cash_eur drops to 0 (new /cash run).
+
+    Spam control: a previously-notified ticker is re-notified only if its
+    composite_z has gained ≥+0.5 since the last notification (significant
+    deepening of the opportunity).
+    """
+    try:
+        from pathlib import Path
+        import json
+        from core.composite_score import (
+            build_universe_stats, composite_from_signals, softmax_sizing,
+        )
+        from core.core_radar import scan_core_universe
+        from utils.news_headlines import fetch_headlines, format_headlines_for_telegram
+
+        _data_dir = Path("/data") if Path("/data").exists() else Path(__file__).resolve().parent / "data"
+        ws_path = _data_dir / "watchdog_state.json"
+
+        if not ws_path.exists():
+            logging.info("[watchdog] no state file — skipping (no /cash run yet)")
+            return
+        try:
+            state = json.loads(ws_path.read_text())
+        except Exception as e:
+            logging.warning(f"[watchdog] state unreadable: {e}")
+            return
+
+        held_cash = float(state.get("held_cash_eur") or 0.0)
+        if held_cash < 100:
+            logging.info(f"[watchdog] held_cash €{held_cash:.0f} < €100 — skipping")
+            return
+
+        deployed_tickers = set(state.get("deployed_tickers") or [])
+        notified = state.get("notified_tickers") or []
+        # notified_tickers is stored as either list of strings (legacy) or
+        # list of {"ticker": str, "z_at_notify": float} dicts (current).
+        # Normalize.
+        notified_map = {}
+        for item in notified:
+            if isinstance(item, str):
+                notified_map[item] = -10.0  # unknown — treat as "always notify on movement"
+            elif isinstance(item, dict):
+                notified_map[item.get("ticker", "")] = float(item.get("z_at_notify") or -10.0)
+
+        stats = build_universe_stats()
+        if not stats:
+            logging.warning("[watchdog] universe stats empty — abort")
+            return
+
+        opps = scan_core_universe(min_score=0.0)
+        if not opps:
+            logging.warning("[watchdog] universe scan returned 0 opps — abort")
+            return
+
+        ranked = []
+        for o in opps:
+            cb = composite_from_signals(o["ticker"], o, horizon="CORE", stats=stats)
+            ranked.append((o, cb))
+        ranked.sort(key=lambda x: -x[1].composite_z)
+
+        # Filter: qualifiers not deployed, and either new OR moved ≥+0.5 z since notify
+        new_qualifiers = []
+        for o, cb in ranked:
+            ticker = o["ticker"]
+            if ticker in deployed_tickers:
+                continue
+            if cb.composite_z < 0.3:
+                continue
+            last_z = notified_map.get(ticker)
+            if last_z is None:
+                new_qualifiers.append((o, cb))
+            elif cb.composite_z - last_z >= 0.5:
+                new_qualifiers.append((o, cb))
+
+        if not new_qualifiers:
+            logging.info(
+                f"[watchdog] no new qualifiers (held_cash €{held_cash:.0f}, "
+                f"top z={ranked[0][1].composite_z:+.2f} {ranked[0][0]['ticker']})"
+            )
+            return
+
+        # Suggest sizing for held_cash via softmax across NEW qualifiers
+        allocs, _skipped = softmax_sizing(
+            [(o["ticker"], cb.composite_z) for o, cb in new_qualifiers],
+            budget_eur=held_cash,
+            threshold_z=0.3,
+            min_alloc_eur=100.0,
+        )
+
+        # Compose Telegram message — top 3 to keep it scannable
+        top3 = new_qualifiers[:3]
+        from datetime import datetime
+        ts = datetime.now(LISBON_TZ).strftime("%Y-%m-%d %H:%M")
+        lines = [
+            f"💰 *Cash Watchdog* — `{ts}`",
+            f"_Cash retido: *€{held_cash:,.0f}* (do último /cash)_",
+            "",
+            f"🚨 *{len(new_qualifiers)} novo(s) qualifier(s)* (z > 0.3 não-deployed):",
+            "",
+        ]
+        for o, cb in top3:
+            ticker = o["ticker"]
+            eur_sug = allocs.get(ticker)
+            dd_52w = float(o.get("dd_from_52w_high") or 0.0)
+            line = (
+                f"*{ticker}*  z=*{cb.composite_z:+.2f}*"
+                f"  (q {cb.quality_z:+.1f} · dd {cb.dd_z:+.1f} · val {cb.valuation_z:+.1f})"
+            )
+            if eur_sug:
+                line += f"  → €{eur_sug:.0f}"
+            lines.append(line)
+            lines.append(
+                f"  DD 52w: {dd_52w*100:+.0f}%  |  score CORE: {o.get('score', 0):.0f}"
+            )
+            hl = fetch_headlines(ticker, max_results=2)
+            if hl:
+                lines.append(format_headlines_for_telegram(hl, max_results=2, indent="  "))
+            lines.append("")
+
+        if len(new_qualifiers) > 3:
+            lines.append(
+                f"_+ {len(new_qualifiers) - 3} mais qualifiers — corre `/scan_now` para ver todos_"
+            )
+            lines.append("")
+        lines.append(
+            f"_Para deploy: `/deployed TICKER AMOUNT reason`  ·  "
+            f"para inspeção: `/analisar TICKER`_"
+        )
+
+        send_telegram("\n".join(lines))
+        logging.info(
+            f"[watchdog] pushed {len(new_qualifiers)} qualifiers, top {top3[0][0]['ticker']} "
+            f"z={top3[0][1].composite_z:+.2f}"
+        )
+
+        # Update notified state — only mark TOP 3 as notified (the ones the
+        # user saw). Lower-ranked qualifiers stay un-notified so they can
+        # surface in a future scan if they overtake the leaders.
+        new_notified = list(notified_map.items())
+        for o, cb in top3:
+            ticker = o["ticker"]
+            existing_idx = next(
+                (i for i, (t, _z) in enumerate(new_notified) if t == ticker), None
+            )
+            if existing_idx is not None:
+                new_notified[existing_idx] = (ticker, cb.composite_z)
+            else:
+                new_notified.append((ticker, cb.composite_z))
+        state["notified_tickers"] = [
+            {"ticker": t, "z_at_notify": z} for t, z in new_notified
+        ]
+        state["last_watchdog_run"] = datetime.now().isoformat(timespec="seconds")
+        try:
+            ws_path.write_text(json.dumps(state, indent=2))
+        except Exception as e:
+            logging.warning(f"[watchdog] state write failed: {e}")
+
+    except Exception as e:
+        logging.error(f"[watchdog] failed: {e}", exc_info=True)
 
 
 # ── Scan principal ────────────────────────────────────────────────────────────
@@ -3147,6 +3473,19 @@ def main() -> None:
         run_momentum_scan,
         CronTrigger(day_of_week="mon-fri", hour=17, minute=50, timezone=LISBON_TZ),
         id="momentum_scan_intraday", name="Momentum Scan US Intraday 17h50",
+    )
+
+    # ── Cash Watchdog: 18h00 Lisboa, seg-sex ─────────────────────────────────
+    # When the last /cash run left held_cash_eur > 0, this scan walks the
+    # CORE universe daily and pushes a Telegram notification when a new
+    # qualifier (composite z > 0.3) emerges that wasn't deployed and hasn't
+    # been notified yet. Solves the "being out of market is expensive" gap:
+    # held cash earns 2.2% at T212; a real opportunity needs to be flagged
+    # in hours, not weeks.
+    scheduler.add_job(
+        run_watchdog_scan,
+        CronTrigger(day_of_week="mon-fri", hour=18, minute=0, timezone=LISBON_TZ),
+        id="cash_watchdog", name="Cash Watchdog 18h",
     )
     # ── Momentum scan US: 21h30 Lisboa (após fecho americano) ────────────────
     scheduler.add_job(
