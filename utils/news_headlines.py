@@ -42,12 +42,26 @@ class Headline:
 def fetch_headlines(
     ticker: str,
     max_results: int = 3,
+    *,
+    as_of_date=None,
 ) -> list[Headline]:
     """Fetch most recent headlines for a ticker. Empty list on failure.
 
     yfinance .news returns a list of dicts with keys: title, publisher,
     providerPublishTime (unix), link, type. We normalize, sort by date
-    desc, and trim to max_results.
+    desc, optionally filter to `published_at <= as_of_date`, then trim
+    to `max_results`.
+
+    `as_of_date` (date | None): when set, headlines published AFTER
+    this date are excluded. Used by the backtest harness for PIT
+    correctness — without this filter, a backtest at as_of=2024-03-15
+    would otherwise see headlines from 2024-03-20 as if they were
+    knowable on the as_of date, which is look-ahead. In production
+    callers pass None (or omit) and get all available headlines.
+
+    Cache stores the RAW unfiltered list; the as_of_date filter is
+    applied per-call so one cache entry serves both production and
+    backtest queries for the same ticker.
     """
     ticker = (ticker or "").upper().strip()
     if not ticker:
@@ -56,7 +70,7 @@ def fetch_headlines(
     now = time.time()
     cached = _cache.get(ticker)
     if cached and (now - cached[0]) < _CACHE_TTL_SEC:
-        return cached[1][:max_results]
+        return _filter_and_trim(cached[1], as_of_date, max_results)
 
     try:
         import yfinance as yf
@@ -117,7 +131,35 @@ def fetch_headlines(
     # Sort descending by published_at (lexicographic on ISO works) — newest first
     parsed.sort(key=lambda h: h.published_at, reverse=True)
     _cache[ticker] = (now, parsed)
-    return parsed[:max_results]
+    return _filter_and_trim(parsed, as_of_date, max_results)
+
+
+def _filter_and_trim(headlines: list, as_of_date, max_results: int) -> list:
+    """Apply optional as_of_date filter then trim to max_results.
+
+    `as_of_date` semantics: only return headlines whose published_at
+    date (parsed from ISO prefix YYYY-MM-DD) is <= as_of_date. None
+    means no filter (production default). When a headline has no
+    parseable date AND a filter is active, the headline is dropped
+    (safer to omit than risk including a future headline by accident).
+    """
+    if as_of_date is None:
+        return headlines[:max_results]
+    from datetime import date as _date
+    out = []
+    for h in headlines:
+        date_str = (h.published_at or "")[:10]
+        if not date_str:
+            continue  # safer drop when filter active
+        try:
+            pub_date = _date.fromisoformat(date_str)
+        except ValueError:
+            continue
+        if pub_date <= as_of_date:
+            out.append(h)
+        if len(out) >= max_results:
+            break
+    return out
 
 
 def format_headlines_for_telegram(
