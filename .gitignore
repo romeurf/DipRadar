@@ -25,8 +25,16 @@ venv/
 *.json.tmp
 
 # ── Local data (Railway volume mount in production) ────────────────────
-data/
-/data/
+# The /data/ tree is the Railway persistent volume — runtime artifacts
+# (parquets, JSONs, pickles, CSVs) must NOT be committed. The previous
+# rules `data/` and `/data/` excluded the directory itself, which made
+# git unable to re-include any source .py files inside it (gitignore
+# can't re-include children of an excluded directory). Use file-level
+# globs instead: ignore contents but keep .py source tracked.
+data/*
+!data/*.py
+!data/**/
+!data/**/*.py
 
 # ── Parquet artifacts ───────────────────────────────────────────────────
 # Exclude all parquet files except the two cold-start seeds committed to
