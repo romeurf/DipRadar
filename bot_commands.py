@@ -9554,10 +9554,9 @@ def _handle_command(text: str) -> None:
                 from pathlib import Path as _P
                 import json as _J
                 from datetime import datetime as _dt
-                from core.composite_score import (
-                    build_universe_stats, composite_from_signals, softmax_sizing,
-                )
+                from core.composite_score import softmax_sizing
                 from core.core_radar import scan_core_universe
+                from core.scoring_dispatch import ScoringSession
                 from utils.news_headlines import fetch_headlines, format_headlines_for_telegram
 
                 _dd = _P("/data") if _P("/data").exists() else _P(__file__).parent / "data"
@@ -9574,33 +9573,42 @@ def _handle_command(text: str) -> None:
                     except Exception:
                         pass
 
-                # Universe stats (cached daily)
-                stats = build_universe_stats()
-                if not stats:
-                    _reply("⚠️ _Universe stats vazio — universo CORE não respondeu_")
-                    return
+                # ScoringSession reads DIPRADAR_USE_DISLOCATION flag ONCE
+                # for this scan; every ticker is scored by the same engine.
+                # The output tags which scorer was used so the 2-week
+                # side-by-side log review (per plan F.6) is unambiguous.
+                session = ScoringSession()
 
-                # Get CORE opps (no min_score filter — let composite z decide)
+                # Get CORE opps (no min_score filter — let the scorer decide)
                 opps = scan_core_universe(min_score=0.0)
                 if not opps:
                     _reply("⚠️ _Scan CORE devolveu 0 oportunidades_")
                     return
 
-                # Compute composite z for each as CORE candidate
-                scored = []
+                # Score each candidate via the session's frozen engine
+                scored = []  # list of (opp, ScoreResult)
                 for opp in opps:
-                    cb = composite_from_signals(
-                        opp["ticker"], opp, horizon="CORE", stats=stats,
-                    )
-                    scored.append((opp, cb))
+                    r = session.score(opp["ticker"], opp)
+                    scored.append((opp, r))
 
-                # Sort by composite z desc
-                scored.sort(key=lambda x: -x[1].composite_z)
+                # Sort by z desc; hard-excluded names (only possible under
+                # dislocation engine) drop to the bottom but stay visible.
+                def _sort_key(item):
+                    o, r = item
+                    if r.hard_excluded:
+                        return (1, 0.0)  # excluded first by tier, neutral z
+                    return (0, -(r.z if r.z is not None else -99.0))
+                scored.sort(key=_sort_key)
 
-                # Softmax sizing for held cash (if any) or hypothetical €1000
+                # Softmax sizing for held cash (if any) or hypothetical €1000.
+                # Hard-excluded names are filtered out before sizing.
                 _budget = _held_cash if _held_cash > 100 else 1000.0
+                _z_pairs = [
+                    (o["ticker"], r.z) for o, r in scored
+                    if not r.hard_excluded and r.z is not None
+                ]
                 _allocs, _skipped = softmax_sizing(
-                    [(o["ticker"], cb.composite_z) for o, cb in scored],
+                    _z_pairs,
                     budget_eur=_budget,
                     threshold_z=0.3,
                     min_alloc_eur=100.0,
@@ -9618,8 +9626,12 @@ def _handle_command(text: str) -> None:
                 _badge = {"FROTHY": "🟦", "NEUTRAL": "🟨", "PANIC": "🟥"}.get(_r_label, "⚪")
 
                 _ts_now = _dt.now().strftime("%Y-%m-%d %H:%M")
+                _engine_tag = (
+                    "🧠 dislocation_z" if session.scorer == "dislocation"
+                    else "📐 composite_z (legacy)"
+                )
                 lines = [
-                    f"🔄 *Scan manual* — `{_ts_now}`",
+                    f"🔄 *Scan manual* — `{_ts_now}`  ·  engine: {_engine_tag}",
                     f"{_badge} Regime: *{_r_label}* ({_r_score:.0f}/100)",
                 ]
                 if _held_cash > 0:
@@ -9633,29 +9645,26 @@ def _handle_command(text: str) -> None:
                     lines.append("⚪ *Nenhum qualifier* — todos abaixo de z=0.3")
                     lines.append("")
                     lines.append("_Top 5 abaixo do threshold (proximidade):_")
-                    for opp, cb in scored[:5]:
-                        lines.append(
-                            f"  `{opp['ticker']:<6}` z=*{cb.composite_z:+.2f}*  "
-                            f"q={cb.quality_z:+.1f} dd={cb.dd_z:+.1f} v={cb.valuation_z:+.1f}"
-                        )
+                    _shown = 0
+                    for opp, r in scored:
+                        if r.hard_excluded or r.z is None:
+                            continue
+                        lines.append(f"  `{opp['ticker']:<6}` z=*{r.z:+.2f}*  ·  {r.summary_line}")
+                        _shown += 1
+                        if _shown >= 5:
+                            break
                 else:
                     lines.append(f"📈 *Qualifiers* (z > 0.3 e alocação ≥ €100):")
                     lines.append("")
-                    # Show each qualifier with breakdown + headlines
-                    for opp, cb in scored:
-                        if opp["ticker"] not in _allocs:
+                    for opp, r in scored:
+                        if r.hard_excluded or opp["ticker"] not in _allocs:
                             continue
                         _eur = _allocs[opp["ticker"]]
                         _ticker = opp["ticker"]
                         _dd_52w = float(opp.get("dd_from_52w_high") or 0.0)
-                        lines.append(
-                            f"*{_ticker}* z=*{cb.composite_z:+.2f}*  "
-                            f"→ €{_eur:.0f}"
-                        )
-                        lines.append(
-                            f"  ├ quality_z {cb.quality_z:+.1f}  "
-                            f"dd_z {cb.dd_z:+.1f}  val_z {cb.valuation_z:+.1f}"
-                        )
+                        lines.append(f"*{_ticker}* z=*{r.z:+.2f}*  →  €{_eur:.0f}")
+                        for expl_line in r.explanation_lines(threshold_abs=0.3)[1:]:
+                            lines.append(expl_line)
                         lines.append(
                             f"  └ DD 52w: {_dd_52w*100:+.0f}%  "
                             f"|  score CORE: {opp.get('score', 0):.0f}"
@@ -9667,19 +9676,31 @@ def _handle_command(text: str) -> None:
                         lines.append("")
 
                 # Show 3 closest below-threshold for context
-                _below = [(o, cb) for o, cb in scored if o["ticker"] not in _allocs and cb.composite_z > -0.5][:3]
-                if _below:
+                _below_seen = 0
+                _below_lines = []
+                for opp, r in scored:
+                    if r.hard_excluded or r.z is None or r.z >= 0.3 or r.z <= -0.5:
+                        continue
+                    _below_lines.append(
+                        f"  `{opp['ticker']:<6}` z=*{r.z:+.2f}*  (falta {0.3 - r.z:+.2f})"
+                    )
+                    _below_seen += 1
+                    if _below_seen >= 3:
+                        break
+                if _below_lines:
                     lines.append("_Próximos do threshold (z entre -0.5 e 0.3):_")
-                    for opp, cb in _below:
-                        lines.append(
-                            f"  `{opp['ticker']:<6}` z=*{cb.composite_z:+.2f}*  "
-                            f"(falta {0.3 - cb.composite_z:+.2f})"
-                        )
+                    lines.extend(_below_lines)
+
+                # Show hard-excluded names if any (dislocation engine only)
+                _excluded = [(o, r) for o, r in scored if r.hard_excluded]
+                if _excluded:
+                    lines.append("")
+                    lines.append(f"🚫 *Hard-excluded* ({len(_excluded)} via quality/governance gates):")
+                    for opp, r in _excluded[:5]:
+                        lines.append(f"  `{opp['ticker']:<6}` — _{r.exclude_reason}_")
 
                 lines.append("")
-                lines.append(
-                    f"_Próximo cron auto: amanhã 17:00 Lisboa._"
-                )
+                lines.append(f"_Próximo cron auto: amanhã 18h00 Lisboa._")
 
                 _reply("\n".join(lines))
             except Exception as e:

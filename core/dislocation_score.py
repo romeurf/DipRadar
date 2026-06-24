@@ -389,7 +389,18 @@ def _sub_drop_attribution(
         date (caller responsibility in backtest spine builder)
       - 8-K Item 4.02 filings via classify_recent_8k (already PIT)
     """
+    # _score_core_dip doesn't populate signals["sector"] today.
+    # Lazy-fetch from yfinance when missing so the highest-weighted
+    # sub-score has the data it needs to actually run. Cached by yfinance
+    # internally so a CORE sweep won't re-hit the network per ticker.
     sector = signals.get("sector") or ""
+    if not sector:
+        try:
+            import yfinance as yf
+            info = yf.Ticker(ticker).info or {}
+            sector = info.get("sector") or ""
+        except Exception:
+            sector = ""
 
     try:
         from data.sector_relative import sector_relative_pair

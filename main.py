@@ -1899,21 +1899,40 @@ def _build_allocation_appendix(symbol: str) -> str:
     try:
         import json as _J
         from pathlib import Path as _P
-        from core.composite_score import (
-            build_universe_stats, composite_for_ticker, softmax_sizing,
-        )
+        from core.composite_score import softmax_sizing
+        from core.scoring_dispatch import ScoringSession
 
-        stats = build_universe_stats()
-        if not stats:
+        # Per-call session: one flag read, one engine for the appendix +
+        # ranking. The engine tag is shown in the output so the user
+        # knows which scorer's verdict they're looking at.
+        session = ScoringSession()
+
+        # Fetch signals for this ticker so the scorer can run. We reuse
+        # the existing core_radar plumbing (fetch hist + quality + scoring)
+        # rather than duplicating the data path.
+        try:
+            from core.core_radar import (
+                _fetch_hist, _score_core_dip,
+            )
+            hist = _fetch_hist(symbol)
+            if hist is None or hist.empty:
+                return (
+                    "\n\n─────────────────────────\n"
+                    "💰 *Allocation context*\n"
+                    "_Score indisponível — sem fundamentals ou price hist._"
+                )
+            close = hist["Close"]
+            volume = hist["Volume"] if "Volume" in hist.columns else None
+            current_price = float(close.iloc[-1])
+            _score_x, signals = _score_core_dip(
+                close, current_price, 0.0,
+                ticker=symbol, volume=volume,
+            )
+        except Exception as e:
+            logging.warning(f"_build_allocation_appendix({symbol}) signals: {e}")
             return ""
 
-        cb = composite_for_ticker(symbol, horizon="CORE", stats=stats)
-        if cb is None:
-            return (
-                "\n\n─────────────────────────\n"
-                "💰 *Allocation context*\n"
-                "_Composite z indisponível — sem fundamentals ou price hist._"
-            )
+        result = session.score(symbol, signals)
 
         # Held cash from last /cash run
         _dd = _P("/data") if _P("/data").exists() else _P(__file__).parent / "data"
@@ -1946,22 +1965,24 @@ def _build_allocation_appendix(symbol: str) -> str:
         cap_eur = portfolio_value * 0.30 if portfolio_value > 0 else 0.0
         headroom = max(0.0, cap_eur - current_pos_eur) if portfolio_value > 0 else float("inf")
 
-        # Ranking vs current universe — quick scan top 5
+        # Ranking vs current universe via the SAME session (consistent engine)
         try:
             from core.core_radar import scan_core_universe
             opps = scan_core_universe(min_score=0.0)
         except Exception:
             opps = []
 
-        ranked = []
+        ranked = []  # list of (ticker, z)
         if opps:
             try:
-                from core.composite_score import composite_from_signals as _cfs
                 for o in opps:
-                    _cb = _cfs(o["ticker"], o, horizon="CORE", stats=stats)
-                    ranked.append((o["ticker"], _cb.composite_z))
+                    r = session.score(o["ticker"], o)
+                    if r.hard_excluded or r.z is None:
+                        continue
+                    ranked.append((o["ticker"], r.z))
                 ranked.sort(key=lambda x: -x[1])
-            except Exception:
+            except Exception as e:
+                logging.debug(f"_build_allocation_appendix ranking: {e}")
                 ranked = []
 
         # Sizing if forced deploy with held_cash (or hypothetical €1000)
@@ -1987,13 +2008,25 @@ def _build_allocation_appendix(symbol: str) -> str:
             )
             suggested_eur = allocs.get(symbol)
 
-        lines = ["\n\n─────────────────────────"]
-        lines.append("💰 *Allocation context (screener)*")
-        lines.append("")
-        lines.append(
-            f"Composite z: *{cb.composite_z:+.2f}*"
-            f"  (q {cb.quality_z:+.1f} · dd {cb.dd_z:+.1f} · val {cb.valuation_z:+.1f})"
+        engine_tag = (
+            "🧠 dislocation_z" if session.scorer == "dislocation"
+            else "📐 composite_z (legacy)"
         )
+
+        lines = ["\n\n─────────────────────────"]
+        lines.append(f"💰 *Allocation context (screener)*  ·  engine: {engine_tag}")
+        lines.append("")
+
+        if result.hard_excluded:
+            lines.append(f"🚫 *HARD-EXCLUDED*: {result.exclude_reason}")
+            lines.append("Sistema NÃO sugere deploy mesmo com cash retido.")
+            return "\n".join(lines)
+
+        # Per-scorer breakdown via the unified explanation_lines helper
+        lines.append(result.summary_line)
+        for expl_line in result.explanation_lines(threshold_abs=0.3)[1:]:
+            lines.append(expl_line)
+
         if rank_position is not None:
             lines.append(
                 f"Ranking actual: *#{rank_position}* de {len(ranked)} (CORE universe)"
@@ -2016,22 +2049,14 @@ def _build_allocation_appendix(symbol: str) -> str:
         # Suggested sizing
         if suggested_eur is not None:
             lines.append("")
-            lines.append(
-                f"💡 *Se forças deploy agora*: €{suggested_eur:.0f}"
-            )
-            lines.append(
-                f"   `/deployed {symbol} {suggested_eur:.0f} livre vontade`"
-            )
-        elif cb.composite_z < 0.3:
+            lines.append(f"💡 *Se forças deploy agora*: €{suggested_eur:.0f}")
+            lines.append(f"   `/deployed {symbol} {suggested_eur:.0f} livre vontade`")
+        elif result.z is not None and result.z < 0.3:
             lines.append("")
-            lines.append(
-                f"⚠️ Below threshold (z<0.3) — sistema sugere *NÃO deploy* agora."
-            )
+            lines.append(f"⚠️ Below threshold (z<0.3) — sistema sugere *NÃO deploy* agora.")
         elif portfolio_value > 0 and current_pct >= 0.30:
             lines.append("")
-            lines.append(
-                f"🚫 Concentration cap 30% atingida — sem headroom para top-up."
-            )
+            lines.append(f"🚫 Concentration cap 30% atingida — sem headroom para top-up.")
 
         return "\n".join(lines)
     except Exception as e:
@@ -2061,10 +2086,9 @@ def run_watchdog_scan() -> None:
     try:
         from pathlib import Path
         import json
-        from core.composite_score import (
-            build_universe_stats, composite_from_signals, softmax_sizing,
-        )
+        from core.composite_score import softmax_sizing
         from core.core_radar import scan_core_universe
+        from core.scoring_dispatch import ScoringSession
         from utils.news_headlines import fetch_headlines, format_headlines_for_telegram
 
         _data_dir = Path("/data") if Path("/data").exists() else Path(__file__).resolve().parent / "data"
@@ -2096,46 +2120,58 @@ def run_watchdog_scan() -> None:
             elif isinstance(item, dict):
                 notified_map[item.get("ticker", "")] = float(item.get("z_at_notify") or -10.0)
 
-        stats = build_universe_stats()
-        if not stats:
-            logging.warning("[watchdog] universe stats empty — abort")
-            return
+        # ScoringSession reads DIPRADAR_USE_DISLOCATION flag ONCE so the
+        # watchdog uses the same engine as /scan_now interactive scans.
+        # Per plan F.4 user review: "if you leave the watchdog on
+        # composite_z while interactive /cash uses dislocation_z, you'd
+        # alert with one logic and respond with another — incoherent
+        # exactly during the 2 weeks you're trying to judge the new
+        # behavior." One flag, both paths.
+        session = ScoringSession()
 
         opps = scan_core_universe(min_score=0.0)
         if not opps:
             logging.warning("[watchdog] universe scan returned 0 opps — abort")
             return
 
-        ranked = []
+        # Score the universe via the session; track each result alongside the opp
+        ranked = []  # list of (opp, ScoreResult)
         for o in opps:
-            cb = composite_from_signals(o["ticker"], o, horizon="CORE", stats=stats)
-            ranked.append((o, cb))
-        ranked.sort(key=lambda x: -x[1].composite_z)
+            r = session.score(o["ticker"], o)
+            ranked.append((o, r))
+        # Sort by z desc; exclude hard-excluded from ranking comparison
+        ranked.sort(key=lambda x: -(x[1].z if (x[1].z is not None and not x[1].hard_excluded) else -99.0))
 
-        # Filter: qualifiers not deployed, and either new OR moved ≥+0.5 z since notify
-        new_qualifiers = []
-        for o, cb in ranked:
+        # Filter: qualifiers not deployed and not hard-excluded; new OR moved ≥+0.5 since notify
+        new_qualifiers = []  # list of (opp, ScoreResult)
+        for o, r in ranked:
             ticker = o["ticker"]
             if ticker in deployed_tickers:
                 continue
-            if cb.composite_z < 0.3:
+            if r.hard_excluded or r.z is None or r.z < 0.3:
                 continue
             last_z = notified_map.get(ticker)
-            if last_z is None:
-                new_qualifiers.append((o, cb))
-            elif cb.composite_z - last_z >= 0.5:
-                new_qualifiers.append((o, cb))
+            if last_z is None or (r.z - last_z) >= 0.5:
+                new_qualifiers.append((o, r))
 
         if not new_qualifiers:
-            logging.info(
-                f"[watchdog] no new qualifiers (held_cash €{held_cash:.0f}, "
-                f"top z={ranked[0][1].composite_z:+.2f} {ranked[0][0]['ticker']})"
+            top_visible = next(
+                ((o, r) for o, r in ranked if not r.hard_excluded and r.z is not None),
+                None,
             )
+            if top_visible:
+                logging.info(
+                    f"[watchdog] no new qualifiers (held_cash €{held_cash:.0f}, "
+                    f"engine={session.scorer}, "
+                    f"top z={top_visible[1].z:+.2f} {top_visible[0]['ticker']})"
+                )
+            else:
+                logging.info(f"[watchdog] no new qualifiers (engine={session.scorer})")
             return
 
         # Suggest sizing for held_cash via softmax across NEW qualifiers
         allocs, _skipped = softmax_sizing(
-            [(o["ticker"], cb.composite_z) for o, cb in new_qualifiers],
+            [(o["ticker"], r.z) for o, r in new_qualifiers],
             budget_eur=held_cash,
             threshold_z=0.3,
             min_alloc_eur=100.0,
@@ -2145,24 +2181,28 @@ def run_watchdog_scan() -> None:
         top3 = new_qualifiers[:3]
         from datetime import datetime
         ts = datetime.now(LISBON_TZ).strftime("%Y-%m-%d %H:%M")
+        engine_tag = (
+            "🧠 dislocation_z" if session.scorer == "dislocation"
+            else "📐 composite_z (legacy)"
+        )
         lines = [
-            f"💰 *Cash Watchdog* — `{ts}`",
+            f"💰 *Cash Watchdog* — `{ts}`  ·  engine: {engine_tag}",
             f"_Cash retido: *€{held_cash:,.0f}* (do último /cash)_",
             "",
             f"🚨 *{len(new_qualifiers)} novo(s) qualifier(s)* (z > 0.3 não-deployed):",
             "",
         ]
-        for o, cb in top3:
+        for o, r in top3:
             ticker = o["ticker"]
             eur_sug = allocs.get(ticker)
             dd_52w = float(o.get("dd_from_52w_high") or 0.0)
-            line = (
-                f"*{ticker}*  z=*{cb.composite_z:+.2f}*"
-                f"  (q {cb.quality_z:+.1f} · dd {cb.dd_z:+.1f} · val {cb.valuation_z:+.1f})"
-            )
+            head = f"*{ticker}*  z=*{r.z:+.2f}*"
             if eur_sug:
-                line += f"  → €{eur_sug:.0f}"
-            lines.append(line)
+                head += f"  → €{eur_sug:.0f}"
+            lines.append(head)
+            # Use the unified explanation_lines so both engines render coherently
+            for expl_line in r.explanation_lines(threshold_abs=0.3)[1:]:
+                lines.append(expl_line)
             lines.append(
                 f"  DD 52w: {dd_52w*100:+.0f}%  |  score CORE: {o.get('score', 0):.0f}"
             )
@@ -2183,23 +2223,24 @@ def run_watchdog_scan() -> None:
 
         send_telegram("\n".join(lines))
         logging.info(
-            f"[watchdog] pushed {len(new_qualifiers)} qualifiers, top {top3[0][0]['ticker']} "
-            f"z={top3[0][1].composite_z:+.2f}"
+            f"[watchdog] pushed {len(new_qualifiers)} qualifiers via {session.scorer}, "
+            f"top {top3[0][0]['ticker']} z={top3[0][1].z:+.2f}"
         )
 
         # Update notified state — only mark TOP 3 as notified (the ones the
         # user saw). Lower-ranked qualifiers stay un-notified so they can
         # surface in a future scan if they overtake the leaders.
         new_notified = list(notified_map.items())
-        for o, cb in top3:
+        for o, r in top3:
             ticker = o["ticker"]
+            cb_z = r.z if r.z is not None else 0.0
             existing_idx = next(
                 (i for i, (t, _z) in enumerate(new_notified) if t == ticker), None
             )
             if existing_idx is not None:
-                new_notified[existing_idx] = (ticker, cb.composite_z)
+                new_notified[existing_idx] = (ticker, cb_z)
             else:
-                new_notified.append((ticker, cb.composite_z))
+                new_notified.append((ticker, cb_z))
         state["notified_tickers"] = [
             {"ticker": t, "z_at_notify": z} for t, z in new_notified
         ]
