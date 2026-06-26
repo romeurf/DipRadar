@@ -208,7 +208,27 @@
       "Bash(git commit -m 'refactor: uniformize on 90d horizon + add parquets to daily backup' -m 'User direction \\(2026-06-12\\): *)",
       "Bash(python -m py_compile utils/news_headlines.py)",
       "Bash(awk '/elif cmd in \\\\\\(\"\\\\/cash\", \"\\\\/allocation\"/{found=1; start=NR} found && /^    elif cmd / && NR > start+5 {print NR; exit}' bot_commands.py)",
-      "Bash(python -m py_compile main.py bot_commands.py core/composite_score.py utils/news_headlines.py)"
+      "Bash(python -m py_compile main.py bot_commands.py core/composite_score.py utils/news_headlines.py)",
+      "Bash(python -m py_compile data/sector_relative.py)",
+      "Bash(python -m py_compile data/estimate_revisions.py)",
+      "Bash(python -m py_compile core/dislocation_score.py)",
+      "Bash(python -m py_compile tests/test_dislocation_score.py)",
+      "Bash(python -m pytest tests/test_dislocation_score.py -v)",
+      "Bash(python -m pip install pytest -q)",
+      "Bash(python -m pip install yfinance pandas requests numpy -q)",
+      "Bash(python -m pytest tests/test_dislocation_score.py -v --tb=no -q)",
+      "Bash(python -m py_compile main.py bot_commands.py core/scoring_dispatch.py core/dislocation_score.py)",
+      "Bash(python -m pytest tests/test_scoring_dispatch.py tests/test_dislocation_score.py -v --tb=short)",
+      "Bash(python -c \"import json; u = json.load\\(open\\('core_universe.json'\\)\\); print\\(f'Total tickers: {len\\(u\\)}'\\); print\\(f'Sample entry: {u[0]}'\\); print\\(f'Keys in entry 0: {list\\(u[0].keys\\(\\)\\)}'\\)\")",
+      "Bash(python -m py_compile scripts/validation_cache_builder.py)",
+      "Bash(python scripts/validation_cache_builder.py --help)",
+      "Bash(python scripts/validation_cache_builder.py)",
+      "Bash(tee data/validation_cache_build.log)",
+      "Bash(tail -50 C:\\\\\\\\Users\\\\\\\\Romeu\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Temp\\\\\\\\claude\\\\\\\\c--Users-Romeu-OneDrive-Documentos-GitHub-DipRadar\\\\\\\\f8a6f0cd-14e7-4e34-916c-5243a9ba0966\\\\\\\\tasks\\\\\\\\blgjjxu8n.output)",
+      "Bash(python -c \"import pyarrow; print\\(f'pyarrow {pyarrow.__version__}'\\)\")",
+      "Bash(pip show *)",
+      "Bash(python -m py_compile scripts/build_dislocation_validation_spine.py scripts/run_dislocation_validation.py)",
+      "Bash(python -m py_compile scripts/patch_validation_cache.py)"
     ],
     "additionalDirectories": [
       "c:\\Users\\Romeu\\OneDrive\\Documentos\\GitHub\\DipRadar"
