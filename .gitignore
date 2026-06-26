@@ -44,6 +44,16 @@ data/*
 !ml_training_base.parquet
 !core_training_base.parquet
 
+# ── F.5 dislocation validation cache (per plan A1 decision) ─────────────
+# The validation cache is the reproducibility guarantee for the BINDING
+# backtest gate. Track in git so re-runs are byte-byte reproducible — a
+# gate result that can't be reproduced is a gate that can't be trusted.
+# Size estimate: ~25MB total. The metadata + spine + JSON output sit
+# alongside the parquets to self-describe the artefact.
+!data/validation_cache/
+!data/validation_cache/*.parquet
+!data/validation_cache/*.json
+
 # ── Editor / OS ─────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
