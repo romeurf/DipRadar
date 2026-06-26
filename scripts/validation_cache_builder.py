@@ -67,6 +67,21 @@ _BENCHMARK_TICKERS = ["SPY"]
 # restart in the middle).
 _EDGAR_THROTTLE_S = 0.20
 
+# Track every ticker silently dropped from each artefact + reason.
+# Surfaced in cache_metadata.json so the BACKTEST READER (when reviewing
+# the JSON output) can see exactly how many names were truncated from
+# the spine population — the population-truncation log that the F.5 user
+# review flagged: "HOLX delisted, skipped" was a back-door for
+# survivorship bias that was happening WITHOUT being recorded. Now it is.
+_SKIPPED: dict[str, list] = {
+    "prices":          [],  # full skip (no recoverable history at all)
+    "prices_partial":  [],  # recovered partial history; ticker DELISTED before window end
+    "sectors":         [],
+    "edgar_8k":        [],
+    "edgar_form4":     [],
+    "fundamentals":    [],
+}
+
 
 def _load_core_universe() -> list[str]:
     universe_path = _ROOT / "core_universe.json"
@@ -92,12 +107,19 @@ def _all_tickers_to_fetch(core: list[str]) -> list[str]:
 # ── Step 1: prices ───────────────────────────────────────────────────
 
 def fetch_prices(all_tickers: list[str], force: bool = False) -> Path:
-    """Batch-download daily OHLCV for all tickers via yfinance.
+    """Batch-download daily OHLCV; retry per-ticker for failures.
 
-    Single multi-ticker call. yfinance returns a long-form DataFrame
-    with MultiIndex columns (level 0 = field, level 1 = ticker). We
-    melt to long format (date, ticker, open, high, low, close, volume,
-    adj_close) for cleaner parquet I/O downstream.
+    Two-pass:
+      1. Single multi-ticker batch call (fast, hits most tickers)
+      2. For tickers that came back empty/missing, fall back to
+         per-ticker `yfinance.Ticker(t).history()` — this often
+         recovers delisted tickers' partial history up to delisting
+         date, which is exactly what we need to AVOID survivorship
+         bias (per F.5 user review: "HOLX delisted, skipped" was
+         the back door letting traps escape the validation).
+
+    Tracks every skipped ticker with a reason into `_SKIPPED["prices"]`
+    so cache_metadata.json carries the full population truncation log.
     """
     out_path = _CACHE_DIR / "prices.parquet"
     if out_path.exists() and not force:
@@ -105,10 +127,13 @@ def fetch_prices(all_tickers: list[str], force: bool = False) -> Path:
         return out_path
 
     import yfinance as yf
+    import pandas as pd
     log.info(
         f"[prices] downloading {len(all_tickers)} tickers "
         f"({_FETCH_START_ISO} → {_FETCH_END_ISO})"
     )
+
+    # Pass 1: batch download
     df = yf.download(
         tickers=all_tickers,
         start=_FETCH_START_ISO,
@@ -122,15 +147,15 @@ def fetch_prices(all_tickers: list[str], force: bool = False) -> Path:
     if df is None or df.empty:
         raise RuntimeError("yfinance.download returned empty DataFrame")
 
-    # Convert MultiIndex columns (ticker, field) into a tidy long table.
-    import pandas as pd
     rows = []
+    tickers_present_batch = set()
+    tickers_missing_batch = []
     for ticker in all_tickers:
         try:
             sub = df[ticker] if isinstance(df.columns, pd.MultiIndex) else df
             sub = sub.dropna(how="all")
             if sub.empty:
-                log.warning(f"[prices] empty for {ticker} — skip")
+                tickers_missing_batch.append(ticker)
                 continue
             for idx, row in sub.iterrows():
                 rows.append({
@@ -142,13 +167,76 @@ def fetch_prices(all_tickers: list[str], force: bool = False) -> Path:
                     "close":  float(row.get("Close"))  if row.get("Close")  is not None else None,
                     "volume": float(row.get("Volume")) if row.get("Volume") is not None else None,
                 })
+            tickers_present_batch.add(ticker)
         except Exception as e:
-            log.warning(f"[prices] {ticker}: {e}")
+            tickers_missing_batch.append(ticker)
+            log.warning(f"[prices] batch error {ticker}: {e}")
+
+    log.info(
+        f"[prices] batch pass: {len(tickers_present_batch)} present, "
+        f"{len(tickers_missing_batch)} missing — trying per-ticker fallback"
+    )
+
+    # Pass 2: per-ticker recovery for missing tickers (delisted history,
+    # transient batch failures). Slower but tries to get partial history.
+    for ticker in tickers_missing_batch:
+        try:
+            tk = yf.Ticker(ticker)
+            hist = tk.history(
+                start=_FETCH_START_ISO, end=_FETCH_END_ISO,
+                auto_adjust=True,
+            )
+            if hist is None or hist.empty:
+                _SKIPPED["prices"].append({
+                    "ticker": ticker,
+                    "reason": "empty in both batch and per-ticker fetch (delisted with no recoverable history, or invalid symbol)",
+                })
+                continue
+            n_added = 0
+            for idx, row in hist.iterrows():
+                if pd.isna(row.get("Close")):
+                    continue
+                rows.append({
+                    "date":   idx.date().isoformat(),
+                    "ticker": ticker,
+                    "open":   float(row.get("Open"))   if not pd.isna(row.get("Open"))   else None,
+                    "high":   float(row.get("High"))   if not pd.isna(row.get("High"))   else None,
+                    "low":    float(row.get("Low"))    if not pd.isna(row.get("Low"))    else None,
+                    "close":  float(row.get("Close"))  if not pd.isna(row.get("Close"))  else None,
+                    "volume": float(row.get("Volume")) if not pd.isna(row.get("Volume")) else None,
+                })
+                n_added += 1
+            if n_added == 0:
+                _SKIPPED["prices"].append({
+                    "ticker": ticker,
+                    "reason": "per-ticker fetch returned no valid close rows",
+                })
+            else:
+                log.info(f"[prices] per-ticker recovery: {ticker} → +{n_added} rows")
+                # Mark whether the recovered series ends before the window
+                last_dt = hist.dropna(subset=["Close"]).index.max()
+                if hasattr(last_dt, "date"):
+                    last_iso = last_dt.date().isoformat()
+                    if last_iso < _FETCH_END_ISO:
+                        _SKIPPED["prices_partial"].append({
+                            "ticker":         ticker,
+                            "last_traded":    last_iso,
+                            "reason":         f"history truncated at {last_iso} (likely delisting before window end)",
+                        })
+        except Exception as e:
+            _SKIPPED["prices"].append({
+                "ticker": ticker,
+                "reason": f"per-ticker fetch raised: {e}",
+            })
 
     out = pd.DataFrame(rows)
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
     out.to_parquet(out_path, index=False)
-    log.info(f"[prices] persisted {len(out)} rows to {out_path}")
+    log.info(
+        f"[prices] persisted {len(out)} rows for "
+        f"{out['ticker'].nunique()} tickers → {out_path}  "
+        f"(skipped={len(_SKIPPED['prices'])}, partial={len(_SKIPPED['prices_partial'])})"
+    )
     return out_path
 
 
@@ -171,10 +259,14 @@ def fetch_sectors(core: list[str], force: bool = False) -> Path:
     for i, t in enumerate(core, 1):
         try:
             info = yf.Ticker(t).info or {}
-            sectors[t] = info.get("sector", "") or ""
+            s = info.get("sector", "") or ""
+            sectors[t] = s
+            if not s:
+                _SKIPPED["sectors"].append({"ticker": t, "reason": "yfinance.info has no sector field"})
         except Exception as e:
             log.warning(f"[sectors] {t}: {e}")
             sectors[t] = ""
+            _SKIPPED["sectors"].append({"ticker": t, "reason": f"yfinance.info raised: {e}"})
         if i % 25 == 0:
             log.info(f"[sectors] {i}/{len(core)}")
 
@@ -234,6 +326,11 @@ def fetch_edgar(core: list[str], force: bool = False) -> tuple[Path, Path]:
                 cik_int = int(sub_data.get("cik", 0) or 0)
             except Exception:
                 cik_int = 0
+
+            if not sub_data:
+                _SKIPPED["edgar_8k"].append({"ticker": t, "reason": "EDGAR submissions empty (non-US ticker or CIK lookup failed)"})
+                _SKIPPED["edgar_form4"].append({"ticker": t, "reason": "EDGAR submissions empty"})
+                continue
 
             recent = sub_data.get("filings", {}).get("recent", {})
             forms        = recent.get("form", [])
@@ -304,6 +401,8 @@ def fetch_edgar(core: list[str], force: bool = False) -> tuple[Path, Path]:
                 )
         except Exception as e:
             log.warning(f"[edgar] {t}: {e}")
+            _SKIPPED["edgar_8k"].append({"ticker": t, "reason": f"submissions/parse error: {e}"})
+            _SKIPPED["edgar_form4"].append({"ticker": t, "reason": f"submissions/parse error: {e}"})
         time.sleep(_EDGAR_THROTTLE_S)
 
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -343,13 +442,16 @@ def fetch_fundamentals(core: list[str], force: bool = False) -> Path:
 
     rows = []
     log.info(f"[fundamentals] fetching quarterly financials for {len(core)} tickers")
+    n_rows_per_ticker = {}
     for i, t in enumerate(core, 1):
+        n_rows_per_ticker[t] = 0
         try:
             tk = yf.Ticker(t)
             q_fin = tk.quarterly_financials
             q_bal = tk.quarterly_balance_sheet
             q_cf  = tk.quarterly_cashflow
             if q_fin is None or q_fin.empty:
+                _SKIPPED["fundamentals"].append({"ticker": t, "reason": "yfinance.quarterly_financials empty"})
                 continue
             for period in q_fin.columns:
                 try:
@@ -379,10 +481,16 @@ def fetch_fundamentals(core: list[str], force: bool = False) -> Path:
                         "gross_margin":   float(gross_margin) if gross_margin is not None else None,
                         "roe":            float(roe) if roe is not None else None,
                     })
+                    n_rows_per_ticker[t] += 1
                 except Exception as e:
                     log.debug(f"[fundamentals] {t} period {period}: {e}")
         except Exception as e:
             log.warning(f"[fundamentals] {t}: {e}")
+            _SKIPPED["fundamentals"].append({"ticker": t, "reason": f"yfinance error: {e}"})
+        if n_rows_per_ticker.get(t, 0) == 0 and not any(
+            s["ticker"] == t for s in _SKIPPED["fundamentals"]
+        ):
+            _SKIPPED["fundamentals"].append({"ticker": t, "reason": "all quarterly periods yielded no usable rows"})
         if i % 25 == 0:
             log.info(f"[fundamentals] {i}/{len(core)}  (rows so far: {len(rows)})")
 
@@ -406,7 +514,19 @@ def _safe_get(df, row_name, col):
 # ── Metadata ─────────────────────────────────────────────────────────
 
 def write_metadata(core: list[str], all_tickers: list[str]) -> Path:
-    """Persist cache provenance for reproducibility audits."""
+    """Persist cache provenance + population-truncation log.
+
+    The skipped_tickers section is the F.5 user review requirement:
+    every silent ticker drop (per artefact) must be visible so the
+    backtest JSON output can be read with the survivorship inflation
+    factor on the table. "HOLX delisted, skipped" was the back door
+    this metadata closes.
+
+    Each entry: {"ticker": "...", "reason": "..."}.
+    `prices_partial` carries delisted tickers WITH recovered partial
+    history — these are IN the spine but with a truncated trading
+    range; their `last_traded` field marks when they stopped.
+    """
     meta_path = _CACHE_DIR / "cache_metadata.json"
     meta = {
         "built_at":         datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -418,16 +538,39 @@ def write_metadata(core: list[str], all_tickers: list[str]) -> Path:
         "core_universe_git_sha": _get_git_sha("core_universe.json"),
         "this_script_git_sha":   _get_git_sha(__file__),
         "sources": {
-            "prices":       "yfinance.download (multi-ticker batch)",
+            "prices":       "yfinance.download (multi-ticker batch) + per-ticker history fallback for batch failures",
             "sectors":      "yfinance.Ticker(t).info.sector",
             "edgar_8k":     "SEC EDGAR submissions endpoint via data.fundamental_signals._edgar_submissions",
-            "edgar_form4":  "same",
+            "edgar_form4":  "same submissions feed + per-filing XML parse via data.fundamental_signals._parse_form4_xml",
             "fundamentals": "yfinance.Ticker(t).quarterly_financials/balance_sheet/cashflow",
+        },
+        "skipped_tickers": {
+            "prices":          _SKIPPED["prices"],
+            "prices_partial":  _SKIPPED["prices_partial"],
+            "sectors":         _SKIPPED["sectors"],
+            "edgar_8k":        _SKIPPED["edgar_8k"],
+            "edgar_form4":     _SKIPPED["edgar_form4"],
+            "fundamentals":    _SKIPPED["fundamentals"],
+        },
+        "skip_counts": {
+            "prices":          len(_SKIPPED["prices"]),
+            "prices_partial":  len(_SKIPPED["prices_partial"]),
+            "sectors":         len(_SKIPPED["sectors"]),
+            "edgar_8k":        len(_SKIPPED["edgar_8k"]),
+            "edgar_form4":     len(_SKIPPED["edgar_form4"]),
+            "fundamentals":    len(_SKIPPED["fundamentals"]),
         },
     }
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(meta, indent=2))
     log.info(f"[meta] persisted cache metadata to {meta_path}")
+    log.info(
+        f"[meta] skip summary — prices: {len(_SKIPPED['prices'])} full, "
+        f"{len(_SKIPPED['prices_partial'])} partial-delisted; "
+        f"sectors: {len(_SKIPPED['sectors'])}; "
+        f"edgar_8k: {len(_SKIPPED['edgar_8k'])}; "
+        f"fundamentals: {len(_SKIPPED['fundamentals'])}"
+    )
     return meta_path
 
 
