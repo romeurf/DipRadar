@@ -342,6 +342,14 @@ def fetch_edgar(core: list[str], force: bool = False) -> tuple[Path, Path]:
             for j in range(n):
                 form = forms[j]
                 filed = dates_filed[j][:10] if dates_filed[j] else ""
+                # CRITICAL: only process filings WITHIN backtest window.
+                # MSFT etc. have historical Form 4s going back to 1994 — if
+                # we Form4-XML-parse each of those (0.3s+ per XML fetch) the
+                # total runtime balloons to dozens of hours. Backtest only
+                # needs 2020-10-01 through 2026-06-30, so old filings are
+                # pure waste.
+                if filed and filed < _FETCH_START_ISO:
+                    continue
                 if form in ("8-K", "8-K/A"):
                     items = items_list[j] if j < len(items_list) else ""
                     rows_8k.append({
