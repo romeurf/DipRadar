@@ -1,0 +1,112 @@
+{
+  "built_at": "2026-06-27T16:06:53+00:00",
+  "fetch_window": {
+    "start": "2020-10-01",
+    "end": "2026-06-30"
+  },
+  "n_core_tickers": 230,
+  "n_total_tickers": 242,
+  "sector_etfs": [
+    "XLK",
+    "XLV",
+    "XLC",
+    "XLF",
+    "XLY",
+    "XLP",
+    "XLI",
+    "XLE",
+    "XLU",
+    "XLRE",
+    "XLB"
+  ],
+  "benchmarks": [
+    "SPY"
+  ],
+  "core_universe_git_sha": "de2de6a6315d",
+  "this_script_git_sha": "7933e2d35dfe",
+  "sources": {
+    "prices": "yfinance.download (multi-ticker batch) + per-ticker history fallback for batch failures",
+    "sectors": "yfinance.Ticker(t).info.sector",
+    "edgar_8k": "SEC EDGAR submissions endpoint via data.fundamental_signals._edgar_submissions",
+    "edgar_form4": "same submissions feed + per-filing XML parse via data.fundamental_signals._parse_form4_xml",
+    "fundamentals": "yfinance.Ticker(t).quarterly_financials/balance_sheet/cashflow"
+  },
+  "skipped_tickers": {
+    "prices": [
+      {
+        "ticker": "HOLX",
+        "reason": "per-ticker fetch returned empty (delisted with no recoverable history, or invalid symbol)"
+      }
+    ],
+    "prices_partial": [],
+    "sectors": [
+      {
+        "ticker": "HOLX",
+        "reason": "missing from sectors.json"
+      },
+      {
+        "ticker": "LION",
+        "reason": "missing from sectors.json"
+      }
+    ],
+    "edgar_8k": [
+      {
+        "ticker": "ASML",
+        "reason": "missing from edgar_8k.parquet"
+      },
+      {
+        "ticker": "HOLX",
+        "reason": "missing from edgar_8k.parquet"
+      },
+      {
+        "ticker": "NVO",
+        "reason": "missing from edgar_8k.parquet"
+      },
+      {
+        "ticker": "SAP",
+        "reason": "missing from edgar_8k.parquet"
+      },
+      {
+        "ticker": "SPOT",
+        "reason": "missing from edgar_8k.parquet"
+      },
+      {
+        "ticker": "TSM",
+        "reason": "missing from edgar_8k.parquet"
+      }
+    ],
+    "edgar_form4": [
+      {
+        "ticker": "ASML",
+        "reason": "missing from edgar_form4.parquet"
+      },
+      {
+        "ticker": "HOLX",
+        "reason": "missing from edgar_form4.parquet"
+      },
+      {
+        "ticker": "NVO",
+        "reason": "missing from edgar_form4.parquet"
+      },
+      {
+        "ticker": "SAP",
+        "reason": "missing from edgar_form4.parquet"
+      }
+    ],
+    "fundamentals": [
+      {
+        "ticker": "HOLX",
+        "reason": "missing from quarterly_financials.parquet"
+      }
+    ]
+  },
+  "skip_counts": {
+    "prices": 1,
+    "prices_partial": 0,
+    "sectors": 2,
+    "edgar_8k": 6,
+    "edgar_form4": 4,
+    "fundamentals": 1
+  },
+  "patched_at": "2026-06-27T16:07:28+00:00"
+}
