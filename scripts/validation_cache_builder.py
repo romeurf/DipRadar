@@ -305,7 +305,7 @@ def fetch_edgar(core: list[str], force: bool = False) -> tuple[Path, Path]:
         log.info(f"[edgar] cache hit: {out_8k} + {out_form4}")
         return out_8k, out_form4
 
-    from data.fundamental_signals import _edgar_submissions, _parse_form4_xml
+    from data.fundamental_signals import _edgar_submissions
     import pandas as pd
 
     rows_8k = []
@@ -361,46 +361,34 @@ def fetch_edgar(core: list[str], force: bool = False) -> tuple[Path, Path]:
                     })
                 elif form == "4" and cik_int > 0:
                     accession = accessions[j] if j < len(accessions) else ""
-                    primary   = primary_docs[j] if j < len(primary_docs) else ""
                     if not accession:
                         continue
-                    # Parse Form 4 XML to extract direction (S/D for SALE, A/P for BUY).
-                    # Hits the permanent cache after first run.
-                    parsed = _parse_form4_xml(accession, str(cik_int), primary) or {}
-                    if not parsed:
-                        n_f4_failed += 1
-                        # Cache failure or fetch failure — record but flag unknown
-                        rows_form4.append({
-                            "ticker":          t,
-                            "filed":           filed,
-                            "accession":       accession,
-                            "title":           "",
-                            "is_sale":         False,
-                            "is_purchase":     False,
-                            "sale_amount_usd": 0.0,
-                            "buy_amount_usd":  0.0,
-                            "direction":       "unknown",
-                        })
-                        continue
+                    # METADATA-ONLY: skip Form 4 XML parse.
+                    #
+                    # Per-filing XML parse + fetch (0.3s+ each, with mega-cap
+                    # tickers like META having 200-500 filings in the 5y
+                    # window) pushed total runtime to ~9+ hours. The user-
+                    # mandated fallback (F.5 review): "se não der, mantém o
+                    # boolean mas reporta o #7 como direccionalmente-ruidoso
+                    # e corre a variant (b) também sem ele". That's what
+                    # we ship — record metadata only, mark direction as
+                    # "metadata_only" (not "sale"/"buy"), and let the spine
+                    # builder treat any Form 4 within window as a generic
+                    # presence signal. The BINDING gate uses
+                    # min(variant_b_with_sub7, variant_b_without_sub7), so
+                    # if the directionally-noisy #7 corrupts the score, the
+                    # without_sub7 reading wins automatically.
                     n_f4_parsed += 1
-                    is_sale  = bool(parsed.get("is_sale", False))
-                    is_buy   = bool(parsed.get("is_purchase", False))
-                    direction = (
-                        "sale" if (is_sale and not is_buy) else
-                        "buy"  if (is_buy and not is_sale) else
-                        "both" if (is_sale and is_buy)     else
-                        "neither"
-                    )
                     rows_form4.append({
                         "ticker":          t,
                         "filed":           filed,
                         "accession":       accession,
-                        "title":           parsed.get("title", "") or "",
-                        "is_sale":         is_sale,
-                        "is_purchase":     is_buy,
-                        "sale_amount_usd": float(parsed.get("sale_amount_usd", 0) or 0),
-                        "buy_amount_usd":  float(parsed.get("amount_usd", 0) or 0),
-                        "direction":       direction,
+                        "title":           "",
+                        "is_sale":         False,
+                        "is_purchase":     False,
+                        "sale_amount_usd": 0.0,
+                        "buy_amount_usd":  0.0,
+                        "direction":       "metadata_only",
                     })
             if i % 10 == 0:
                 log.info(
