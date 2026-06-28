@@ -6673,43 +6673,49 @@ def _handle_command(text: str) -> None:
                     _reply("\n".join(lines))
                     return
 
-                # Top-K cap: equal-weight across many names produces sub-€100
-                # per-name allocations that all get wiped by the fee floor.
-                # K is sized so each allocation is at least €100 (T212 fee
-                # floor) and at most 8 (avoid over-fragmentation). Names
-                # outside top K are shown as "watch only" — visible for
-                # context but not allocated this round.
-                _MIN_ALLOC_PER_NAME = 100.0
-                _MAX_TOP_K = 8
-                _k_by_floor = int(_deployable // _MIN_ALLOC_PER_NAME) if _deployable >= _MIN_ALLOC_PER_NAME else 1
-                top_k = min(_MAX_TOP_K, _k_by_floor, len(entries))
-                # Names sorted by DD depth (deepest first); top_k slice gets allocations
-                allocated_set = {e.ticker for e in entries[:top_k]}
+                # No top-K cap, no arbitrary floor. T212 is zero-commission
+                # with fractional shares — €15 in a stock is a real position.
+                # Concentration emerges from the QUALITY FILTER (data-driven
+                # universe-median thresholds), not from artificial allocation
+                # caps. Per user F.5 followup: "queria que efetivamente desse
+                # tudo o que tem qualidade, sem eu estar a cortar".
 
                 lines.append(f"📋 *Watchlist*: {len(entries)} nomes qualificam (DD depth desc)")
+                # Surface the data-driven thresholds for transparency
+                from core.honest_watchlist import get_last_run_stats as _wl_stats
+                _qt = _wl_stats().get("quality_thresholds") or {}
+                if _qt.get("roe") is not None:
+                    lines.append(
+                        f"_Thresholds (universe median): "
+                        f"ROE >= {_qt['roe']*100:.0f}%, "
+                        f"GM >= {_qt.get('gross_margin',0)*100:.0f}%, "
+                        f"rev_growth >= {_qt.get('revenue_growth',0)*100:+.0f}%_"
+                    )
                 lines.append(f"💸 Cash buffer (regime): €{_cash_buffer:,.0f}")
                 lines.append(f"💸 Deployable: €{_deployable:,.0f}")
-                lines.append(f"🎯 Top-K alocados: *{top_k}* (equal-weight ~€{_deployable/max(1,top_k):.0f} cada; restantes visíveis mas não alocados)")
+                _per_name = _deployable / max(1, len(entries))
+                lines.append(f"💵 Equal-weight per name: *€{_per_name:.0f}* ({len(entries)} positions)")
                 lines.append("")
 
-                # Equal-weight across top K, respecting concentration cap.
+                # Equal-weight across ALL qualifiers, respecting concentration cap.
                 allocations = {}
                 remaining = _deployable
-                eligible = entries[:top_k]
                 _cap_skipped_lines = []
 
-                if eligible and remaining > 100:
-                    base_share = remaining / len(eligible)
-                    for e in eligible:
+                if entries and remaining > 0:
+                    base_share = remaining / len(entries)
+                    for e in entries:
                         if portfolio_value > 0:
                             current = ticker_current_value.get(e.ticker.upper(), 0.0)
                             new_total = portfolio_value + remaining
                             max_held_eur = new_total * CONCENTRATION_HARD
                             headroom = max(0.0, max_held_eur - current)
                             alloc = min(base_share, headroom)
-                            if alloc < _MIN_ALLOC_PER_NAME:
+                            # Concentration cap can produce zero alloc if
+                            # already at 30%; honest skip with reason
+                            if alloc <= 0:
                                 _cap_skipped_lines.append(
-                                    f"  ⏭️ `{e.ticker}` — concentration cap (já em portfolio), headroom €{headroom:.0f}"
+                                    f"  ⏭️ `{e.ticker}` — já em 30% concentration cap (€{current:.0f} held)"
                                 )
                                 continue
                         else:
@@ -6719,21 +6725,15 @@ def _handle_command(text: str) -> None:
                 _deployed = sum(allocations.values())
                 _final_cash = cash_amount - _deployed
 
-                # Render: top_k WITH allocation tag, rest as watch-only
-                lines.append("*Top alocados:*")
-                for e in entries[:top_k]:
+                # Render ALL qualifiers with their allocation
+                lines.append("*BUYs propostos (equal-weight, all qualifiers):*")
+                for e in entries:
                     eur = allocations.get(e.ticker)
                     if eur:
                         lines.append(f"`{e.summary_line}`  →  *€{eur:.0f}*")
                     else:
-                        lines.append(f"`{e.summary_line}`  →  _skipped (concentration cap)_")
+                        lines.append(f"`{e.summary_line}`  →  _skipped (cap)_")
                 lines.append("")
-
-                if len(entries) > top_k:
-                    lines.append(f"*Watch only (não alocados, {len(entries) - top_k} nomes):*")
-                    for e in entries[top_k:]:
-                        lines.append(f"`{e.summary_line}`")
-                    lines.append("")
 
                 if _cap_skipped_lines:
                     lines.append("_Skipped por concentration cap (já tens posição cheia):_")

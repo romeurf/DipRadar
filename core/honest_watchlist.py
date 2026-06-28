@@ -137,38 +137,91 @@ class WatchlistEntry:
         return asdict(self)
 
 
-def _quality_passes(signals: dict) -> tuple[bool, str]:
-    """Hard quality gate.
+def _quality_passes(signals: dict, thresholds: Optional[dict] = None) -> tuple[bool, str]:
+    """RIGOROUS quality gate — DATA-DRIVEN thresholds, partial data OK.
 
-    Three sub-criteria:
-      1. revenue_growth >= -10%
-      2. gross_margin >= 25%
-      3. fcf positive OR is_investment_phase
+    Per user F.5 followup, two principles:
+      1. "Cortar com data, não com acho que" — thresholds derive from
+         the universe's own distribution (median), not my judgment.
+      2. "Requerer todos os campos pode ser limitador, sem aceitar 0
+         nem pedir tudo" — partial data is OK (at least 2 of 3 signals
+         present), but missing data does NOT count as 0 / pass; it
+         simply doesn't vote.
 
-    Plus a DATA SUFFICIENCY check: at least ONE of {roe, gross_margin,
-    revenue_growth} must be present. If ALL three are missing we cannot
-    assert quality — name is excluded with "no quality signals available".
-    Previous behavior was "missing = PASS" which let non-CORE tickers
-    from DIP alert union slide through when fundamentals weren't fetched.
+    Rules:
+      - At least 2 of {revenue_growth, gross_margin, roe} must be PRESENT
+      - Each PRESENT signal must pass its universe-derived threshold
+      - Missing signals are NEUTRAL (don't vote for or against)
+      - FCF: if present and negative + not investment-phase → fail
+              (FCF is graded so don't count for the 2-of-3 sufficiency)
+
+    `thresholds` dict (from compute_quality_thresholds) carries
+    universe-derived medians:
+      {"roe": 0.XX, "gross_margin": 0.XX, "revenue_growth": 0.XX}
+    A name qualifies when its PRESENT signals all sit above the
+    CORE universe median for that metric.
+
+    When thresholds is None (e.g. /analisar single-ticker), falls back
+    to data-sufficiency only (2 of 3 fields present).
     """
-    # Data sufficiency: at least one quality signal must exist
-    has_signal = any(
-        signals.get(k) is not None
-        for k in ("roe", "gross_margin", "revenue_growth")
-    )
-    if not has_signal:
-        return False, "no quality signals available (ROE / GM / revenue_growth all missing)"
+    rg  = signals.get("revenue_growth")
+    gm  = signals.get("gross_margin")
+    roe = signals.get("roe")
 
-    rg = signals.get("revenue_growth")
-    if rg is not None and rg < -0.10:
-        return False, f"revenue_growth {rg*100:+.0f}% < -10%"
-    gm = signals.get("gross_margin")
-    if gm is not None and gm < 0.25:
-        return False, f"gross_margin {gm*100:.0f}% < 25%"
+    present = sum(1 for v in (rg, gm, roe) if v is not None)
+    if present < 2:
+        missing = []
+        if rg is None:  missing.append("revenue_growth")
+        if gm is None:  missing.append("gross_margin")
+        if roe is None: missing.append("roe")
+        return False, f"only {present}/3 quality signals present (missing: {', '.join(missing)})"
+
+    # Data-driven threshold gates: each PRESENT signal must pass universe
+    # median. Missing signals are neutral (skipped, neither vote).
+    if thresholds:
+        roe_floor = thresholds.get("roe")
+        gm_floor  = thresholds.get("gross_margin")
+        rg_floor  = thresholds.get("revenue_growth")
+        if roe is not None and roe_floor is not None and roe < roe_floor:
+            return False, f"roe {roe*100:.0f}% < universe median {roe_floor*100:.0f}%"
+        if gm is not None and gm_floor is not None and gm < gm_floor:
+            return False, f"gross_margin {gm*100:.0f}% < universe median {gm_floor*100:.0f}%"
+        if rg is not None and rg_floor is not None and rg < rg_floor:
+            return False, f"revenue_growth {rg*100:+.0f}% < universe median {rg_floor*100:+.0f}%"
+
+    # FCF graded check (allows investment-phase compounders like AMZN-style).
+    # Doesn't count toward the 2-of-3 sufficiency — purely a veto check
+    # for clearly broken cash flow without investment-phase justification.
     fcf = signals.get("fcf_yield_fund") or signals.get("fcf_yield")
     if fcf is not None and fcf < 0 and not signals.get("is_investment_phase"):
         return False, f"fcf_yield {fcf*100:+.1f}% < 0 (not investment phase)"
+
     return True, ""
+
+
+def compute_quality_thresholds(opps: list[dict]) -> dict:
+    """Derive quality thresholds from the universe distribution.
+
+    Computes the median of ROE, gross_margin, revenue_growth across
+    all opps with data present. Returns dict with floors per metric.
+
+    Used by get_watchlist to set _quality_passes() thresholds — names
+    must be ABOVE the CORE universe median on all three signals.
+    Curated CORE is all quality compounders, so above-median there
+    is a high bar.
+    """
+    import numpy as np
+    def _median_of(key: str) -> Optional[float]:
+        vals = [o.get(key) for o in opps if o.get(key) is not None]
+        if not vals:
+            return None
+        return float(np.median(vals))
+
+    return {
+        "roe":            _median_of("roe"),
+        "gross_margin":   _median_of("gross_margin"),
+        "revenue_growth": _median_of("revenue_growth"),
+    }
 
 
 def _fetch_sector_for(ticker: str) -> str:
@@ -373,10 +426,22 @@ def get_watchlist(
         log.info("[watchlist] universe scan returned 0 opps")
         return []
 
+    # Derive quality thresholds from CORE universe distribution.
+    # Per user F.5 followup: cut by data, not "acho que". Thresholds
+    # are the universe median (P50) of ROE / gross_margin / revenue_growth
+    # across the CURATED CORE baseline — names then need to be ABOVE
+    # the median of their peer group.
+    quality_thresholds = compute_quality_thresholds(opps)
+    log.info(
+        f"[watchlist] data-driven quality thresholds (universe median): "
+        f"ROE >= {(quality_thresholds.get('roe') or 0)*100:.0f}%, "
+        f"GM >= {(quality_thresholds.get('gross_margin') or 0)*100:.0f}%, "
+        f"rev_growth >= {(quality_thresholds.get('revenue_growth') or 0)*100:+.0f}%"
+    )
+
     # ── Pre-filter: cheap signals already in opp dict ─────────────────
     # DD threshold + quality gate use fields scan_core_universe already
-    # populated (dd_from_52w_high, revenue_growth, gross_margin,
-    # fcf_yield_fund). No yfinance calls here — pure dict lookups.
+    # populated. Quality now data-driven via universe-median thresholds.
     candidates = []
     n_dd_fail = 0
     n_quality_fail = 0
@@ -385,7 +450,7 @@ def get_watchlist(
         if dd is None or dd > min_dd_pct:
             n_dd_fail += 1
             continue
-        ok, _reason = _quality_passes(opp)
+        ok, _reason = _quality_passes(opp, thresholds=quality_thresholds)
         if not ok:
             n_quality_fail += 1
             continue
@@ -439,17 +504,19 @@ def get_watchlist(
         f"({n_with_catalyst} with near catalyst, {len(entries) - n_with_catalyst} without)"
     )
 
-    # Persist run stats for callers to render diagnostics. Catalyst now
-    # tracked as INFO (with vs without near catalyst), NOT as a failed gate.
+    # Persist run stats + the data-driven thresholds for callers to
+    # render in /cash and /scan_now output (transparency: user sees
+    # WHICH median ROE/GM/rev_growth was used to cut).
     from datetime import datetime as _dt
     global _last_run_stats
     _last_run_stats = {
-        "n_universe":          len(opps),
-        "n_dd_fail":           n_dd_fail,
-        "n_quality_fail":      n_quality_fail,
-        "n_qualified":         len(entries),
+        "n_universe":           len(opps),
+        "n_dd_fail":            n_dd_fail,
+        "n_quality_fail":       n_quality_fail,
+        "n_qualified":          len(entries),
         "n_with_near_catalyst": n_with_catalyst,
-        "fetched_at_iso":      _dt.now().isoformat(timespec="seconds"),
+        "quality_thresholds":   quality_thresholds,
+        "fetched_at_iso":       _dt.now().isoformat(timespec="seconds"),
     }
     return entries
 

@@ -26,47 +26,101 @@ from core.scoring_dispatch import (
 # ── Quality gate ─────────────────────────────────────────────────────
 
 class TestQualityGate:
-    def test_pass(self):
-        sigs = {"revenue_growth": 0.10, "gross_margin": 0.50, "fcf_yield_fund": 0.05}
-        ok, reason = hw._quality_passes(sigs)
-        assert ok and reason == ""
+    """Per F.5 design: 2-of-3 signal sufficiency + data-driven thresholds."""
 
-    def test_fail_revenue_collapse(self):
-        sigs = {"revenue_growth": -0.20, "gross_margin": 0.50, "fcf_yield_fund": 0.05}
-        ok, reason = hw._quality_passes(sigs)
-        assert not ok and "revenue_growth" in reason
+    # 2-of-3 SUFFICIENCY (counts of {ROE, GM, revenue_growth} present)
 
-    def test_fail_low_gm(self):
-        sigs = {"revenue_growth": 0.10, "gross_margin": 0.15, "fcf_yield_fund": 0.05}
-        ok, reason = hw._quality_passes(sigs)
-        assert not ok and "gross_margin" in reason
+    def test_sufficiency_pass_with_all_three(self):
+        sigs = {"revenue_growth": 0.10, "gross_margin": 0.50, "roe": 0.30}
+        ok, _ = hw._quality_passes(sigs)
+        assert ok
 
-    def test_fail_fcf_unless_investment_phase(self):
-        sigs = {"revenue_growth": 0.10, "gross_margin": 0.50, "fcf_yield_fund": -0.05}
+    def test_sufficiency_pass_with_two_of_three(self):
+        """Per user: partial data OK if at least 2 present."""
+        ok, _ = hw._quality_passes({"roe": 0.30, "gross_margin": 0.50})
+        assert ok
+
+    def test_sufficiency_fail_with_only_one(self):
+        ok, reason = hw._quality_passes({"roe": 0.30})
+        assert not ok
+        assert "1/3" in reason
+
+    def test_sufficiency_fail_with_zero(self):
+        ok, reason = hw._quality_passes({})
+        assert not ok
+        assert "0/3" in reason
+
+    # FCF graded check (allows investment-phase compounders)
+
+    def test_fcf_negative_excludes_without_investment_phase(self):
+        sigs = {"revenue_growth": 0.10, "gross_margin": 0.50, "roe": 0.30,
+                "fcf_yield_fund": -0.05}
         ok, reason = hw._quality_passes(sigs)
         assert not ok and "fcf" in reason.lower()
 
-    def test_investment_phase_exempts_fcf(self):
-        sigs = {"revenue_growth": 0.10, "gross_margin": 0.50,
+    def test_fcf_negative_ok_when_investment_phase(self):
+        sigs = {"revenue_growth": 0.10, "gross_margin": 0.50, "roe": 0.30,
                 "fcf_yield_fund": -0.05, "is_investment_phase": True}
         ok, _ = hw._quality_passes(sigs)
         assert ok
 
-    def test_all_signals_missing_excludes(self):
-        """Data sufficiency requirement: at least one of {roe, gross_margin,
-        revenue_growth} must be present. Without ANY signal we can't assert
-        quality — exclude with a clear reason. This prevents non-CORE
-        tickers from DIP alert union (which often lack fundamentals data)
-        from sliding through the gate silently."""
-        ok, reason = hw._quality_passes({})
-        assert not ok
-        assert "no quality signals" in reason.lower()
+    # DATA-DRIVEN THRESHOLDS (not "acho que")
 
-    def test_one_signal_present_passes(self):
-        """At least one signal is enough to assert quality (when that
-        signal passes its threshold). E.g. just ROE with no GM/rev_growth."""
-        ok, _ = hw._quality_passes({"roe": 0.35})
+    def test_threshold_fail_below_universe_median_roe(self):
+        sigs = {"roe": 0.05, "gross_margin": 0.50, "revenue_growth": 0.10}
+        # Universe median ROE = 0.20 → ticker ROE 0.05 fails
+        thresholds = {"roe": 0.20, "gross_margin": 0.30, "revenue_growth": 0.0}
+        ok, reason = hw._quality_passes(sigs, thresholds=thresholds)
+        assert not ok and "roe" in reason.lower() and "median" in reason.lower()
+
+    def test_threshold_fail_below_universe_median_gm(self):
+        sigs = {"roe": 0.30, "gross_margin": 0.20, "revenue_growth": 0.10}
+        thresholds = {"roe": 0.20, "gross_margin": 0.30, "revenue_growth": 0.0}
+        ok, reason = hw._quality_passes(sigs, thresholds=thresholds)
+        assert not ok and "gross_margin" in reason.lower()
+
+    def test_threshold_pass_above_all_universe_medians(self):
+        sigs = {"roe": 0.30, "gross_margin": 0.50, "revenue_growth": 0.10}
+        thresholds = {"roe": 0.20, "gross_margin": 0.30, "revenue_growth": 0.0}
+        ok, _ = hw._quality_passes(sigs, thresholds=thresholds)
         assert ok
+
+    def test_threshold_missing_signal_neutral(self):
+        """Missing signal does NOT vote — neither fails nor passes its
+        threshold. As long as 2 of 3 are present and pass theirs, the
+        name qualifies."""
+        sigs = {"roe": 0.30, "gross_margin": 0.50}  # no revenue_growth
+        thresholds = {"roe": 0.20, "gross_margin": 0.30, "revenue_growth": 0.0}
+        ok, _ = hw._quality_passes(sigs, thresholds=thresholds)
+        assert ok
+
+    # compute_quality_thresholds helper
+
+    def test_compute_thresholds_from_universe(self):
+        opps = [
+            {"roe": 0.10, "gross_margin": 0.30, "revenue_growth": 0.05},
+            {"roe": 0.20, "gross_margin": 0.40, "revenue_growth": 0.10},
+            {"roe": 0.30, "gross_margin": 0.50, "revenue_growth": 0.15},
+        ]
+        t = hw.compute_quality_thresholds(opps)
+        # Medians of [0.10, 0.20, 0.30] = 0.20 etc
+        assert t["roe"] == 0.20
+        assert t["gross_margin"] == 0.40
+        assert t["revenue_growth"] == 0.10
+
+    def test_compute_thresholds_handles_missing(self):
+        """Tickers missing a field shouldn't break median computation;
+        only PRESENT values count toward median."""
+        opps = [
+            {"roe": 0.10, "gross_margin": 0.30},  # no rev_growth
+            {"roe": 0.20, "revenue_growth": 0.05},  # no gm
+            {"gross_margin": 0.50, "revenue_growth": 0.15},  # no roe
+        ]
+        t = hw.compute_quality_thresholds(opps)
+        # ROE median of [0.10, 0.20] = 0.15
+        assert abs(t["roe"] - 0.15) < 1e-9
+        # GM median of [0.30, 0.50] = 0.40
+        assert abs(t["gross_margin"] - 0.40) < 1e-9
 
 
 # ── Watchlist criteria assembly ──────────────────────────────────────
@@ -135,18 +189,21 @@ class TestEvaluateTicker:
         e = hw.evaluate_ticker("YYY", sigs)
         assert e.qualifies
 
-    def test_quality_fail_excludes_via_hard_excluded(self, monkeypatch):
-        """Hard quality fail means not in watchlist regardless of DD/catalyst."""
+    def test_quality_fail_via_insufficient_data(self, monkeypatch):
+        """Without threshold dict (single-ticker /analisar path), quality
+        passes if 2 of 3 sufficiency holds. Failure here is only on
+        insufficient data (≤1 of 3 fields). Threshold-based exclusion
+        is tested separately in TestQualityGate."""
         self._stub_externals(monkeypatch)
         sigs = {
-            "revenue_growth": -0.30,  # collapse
-            "gross_margin": 0.85, "fcf_yield_fund": 0.04,
+            "gross_margin": 0.85,  # only 1 of 3 signals — fails sufficiency
+            "fcf_yield_fund": 0.04,
             "dd_from_52w_high": -0.44,
         }
         e = hw.evaluate_ticker("BAD", sigs)
         assert not e.qualifies
         assert not e.quality_passes
-        assert "revenue_growth" in e.quality_reason
+        assert "1/3" in e.quality_reason
 
 
 # ── CRITICAL: sector-relative is DISPLAY, not FILTER ─────────────────
