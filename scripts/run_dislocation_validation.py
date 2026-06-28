@@ -182,6 +182,17 @@ def aggregate_folds(per_fold: list[dict]) -> dict:
 
 # ── Run a variant ────────────────────────────────────────────────────
 
+def _augment_with_yq(spine: pd.DataFrame) -> pd.DataFrame:
+    """Add as_of_dt, year, quarter, yq columns so fold_metrics can slice
+    by quarter without re-parsing the date string per call."""
+    spine = spine.copy()
+    spine["as_of_dt"] = pd.to_datetime(spine["as_of"])
+    spine["year"] = spine["as_of_dt"].dt.year
+    spine["quarter"] = spine["as_of_dt"].dt.quarter
+    spine["yq"] = spine["year"].astype(str) + "Q" + spine["quarter"].astype(str)
+    return spine
+
+
 def run_variant(
     spine: pd.DataFrame,
     score_col: str,
@@ -189,9 +200,10 @@ def run_variant(
 ) -> dict:
     """Run the fold pipeline for one composite-score column."""
     log.info(f"[variant] {label} (score_col={score_col})")
-    folds = quarterly_folds(spine)
+    spine_aug = _augment_with_yq(spine)
+    folds = quarterly_folds(spine_aug)
     per_fold = [
-        fold_metrics(spine, f["fold"], score_col, "forward_6m_return", "spy_fwd_6m")
+        fold_metrics(spine_aug, f["fold"], score_col, "forward_6m_return", "spy_fwd_6m")
         for f in folds
     ]
     agg = aggregate_folds(per_fold)

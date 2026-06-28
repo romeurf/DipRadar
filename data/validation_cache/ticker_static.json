@@ -1,0 +1,1158 @@
+{
+  "fetched_at": "2026-06-28T14:58:36+00:00",
+  "n_tickers": 229,
+  "n_skipped": 1,
+  "skipped": [
+    {
+      "ticker": "HOLX",
+      "reason": "no sharesOutstanding"
+    }
+  ],
+  "tickers": {
+    "MSFT": {
+      "shares_outstanding": 7428434704.0,
+      "trailing_eps": 16.78,
+      "market_cap_current": 2770583420928.0
+    },
+    "AAPL": {
+      "shares_outstanding": 14687356000.0,
+      "trailing_eps": 8.26,
+      "market_cap_current": 4167977926656.0
+    },
+    "GOOGL": {
+      "shares_outstanding": 5867155790.0,
+      "trailing_eps": 13.12,
+      "market_cap_current": 4117026308096.0
+    },
+    "META": {
+      "shares_outstanding": 2196045588.0,
+      "trailing_eps": 27.51,
+      "market_cap_current": 1396767457280.0
+    },
+    "AMZN": {
+      "shares_outstanding": 10757109436.0,
+      "trailing_eps": 7.35,
+      "market_cap_current": 2503072022528.0
+    },
+    "NVDA": {
+      "shares_outstanding": 24221000000.0,
+      "trailing_eps": 6.53,
+      "market_cap_current": 4663269130240.0
+    },
+    "ADBE": {
+      "shares_outstanding": 397500000.0,
+      "trailing_eps": 17.48,
+      "market_cap_current": 80585170944.0
+    },
+    "INTU": {
+      "shares_outstanding": 273537000.0,
+      "trailing_eps": 16.38,
+      "market_cap_current": 73231327232.0
+    },
+    "CRM": {
+      "shares_outstanding": 819000000.0,
+      "trailing_eps": 8.63,
+      "market_cap_current": 129705025536.0
+    },
+    "NOW": {
+      "shares_outstanding": 1031308000.0,
+      "trailing_eps": 1.68,
+      "market_cap_current": 101418827776.0
+    },
+    "ORCL": {
+      "shares_outstanding": 2880471000.0,
+      "trailing_eps": 5.84,
+      "market_cap_current": 427836375040.0
+    },
+    "WDAY": {
+      "shares_outstanding": 201000000.0,
+      "trailing_eps": 3.2,
+      "market_cap_current": 30676574208.0
+    },
+    "CDNS": {
+      "shares_outstanding": 275816000.0,
+      "trailing_eps": 4.3,
+      "market_cap_current": 104057102336.0
+    },
+    "SNPS": {
+      "shares_outstanding": 191479325.0,
+      "trailing_eps": 4.36,
+      "market_cap_current": 86996713472.0
+    },
+    "ROP": {
+      "shares_outstanding": 100917359.0,
+      "trailing_eps": 16.0,
+      "market_cap_current": 34141351936.0
+    },
+    "IT": {
+      "shares_outstanding": 66951889.0,
+      "trailing_eps": 10.12,
+      "market_cap_current": 9035827200.0
+    },
+    "EPAM": {
+      "shares_outstanding": 52244451.0,
+      "trailing_eps": 6.96,
+      "market_cap_current": 4215082496.0
+    },
+    "PAYC": {
+      "shares_outstanding": 46627098.0,
+      "trailing_eps": 8.64,
+      "market_cap_current": 6023287808.0
+    },
+    "VEEV": {
+      "shares_outstanding": 162443291.0,
+      "trailing_eps": 5.64,
+      "market_cap_current": 27836282880.0
+    },
+    "DDOG": {
+      "shares_outstanding": 330825798.0,
+      "trailing_eps": 0.38,
+      "market_cap_current": 85348573184.0
+    },
+    "FTNT": {
+      "shares_outstanding": 732648391.0,
+      "trailing_eps": 2.57,
+      "market_cap_current": 110886338560.0
+    },
+    "PANW": {
+      "shares_outstanding": 815000000.0,
+      "trailing_eps": 1.16,
+      "market_cap_current": 247923015680.0
+    },
+    "CRWD": {
+      "shares_outstanding": 254564820.0,
+      "trailing_eps": -0.14,
+      "market_cap_current": 178472861696.0
+    },
+    "OKTA": {
+      "shares_outstanding": 167658970.0,
+      "trailing_eps": 1.38,
+      "market_cap_current": 21792057344.0
+    },
+    "ZS": {
+      "shares_outstanding": 161709525.0,
+      "trailing_eps": -0.48,
+      "market_cap_current": 21387700224.0
+    },
+    "HUBS": {
+      "shares_outstanding": 51190708.0,
+      "trailing_eps": 1.89,
+      "market_cap_current": 9494340608.0
+    },
+    "TTD": {
+      "shares_outstanding": 426999732.0,
+      "trailing_eps": 0.88,
+      "market_cap_current": 8635890688.0
+    },
+    "RBLX": {
+      "shares_outstanding": 671595792.0,
+      "trailing_eps": -1.57,
+      "market_cap_current": 34051950592.0
+    },
+    "HOOD": {
+      "shares_outstanding": 791184698.0,
+      "trailing_eps": 2.06,
+      "market_cap_current": 88870846464.0
+    },
+    "TXN": {
+      "shares_outstanding": 910092791.0,
+      "trailing_eps": 5.85,
+      "market_cap_current": 259763224576.0
+    },
+    "ADI": {
+      "shares_outstanding": 487087040.0,
+      "trailing_eps": 6.73,
+      "market_cap_current": 188458844160.0
+    },
+    "AVGO": {
+      "shares_outstanding": 4757580198.0,
+      "trailing_eps": 6.02,
+      "market_cap_current": 1736611856384.0
+    },
+    "AMAT": {
+      "shares_outstanding": 793959430.0,
+      "trailing_eps": 10.66,
+      "market_cap_current": 497685561344.0
+    },
+    "KLAC": {
+      "shares_outstanding": 1306275210.0,
+      "trailing_eps": 3.53,
+      "market_cap_current": 324792254464.0
+    },
+    "LRCX": {
+      "shares_outstanding": 1250571000.0,
+      "trailing_eps": 5.31,
+      "market_cap_current": 474078969856.0
+    },
+    "QCOM": {
+      "shares_outstanding": 1054000000.0,
+      "trailing_eps": 9.3,
+      "market_cap_current": 199617052672.0
+    },
+    "MRVL": {
+      "shares_outstanding": 875553173.0,
+      "trailing_eps": 2.91,
+      "market_cap_current": 233571303424.0
+    },
+    "ON": {
+      "shares_outstanding": 389185602.0,
+      "trailing_eps": 1.36,
+      "market_cap_current": 35279675392.0
+    },
+    "MPWR": {
+      "shares_outstanding": 49130000.0,
+      "trailing_eps": 13.92,
+      "market_cap_current": 64523407360.0
+    },
+    "LLY": {
+      "shares_outstanding": 891741406.0,
+      "trailing_eps": 28.15,
+      "market_cap_current": 1077330575360.0
+    },
+    "NVO": {
+      "shares_outstanding": 3351983520.0,
+      "trailing_eps": 4.16,
+      "market_cap_current": 212798930944.0
+    },
+    "ABBV": {
+      "shares_outstanding": 1766792821.0,
+      "trailing_eps": 2.05,
+      "market_cap_current": 447616974848.0
+    },
+    "ISRG": {
+      "shares_outstanding": 354162842.0,
+      "trailing_eps": 8.22,
+      "market_cap_current": 143329705984.0
+    },
+    "TMO": {
+      "shares_outstanding": 371621465.0,
+      "trailing_eps": 18.21,
+      "market_cap_current": 190652973056.0
+    },
+    "DHR": {
+      "shares_outstanding": 707770627.0,
+      "trailing_eps": 5.16,
+      "market_cap_current": 138857512960.0
+    },
+    "VRTX": {
+      "shares_outstanding": 253805417.0,
+      "trailing_eps": 16.85,
+      "market_cap_current": 124704759808.0
+    },
+    "ZTS": {
+      "shares_outstanding": 419228118.0,
+      "trailing_eps": 6.1,
+      "market_cap_current": 31899066368.0
+    },
+    "AMGN": {
+      "shares_outstanding": 539708274.0,
+      "trailing_eps": 14.37,
+      "market_cap_current": 193393655808.0
+    },
+    "REGN": {
+      "shares_outstanding": 103021886.0,
+      "trailing_eps": 40.95,
+      "market_cap_current": 66352627712.0
+    },
+    "IDXX": {
+      "shares_outstanding": 78882997.0,
+      "trailing_eps": 13.57,
+      "market_cap_current": 43503976448.0
+    },
+    "ALGN": {
+      "shares_outstanding": 71618127.0,
+      "trailing_eps": 5.94,
+      "market_cap_current": 12778821632.0
+    },
+    "ABT": {
+      "shares_outstanding": 1741813154.0,
+      "trailing_eps": 3.57,
+      "market_cap_current": 163939450880.0
+    },
+    "SYK": {
+      "shares_outstanding": 383360762.0,
+      "trailing_eps": 8.65,
+      "market_cap_current": 127547957248.0
+    },
+    "BSX": {
+      "shares_outstanding": 1486355179.0,
+      "trailing_eps": 2.39,
+      "market_cap_current": 65741488128.0
+    },
+    "EW": {
+      "shares_outstanding": 575800000.0,
+      "trailing_eps": 1.85,
+      "market_cap_current": 52271124480.0
+    },
+    "STE": {
+      "shares_outstanding": 97457680.0,
+      "trailing_eps": 7.94,
+      "market_cap_current": 21018697728.0
+    },
+    "BDX": {
+      "shares_outstanding": 275540427.0,
+      "trailing_eps": 5.72,
+      "market_cap_current": 42962259968.0
+    },
+    "WST": {
+      "shares_outstanding": 70647595.0,
+      "trailing_eps": 7.47,
+      "market_cap_current": 24786708480.0
+    },
+    "UNH": {
+      "shares_outstanding": 908144404.0,
+      "trailing_eps": 13.26,
+      "market_cap_current": 388585914368.0
+    },
+    "CI": {
+      "shares_outstanding": 264532404.0,
+      "trailing_eps": 23.58,
+      "market_cap_current": 74807115776.0
+    },
+    "HUM": {
+      "shares_outstanding": 120061500.0,
+      "trailing_eps": 9.37,
+      "market_cap_current": 46084407296.0
+    },
+    "MCK": {
+      "shares_outstanding": 117077745.0,
+      "trailing_eps": 38.4,
+      "market_cap_current": 89390030848.0
+    },
+    "V": {
+      "shares_outstanding": 1659709932.0,
+      "trailing_eps": 11.47,
+      "market_cap_current": 639423348736.0
+    },
+    "MA": {
+      "shares_outstanding": 877036230.0,
+      "trailing_eps": 17.27,
+      "market_cap_current": 440926011392.0
+    },
+    "AXP": {
+      "shares_outstanding": 682326443.0,
+      "trailing_eps": 16.03,
+      "market_cap_current": 232236630016.0
+    },
+    "SPGI": {
+      "shares_outstanding": 296000000.0,
+      "trailing_eps": 15.8,
+      "market_cap_current": 120815362048.0
+    },
+    "MCO": {
+      "shares_outstanding": 174676438.0,
+      "trailing_eps": 13.95,
+      "market_cap_current": 78606139392.0
+    },
+    "ICE": {
+      "shares_outstanding": 565512495.0,
+      "trailing_eps": 6.87,
+      "market_cap_current": 70044377088.0
+    },
+    "CME": {
+      "shares_outstanding": 361319613.0,
+      "trailing_eps": 11.71,
+      "market_cap_current": 79852331008.0
+    },
+    "MSCI": {
+      "shares_outstanding": 72727592.0,
+      "trailing_eps": 17.53,
+      "market_cap_current": 40352903168.0
+    },
+    "BLK": {
+      "shares_outstanding": 155233989.0,
+      "trailing_eps": 39.75,
+      "market_cap_current": 157101588480.0
+    },
+    "JPM": {
+      "shares_outstanding": 2679511418.0,
+      "trailing_eps": 20.89,
+      "market_cap_current": 881693163520.0
+    },
+    "BRK-B": {
+      "shares_outstanding": 1398308677.0,
+      "trailing_eps": 33.61,
+      "market_cap_current": 1075536723968.0
+    },
+    "NTRS": {
+      "shares_outstanding": 185047258.0,
+      "trailing_eps": 9.56,
+      "market_cap_current": 32174166016.0
+    },
+    "TROW": {
+      "shares_outstanding": 214266606.0,
+      "trailing_eps": 9.32,
+      "market_cap_current": 23627177984.0
+    },
+    "FDS": {
+      "shares_outstanding": 36431127.0,
+      "trailing_eps": 15.55,
+      "market_cap_current": 8442549760.0
+    },
+    "CBOE": {
+      "shares_outstanding": 104653784.0,
+      "trailing_eps": 11.7,
+      "market_cap_current": 25348194304.0
+    },
+    "NDAQ": {
+      "shares_outstanding": 565540798.0,
+      "trailing_eps": 3.32,
+      "market_cap_current": 44428881920.0
+    },
+    "GS": {
+      "shares_outstanding": 295007421.0,
+      "trailing_eps": 54.75,
+      "market_cap_current": 300792512512.0
+    },
+    "MS": {
+      "shares_outstanding": 1577284817.0,
+      "trailing_eps": 11.05,
+      "market_cap_current": 334431715328.0
+    },
+    "AMP": {
+      "shares_outstanding": 89897084.0,
+      "trailing_eps": 40.12,
+      "market_cap_current": 40706301952.0
+    },
+    "MRSH": {
+      "shares_outstanding": 481794501.0,
+      "trailing_eps": 8.0,
+      "market_cap_current": 81437720576.0
+    },
+    "AJG": {
+      "shares_outstanding": 256942000.0,
+      "trailing_eps": 6.17,
+      "market_cap_current": 58071461888.0
+    },
+    "AON": {
+      "shares_outstanding": 213576949.0,
+      "trailing_eps": 18.21,
+      "market_cap_current": 70200606720.0
+    },
+    "WTW": {
+      "shares_outstanding": 94447976.0,
+      "trailing_eps": 17.04,
+      "market_cap_current": 25069326336.0
+    },
+    "CB": {
+      "shares_outstanding": 387860106.0,
+      "trailing_eps": 28.27,
+      "market_cap_current": 132430954496.0
+    },
+    "CINF": {
+      "shares_outstanding": 154686742.0,
+      "trailing_eps": 17.49,
+      "market_cap_current": 28474734592.0
+    },
+    "RLI": {
+      "shares_outstanding": 91938331.0,
+      "trailing_eps": 4.29,
+      "market_cap_current": 5291970048.0
+    },
+    "KO": {
+      "shares_outstanding": 4302482418.0,
+      "trailing_eps": 3.18,
+      "market_cap_current": 355514122240.0
+    },
+    "PEP": {
+      "shares_outstanding": 1366768315.0,
+      "trailing_eps": 6.38,
+      "market_cap_current": 193271775232.0
+    },
+    "PG": {
+      "shares_outstanding": 2328598978.0,
+      "trailing_eps": 6.84,
+      "market_cap_current": 347007844352.0
+    },
+    "CL": {
+      "shares_outstanding": 800189310.0,
+      "trailing_eps": 2.58,
+      "market_cap_current": 73673433088.0
+    },
+    "KMB": {
+      "shares_outstanding": 331940357.0,
+      "trailing_eps": 5.17,
+      "market_cap_current": 36304318464.0
+    },
+    "CLX": {
+      "shares_outstanding": 120921351.0,
+      "trailing_eps": 6.15,
+      "market_cap_current": 11794668544.0
+    },
+    "CHD": {
+      "shares_outstanding": 236943602.0,
+      "trailing_eps": 3.04,
+      "market_cap_current": 23594844160.0
+    },
+    "MKC": {
+      "shares_outstanding": 254055150.0,
+      "trailing_eps": 6.01,
+      "market_cap_current": 13724871680.0
+    },
+    "HRL": {
+      "shares_outstanding": 550284207.0,
+      "trailing_eps": 0.85,
+      "market_cap_current": 14588035072.0
+    },
+    "GIS": {
+      "shares_outstanding": 533681218.0,
+      "trailing_eps": 4.09,
+      "market_cap_current": 19217860608.0
+    },
+    "CPB": {
+      "shares_outstanding": 298206243.0,
+      "trailing_eps": 2.04,
+      "market_cap_current": 6778227712.0
+    },
+    "SJM": {
+      "shares_outstanding": 106880690.0,
+      "trailing_eps": -1.3,
+      "market_cap_current": 12359683072.0
+    },
+    "MNST": {
+      "shares_outstanding": 978008110.0,
+      "trailing_eps": 2.07,
+      "market_cap_current": 94260420608.0
+    },
+    "CELH": {
+      "shares_outstanding": 255640360.0,
+      "trailing_eps": 0.43,
+      "market_cap_current": 7630864384.0
+    },
+    "EL": {
+      "shares_outstanding": 247287571.0,
+      "trailing_eps": -0.7,
+      "market_cap_current": 29138962432.0
+    },
+    "ULTA": {
+      "shares_outstanding": 42989311.0,
+      "trailing_eps": 26.67,
+      "market_cap_current": 20998129664.0
+    },
+    "KVUE": {
+      "shares_outstanding": 1920008668.0,
+      "trailing_eps": 0.84,
+      "market_cap_current": 36729765888.0
+    },
+    "MCD": {
+      "shares_outstanding": 710505859.0,
+      "trailing_eps": 12.14,
+      "market_cap_current": 191666061312.0
+    },
+    "SBUX": {
+      "shares_outstanding": 1139700000.0,
+      "trailing_eps": 1.31,
+      "market_cap_current": 119212613632.0
+    },
+    "YUM": {
+      "shares_outstanding": 275621202.0,
+      "trailing_eps": 6.19,
+      "market_cap_current": 43109916672.0
+    },
+    "CMG": {
+      "shares_outstanding": 1282734000.0,
+      "trailing_eps": 1.09,
+      "market_cap_current": 42766348288.0
+    },
+    "DPZ": {
+      "shares_outstanding": 33261870.0,
+      "trailing_eps": 17.38,
+      "market_cap_current": 9918023680.0
+    },
+    "WING": {
+      "shares_outstanding": 27232553.0,
+      "trailing_eps": 4.05,
+      "market_cap_current": 4541300224.0
+    },
+    "NKE": {
+      "shares_outstanding": 1199499281.0,
+      "trailing_eps": 1.52,
+      "market_cap_current": 60346146816.0
+    },
+    "LULU": {
+      "shares_outstanding": 108437957.0,
+      "trailing_eps": 12.34,
+      "market_cap_current": 13350534144.0
+    },
+    "COST": {
+      "shares_outstanding": 443478804.0,
+      "trailing_eps": 19.91,
+      "market_cap_current": 422431293440.0
+    },
+    "TJX": {
+      "shares_outstanding": 1104704446.0,
+      "trailing_eps": 5.14,
+      "market_cap_current": 171704188928.0
+    },
+    "WMT": {
+      "shares_outstanding": 7958079155.0,
+      "trailing_eps": 2.83,
+      "market_cap_current": 920670175232.0
+    },
+    "ORLY": {
+      "shares_outstanding": 828715079.0,
+      "trailing_eps": 3.07,
+      "market_cap_current": 74211434496.0
+    },
+    "AZO": {
+      "shares_outstanding": 16325355.0,
+      "trailing_eps": 145.48,
+      "market_cap_current": 51077136384.0
+    },
+    "O": {
+      "shares_outstanding": 932492530.0,
+      "trailing_eps": 1.22,
+      "market_cap_current": 58858930176.0
+    },
+    "HON": {
+      "shares_outstanding": 316826559.0,
+      "trailing_eps": 12.54,
+      "market_cap_current": 73570295808.0
+    },
+    "ETN": {
+      "shares_outstanding": 388300000.0,
+      "trailing_eps": 10.23,
+      "market_cap_current": 156360638464.0
+    },
+    "ITW": {
+      "shares_outstanding": 287700000.0,
+      "trailing_eps": 10.76,
+      "market_cap_current": 77020168192.0
+    },
+    "EMR": {
+      "shares_outstanding": 560100000.0,
+      "trailing_eps": 4.32,
+      "market_cap_current": 80368746496.0
+    },
+    "PH": {
+      "shares_outstanding": 126086389.0,
+      "trailing_eps": 27.13,
+      "market_cap_current": 122167623680.0
+    },
+    "GD": {
+      "shares_outstanding": 270430187.0,
+      "trailing_eps": 15.88,
+      "market_cap_current": 93760847872.0
+    },
+    "LMT": {
+      "shares_outstanding": 230563608.0,
+      "trailing_eps": 20.65,
+      "market_cap_current": 116987977728.0
+    },
+    "RTX": {
+      "shares_outstanding": 1346683428.0,
+      "trailing_eps": 5.34,
+      "market_cap_current": 253163012096.0
+    },
+    "NOC": {
+      "shares_outstanding": 142033476.0,
+      "trailing_eps": 31.9,
+      "market_cap_current": 71020994560.0
+    },
+    "CTAS": {
+      "shares_outstanding": 400136881.0,
+      "trailing_eps": 4.74,
+      "market_cap_current": 68783529984.0
+    },
+    "CPRT": {
+      "shares_outstanding": 963308388.0,
+      "trailing_eps": 1.61,
+      "market_cap_current": 29429071872.0
+    },
+    "ODFL": {
+      "shares_outstanding": 207968283.0,
+      "trailing_eps": 4.79,
+      "market_cap_current": 45501378560.0
+    },
+    "FAST": {
+      "shares_outstanding": 1148035061.0,
+      "trailing_eps": 1.13,
+      "market_cap_current": 54072451072.0
+    },
+    "GWW": {
+      "shares_outstanding": 47213119.0,
+      "trailing_eps": 37.22,
+      "market_cap_current": 63908151296.0
+    },
+    "RSG": {
+      "shares_outstanding": 307664087.0,
+      "trailing_eps": 6.97,
+      "market_cap_current": 66575433728.0
+    },
+    "WM": {
+      "shares_outstanding": 401575752.0,
+      "trailing_eps": 6.9,
+      "market_cap_current": 90567376896.0
+    },
+    "VRSK": {
+      "shares_outstanding": 131021840.0,
+      "trailing_eps": 6.56,
+      "market_cap_current": 23869558784.0
+    },
+    "AXON": {
+      "shares_outstanding": 80602077.0,
+      "trailing_eps": 2.46,
+      "market_cap_current": 37466263552.0
+    },
+    "TDG": {
+      "shares_outstanding": 55933583.0,
+      "trailing_eps": 32.05,
+      "market_cap_current": 74087391232.0
+    },
+    "MOG-A": {
+      "shares_outstanding": 28439084.0,
+      "trailing_eps": 8.85,
+      "market_cap_current": 13476491264.0
+    },
+    "WSO": {
+      "shares_outstanding": 35534537.0,
+      "trailing_eps": 12.2,
+      "market_cap_current": 16917673984.0
+    },
+    "POOL": {
+      "shares_outstanding": 36443003.0,
+      "trailing_eps": 10.88,
+      "market_cap_current": 7711704064.0
+    },
+    "SWK": {
+      "shares_outstanding": 155455564.0,
+      "trailing_eps": 2.44,
+      "market_cap_current": 14298803200.0
+    },
+    "NVR": {
+      "shares_outstanding": 2699292.0,
+      "trailing_eps": 409.72,
+      "market_cap_current": 18432440320.0
+    },
+    "AMT": {
+      "shares_outstanding": 465893069.0,
+      "trailing_eps": 6.2,
+      "market_cap_current": 81806163968.0
+    },
+    "EQIX": {
+      "shares_outstanding": 98624248.0,
+      "trailing_eps": 14.51,
+      "market_cap_current": 107628650496.0
+    },
+    "CCI": {
+      "shares_outstanding": 436451983.0,
+      "trailing_eps": 2.37,
+      "market_cap_current": 36059664384.0
+    },
+    "SBAC": {
+      "shares_outstanding": 106063017.0,
+      "trailing_eps": 9.5,
+      "market_cap_current": 19490140160.0
+    },
+    "VICI": {
+      "shares_outstanding": 1076780187.0,
+      "trailing_eps": 2.92,
+      "market_cap_current": 29299187712.0
+    },
+    "PSA": {
+      "shares_outstanding": 175579656.0,
+      "trailing_eps": 9.67,
+      "market_cap_current": 56956284928.0
+    },
+    "EXR": {
+      "shares_outstanding": 211260936.0,
+      "trailing_eps": 4.45,
+      "market_cap_current": 32929740800.0
+    },
+    "FRT": {
+      "shares_outstanding": 86389197.0,
+      "trailing_eps": 5.77,
+      "market_cap_current": 10871753728.0
+    },
+    "TRNO": {
+      "shares_outstanding": 105717386.0,
+      "trailing_eps": 4.1,
+      "market_cap_current": 6975233536.0
+    },
+    "EGP": {
+      "shares_outstanding": 53755229.0,
+      "trailing_eps": 5.49,
+      "market_cap_current": 11142921216.0
+    },
+    "SHW": {
+      "shares_outstanding": 246635621.0,
+      "trailing_eps": 10.43,
+      "market_cap_current": 84859920384.0
+    },
+    "ECL": {
+      "shares_outstanding": 281437502.0,
+      "trailing_eps": 7.4,
+      "market_cap_current": 79829745664.0
+    },
+    "APD": {
+      "shares_outstanding": 222680686.0,
+      "trailing_eps": 9.5,
+      "market_cap_current": 61858471936.0
+    },
+    "PPG": {
+      "shares_outstanding": 222900000.0,
+      "trailing_eps": 6.98,
+      "market_cap_current": 27470194688.0
+    },
+    "IFF": {
+      "shares_outstanding": 255303473.0,
+      "trailing_eps": 3.23,
+      "market_cap_current": 19492419584.0
+    },
+    "RPM": {
+      "shares_outstanding": 127626527.0,
+      "trailing_eps": 5.18,
+      "market_cap_current": 14403390464.0
+    },
+    "CAT": {
+      "shares_outstanding": 460591983.0,
+      "trailing_eps": 20.05,
+      "market_cap_current": 459426660352.0
+    },
+    "DE": {
+      "shares_outstanding": 270107282.0,
+      "trailing_eps": 17.66,
+      "market_cap_current": 165640601600.0
+    },
+    "GPC": {
+      "shares_outstanding": 137624545.0,
+      "trailing_eps": 0.44,
+      "market_cap_current": 16140947456.0
+    },
+    "NDSN": {
+      "shares_outstanding": 55717948.0,
+      "trailing_eps": 9.37,
+      "market_cap_current": 16797289472.0
+    },
+    "DOV": {
+      "shares_outstanding": 134661414.0,
+      "trailing_eps": 8.0,
+      "market_cap_current": 30428092416.0
+    },
+    "ALLE": {
+      "shares_outstanding": 85935861.0,
+      "trailing_eps": 7.32,
+      "market_cap_current": 12006099968.0
+    },
+    "AME": {
+      "shares_outstanding": 229203002.0,
+      "trailing_eps": 6.63,
+      "market_cap_current": 54440300544.0
+    },
+    "ROK": {
+      "shares_outstanding": 111273953.0,
+      "trailing_eps": 9.63,
+      "market_cap_current": 53057646592.0
+    },
+    "FTV": {
+      "shares_outstanding": 304861021.0,
+      "trailing_eps": 1.7,
+      "market_cap_current": 18742855680.0
+    },
+    "RRX": {
+      "shares_outstanding": 66569573.0,
+      "trailing_eps": 4.31,
+      "market_cap_current": 14628663296.0
+    },
+    "HUBB": {
+      "shares_outstanding": 52841777.0,
+      "trailing_eps": 16.91,
+      "market_cap_current": 27320256512.0
+    },
+    "GBCI": {
+      "shares_outstanding": 130142654.0,
+      "trailing_eps": 2.14,
+      "market_cap_current": 6772623872.0
+    },
+    "ADP": {
+      "shares_outstanding": 399734282.0,
+      "trailing_eps": 10.73,
+      "market_cap_current": 89360596992.0
+    },
+    "PAYX": {
+      "shares_outstanding": 355600000.0,
+      "trailing_eps": 4.89,
+      "market_cap_current": 35524440064.0
+    },
+    "EFX": {
+      "shares_outstanding": 119072409.0,
+      "trailing_eps": 5.67,
+      "market_cap_current": 19118170112.0
+    },
+    "TRU": {
+      "shares_outstanding": 192800000.0,
+      "trailing_eps": 3.61,
+      "market_cap_current": 13563480064.0
+    },
+    "BRZE": {
+      "shares_outstanding": 112631669.0,
+      "trailing_eps": -1.12,
+      "market_cap_current": 2367517696.0
+    },
+    "PCTY": {
+      "shares_outstanding": 53544058.0,
+      "trailing_eps": 4.68,
+      "market_cap_current": 5694410240.0
+    },
+    "CVX": {
+      "shares_outstanding": 1991597732.0,
+      "trailing_eps": 5.75,
+      "market_cap_current": 340682702848.0
+    },
+    "XOM": {
+      "shares_outstanding": 4144947162.0,
+      "trailing_eps": 5.94,
+      "market_cap_current": 565951070208.0
+    },
+    "EOG": {
+      "shares_outstanding": 532628530.0,
+      "trailing_eps": 10.17,
+      "market_cap_current": 70626549760.0
+    },
+    "NEE": {
+      "shares_outstanding": 2085605358.0,
+      "trailing_eps": 3.94,
+      "market_cap_current": 184701206528.0
+    },
+    "D": {
+      "shares_outstanding": 879512484.0,
+      "trailing_eps": 3.39,
+      "market_cap_current": 61029371904.0
+    },
+    "ATO": {
+      "shares_outstanding": 166919822.0,
+      "trailing_eps": 8.13,
+      "market_cap_current": 29239345152.0
+    },
+    "AEP": {
+      "shares_outstanding": 544105032.0,
+      "trailing_eps": 6.75,
+      "market_cap_current": 75461926912.0
+    },
+    "WEC": {
+      "shares_outstanding": 325725678.0,
+      "trailing_eps": 4.99,
+      "market_cap_current": 38712496128.0
+    },
+    "ED": {
+      "shares_outstanding": 368529705.0,
+      "trailing_eps": 5.93,
+      "market_cap_current": 41297436672.0
+    },
+    "AWK": {
+      "shares_outstanding": 195280521.0,
+      "trailing_eps": 5.64,
+      "market_cap_current": 25909819392.0
+    },
+    "MSEX": {
+      "shares_outstanding": 18624329.0,
+      "trailing_eps": 2.4,
+      "market_cap_current": 1033277696.0
+    },
+    "UBER": {
+      "shares_outstanding": 2035599013.0,
+      "trailing_eps": 4.03,
+      "market_cap_current": 155112636416.0
+    },
+    "LYFT": {
+      "shares_outstanding": 379682532.0,
+      "trailing_eps": 6.84,
+      "market_cap_current": 5418070016.0
+    },
+    "ABNB": {
+      "shares_outstanding": 417930233.0,
+      "trailing_eps": 4.05,
+      "market_cap_current": 86390571008.0
+    },
+    "BKNG": {
+      "shares_outstanding": 774878436.0,
+      "trailing_eps": 7.59,
+      "market_cap_current": 140609454080.0
+    },
+    "EXPE": {
+      "shares_outstanding": 114498625.0,
+      "trailing_eps": 11.33,
+      "market_cap_current": 31541800960.0
+    },
+    "MAR": {
+      "shares_outstanding": 263688623.0,
+      "trailing_eps": 9.55,
+      "market_cap_current": 99492356096.0
+    },
+    "HLT": {
+      "shares_outstanding": 227648372.0,
+      "trailing_eps": 6.56,
+      "market_cap_current": 75775033344.0
+    },
+    "H": {
+      "shares_outstanding": 41030133.0,
+      "trailing_eps": -0.34,
+      "market_cap_current": 18613866496.0
+    },
+    "GH": {
+      "shares_outstanding": 132599929.0,
+      "trailing_eps": -3.4,
+      "market_cap_current": 19786561536.0
+    },
+    "DOCS": {
+      "shares_outstanding": 131975436.0,
+      "trailing_eps": 0.98,
+      "market_cap_current": 3818368256.0
+    },
+    "ACAD": {
+      "shares_outstanding": 171235870.0,
+      "trailing_eps": 2.21,
+      "market_cap_current": 4335692288.0
+    },
+    "GILD": {
+      "shares_outstanding": 1241569874.0,
+      "trailing_eps": 7.35,
+      "market_cap_current": 158771953664.0
+    },
+    "BIIB": {
+      "shares_outstanding": 147637117.0,
+      "trailing_eps": 9.29,
+      "market_cap_current": 31894046720.0
+    },
+    "MRNA": {
+      "shares_outstanding": 396786259.0,
+      "trailing_eps": -8.14,
+      "market_cap_current": 26691811328.0
+    },
+    "NFLX": {
+      "shares_outstanding": 4210798528.0,
+      "trailing_eps": 3.1,
+      "market_cap_current": 310799040512.0
+    },
+    "DIS": {
+      "shares_outstanding": 1736511424.0,
+      "trailing_eps": 6.25,
+      "market_cap_current": 171549966336.0
+    },
+    "CMCSA": {
+      "shares_outstanding": 3562784182.0,
+      "trailing_eps": 5.1,
+      "market_cap_current": 82768535552.0
+    },
+    "CHTR": {
+      "shares_outstanding": 141178369.0,
+      "trailing_eps": 36.96,
+      "market_cap_current": 20938496000.0
+    },
+    "SPOT": {
+      "shares_outstanding": 205620061.0,
+      "trailing_eps": 14.63,
+      "market_cap_current": 94589337600.0
+    },
+    "LION": {
+      "shares_outstanding": 290633610.0,
+      "trailing_eps": null,
+      "market_cap_current": 4766390784.0
+    },
+    "KEYS": {
+      "shares_outstanding": 170895368.0,
+      "trailing_eps": 6.21,
+      "market_cap_current": 56166469632.0
+    },
+    "TER": {
+      "shares_outstanding": 156542162.0,
+      "trailing_eps": 5.37,
+      "market_cap_current": 68387004416.0
+    },
+    "TRMB": {
+      "shares_outstanding": 233111519.0,
+      "trailing_eps": 1.91,
+      "market_cap_current": 11818754048.0
+    },
+    "WAT": {
+      "shares_outstanding": 98185855.0,
+      "trailing_eps": 7.86,
+      "market_cap_current": 36761767936.0
+    },
+    "MTD": {
+      "shares_outstanding": 20207601.0,
+      "trailing_eps": 42.59,
+      "market_cap_current": 25537353728.0
+    },
+    "A": {
+      "shares_outstanding": 282431944.0,
+      "trailing_eps": 4.98,
+      "market_cap_current": 38413565952.0
+    },
+    "BIO": {
+      "shares_outstanding": 21700560.0,
+      "trailing_eps": 6.02,
+      "market_cap_current": 8049621504.0
+    },
+    "TECH": {
+      "shares_outstanding": 155810652.0,
+      "trailing_eps": 0.7,
+      "market_cap_current": 11062556672.0
+    },
+    "ACN": {
+      "shares_outstanding": 611942109.0,
+      "trailing_eps": 12.52,
+      "market_cap_current": 78928289792.0
+    },
+    "LDOS": {
+      "shares_outstanding": 125785466.0,
+      "trailing_eps": 10.93,
+      "market_cap_current": 12799929344.0
+    },
+    "SAIC": {
+      "shares_outstanding": 42276819.0,
+      "trailing_eps": 8.89,
+      "market_cap_current": 4662710272.0
+    },
+    "CACI": {
+      "shares_outstanding": 22091305.0,
+      "trailing_eps": 24.24,
+      "market_cap_current": 10027684864.0
+    },
+    "BAH": {
+      "shares_outstanding": 119934041.0,
+      "trailing_eps": 6.9,
+      "market_cap_current": 7462296064.0
+    },
+    "UPS": {
+      "shares_outstanding": 746581816.0,
+      "trailing_eps": 6.17,
+      "market_cap_current": 91919679488.0
+    },
+    "FDX": {
+      "shares_outstanding": 238606756.0,
+      "trailing_eps": 18.73,
+      "market_cap_current": 76003409920.0
+    },
+    "EXPD": {
+      "shares_outstanding": 130791133.0,
+      "trailing_eps": 6.19,
+      "market_cap_current": 21022058496.0
+    },
+    "CHRW": {
+      "shares_outstanding": 117873042.0,
+      "trailing_eps": 4.95,
+      "market_cap_current": 21138171904.0
+    },
+    "J": {
+      "shares_outstanding": 118080879.0,
+      "trailing_eps": 3.39,
+      "market_cap_current": 14841585664.0
+    },
+    "TSM": {
+      "shares_outstanding": 5186474013.0,
+      "trailing_eps": 11.54,
+      "market_cap_current": 2242372173824.0
+    },
+    "ASML": {
+      "shares_outstanding": 385417665.0,
+      "trailing_eps": 29.43,
+      "market_cap_current": 691678216192.0
+    },
+    "SAP": {
+      "shares_outstanding": 1167559048.0,
+      "trailing_eps": 7.09,
+      "market_cap_current": 182840606720.0
+    }
+  }
+}

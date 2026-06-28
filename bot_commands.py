@@ -6596,11 +6596,204 @@ def _handle_command(text: str) -> None:
             f"_~30-60s: sells primeiro (freed cash), depois buys..._"
         )
 
+        def _run_allocation_watchlist(cash_amount):
+            """Watchlist-mode /cash: equal-weight across honest filter qualifiers.
+
+            Source candidates from honest_watchlist (quality + DD>=25% +
+            catalyst<=30d). Allocate equal-weight, respect concentration
+            cap (30% hard per ticker), respect regime cash buffer target.
+            No edge-weighted ranking. No alpha claim. Persists
+            watchdog_state.json the same way legacy /cash does so cron
+            and downstream consumers see the held_cash + deployed
+            tickers from this run.
+            """
+            try:
+                import json as _json
+                from pathlib import Path as _Path
+                from datetime import datetime as _dt
+                from portfolio.portfolio import get_positions
+                from core.honest_watchlist import get_watchlist
+                from utils.news_headlines import fetch_headlines, format_headlines_for_telegram
+
+                CONCENTRATION_HARD = 0.30
+
+                # Portfolio state
+                positions = get_positions() or {}
+                portfolio_value = sum(
+                    float(p.get("value_eur") or p.get("cost_eur") or 0)
+                    for p in positions.values()
+                )
+                ticker_current_value = {}
+                for sym, pos in positions.items():
+                    val = float(pos.get("value_eur") or pos.get("cost_eur") or 0)
+                    ticker_current_value[sym.upper()] = val
+
+                # Regime context for cash buffer guidance
+                try:
+                    from core.market_regime import compute_regime
+                    _regime = compute_regime()
+                    _r_label = _regime.get("regime_label", "?")
+                    _r_score = _regime.get("regime_score", 50.0)
+                    _r_target = _regime.get("cash_target_pct", 20)
+                except Exception:
+                    _r_label, _r_score, _r_target = "?", 50.0, 20
+                _badge = {"FROTHY": "🟦", "NEUTRAL": "🟨", "PANIC": "🟥"}.get(_r_label, "⚪")
+
+                # Watchlist candidates
+                entries = get_watchlist()
+
+                lines = ["💰 *Allocation Proposal — Watchlist mode*"]
+                lines.append("")
+                lines.append(f"📊 Portfolio: live €{portfolio_value:,.0f} | {len(positions)} positions")
+                lines.append(f"💵 Cash inflow: €{cash_amount:,.2f}")
+                lines.append(f"{_badge} Regime: *{_r_label}* ({_r_score:.0f}/100) | cash target {_r_target}%")
+                lines.append("")
+
+                # Regime cash buffer first
+                _cash_buffer = cash_amount * (_r_target / 100.0)
+                _deployable = max(0.0, cash_amount - _cash_buffer)
+
+                if not entries:
+                    lines.append("⚪ *Watchlist vazia* — nenhum nome qualifica hoje.")
+                    lines.append("_Critérios: quality + DD ≥ 25% + catalyst ≤ 30d._")
+                    lines.append("")
+                    lines.append(f"💰 Sugestão: manter os €{cash_amount:,.0f} em cash.")
+                    lines.append("_T212 @ 2.2%/ano = "
+                                 f"€{cash_amount * 0.022:.2f}/ano enquanto esperas._")
+                    _reply("\n".join(lines))
+                    return
+
+                lines.append(f"📋 *Watchlist*: {len(entries)} nomes qualificam (DD depth desc)")
+                lines.append(f"💸 Cash buffer (regime): €{_cash_buffer:,.0f}")
+                lines.append(f"💸 Deployable: €{_deployable:,.0f}")
+                lines.append("")
+
+                # Equal-weight across watchlist, respecting concentration cap.
+                # Loop until all deployable cash is placed or all caps hit.
+                allocations = {}
+                remaining = _deployable
+                eligible = list(entries)
+                _skipped_lines = []
+
+                # First pass: equal split
+                if eligible and remaining > 100:
+                    base_share = remaining / len(eligible)
+                    for e in eligible:
+                        # Concentration headroom
+                        if portfolio_value > 0:
+                            current = ticker_current_value.get(e.ticker.upper(), 0.0)
+                            new_total = portfolio_value + remaining
+                            max_held_eur = new_total * CONCENTRATION_HARD
+                            headroom = max(0.0, max_held_eur - current)
+                            alloc = min(base_share, headroom)
+                            if alloc < 100:
+                                _skipped_lines.append(
+                                    f"  ⏭️ `{e.ticker}` — concentration cap, headroom €{headroom:.0f}"
+                                )
+                                continue
+                        else:
+                            alloc = base_share
+                        allocations[e.ticker] = round(alloc, 0)
+
+                _deployed = sum(allocations.values())
+                _final_cash = cash_amount - _deployed
+
+                # Render watchlist entries with allocations
+                lines.append("*BUYs propostos (equal-weight across watchlist):*")
+                for e in entries:
+                    eur = allocations.get(e.ticker)
+                    if eur:
+                        lines.append(f"`{e.summary_line}`  →  *€{eur:.0f}*")
+                    else:
+                        lines.append(f"`{e.summary_line}`  →  _skipped_")
+                lines.append("")
+
+                if _skipped_lines:
+                    lines.append("_Skipped (concentration cap):_")
+                    lines.extend(_skipped_lines)
+                    lines.append("")
+
+                lines.append("📥 *Pós-execução:*")
+                lines.append(f"   Deployed: *€{_deployed:,.0f}* across {len(allocations)} positions")
+                lines.append(f"   Cash em T212: *€{_final_cash:,.0f}*")
+                lines.append("")
+                lines.append("_Watchlist mode: equal-weight, no edge ranking. Decide tu se sizing equal faz sentido._")
+
+                # Checklist
+                if allocations:
+                    lines.append("")
+                    lines.append("📋 *CHECKLIST para T212:*")
+                    for i, (t, eur) in enumerate(allocations.items(), 1):
+                        lines.append(f"  {i}. BUY `{t}` €{eur:.0f}")
+
+                _reply("\n".join(lines))
+
+                # Persist watchdog state so cron + /scan_now see this run
+                try:
+                    _dd = _Path("/data") if _Path("/data").exists() else _Path(__file__).parent / "data"
+                    _ws_path = _dd / "watchdog_state.json"
+                    _ws_state = {
+                        "timestamp":         _dt.now().isoformat(timespec="seconds"),
+                        "total_budget":      float(cash_amount),
+                        "deployed_eur":      float(_deployed),
+                        "held_cash_eur":     float(_final_cash),
+                        "deployed_tickers":  list(allocations.keys()),
+                        "notified_tickers":  [],
+                        "scorer_used":       "watchlist",
+                    }
+                    _ws_path.write_text(_json.dumps(_ws_state, indent=2))
+                except Exception as _we:
+                    logging.debug(f"[cash/watchlist] persist watchdog_state failed: {_we}")
+
+                # Persist last_cash_proposal for /deployed comparison
+                try:
+                    _proposal_path = (
+                        _Path("/data") if _Path("/data").exists() else _Path(__file__).parent / "data"
+                    ) / "last_cash_proposal.json"
+                    _proposal = {
+                        "timestamp":    _dt.now().isoformat(timespec="seconds"),
+                        "budget":       float(cash_amount),
+                        "cash_inflow":  float(cash_amount),
+                        "freed_cash":   0.0,
+                        "scorer_used":  "watchlist",
+                        "actions": [
+                            {
+                                "ticker":            t,
+                                "bucket":            "WATCHLIST",
+                                "recommended_eur":   float(eur),
+                                "ann_alpha_pct":     None,
+                                "score":             None,
+                                "win_prob":          None,
+                                "kelly_alloc":       None,
+                            }
+                            for t, eur in allocations.items()
+                        ],
+                    }
+                    _proposal_path.write_text(_json.dumps(_proposal, indent=2))
+                except Exception as _pe:
+                    logging.debug(f"[cash/watchlist] persist proposal failed: {_pe}")
+
+            except Exception as _e:
+                logging.error(f"[cash/watchlist] {_e}", exc_info=True)
+                _reply(f"❌ Allocation (watchlist) falhou: `{_md_safe(_e)}`")
+
         def _run_allocation():
             try:
                 from portfolio.portfolio import get_positions
                 from core import conviction_radar as cr
                 from core.tax_engine import should_rotate as tax_should_rotate
+                from core.scoring_dispatch import get_active_scorer
+
+                # ── Watchlist mode (default after F.5 REVERT) ───────────
+                # When scoring mode is "watchlist", /cash uses the honest
+                # filter as candidate source. Sizing is equal-weight
+                # across qualifiers (no edge-weighted allocation). Same
+                # concentration cap + regime cash buffer respected.
+                # Legacy Kelly+ML path runs only when SCORING_MODE is
+                # composite or dislocation.
+                if get_active_scorer() == "watchlist":
+                    _run_allocation_watchlist(cash_amount)
+                    return
 
                 # Concentration caps (per-ticker share of total portfolio)
                 CONCENTRATION_SOFT = 0.25
@@ -9573,12 +9766,64 @@ def _handle_command(text: str) -> None:
                     except Exception:
                         pass
 
-                # ScoringSession reads DIPRADAR_USE_DISLOCATION flag ONCE
-                # for this scan; every ticker is scored by the same engine.
-                # The output tags which scorer was used so the 2-week
-                # side-by-side log review (per plan F.6) is unambiguous.
+                # ScoringSession reads DIPRADAR_SCORING_MODE flag ONCE.
+                # The dispatcher honors one switch across /scan_now,
+                # /analisar, watchdog, /cash so the system never tells
+                # you one thing in one place and another somewhere else.
                 session = ScoringSession()
 
+                # ── Watchlist mode (default after F.5 REVERT) ────────────
+                # Honest filter, no ranking pretension. Composes the
+                # output via core/honest_watchlist.py.
+                if session.scorer == "watchlist":
+                    from core.honest_watchlist import get_watchlist, format_watchlist_telegram
+
+                    entries = get_watchlist()
+
+                    try:
+                        from core.market_regime import compute_regime
+                        _regime = compute_regime()
+                        _r_label = _regime.get("regime_label", "?")
+                        _r_score = _regime.get("regime_score", 50.0)
+                    except Exception:
+                        _r_label = "?"
+                        _r_score = 50.0
+                    _badge = {"FROTHY": "🟦", "NEUTRAL": "🟨", "PANIC": "🟥"}.get(_r_label, "⚪")
+
+                    _ts_now = _dt.now().strftime("%Y-%m-%d %H:%M")
+                    header_lines = [
+                        f"📋 *Honest Watchlist* — `{_ts_now}`",
+                        f"{_badge} Regime: *{_r_label}* ({_r_score:.0f}/100)",
+                    ]
+                    if _held_cash > 0:
+                        _last_str = (_last_cash_ts or "?")[:10]
+                        header_lines.append(
+                            f"💰 Cash retido: *€{_held_cash:,.0f}* (do /cash de {_last_str})"
+                        )
+                    else:
+                        header_lines.append("💡 Sem cash retido (post-/cash state vazio)")
+
+                    body = format_watchlist_telegram(
+                        entries,
+                        header="\n".join(header_lines),
+                        include_disclaimer=True,
+                    )
+                    # Headlines: top 3 entries by DD depth get news context
+                    if entries:
+                        body += "\n\n*📰 News (top 3 by DD depth):*"
+                        for e in entries[:3]:
+                            _hl = fetch_headlines(e.ticker, max_results=2)
+                            if _hl:
+                                body += f"\n*{e.ticker}:*\n"
+                                body += format_headlines_for_telegram(
+                                    _hl, max_results=2, indent="  "
+                                )
+
+                    body += f"\n\n_Próximo cron auto: amanhã 18h00 Lisboa._"
+                    _reply(body)
+                    return
+
+                # ── Legacy scorer paths (composite / dislocation) ────────
                 # Get CORE opps (no min_score filter — let the scorer decide)
                 opps = scan_core_universe(min_score=0.0)
                 if not opps:
@@ -9626,10 +9871,11 @@ def _handle_command(text: str) -> None:
                 _badge = {"FROTHY": "🟦", "NEUTRAL": "🟨", "PANIC": "🟥"}.get(_r_label, "⚪")
 
                 _ts_now = _dt.now().strftime("%Y-%m-%d %H:%M")
-                _engine_tag = (
-                    "🧠 dislocation_z" if session.scorer == "dislocation"
-                    else "📐 composite_z (legacy)"
-                )
+                _engine_tag = {
+                    "watchlist":   "📋 watchlist",
+                    "dislocation": "🧠 dislocation_z (experimental)",
+                    "composite":   "📐 composite_z (legacy)",
+                }.get(session.scorer, "?")
                 lines = [
                     f"🔄 *Scan manual* — `{_ts_now}`  ·  engine: {_engine_tag}",
                     f"{_badge} Regime: *{_r_label}* ({_r_score:.0f}/100)",

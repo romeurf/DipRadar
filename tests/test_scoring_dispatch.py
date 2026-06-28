@@ -27,9 +27,11 @@ from core.scoring_dispatch import (
 # ── Default + env semantics ──────────────────────────────────────────
 
 class TestFlagSemantics:
-    def test_default_is_dislocation(self, monkeypatch):
+    def test_default_is_watchlist(self, monkeypatch):
+        """Default after F.5 REVERT changed from 'dislocation' to 'watchlist'."""
         monkeypatch.delenv("DIPRADAR_USE_DISLOCATION", raising=False)
-        assert get_active_scorer() == "dislocation"
+        monkeypatch.delenv("DIPRADAR_SCORING_MODE", raising=False)
+        assert get_active_scorer() == "watchlist"
 
     def test_flag_1_is_dislocation(self, monkeypatch):
         monkeypatch.setenv("DIPRADAR_USE_DISLOCATION", "1")
@@ -130,6 +132,7 @@ class TestExplanationLinesUnified:
         from core.dislocation_score import DislocationBreakdown, SubScore
         result = ScoreResult(
             ticker="NVO", scorer="dislocation", z=2.3,
+            qualifies=True,
             hard_excluded=False, exclude_reason=None,
             summary_line="NVO  +2.30z  | cheap + sector_drop -28%",
             breakdown=DislocationBreakdown(
@@ -158,6 +161,7 @@ class TestExplanationLinesUnified:
         from core.composite_score import CompositeBreakdown
         result = ScoreResult(
             ticker="NVO", scorer="composite", z=1.5,
+            qualifies=True,
             hard_excluded=False, exclude_reason=None,
             summary_line="NVO  +1.50z (composite legacy)",
             breakdown=CompositeBreakdown(

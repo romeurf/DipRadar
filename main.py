@@ -1965,6 +1965,62 @@ def _build_allocation_appendix(symbol: str) -> str:
         cap_eur = portfolio_value * 0.30 if portfolio_value > 0 else 0.0
         headroom = max(0.0, cap_eur - current_pos_eur) if portfolio_value > 0 else float("inf")
 
+        # ── Watchlist mode: criteria pass/fail, no sizing ──────────────
+        # Honest mode doesn't suggest allocations; it just tells you if
+        # this name passes the watchlist filter and how it compares on
+        # the criteria. Sizing is for legacy modes only.
+        if session.scorer == "watchlist":
+            entry = result.breakdown  # WatchlistEntry
+            lines = ["\n\n─────────────────────────"]
+            lines.append("📋 *Watchlist context*  ·  engine: watchlist (honest filter)")
+            lines.append("")
+
+            # Pass/fail per criterion
+            quality_ok = "✅" if entry.quality_passes else "❌"
+            dd_val = entry.dd_from_52w_high
+            dd_ok = "✅" if (dd_val is not None and dd_val <= -0.25) else "❌"
+            cd_val = entry.days_to_catalyst
+            cat_ok = "✅" if (cd_val is not None and -10 <= cd_val <= 30) else "❌"
+
+            lines.append(f"{quality_ok} Quality gate: {entry.quality_reason or 'pass'}")
+            lines.append(f"{dd_ok} DD from 52w high: {dd_val*100:+.0f}% (need <= -25%)"
+                         if dd_val is not None else f"{dd_ok} DD n/a")
+            if cd_val is None:
+                lines.append(f"{cat_ok} Catalyst: n/a (need within -10d to +30d)")
+            elif cd_val < 0:
+                lines.append(f"{cat_ok} Catalyst: reported {-cd_val}d ago (need within -10d to +30d)")
+            else:
+                lines.append(f"{cat_ok} Catalyst: {cd_val}d ahead (need within -10d to +30d)")
+
+            if entry.sector_relative_60d is not None:
+                sr_pp = entry.sector_relative_60d * 100
+                sr_note = (
+                    "fell with market — not a specific dislocation"
+                    if abs(entry.sector_relative_60d) < 0.05
+                    else "specific underperformance vs sector — investigate why"
+                    if entry.sector_relative_60d < -0.05
+                    else "outperformed sector — not a dislocation"
+                )
+                lines.append(f"ℹ️ vs sector 60d: {sr_pp:+.0f}pp  _({sr_note})_")
+
+            lines.append("")
+            qualifies_str = ("✅ *QUALIFIES* for watchlist" if entry.qualifies
+                             else "⚪ *Does not qualify* — at least one criterion fails")
+            lines.append(qualifies_str)
+
+            # Portfolio + held cash context (informational only — no sizing)
+            if portfolio_value > 0:
+                lines.append("")
+                lines.append(f"Posição actual: €{current_pos_eur:,.0f} ({current_pct*100:.1f}% portfolio)")
+                if headroom != float("inf"):
+                    lines.append(f"Headroom até cap 30%: €{headroom:,.0f}")
+            if held_cash > 0:
+                _ts_short = (last_cash_ts or "?")[:10]
+                lines.append(f"Cash retido (último /cash {_ts_short}): *€{held_cash:,.0f}*")
+                lines.append("_Watchlist mode não sugere alocação — decisão é tua._")
+
+            return "\n".join(lines)
+
         # Ranking vs current universe via the SAME session (consistent engine)
         try:
             from core.core_radar import scan_core_universe
@@ -2008,10 +2064,11 @@ def _build_allocation_appendix(symbol: str) -> str:
             )
             suggested_eur = allocs.get(symbol)
 
-        engine_tag = (
-            "🧠 dislocation_z" if session.scorer == "dislocation"
-            else "📐 composite_z (legacy)"
-        )
+        engine_tag = {
+            "watchlist":   "📋 watchlist",
+            "dislocation": "🧠 dislocation_z (experimental)",
+            "composite":   "📐 composite_z (legacy)",
+        }.get(session.scorer, "?")
 
         lines = ["\n\n─────────────────────────"]
         lines.append(f"💰 *Allocation context (screener)*  ·  engine: {engine_tag}")
@@ -2120,15 +2177,85 @@ def run_watchdog_scan() -> None:
             elif isinstance(item, dict):
                 notified_map[item.get("ticker", "")] = float(item.get("z_at_notify") or -10.0)
 
-        # ScoringSession reads DIPRADAR_USE_DISLOCATION flag ONCE so the
-        # watchdog uses the same engine as /scan_now interactive scans.
-        # Per plan F.4 user review: "if you leave the watchdog on
-        # composite_z while interactive /cash uses dislocation_z, you'd
-        # alert with one logic and respond with another — incoherent
-        # exactly during the 2 weeks you're trying to judge the new
-        # behavior." One flag, both paths.
+        # ScoringSession reads DIPRADAR_SCORING_MODE flag ONCE so the
+        # watchdog uses the same engine as /scan_now interactive scans
+        # and /cash. One flag, all paths — never alert with one logic
+        # and respond with another.
         session = ScoringSession()
 
+        # ── Watchlist mode (default after F.5 REVERT) ─────────────────
+        # Direct path through honest_watchlist for clarity. No z-based
+        # ranking. "New qualifier" = ticker in current watchlist AND
+        # not in notified set AND not already deployed.
+        if session.scorer == "watchlist":
+            from core.honest_watchlist import get_watchlist
+            entries = get_watchlist()
+            previously_notified = set(notified_map.keys())
+            new_qualifiers_wl = [
+                e for e in entries
+                if e.ticker not in deployed_tickers
+                and e.ticker not in previously_notified
+            ]
+            if not new_qualifiers_wl:
+                logging.info(
+                    f"[watchdog] watchlist: 0 new qualifiers "
+                    f"(held_cash €{held_cash:.0f}, total qualifiers={len(entries)}, "
+                    f"already notified or deployed)"
+                )
+                return
+
+            from datetime import datetime
+            ts = datetime.now(LISBON_TZ).strftime("%Y-%m-%d %H:%M")
+            top3 = new_qualifiers_wl[:3]  # already sorted by DD depth in get_watchlist
+            lines = [
+                f"📋 *Watchlist Watchdog* — `{ts}`  ·  engine: 📋 watchlist",
+                f"_Cash retido: *€{held_cash:,.0f}* (do último /cash)_",
+                "",
+                f"🚨 *{len(new_qualifiers_wl)} novo(s) qualifier(s)* (não-deployed, não-notificado):",
+                "",
+            ]
+            for e in top3:
+                lines.append(f"`{e.summary_line}`")
+                hl = fetch_headlines(e.ticker, max_results=2)
+                if hl:
+                    lines.append(format_headlines_for_telegram(hl, max_results=2, indent="  "))
+                lines.append("")
+            if len(new_qualifiers_wl) > 3:
+                lines.append(
+                    f"_+ {len(new_qualifiers_wl) - 3} mais qualifiers — corre `/scan_now` para ver todos_"
+                )
+                lines.append("")
+            lines.append(
+                "_Watchlist mode: filter only, no edge ranking._ "
+                "_Deploy: `/deployed TICKER AMOUNT reason`. Investigate: `/analisar TICKER`._"
+            )
+            send_telegram("\n".join(lines))
+            logging.info(
+                f"[watchdog] watchlist pushed {len(new_qualifiers_wl)} qualifiers, "
+                f"deepest DD: {top3[0].ticker} {top3[0].dd_from_52w_high*100:+.0f}%"
+            )
+            # Update notified state — store ticker only (z_at_notify=None for watchlist)
+            new_notified = list(notified_map.items())
+            for e in top3:
+                existing_idx = next(
+                    (i for i, (t, _z) in enumerate(new_notified) if t == e.ticker), None
+                )
+                if existing_idx is not None:
+                    new_notified[existing_idx] = (e.ticker, None)
+                else:
+                    new_notified.append((e.ticker, None))
+            state["notified_tickers"] = [
+                {"ticker": t, "z_at_notify": z} for t, z in new_notified
+            ]
+            state["last_watchdog_run"] = datetime.now().isoformat(timespec="seconds")
+            state["last_watchdog_scorer"] = "watchlist"
+            try:
+                ws_path.write_text(json.dumps(state, indent=2))
+            except Exception as e:
+                logging.warning(f"[watchdog] state write failed: {e}")
+            return
+
+        # ── Legacy scorer paths (composite / dislocation) ─────────────
         opps = scan_core_universe(min_score=0.0)
         if not opps:
             logging.warning("[watchdog] universe scan returned 0 opps — abort")
@@ -2181,10 +2308,11 @@ def run_watchdog_scan() -> None:
         top3 = new_qualifiers[:3]
         from datetime import datetime
         ts = datetime.now(LISBON_TZ).strftime("%Y-%m-%d %H:%M")
-        engine_tag = (
-            "🧠 dislocation_z" if session.scorer == "dislocation"
-            else "📐 composite_z (legacy)"
-        )
+        engine_tag = {
+            "watchlist":   "📋 watchlist",
+            "dislocation": "🧠 dislocation_z (experimental)",
+            "composite":   "📐 composite_z (legacy)",
+        }.get(session.scorer, "?")
         lines = [
             f"💰 *Cash Watchdog* — `{ts}`  ·  engine: {engine_tag}",
             f"_Cash retido: *€{held_cash:,.0f}* (do último /cash)_",

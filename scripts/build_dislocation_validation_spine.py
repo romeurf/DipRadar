@@ -80,7 +80,7 @@ _SUB_SCORES_ACTIVE_IN_SPINE = {
     "guidance":            "8k_item_2_02_only_news_keywords_zeroed",
     "drop_attribution":    "sector_rel_60d_20d_plus_8k_4_02_news_keywords_zeroed",
     "catalyst":            "next_8k_2_02_or_10q_proxy",
-    "valuation":           "zeroed_no_pit_forward_eps",
+    "valuation":           "trailing_pe_ps_peg_pit_clean_v2_with_static_shares",
     "quality":             "rev_growth_yoy_gross_margin_roe_only_fcf_skipped",
     "governance":          "form4_sale_only_filter_plus_8k_4_02_news_mgmt_departure_zeroed",
 }
@@ -123,6 +123,19 @@ def load_cache():
     edgar_form4  = pd.read_parquet(edgar_form4_path)
     fundamentals = pd.read_parquet(fundamentals_path)
 
+    # Static (per-ticker shares + trailing EPS anchor for s5 PIT valuation)
+    static_path = _CACHE_DIR / "ticker_static.json"
+    static_data = {}
+    if static_path.exists():
+        try:
+            static_data = json.loads(static_path.read_text()).get("tickers", {})
+            log.info(f"[cache] loaded ticker_static for {len(static_data)} tickers (s5 valuation active)")
+        except Exception as e:
+            log.warning(f"[cache] ticker_static unreadable: {e} — s5 valuation will be 0 for all rows")
+    else:
+        log.warning(f"[cache] {static_path} missing — s5 valuation will be 0 for all rows. "
+                    f"Run scripts/validation_static_fetch.py first.")
+
     # Index by ticker + date for fast slicing
     prices["date"] = pd.to_datetime(prices["date"]).dt.date
     edgar_8k["filed"] = pd.to_datetime(edgar_8k["filed"]).dt.date
@@ -140,6 +153,7 @@ def load_cache():
         "edgar_8k":     edgar_8k,
         "edgar_form4":  edgar_form4,
         "fundamentals": fundamentals,
+        "static":       static_data,
     }
 
 
@@ -384,6 +398,121 @@ def sub_guidance_spine(
     return 0.0, raw
 
 
+# ── Sub-score #5 — valuation PIT (trailing P/E + P/S + PEG) ──────────
+
+def sub_valuation_pit_spine(
+    ticker: str,
+    as_of: date,
+    prices_t: pd.DataFrame,
+    fundamentals_t: pd.DataFrame,
+    static_t: dict,
+) -> tuple[float, dict]:
+    """PIT-clean trailing valuation: P/E + P/S + PEG, derived from prices
+    + cached fundamentals + static shares anchor (approximation).
+
+    Pre-registered formulas (locked BEFORE seeing backtest result, no
+    post-hoc tweaking per user F.5 review):
+
+        pe_t  = price / TTM_EPS
+        ps_t  = (price × shares_current) / TTM_revenue
+        peg_t = pe_t / (rev_growth_yoy × 100)   (None if growth <= 0)
+
+        score_pe  = -tanh((pe_t  - 20)  / 15)     +1 @ PE=5,  0 @ PE=20,  -1 @ PE=35+
+        score_ps  = -tanh((ps_t  -  5)  /  4)     +1 @ PS=1,  0 @ PS=5,   -1 @ PS=9+
+        score_peg = -tanh((peg_t - 1.5) / 1.5)    +1 @ PEG=0.5, 0 @ PEG=1.5, -1 @ PEG=3+
+
+        s5 = mean(available_components), clipped to [-1, +1]
+
+    Why these thresholds: industry-standard heuristics.
+      PE=20 is roughly long-term S&P 500 average. Lynch PEG=1.5 is the
+      classic "growth-at-reasonable-price" frontier. PS=5 sits at the
+      growth-vs-mature dividing line typical for software/healthcare.
+    """
+    static = static_t or {}
+    shares = static.get("shares_outstanding")
+    if not shares or shares <= 0:
+        return 0.0, {"note": "no shares_outstanding for ticker"}
+
+    # Current price at as_of date
+    px_sub = prices_t[prices_t["date"] <= as_of]
+    if px_sub.empty:
+        return 0.0, {"note": "no price <= as_of"}
+    try:
+        price = float(px_sub.sort_values("date")["close"].iloc[-1])
+    except Exception:
+        return 0.0, {"note": "price lookup failed"}
+    if price <= 0:
+        return 0.0, {"note": "price <= 0"}
+
+    # TTM net income + revenue from last 4 quarters with pit_date <= as_of
+    available = fundamentals_t[fundamentals_t["pit_date"] <= as_of]
+    available = available.sort_values("pit_date", ascending=False).head(4)
+    if len(available) < 4:
+        return 0.0, {"note": f"only {len(available)} quarters of TTM data"}
+
+    try:
+        ttm_ni = float(available["net_income"].sum())
+        ttm_rev = float(available["revenue"].sum())
+    except Exception:
+        return 0.0, {"note": "TTM sum failed"}
+
+    # YoY revenue growth from quarterly aggregation
+    try:
+        all_avail = fundamentals_t[fundamentals_t["pit_date"] <= as_of]
+        all_avail = all_avail.sort_values("pit_date", ascending=False)
+        if len(all_avail) >= 8:
+            cur_year = float(all_avail.head(4)["revenue"].sum())
+            prev_year = float(all_avail.iloc[4:8]["revenue"].sum())
+            rev_growth_yoy = (cur_year / prev_year - 1.0) if prev_year > 0 else None
+        else:
+            rev_growth_yoy = None
+    except Exception:
+        rev_growth_yoy = None
+
+    # Compute ratios
+    eps_ttm = ttm_ni / shares if shares > 0 else None
+    pe_t = (price / eps_ttm) if (eps_ttm and eps_ttm > 0) else None
+    market_cap = price * shares
+    ps_t = (market_cap / ttm_rev) if (ttm_rev > 0) else None
+    peg_t = (pe_t / (rev_growth_yoy * 100)) if (pe_t and rev_growth_yoy and rev_growth_yoy > 0) else None
+
+    # Pre-registered scoring formulas
+    import math
+    components = []
+    raw = {
+        "price":           round(price, 2),
+        "shares":          shares,
+        "ttm_ni":          round(ttm_ni, 0),
+        "ttm_revenue":     round(ttm_rev, 0),
+        "eps_ttm":         round(eps_ttm, 3) if eps_ttm else None,
+        "pe_trailing":     round(pe_t, 2) if pe_t else None,
+        "ps_ratio":        round(ps_t, 2) if ps_t else None,
+        "peg_ratio":       round(peg_t, 2) if peg_t else None,
+        "rev_growth_yoy":  round(rev_growth_yoy, 4) if rev_growth_yoy else None,
+    }
+
+    if pe_t and 0 < pe_t < 500:  # ignore absurd ratios (data noise)
+        score_pe = -math.tanh((pe_t - 20.0) / 15.0)
+        components.append(score_pe)
+        raw["score_pe"] = round(score_pe, 3)
+
+    if ps_t and 0 < ps_t < 100:
+        score_ps = -math.tanh((ps_t - 5.0) / 4.0)
+        components.append(score_ps)
+        raw["score_ps"] = round(score_ps, 3)
+
+    if peg_t is not None and -10 < peg_t < 50:  # exclude pathological PEG
+        score_peg = -math.tanh((peg_t - 1.5) / 1.5)
+        components.append(score_peg)
+        raw["score_peg"] = round(score_peg, 3)
+
+    if not components:
+        return 0.0, {**raw, "note": "no usable valuation components"}
+
+    s5 = float(np.clip(np.mean(components), -1.0, 1.0))
+    return s5, raw
+
+
 # ── Spine row builder ────────────────────────────────────────────────
 
 def _forward_return(prices_t: pd.DataFrame, as_of: date, horizon_days: int):
@@ -450,7 +579,8 @@ def build_spine_row(
     s2, raw_s2 = sub_guidance_spine(ticker, as_of, edgar_8k_t)
     s3, raw_s3 = sub_drop_attribution_spine(ticker, as_of, sector, prices_by_ticker, edgar_8k_t)
     s4, raw_s4 = sub_catalyst_spine(ticker, as_of, edgar_8k_t)
-    s5 = 0.0  # valuation ZEROED
+    static_t = cache.get("static", {}).get(ticker, {})
+    s5, raw_s5 = sub_valuation_pit_spine(ticker, as_of, prices_t, fundamentals_t, static_t)
     s6, raw_s6 = sub_quality_spine(ticker, as_of, fundamentals_t)
     s7, raw_s7 = sub_governance_spine(ticker, as_of, edgar_form4_t, edgar_8k_t)
 
@@ -488,6 +618,7 @@ def build_spine_row(
         "raw_s2":                 json.dumps(raw_s2),
         "raw_s3":                 json.dumps(raw_s3),
         "raw_s4":                 json.dumps(raw_s4),
+        "raw_s5":                 json.dumps(raw_s5),
         "raw_s6":                 json.dumps(raw_s6, default=str),
         "raw_s7":                 json.dumps(raw_s7, default=str),
         "pit_membership":         "today_list",
