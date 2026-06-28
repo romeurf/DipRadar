@@ -52,9 +52,20 @@ class TestQualityGate:
         ok, _ = hw._quality_passes(sigs)
         assert ok
 
-    def test_missing_fields_default_pass(self):
-        """Missing data shouldn't exclude — we exclude on signal, not on absence."""
-        ok, _ = hw._quality_passes({})
+    def test_all_signals_missing_excludes(self):
+        """Data sufficiency requirement: at least one of {roe, gross_margin,
+        revenue_growth} must be present. Without ANY signal we can't assert
+        quality — exclude with a clear reason. This prevents non-CORE
+        tickers from DIP alert union (which often lack fundamentals data)
+        from sliding through the gate silently."""
+        ok, reason = hw._quality_passes({})
+        assert not ok
+        assert "no quality signals" in reason.lower()
+
+    def test_one_signal_present_passes(self):
+        """At least one signal is enough to assert quality (when that
+        signal passes its threshold). E.g. just ROE with no GM/rev_growth."""
+        ok, _ = hw._quality_passes({"roe": 0.35})
         assert ok
 
 

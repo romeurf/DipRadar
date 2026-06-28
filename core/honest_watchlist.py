@@ -138,10 +138,27 @@ class WatchlistEntry:
 
 
 def _quality_passes(signals: dict) -> tuple[bool, str]:
-    """Hard quality gate. Matches core_radar criteria.
+    """Hard quality gate.
 
-    Missing fields default to PASS (we don't exclude on missing data).
+    Three sub-criteria:
+      1. revenue_growth >= -10%
+      2. gross_margin >= 25%
+      3. fcf positive OR is_investment_phase
+
+    Plus a DATA SUFFICIENCY check: at least ONE of {roe, gross_margin,
+    revenue_growth} must be present. If ALL three are missing we cannot
+    assert quality — name is excluded with "no quality signals available".
+    Previous behavior was "missing = PASS" which let non-CORE tickers
+    from DIP alert union slide through when fundamentals weren't fetched.
     """
+    # Data sufficiency: at least one quality signal must exist
+    has_signal = any(
+        signals.get(k) is not None
+        for k in ("roe", "gross_margin", "revenue_growth")
+    )
+    if not has_signal:
+        return False, "no quality signals available (ROE / GM / revenue_growth all missing)"
+
     rg = signals.get("revenue_growth")
     if rg is not None and rg < -0.10:
         return False, f"revenue_growth {rg*100:+.0f}% < -10%"
