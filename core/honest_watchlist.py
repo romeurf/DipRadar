@@ -54,6 +54,48 @@ DEFAULT_CATALYST_MIN_DAYS   = -10   # accept "just reported" too (post-earnings 
 _last_run_stats: dict = {}
 
 
+def _scan_extra_tickers(tickers: list[str]) -> list[dict]:
+    """Run scan_core_universe-equivalent path for tickers OUTSIDE the CORE
+    universe (DIP alerts or full universe). Reuses core_radar's
+    _fetch_hist + _score_core_dip + _fetch_quality_metrics so the
+    returned dicts have the same shape as scan_core_universe opps.
+
+    Slow (one yfinance hist + info per ticker). The pre-filter in
+    get_watchlist gates the EVEN MORE expensive evaluate_ticker fetches.
+    """
+    if not tickers:
+        return []
+    try:
+        from core.core_radar import _fetch_hist, _score_core_dip
+    except Exception as e:
+        log.warning(f"[watchlist] core_radar imports failed: {e}")
+        return []
+
+    extras = []
+    for t in tickers:
+        try:
+            hist = _fetch_hist(t)
+            if hist is None or hist.empty:
+                continue
+            close = hist["Close"]
+            current_price = float(close.iloc[-1])
+            volume = hist["Volume"] if "Volume" in hist.columns else None
+            score, signals = _score_core_dip(
+                close, current_price, 0.0,
+                ticker=t, volume=volume,
+            )
+            extras.append({
+                "ticker": t,
+                "score": score,
+                "current_price": current_price,
+                **signals,
+            })
+        except Exception as e:
+            log.debug(f"[watchlist] _scan_extra {t}: {e}")
+            continue
+    return extras
+
+
 def get_last_run_stats() -> dict:
     """Per-gate breakdown of the most recent get_watchlist() call.
 
@@ -159,13 +201,21 @@ def _format_summary_line(entry: WatchlistEntry) -> str:
     sr = entry.sector_relative_60d
     sr_str = f"vs sector {sr*100:+.0f}%" if sr is not None else "vs sector n/a"
 
+    # Catalyst as SIGNAL not FILTER: badge 🎯 when within 30d window
+    # (recent post-earnings or upcoming), "—" otherwise. Never excludes.
     cd = entry.days_to_catalyst
     if cd is None:
-        cat_str = "catalyst n/a"
-    elif cd < 0:
+        cat_str = "catalyst —"
+    elif cd < -10:
         cat_str = f"catalyst {-cd}d ago"
+    elif cd < 0:
+        cat_str = f"🎯 catalyst {-cd}d ago"  # post-earnings revaluation window
+    elif cd <= 30:
+        cat_str = f"🎯 catalyst {cd}d"        # near catalyst — bonus
+    elif cd <= 60:
+        cat_str = f"catalyst {cd}d"            # visible but no badge
     else:
-        cat_str = f"catalyst {cd}d"
+        cat_str = f"catalyst far ({cd}d)"      # honest: too far to matter
 
     quals = []
     if entry.roe is not None:
@@ -191,8 +241,13 @@ def evaluate_ticker(
     (has roe, gross_margin, dd_from_52w_high, etc.).
 
     Always returns an entry; `entry.qualifies` indicates whether all
-    criteria passed. Use this for both "should I add to watchlist?" and
-    "show me why this candidate did/didn't qualify" (e.g. /analisar).
+    HARD criteria passed (quality gate + DD threshold). Catalyst is
+    a SIGNAL not a filter: computed and shown for prioritization but
+    does NOT exclude. A great quality dislocation 60d before earnings
+    shouldn't be missed just because the catalyst is far away.
+
+    Use this for both "should I add to watchlist?" and "show me why
+    this candidate did/didn't qualify" (e.g. /analisar appendix).
     """
     dd = signals.get("dd_from_52w_high")
     dd_ok = (dd is not None) and (dd <= min_dd_pct)
@@ -203,12 +258,16 @@ def evaluate_ticker(
     sector_rel = _fetch_sector_relative_60d(ticker, sector)
 
     catalyst_days = _fetch_catalyst_days(ticker)
-    catalyst_ok = (
+    catalyst_near = (
         catalyst_days is not None
         and catalyst_min_days <= catalyst_days <= catalyst_max_days
     )
 
-    qualifies = bool(quality_passes and dd_ok and catalyst_ok)
+    # HARD criteria: quality + DD. Catalyst is a bonus signal, NOT a
+    # filter — per user F.5 review followup: "catalyst should be an
+    # advantage, not an impediment; a genuinely good dislocation
+    # shouldn't be missed just because it's far from a catalyst."
+    qualifies = bool(quality_passes and dd_ok)
 
     entry = WatchlistEntry(
         ticker=ticker,
@@ -237,32 +296,61 @@ def get_watchlist(
     min_dd_pct: float = DEFAULT_MIN_DD_PCT,
     catalyst_max_days: int = DEFAULT_CATALYST_MAX_DAYS,
     catalyst_min_days: int = DEFAULT_CATALYST_MIN_DAYS,
+    source: str = "default",
+    dip_lookback_days: int = 14,
 ) -> list[WatchlistEntry]:
-    """Walk CORE universe, evaluate each, return qualifying entries.
+    """Walk the chosen universe, evaluate each, return qualifying entries.
 
-    Sorted by dd_from_52w_high ascending (deepest drop first).
-    Names that don't qualify are EXCLUDED from the returned list.
-    Use evaluate_ticker() directly for the pass/fail breakdown of a
-    single ticker (e.g. /analisar appendix).
+    Sources (per F.5 followup: "why only CORE? what about the 1000+ universe?"):
+      "default" — CORE (230 curated) ∪ DIP scanner alerts last 14d.
+                  Fast: only re-scans names the DIP scanner already flagged
+                  from the broader universe, adds them to CORE. Typical
+                  runtime ~1-3 min.
+      "full"    — Full 1518-ticker universe from us_universe_static.json.
+                  Slow (~30-60min cold; subsequent fast via /data caches).
+                  Use when you suspect interesting names outside CORE.
 
-    Performance: pre-filters by DD + quality gate (CHEAP — uses signals
-    already produced by scan_core_universe) BEFORE calling
-    evaluate_ticker (which does 3 expensive yfinance fetches per
-    candidate: sector lookup, sector_relative price hist pair, earnings
-    calendar). Without pre-filter, a 230-ticker universe took ~20min;
-    with pre-filter, ~1-2min because only the 10-30 candidates that
-    pass the cheap gates incur the network cost.
+    Sorted: names with near catalyst (~30d) first as tiebreaker, then by
+    drawdown depth (deepest first). Catalyst is a SIGNAL not a FILTER
+    (does not exclude — names with no near catalyst still qualify).
 
-    Catalyst proximity stays in the expensive bucket — there's no PIT
-    proxy for it in signals — so the worst-case is still bound by the
-    pre-filter size, not the full universe.
+    Pre-filter: cheap signals (DD + quality from signals dict) gate the
+    expensive evaluate_ticker fetches (sector, sector_relative, calendar).
     """
+    # Source: CORE base, optionally extended
     try:
         from core.core_radar import scan_core_universe
         opps = scan_core_universe(min_score=0.0)
     except Exception as e:
-        log.warning(f"[watchlist] universe scan failed: {e}")
-        return []
+        log.warning(f"[watchlist] CORE scan failed: {e}")
+        opps = []
+
+    if source == "full":
+        # Full universe: include all 1518 from us_universe_static.json
+        try:
+            from core.universe import get_full_universe
+            full = get_full_universe()
+            core_set = {o["ticker"] for o in opps}
+            extra = [t for t in full if t not in core_set]
+            log.info(f"[watchlist] source=full: CORE={len(opps)} + {len(extra)} broader = {len(opps) + len(extra)} to scan")
+            # Scan the extras through scan_core_universe equivalent path
+            opps.extend(_scan_extra_tickers(extra))
+        except Exception as e:
+            log.warning(f"[watchlist] full universe expansion failed: {e}")
+    elif source == "default":
+        # Default: union CORE + recent DIP alert_db tickers (cheap — names
+        # the DIP scanner already flagged from broader universe over 14d).
+        try:
+            from scanners.alert_db import get_recent_alert_tickers
+            dip_tickers = get_recent_alert_tickers(lookback_days=dip_lookback_days)
+            core_set = {o["ticker"] for o in opps}
+            extra = [t for t in dip_tickers if t not in core_set]
+            if extra:
+                log.info(f"[watchlist] source=default: CORE={len(opps)} + {len(extra)} from DIP alerts ({dip_lookback_days}d)")
+                opps.extend(_scan_extra_tickers(extra))
+        except Exception as e:
+            log.debug(f"[watchlist] DIP alert_db union skipped: {e}")
+    # source == "core" → no expansion, just CORE
 
     if not opps:
         log.info("[watchlist] universe scan returned 0 opps")
@@ -313,23 +401,38 @@ def get_watchlist(
             log.debug(f"[watchlist] {opp.get('ticker','?')}: {e}")
             continue
 
-    # Sort by drawdown depth (most negative first = deepest drop first)
-    entries.sort(key=lambda e: e.dd_from_52w_high if e.dd_from_52w_high is not None else 0.0)
+    # Sort: (1) names with near catalyst (~30d window) come first as
+    # tiebreaker — catalyst is now a SIGNAL not FILTER (per F.5
+    # followup) so it sorts but doesn't exclude; (2) within each group,
+    # deepest drawdown first.
+    def _sort_key(e: WatchlistEntry):
+        cd = e.days_to_catalyst
+        has_near_catalyst = cd is not None and -10 <= cd <= 30
+        dd = e.dd_from_52w_high if e.dd_from_52w_high is not None else 0.0
+        # Primary: near-catalyst first (False sorts before True; invert)
+        return (not has_near_catalyst, dd)
+    entries.sort(key=_sort_key)
+
+    n_with_catalyst = sum(
+        1 for e in entries
+        if e.days_to_catalyst is not None and -10 <= e.days_to_catalyst <= 30
+    )
     log.info(
         f"[watchlist] {len(entries)} names qualified "
-        f"({n_catalyst_fail} dropped on catalyst proximity)"
+        f"({n_with_catalyst} with near catalyst, {len(entries) - n_with_catalyst} without)"
     )
 
-    # Persist run stats for callers to render diagnostics
+    # Persist run stats for callers to render diagnostics. Catalyst now
+    # tracked as INFO (with vs without near catalyst), NOT as a failed gate.
     from datetime import datetime as _dt
     global _last_run_stats
     _last_run_stats = {
-        "n_universe":       len(opps),
-        "n_dd_fail":        n_dd_fail,
-        "n_quality_fail":   n_quality_fail,
-        "n_catalyst_fail":  n_catalyst_fail,
-        "n_qualified":      len(entries),
-        "fetched_at_iso":   _dt.now().isoformat(timespec="seconds"),
+        "n_universe":          len(opps),
+        "n_dd_fail":           n_dd_fail,
+        "n_quality_fail":      n_quality_fail,
+        "n_qualified":         len(entries),
+        "n_with_near_catalyst": n_with_catalyst,
+        "fetched_at_iso":      _dt.now().isoformat(timespec="seconds"),
     }
     return entries
 
@@ -346,30 +449,28 @@ def format_watchlist_telegram(
     not "best alpha". Disclaimer reinforces this honestly.
     """
     if not entries:
-        # Surface the per-gate breakdown so the user sees WHY it's empty
         stats = get_last_run_stats()
         lines = [
             header,
             "",
             "⚪ *No qualifiers — empty watchlist hoje.*",
             "",
-            "_Critérios: quality + DD >= 25% + catalyst <= 30d._",
+            "_Critérios hard: quality gate + DD ≥ 25%. Catalyst é sinal, não filtro._",
         ]
         if stats:
             lines.append("")
             lines.append("📊 *Breakdown* (porquê está vazia):")
-            lines.append(f"  • Universo CORE scanado: *{stats.get('n_universe', '?')}* tickers")
+            lines.append(f"  • Universo scanado: *{stats.get('n_universe', '?')}* tickers")
             lines.append(f"  • Falharam DD ≥ 25%: *{stats.get('n_dd_fail', '?')}*")
             lines.append(f"  • Falharam quality gate: *{stats.get('n_quality_fail', '?')}*")
-            lines.append(f"  • Passaram DD + quality mas falharam catalyst: *{stats.get('n_catalyst_fail', '?')}*")
-            lines.append(f"  • Qualificaram (todos os 3): *{stats.get('n_qualified', 0)}*")
+            lines.append(f"  • Qualificaram (quality + DD): *{stats.get('n_qualified', 0)}*")
             n_dd_pass = stats.get("n_universe", 0) - stats.get("n_dd_fail", 0) - stats.get("n_quality_fail", 0)
-            if n_dd_pass > 0 and stats.get("n_catalyst_fail", 0) == n_dd_pass:
+            if n_dd_pass == 0:
                 lines.append("")
-                lines.append("_Diagnóstico: candidatos passam DD+quality mas nenhum tem earnings nos próximos 30d (ou nos últimos 10d). Catalyst filter é o gate restritivo hoje._")
-            elif n_dd_pass == 0:
+                lines.append("_Diagnóstico: nenhum nome com DD ≥ 25% — mercado provavelmente em regime caro/lateral. Considera correr `/scan_now --full` para escanar universo broader (1500+ tickers)._")
+            else:
                 lines.append("")
-                lines.append("_Diagnóstico: poucos nomes com DD ≥ 25% — mercado provavelmente em regime caro/lateral._")
+                lines.append("_Inesperado: candidatos passaram DD+quality mas 0 entraram. Pode haver erro silencioso — verifica logs._")
         return "\n".join(lines)
 
     lines = [

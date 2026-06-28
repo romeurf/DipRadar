@@ -96,15 +96,22 @@ class TestEvaluateTicker:
         assert e.quality_passes  # gate still passed
         # the DD is the failing criterion
 
-    def test_catalyst_too_far_disqualifies(self, monkeypatch):
-        """catalyst 60d ahead is OUTSIDE 30d window — disqualifies."""
+    def test_catalyst_far_still_qualifies_when_quality_and_dd_pass(self, monkeypatch):
+        """Per F.5 followup: catalyst is a SIGNAL not a FILTER.
+        A name with deep DD + quality passing must qualify even when
+        catalyst is 60d away — we don't want to miss good dislocations
+        just because earnings are distant."""
         self._stub_externals(monkeypatch, catalyst_days=60)
         sigs = {
             "revenue_growth": 0.08, "gross_margin": 0.85, "fcf_yield_fund": 0.04,
             "dd_from_52w_high": -0.44,
         }
         e = hw.evaluate_ticker("ZZZ", sigs)
-        assert not e.qualifies
+        assert e.qualifies, "Far catalyst must NOT exclude (now signal, not filter)"
+        # Catalyst info still shown in summary for prioritization
+        assert "60d" in e.summary_line
+        # But no 🎯 badge (not near)
+        assert "🎯" not in e.summary_line
 
     def test_just_reported_recent_qualifies(self, monkeypatch):
         """Catalyst -5d (just reported) is WITHIN the post-earnings

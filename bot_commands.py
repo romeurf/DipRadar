@@ -9788,7 +9788,12 @@ def _handle_command(text: str) -> None:
                 if session.scorer == "watchlist":
                     from core.honest_watchlist import get_watchlist, format_watchlist_telegram
 
-                    entries = get_watchlist()
+                    # /scan_now --full -> scan full 1518-ticker universe
+                    # /scan_now (default) -> CORE 230 + DIP alert union (~14d)
+                    _source = "full" if "--full" in parts else "default"
+                    if _source == "full":
+                        _reply("⏳ _Scan full universe (1518 tickers) — pode demorar 30-60min._")
+                    entries = get_watchlist(source=_source)
 
                     try:
                         from core.market_regime import compute_regime
