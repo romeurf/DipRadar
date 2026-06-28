@@ -49,6 +49,23 @@ DEFAULT_MIN_DD_PCT          = -0.25
 DEFAULT_CATALYST_MAX_DAYS   = 30
 DEFAULT_CATALYST_MIN_DAYS   = -10   # accept "just reported" too (post-earnings revaluation window)
 
+# Last get_watchlist() run breakdown — exposed for /cash and /scan_now
+# to surface "why watchlist is empty" honestly. Reset on each call.
+_last_run_stats: dict = {}
+
+
+def get_last_run_stats() -> dict:
+    """Per-gate breakdown of the most recent get_watchlist() call.
+
+    Used by callers (/cash, /scan_now) to render an honest diagnostic
+    when the watchlist is empty — answers "why?" with concrete numbers
+    instead of leaving the user guessing if it's the filter or a bug.
+
+    Schema: {n_universe, n_dd_fail, n_quality_fail, n_catalyst_fail,
+             n_qualified, fetched_at_iso}
+    """
+    return dict(_last_run_stats)
+
 
 @dataclass
 class WatchlistEntry:
@@ -277,6 +294,7 @@ def get_watchlist(
 
     # ── Expensive fetches only on pre-filtered candidates ─────────────
     entries = []
+    n_catalyst_fail = 0
     for opp in candidates:
         try:
             entry = evaluate_ticker(
@@ -287,6 +305,10 @@ def get_watchlist(
             )
             if entry.qualifies:
                 entries.append(entry)
+            else:
+                # Pre-filter already passed quality + DD, so failure here
+                # is catalyst (the only remaining filter at this stage)
+                n_catalyst_fail += 1
         except Exception as e:
             log.debug(f"[watchlist] {opp.get('ticker','?')}: {e}")
             continue
@@ -295,8 +317,20 @@ def get_watchlist(
     entries.sort(key=lambda e: e.dd_from_52w_high if e.dd_from_52w_high is not None else 0.0)
     log.info(
         f"[watchlist] {len(entries)} names qualified "
-        f"({len(candidates) - len(entries)} dropped on catalyst proximity)"
+        f"({n_catalyst_fail} dropped on catalyst proximity)"
     )
+
+    # Persist run stats for callers to render diagnostics
+    from datetime import datetime as _dt
+    global _last_run_stats
+    _last_run_stats = {
+        "n_universe":       len(opps),
+        "n_dd_fail":        n_dd_fail,
+        "n_quality_fail":   n_quality_fail,
+        "n_catalyst_fail":  n_catalyst_fail,
+        "n_qualified":      len(entries),
+        "fetched_at_iso":   _dt.now().isoformat(timespec="seconds"),
+    }
     return entries
 
 
@@ -312,14 +346,30 @@ def format_watchlist_telegram(
     not "best alpha". Disclaimer reinforces this honestly.
     """
     if not entries:
+        # Surface the per-gate breakdown so the user sees WHY it's empty
+        stats = get_last_run_stats()
         lines = [
             header,
             "",
-            "⚪ _No qualifiers — empty watchlist hoje._",
+            "⚪ *No qualifiers — empty watchlist hoje.*",
             "",
-            "_Critérios: quality gates + DD >= 25% + catalyst <= 30d._",
-            "_Mercado pode estar caro across the board, ou catalysts longe._",
+            "_Critérios: quality + DD >= 25% + catalyst <= 30d._",
         ]
+        if stats:
+            lines.append("")
+            lines.append("📊 *Breakdown* (porquê está vazia):")
+            lines.append(f"  • Universo CORE scanado: *{stats.get('n_universe', '?')}* tickers")
+            lines.append(f"  • Falharam DD ≥ 25%: *{stats.get('n_dd_fail', '?')}*")
+            lines.append(f"  • Falharam quality gate: *{stats.get('n_quality_fail', '?')}*")
+            lines.append(f"  • Passaram DD + quality mas falharam catalyst: *{stats.get('n_catalyst_fail', '?')}*")
+            lines.append(f"  • Qualificaram (todos os 3): *{stats.get('n_qualified', 0)}*")
+            n_dd_pass = stats.get("n_universe", 0) - stats.get("n_dd_fail", 0) - stats.get("n_quality_fail", 0)
+            if n_dd_pass > 0 and stats.get("n_catalyst_fail", 0) == n_dd_pass:
+                lines.append("")
+                lines.append("_Diagnóstico: candidatos passam DD+quality mas nenhum tem earnings nos próximos 30d (ou nos últimos 10d). Catalyst filter é o gate restritivo hoje._")
+            elif n_dd_pass == 0:
+                lines.append("")
+                lines.append("_Diagnóstico: poucos nomes com DD ≥ 25% — mercado provavelmente em regime caro/lateral._")
         return "\n".join(lines)
 
     lines = [

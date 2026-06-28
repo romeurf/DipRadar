@@ -1953,13 +1953,18 @@ def _build_allocation_appendix(symbol: str) -> str:
             positions = get_positions() or {}
         except Exception:
             positions = {}
+        # /sync_portfolio stores `total_cost` (USD = shares × avg_price);
+        # value_eur/cost_eur are legacy/alternate fields. Try total_cost first.
         portfolio_value = sum(
-            float(p.get("value_eur") or p.get("cost_eur") or 0)
+            float(p.get("total_cost") or p.get("value_eur") or p.get("cost_eur") or 0)
             for p in positions.values()
         )
         ticker_pos = positions.get(symbol, {}) if isinstance(positions, dict) else {}
         current_pos_eur = float(
-            ticker_pos.get("value_eur") or ticker_pos.get("cost_eur") or 0
+            ticker_pos.get("total_cost")
+            or ticker_pos.get("value_eur")
+            or ticker_pos.get("cost_eur")
+            or 0
         )
         current_pct = (current_pos_eur / portfolio_value) if portfolio_value > 0 else 0.0
         cap_eur = portfolio_value * 0.30 if portfolio_value > 0 else 0.0

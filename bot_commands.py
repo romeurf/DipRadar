@@ -6617,15 +6617,25 @@ def _handle_command(text: str) -> None:
 
                 CONCENTRATION_HARD = 0.30
 
-                # Portfolio state
+                # Portfolio state. /sync_portfolio populates `total_cost`
+                # (USD: shares × avg_price), NOT value_eur/cost_eur — those
+                # come from a different (older) code path. For concentration
+                # cap math the unit doesn't matter (it's a ratio), so we
+                # use total_cost directly. Falls back to value_eur/cost_eur
+                # if total_cost missing (older position records).
                 positions = get_positions() or {}
                 portfolio_value = sum(
-                    float(p.get("value_eur") or p.get("cost_eur") or 0)
+                    float(p.get("total_cost") or p.get("value_eur") or p.get("cost_eur") or 0)
                     for p in positions.values()
                 )
                 ticker_current_value = {}
                 for sym, pos in positions.items():
-                    val = float(pos.get("value_eur") or pos.get("cost_eur") or 0)
+                    val = float(
+                        pos.get("total_cost")
+                        or pos.get("value_eur")
+                        or pos.get("cost_eur")
+                        or 0
+                    )
                     ticker_current_value[sym.upper()] = val
 
                 # Regime context for cash buffer guidance
