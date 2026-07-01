@@ -1,6 +1,6 @@
 {
   "schema_version": 3,
-  "trained_at": "2026-06-14T02:18:13Z",
+  "trained_at": "2026-07-01T07:40:12Z",
   "champion": "RF-alpha",
   "n_features": 32,
   "feature_cols": [
@@ -64,12 +64,12 @@
   },
   "comparison": [
     {
-      "model": "XGB-DART-alpha",
-      "rho_alpha_mean": 0.066,
-      "rho_alpha_std": 0.0935,
-      "rho_down_mean": 0.1602,
-      "topk_pnl_mean": 0.0162,
-      "topk_pnl_std": 0.0398,
+      "model": "XGB-ES-alpha",
+      "rho_alpha_mean": 0.0659,
+      "rho_alpha_std": 0.0909,
+      "rho_down_mean": 0.144,
+      "topk_pnl_mean": 0.0169,
+      "topk_pnl_std": 0.0419,
       "n_folds": 10
     },
     {
@@ -82,21 +82,21 @@
       "n_folds": 10
     },
     {
-      "model": "XGB-alpha",
-      "rho_alpha_mean": 0.0623,
-      "rho_alpha_std": 0.0895,
-      "rho_down_mean": 0.1645,
-      "topk_pnl_mean": 0.0147,
-      "topk_pnl_std": 0.0404,
+      "model": "XGB-DART-alpha",
+      "rho_alpha_mean": 0.0631,
+      "rho_alpha_std": 0.0963,
+      "rho_down_mean": 0.1585,
+      "topk_pnl_mean": 0.0153,
+      "topk_pnl_std": 0.041,
       "n_folds": 10
     },
     {
-      "model": "XGB-ES-alpha",
-      "rho_alpha_mean": 0.0619,
-      "rho_alpha_std": 0.0867,
-      "rho_down_mean": 0.1424,
-      "topk_pnl_mean": 0.0146,
-      "topk_pnl_std": 0.0412,
+      "model": "XGB-alpha",
+      "rho_alpha_mean": 0.0602,
+      "rho_alpha_std": 0.0891,
+      "rho_down_mean": 0.1595,
+      "topk_pnl_mean": 0.0158,
+      "topk_pnl_std": 0.0394,
       "n_folds": 10
     },
     {
@@ -119,20 +119,20 @@
     },
     {
       "model": "LGBM-GOSS-alpha",
-      "rho_alpha_mean": 0.0565,
-      "rho_alpha_std": 0.0772,
-      "rho_down_mean": 0.1639,
-      "topk_pnl_mean": 0.0127,
-      "topk_pnl_std": 0.0373,
+      "rho_alpha_mean": 0.0559,
+      "rho_alpha_std": 0.078,
+      "rho_down_mean": 0.1635,
+      "topk_pnl_mean": 0.0132,
+      "topk_pnl_std": 0.0377,
       "n_folds": 10
     },
     {
       "model": "XGB-alpha-baseline",
-      "rho_alpha_mean": 0.0511,
-      "rho_alpha_std": 0.0917,
-      "rho_down_mean": 0.1542,
-      "topk_pnl_mean": 0.0102,
-      "topk_pnl_std": 0.0399,
+      "rho_alpha_mean": 0.0503,
+      "rho_alpha_std": 0.0892,
+      "rho_down_mean": 0.1526,
+      "topk_pnl_mean": 0.0091,
+      "topk_pnl_std": 0.0392,
       "n_folds": 10
     },
     {
@@ -361,17 +361,17 @@
     "winsorize_features": true,
     "champion_kind": "single",
     "ensemble_models": [
-      "XGB-DART-alpha",
+      "XGB-ES-alpha",
       "RF-alpha",
-      "XGB-alpha"
+      "XGB-DART-alpha"
     ],
     "ensemble_weights": {
-      "XGB-DART-alpha": 0.35583268772353627,
-      "RF-alpha": 0.3274382753838454,
-      "XGB-alpha": 0.3167290368926184
+      "XGB-ES-alpha": 0.3519377591538112,
+      "RF-alpha": 0.3249415030813065,
+      "XGB-DART-alpha": 0.3231207377648823
     },
-    "ensemble_ic_oof": 0.0716527973504471,
-    "ensemble_ic_per_fold_mean": 0.04330960560828743,
+    "ensemble_ic_oof": 0.0761575440621571,
+    "ensemble_ic_per_fold_mean": 0.04347282610064146,
     "single_best_name": "RF-alpha",
     "single_best_rho_alpha": 0.06330441677874872
   },
