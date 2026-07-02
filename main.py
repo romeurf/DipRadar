@@ -692,17 +692,35 @@ def send_heartbeat() -> None:
     # + freed cash from /cash sells). The heartbeat now leaves the deploy
     # math to /cash, which has all the live inputs.
 
-    if total > 0:
+    # Concentration denominator: stocks + liquidity, WITHOUT PPR (user
+    # decision 2026-07-02, option A). The PPR is real wealth but illiquid
+    # and outside the actively-managed decision space the cap protects —
+    # including it made NVO read 21.2% while the triage's buy-gate
+    # (correctly) read ~30%. Same basis everywhere now; the headline
+    # "Carteira total" above deliberately KEEPS PPR (also user decision).
+    _stocks_total = sum(
+        (p.get("value_eur") or 0) for p in snapshot["positions"]
+    )
+    try:
+        from portfolio.portfolio import get_liquidity as _hb_liq
+        _stocks_total += float(_hb_liq() or 0)
+    except Exception:
+        pass
+
+    if _stocks_total > 0:
         # Generic 10-step monitoring ladder (user decision 2026-07-02:
         # "de 10 em 10 — 30, 20 e 10"). Replaces the old per-ticker
         # hardcodes (NVO >= 28, ADBE "limite é 10-12%") with one policy
         # applied uniformly. NOTE: this ladder governs MONITORING alerts
         # on existing positions; the separate 25% soft / 30% hard caps
         # govern BUY eligibility in /cash + watchlist triage. Two scales,
-        # two purposes — both deliberate.
+        # two purposes — both deliberate. Weights here are LIVE values on
+        # the stocks+liquidity base; triage uses COST basis on the same
+        # base — small residual differences are the documented
+        # cost-vs-live design note, no longer a denominator mismatch.
         concentration_warnings = []
         for pos in snapshot["positions"]:
-            weight = pos["value_eur"] / total * 100
+            weight = pos["value_eur"] / _stocks_total * 100
             sym = pos["symbol"]
             if weight >= 30:
                 concentration_warnings.append(
