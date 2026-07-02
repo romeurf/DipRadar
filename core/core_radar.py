@@ -491,9 +491,14 @@ def _score_core_dip(
     #       -down quality compounder that has stabilized; NVO at -44% from
     #       high with return_20d = -4% would otherwise be filtered out
     #       even though it's exactly the contrarian buy our user wants).
-    # Compute the 52w drawdown early so the check can use it.
+    # Compute the 52w drawdown early so the check can use it. Persist it
+    # into signals BEFORE the early return below — consumers of the
+    # non-qualifying path (/analisar watchlist appendix) need the real
+    # DD number to show "DD -22% (need <= -25%)" instead of "DD n/a"
+    # (user report 2026-07-02, LMT case).
     _high_52w_early = float(close.rolling(min(252, n)).max().iloc[-1])
     _dd_52w_early = (current_price / _high_52w_early - 1) if _high_52w_early > 0 else 0.0
+    signals["dd_from_52w_high"] = round(_dd_52w_early, 4)
     _is_tactical_dip = ret_20d < _ENTRY_RETURN_20D
     _is_deep_value   = _dd_52w_early < -0.25
     if not (_is_tactical_dip or _is_deep_value):

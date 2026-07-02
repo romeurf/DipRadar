@@ -2024,6 +2024,27 @@ def _build_allocation_appendix(symbol: str) -> str:
                 close, current_price, 0.0,
                 ticker=symbol, volume=volume,
             )
+            # _score_core_dip early-returns a sparse signals dict when the
+            # ticker doesn't qualify as a dip (its quality fetch happens
+            # AFTER the dip gate). /analisar is a diagnostic command — the
+            # criteria check must show REAL numbers ("GM 10% < median"),
+            # never "missing data" for data that exists. Top-up quality
+            # fields with a direct fetch when the gate skipped them
+            # (user report 2026-07-02, LMT case).
+            if signals.get("roe") is None and signals.get("gross_margin") is None:
+                try:
+                    from core.core_radar import _fetch_quality_metrics
+                    _q = _fetch_quality_metrics(symbol) or {}
+                    for _k_src, _k_dst in (
+                        ("roe", "roe"),
+                        ("gross_margin", "gross_margin"),
+                        ("revenue_growth", "revenue_growth"),
+                        ("fcf_yield", "fcf_yield_fund"),
+                    ):
+                        if signals.get(_k_dst) is None and _q.get(_k_src) is not None:
+                            signals[_k_dst] = _q[_k_src]
+                except Exception as _qe:
+                    logging.debug(f"_build_allocation_appendix({symbol}) quality top-up: {_qe}")
         except Exception as e:
             logging.warning(f"_build_allocation_appendix({symbol}) signals: {e}")
             return ""

@@ -892,9 +892,18 @@ def get_catalyst(symbol: str, company_name: str = "") -> dict:
             snippet = ""
             for r in data.get("results", []):
                 content = r.get("content") or ""
+                # (3) markdown heading runs ("## Industry News. ## Earnings
+                # Calendar. ## Music news.") — page nav/section scaffolding
+                # from scraped articles, not news. Content dominated by
+                # headings produced the garbage "Earnings próximo: ##
+                # Industry News ## Music news" seen in the LMT alert
+                # (2026-07-02). Skip these results entirely.
+                if content.count("##") >= 2:
+                    continue
                 content = _url_re.sub("", content)
                 content = _mdlink_re.sub(r"\1", content)
                 content = _bracket_re.sub("", content)
+                content = _re.sub(r"#{1,6}\s*", "", content)  # stray single headings
                 # Collapse runs of whitespace introduced by the strips
                 content = _re.sub(r"\s+", " ", content)
                 idx = content.lower().find(keyword)
