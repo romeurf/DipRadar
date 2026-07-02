@@ -44,7 +44,7 @@ cloudscraper>=1.2.71
 # investing.com is Cloudflare-blocked). Lazy-imported.
 pypdf>=4.0.0
 
-# LLM drop-attribution classifier for watchlist triage (core/llm_attribution.py).
-# Lazy-imported — bot boots and triage falls back to keyword scan if missing
-# or if ANTHROPIC_API_KEY is not set.
-anthropic>=0.92.0
+# LLM drop-attribution classifier (core/llm_attribution.py): the shipped
+# backend is the Gemini FREE tier via plain REST (`requests`, above) —
+# set GEMINI_API_KEY to enable. The optional paid Anthropic backend needs
+# `pip install anthropic` (deliberately not listed: tudo free).

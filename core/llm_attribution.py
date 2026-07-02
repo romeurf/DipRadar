@@ -9,7 +9,7 @@ evidence. This automates the judgment the user applied manually to the
 kills keyword false-positives (a Datadog "price target cut" headline
 in the ESTC feed used to flag ESTC as event-risk).
 
-Categories (fixed enum, enforced by json_schema):
+Categories (fixed enum, enforced by response schema):
   corporate_event   merger/acquisition/spin-off — the analyzed company
                     stops existing in that form; thesis changes
   deterioration     guidance cut, structural damage, restatement —
@@ -24,21 +24,28 @@ Honest-by-construction (enforced by the caller, triage_watchlist):
     never promote, never predicts alpha — it explains, it doesn't score
   - the triage reason always carries the explanation + headline snippet
     so the human can dismiss a false flag in seconds
-  - ANY failure (no API key, SDK missing, API error, refusal, bad JSON)
+  - ANY failure (no API key, API error, refusal/safety block, bad JSON)
     → return None → caller runs the keyword scan, byte-identical to the
     pre-LLM behavior
 
-Config (env vars):
-  ANTHROPIC_API_KEY    required; absent → classifier disabled, keyword
-                       fallback everywhere (bot works without it)
-  DIPRADAR_LLM_TRIAGE  "0" to force-disable even with a key present
-  DIPRADAR_LLM_MODEL   default "claude-opus-4-8"; e.g. "claude-haiku-4-5"
-                       for ~20x cheaper classification
+Providers (auto-detected, free-first):
+  gemini     GEMINI_API_KEY — Google AI Studio (aistudio.google.com/apikey).
+             FREE tier (~250 req/day on flash — the watchdog + /cash use
+             ~15/day). Plain REST via `requests`, no extra dependency.
+             Default model: gemini-2.5-flash. PREFERRED when key present.
+  anthropic  ANTHROPIC_API_KEY — paid credits; needs `pip install anthropic`
+             (deliberately NOT in requirements.txt — the shipped path is
+             the free Gemini tier). Default model: claude-opus-4-8.
 
-Cost note: ~750 input + ~120 output tokens per name → ~$0.007/name on
-Opus 4.8. Watchdog (1x/day) + interactive /cash runs classify only
-non-EXCLUDED names with headlines; the 6h result cache means the same
-ticker+headlines pair is never billed twice in a day.
+Config (env vars):
+  GEMINI_API_KEY        enables the free Gemini backend (preferred)
+  ANTHROPIC_API_KEY     enables the Anthropic backend (paid, optional)
+  DIPRADAR_LLM_PROVIDER "gemini" | "anthropic" — force one; default auto
+                        (gemini first, then anthropic)
+  DIPRADAR_LLM_TRIAGE   "0" to force-disable everything → keyword fallback
+  DIPRADAR_LLM_MODEL    override the ACTIVE provider's default model
+                        (Gemini: must be a 2.5-family model — 2.0 rejects
+                        the thinkingConfig field we send)
 """
 from __future__ import annotations
 
@@ -51,7 +58,10 @@ from typing import Optional
 
 log = logging.getLogger("llm_attribution")
 
-_DEFAULT_MODEL = "claude-opus-4-8"
+_DEFAULT_MODELS = {
+    "gemini":    "gemini-2.5-flash",
+    "anthropic": "claude-opus-4-8",
+}
 
 CATEGORIES = (
     "corporate_event",
@@ -65,7 +75,8 @@ CATEGORIES = (
 FLAG_CATEGORIES = ("corporate_event", "deterioration")
 
 # Result cache: same ticker + same headline set → same answer. 6h TTL
-# bounds cost when /cash, /scan_now and the watchdog run on the same day.
+# bounds API usage when /cash, /scan_now and the watchdog run on the
+# same day (also keeps us far inside the Gemini free-tier daily quota).
 _CACHE_TTL_SEC = 6 * 3600
 _result_cache: dict[str, tuple[float, "DropAttribution"]] = {}
 
@@ -75,7 +86,8 @@ _result_cache: dict[str, tuple[float, "DropAttribution"]] = {}
 _BREAKER_SEC = 600
 _disabled_until: float = 0.0
 
-_client = None  # lazy anthropic.Anthropic singleton
+_client = None            # lazy anthropic.Anthropic singleton
+_logged_provider = False  # one INFO line per process for Railway logs
 
 
 @dataclass
@@ -112,10 +124,13 @@ outras empresas, usa "unclear".
 e falsos alarmes têm custo. Mas um corporate_event ou deterioration claro NUNCA deve \
 passar despercebido.
 - explanation: 1 frase em português, concreta, citando o facto relevante (valores, nomes).
-- key_headline: copia EXATAMENTE o título da headline decisiva, ou "" se nenhuma."""
+- key_headline: copia EXATAMENTE o título da headline decisiva, ou "" se nenhuma.
+
+Responde APENAS com o JSON pedido."""
 
 
-_SCHEMA = {
+# Anthropic structured-outputs schema (JSON Schema draft subset).
+_ANTHROPIC_SCHEMA = {
     "type": "object",
     "properties": {
         "category": {"type": "string", "enum": list(CATEGORIES)},
@@ -127,21 +142,57 @@ _SCHEMA = {
     "additionalProperties": False,
 }
 
+# Gemini responseSchema (proto Schema — UPPERCASE type enum names).
+_GEMINI_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "category":     {"type": "STRING", "enum": list(CATEGORIES)},
+        "explanation":  {"type": "STRING"},
+        "key_headline": {"type": "STRING"},
+        "confidence":   {"type": "STRING", "enum": ["high", "medium", "low"]},
+    },
+    "required": ["category", "explanation", "key_headline", "confidence"],
+}
+
+_GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+)
+
+
+def _anthropic_sdk_ok() -> bool:
+    try:
+        import anthropic  # noqa: F401 — availability probe only
+        return True
+    except ImportError:
+        return False
+
+
+def _active_provider() -> Optional[str]:
+    """Which backend can run right now. Free-first: gemini preferred when
+    its key is present; DIPRADAR_LLM_PROVIDER forces one (still requires
+    the matching key). None → classifier disabled → keyword fallback."""
+    forced = (os.getenv("DIPRADAR_LLM_PROVIDER") or "").strip().lower()
+    order = [forced] if forced in ("gemini", "anthropic") else ["gemini", "anthropic"]
+    for prov in order:
+        if prov == "gemini" and os.getenv("GEMINI_API_KEY"):
+            return "gemini"
+        if prov == "anthropic" and os.getenv("ANTHROPIC_API_KEY") and _anthropic_sdk_ok():
+            return "anthropic"
+    return None
+
+
+def _model_for(provider: str) -> str:
+    return os.getenv("DIPRADAR_LLM_MODEL") or _DEFAULT_MODELS[provider]
+
 
 def is_enabled() -> bool:
-    """True when the classifier can run: key present, not force-disabled,
-    SDK installed, circuit breaker not tripped."""
+    """True when the classifier can run: not force-disabled, breaker not
+    tripped, and at least one provider has a usable key."""
     if (os.getenv("DIPRADAR_LLM_TRIAGE") or "").strip() == "0":
-        return False
-    if not os.getenv("ANTHROPIC_API_KEY"):
         return False
     if time.time() < _disabled_until:
         return False
-    try:
-        import anthropic  # noqa: F401 — availability probe only
-    except ImportError:
-        return False
-    return True
+    return _active_provider() is not None
 
 
 def classify_drop(
@@ -157,11 +208,14 @@ def classify_drop(
     Returns None on any failure — the caller MUST treat None as "run the
     keyword fallback", never as "no event risk".
     """
-    global _disabled_until
+    global _disabled_until, _logged_provider
 
     if not headlines:
         return None
     if time.time() < _disabled_until:
+        return None
+    provider = _active_provider()
+    if provider is None:
         return None
 
     titles = tuple((getattr(h, "title", "") or "") for h in headlines[:10])
@@ -170,14 +224,18 @@ def classify_drop(
     if cached and (time.time() - cached[0]) < _CACHE_TTL_SEC:
         return cached[1]
 
+    if not _logged_provider:
+        log.info(f"[llm-attribution] provider={provider} model={_model_for(provider)}")
+        _logged_provider = True
+
     try:
-        raw = _call_api(ticker, headlines, dd_pct, sector_rel_pp, sector)
+        raw = _call_api(provider, ticker, headlines, dd_pct, sector_rel_pp, sector)
     except Exception as e:
         # Trip the breaker: one failure → keyword fallback for 10 min,
         # instead of a timeout per remaining name in the scan.
         _disabled_until = time.time() + _BREAKER_SEC
         log.warning(
-            f"[llm-attribution] {ticker}: API falhou ({e}) — "
+            f"[llm-attribution] {ticker}: {provider} falhou ({e}) — "
             f"keyword fallback pelos próximos {_BREAKER_SEC // 60} min"
         )
         return None
@@ -192,16 +250,6 @@ def classify_drop(
         f"({result.confidence}) — {result.explanation[:80]}"
     )
     return result
-
-
-def _get_client():
-    global _client
-    if _client is None:
-        import anthropic
-        # 20s timeout + 1 retry: triage runs sequentially over ~5-15
-        # names; a slow API must degrade to keywords, not stall /cash.
-        _client = anthropic.Anthropic(timeout=20.0, max_retries=1)
-    return _client
 
 
 def _build_user_msg(ticker, headlines, dd_pct, sector_rel_pp, sector) -> str:
@@ -230,13 +278,85 @@ def _build_user_msg(ticker, headlines, dd_pct, sector_rel_pp, sector) -> str:
     return "\n".join(lines)
 
 
-def _call_api(ticker, headlines, dd_pct, sector_rel_pp, sector) -> str:
+def _call_api(provider, ticker, headlines, dd_pct, sector_rel_pp, sector) -> str:
+    if provider == "gemini":
+        return _call_gemini(ticker, headlines, dd_pct, sector_rel_pp, sector)
+    return _call_anthropic(ticker, headlines, dd_pct, sector_rel_pp, sector)
+
+
+# ── Gemini backend (free tier, plain REST) ───────────────────────────
+
+def _call_gemini(ticker, headlines, dd_pct, sector_rel_pp, sector) -> str:
+    import requests
+    model = _model_for("gemini")
+    body = {
+        "systemInstruction": {"parts": [{"text": _SYSTEM_PROMPT}]},
+        "contents": [{
+            "role": "user",
+            "parts": [{"text": _build_user_msg(
+                ticker, headlines, dd_pct, sector_rel_pp, sector)}],
+        }],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": _GEMINI_SCHEMA,
+            "maxOutputTokens": 1024,
+            "temperature": 0.0,
+            # 2.5-flash "thinks" by default and thoughts bill against
+            # maxOutputTokens — an unbounded think can eat the whole
+            # budget and return empty text. Disable it: classification
+            # of 8 headlines doesn't need it. (2.5-family only; 2.0
+            # models reject this field → breaker → keyword fallback.)
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }
+    resp = requests.post(
+        _GEMINI_URL.format(model=model),
+        headers={
+            "x-goog-api-key": os.environ["GEMINI_API_KEY"],
+            "Content-Type": "application/json",
+        },
+        json=body,
+        timeout=20,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Gemini HTTP {resp.status_code}: {resp.text[:200]}")
+    return _extract_gemini_text(resp.json())
+
+
+def _extract_gemini_text(payload) -> str:
+    """Pull the text out of a generateContent response. Defensive: safety
+    blocks / empty candidates / schema drift all collapse to "" (→ parse
+    None → keyword fallback), never an exception."""
+    try:
+        cands = payload.get("candidates") or []
+        content = (cands[0].get("content") or {}) if cands else {}
+        parts = content.get("parts") or []
+        return "".join(
+            p.get("text", "") for p in parts if isinstance(p, dict)
+        ).strip()
+    except (AttributeError, IndexError, TypeError):
+        return ""
+
+
+# ── Anthropic backend (paid credits, optional) ───────────────────────
+
+def _get_client():
+    global _client
+    if _client is None:
+        import anthropic
+        # 20s timeout + 1 retry: triage runs sequentially over ~5-15
+        # names; a slow API must degrade to keywords, not stall /cash.
+        _client = anthropic.Anthropic(timeout=20.0, max_retries=1)
+    return _client
+
+
+def _call_anthropic(ticker, headlines, dd_pct, sector_rel_pp, sector) -> str:
     client = _get_client()
     response = client.messages.create(
-        model=os.getenv("DIPRADAR_LLM_MODEL", _DEFAULT_MODEL),
+        model=_model_for("anthropic"),
         max_tokens=1024,
         system=_SYSTEM_PROMPT,
-        output_config={"format": {"type": "json_schema", "schema": _SCHEMA}},
+        output_config={"format": {"type": "json_schema", "schema": _ANTHROPIC_SCHEMA}},
         messages=[{
             "role": "user",
             "content": _build_user_msg(ticker, headlines, dd_pct, sector_rel_pp, sector),
@@ -247,9 +367,11 @@ def _call_api(ticker, headlines, dd_pct, sector_rel_pp, sector) -> str:
     return next((b.text for b in response.content if b.type == "text"), "")
 
 
+# ── Shared response parsing ──────────────────────────────────────────
+
 def _parse_response(raw: str) -> Optional[DropAttribution]:
-    """Defensive parse: json_schema output_config guarantees valid JSON on
-    success, but refusals/max_tokens/older-SDK paths can produce anything."""
+    """Defensive parse: both backends enforce a schema server-side, but
+    refusals/safety blocks/max_tokens/HTTP oddities can produce anything."""
     if not raw or not raw.strip():
         return None
     try:

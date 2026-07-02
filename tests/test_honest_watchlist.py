@@ -701,3 +701,124 @@ class TestLLMAttributionParsing:
         assert r.category == "unclear"
         assert r.explanation == ""
         assert r.confidence == "low"
+
+
+class TestLLMProviders:
+    """Provider auto-detection: free-first (Gemini preferred), forced
+    provider still requires its key, kill-switch and breaker win."""
+
+    def _reset(self, monkeypatch):
+        for var in ("GEMINI_API_KEY", "ANTHROPIC_API_KEY",
+                    "DIPRADAR_LLM_PROVIDER", "DIPRADAR_LLM_TRIAGE"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(la, "_disabled_until", 0.0)
+
+    def test_gemini_preferred_when_both_keys_present(self, monkeypatch):
+        self._reset(monkeypatch)
+        monkeypatch.setenv("GEMINI_API_KEY", "g")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "a")
+        monkeypatch.setattr(la, "_anthropic_sdk_ok", lambda: True)
+        assert la._active_provider() == "gemini"
+
+    def test_gemini_key_alone_enables(self, monkeypatch):
+        self._reset(monkeypatch)
+        monkeypatch.setenv("GEMINI_API_KEY", "g")
+        assert la._active_provider() == "gemini"
+        assert la.is_enabled() is True
+
+    def test_no_keys_disabled(self, monkeypatch):
+        self._reset(monkeypatch)
+        assert la._active_provider() is None
+        assert la.is_enabled() is False
+
+    def test_kill_switch_wins(self, monkeypatch):
+        self._reset(monkeypatch)
+        monkeypatch.setenv("GEMINI_API_KEY", "g")
+        monkeypatch.setenv("DIPRADAR_LLM_TRIAGE", "0")
+        assert la.is_enabled() is False
+
+    def test_forced_provider_requires_its_key(self, monkeypatch):
+        """DIPRADAR_LLM_PROVIDER=anthropic without a usable anthropic
+        setup must NOT silently fall back to gemini."""
+        self._reset(monkeypatch)
+        monkeypatch.setenv("GEMINI_API_KEY", "g")
+        monkeypatch.setenv("DIPRADAR_LLM_PROVIDER", "anthropic")
+        monkeypatch.setattr(la, "_anthropic_sdk_ok", lambda: False)
+        assert la._active_provider() is None
+
+    def test_anthropic_when_only_its_key_and_sdk(self, monkeypatch):
+        self._reset(monkeypatch)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "a")
+        monkeypatch.setattr(la, "_anthropic_sdk_ok", lambda: True)
+        assert la._active_provider() == "anthropic"
+
+    def test_anthropic_key_without_sdk_disabled(self, monkeypatch):
+        """The Railway reality: ANTHROPIC_API_KEY set but the sdk is not
+        in requirements — provider must resolve to None, not crash."""
+        self._reset(monkeypatch)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "a")
+        monkeypatch.setattr(la, "_anthropic_sdk_ok", lambda: False)
+        assert la._active_provider() is None
+
+    def test_breaker_disables(self, monkeypatch):
+        self._reset(monkeypatch)
+        monkeypatch.setenv("GEMINI_API_KEY", "g")
+        monkeypatch.setattr(la, "_disabled_until", la.time.time() + 60)
+        assert la.is_enabled() is False
+
+    def test_model_override_applies_to_active_provider(self, monkeypatch):
+        self._reset(monkeypatch)
+        monkeypatch.setenv("DIPRADAR_LLM_MODEL", "gemini-2.5-flash-lite")
+        assert la._model_for("gemini") == "gemini-2.5-flash-lite"
+        monkeypatch.delenv("DIPRADAR_LLM_MODEL")
+        assert la._model_for("gemini") == "gemini-2.5-flash"
+        assert la._model_for("anthropic") == "claude-opus-4-8"
+
+
+class TestGeminiExtraction:
+    """_extract_gemini_text: the generateContent envelope → JSON string.
+    Safety blocks and schema drift must collapse to "" (keyword fallback),
+    never raise."""
+
+    def test_realistic_payload(self):
+        import json as _json
+        inner = _json.dumps({
+            "category": "corporate_event",
+            "explanation": "MKC anunciou fusão de $44.8B",
+            "key_headline": "McCormick announces $44.8B merger",
+            "confidence": "high",
+        })
+        payload = {
+            "candidates": [{
+                "content": {"parts": [{"text": inner}], "role": "model"},
+                "finishReason": "STOP",
+            }],
+            "usageMetadata": {"promptTokenCount": 700},
+        }
+        text = la._extract_gemini_text(payload)
+        r = la._parse_response(text)
+        assert r is not None
+        assert r.category == "corporate_event"
+        assert "$44.8B" in r.explanation
+
+    def test_multi_part_concatenated(self):
+        payload = {"candidates": [{"content": {"parts": [
+            {"text": '{"category": '}, {"text": '"unclear"}'},
+        ]}}]}
+        assert la._extract_gemini_text(payload) == '{"category": "unclear"}'
+
+    def test_empty_candidates(self):
+        assert la._extract_gemini_text({"candidates": []}) == ""
+
+    def test_safety_block_no_candidates(self):
+        payload = {"promptFeedback": {"blockReason": "SAFETY"}}
+        assert la._extract_gemini_text(payload) == ""
+
+    def test_candidate_without_content(self):
+        # finishReason SAFETY mid-generation: candidate present, no parts
+        payload = {"candidates": [{"finishReason": "SAFETY"}]}
+        assert la._extract_gemini_text(payload) == ""
+
+    def test_garbage_payload(self):
+        assert la._extract_gemini_text({}) == ""
+        assert la._extract_gemini_text({"candidates": [{"content": {"parts": "?"}}]}) == ""
