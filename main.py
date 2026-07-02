@@ -3893,12 +3893,12 @@ def main() -> None:
         id="rejected_outcomes", name="Shadow Portfolio Rejeições",
     )
 
-    # ── Monthly ML Retrain — DipRadar: dia 1, 06:00 Lisboa ────────────────────
-    scheduler.add_job(
-        run_monthly_retrain,
-        CronTrigger(day=1, hour=6, minute=0, timezone=LISBON_TZ),
-        id="monthly_retrain", name="Monthly ML Retrain (DipRadar)",
-    )
+    # ── Monthly ML Retrain — REMOVED (2026-07-02) ─────────────────────────────
+    # The DIP retrain cron kept promoting models monthly (2400s compute) that
+    # nothing consumes: ML scoring is inert (DIPRADAR_USE_ML_SCORE=0 default)
+    # and production scoring is DIPRADAR_SCORING_MODE=watchlist after the
+    # F.5 validation REVERT. run_monthly_retrain stays available for manual
+    # invocation via /admin_retrain if ML is ever revisited.
 
     # ── Monthly Retrain — MomentumRadar: dia 1, 08:00 Lisboa ──────────────────
     # Corre 2h após o DipRadar retrain para não competir por recursos.
@@ -3977,11 +3977,11 @@ def main() -> None:
             logging.error(f"[momentum_retrain] {e}", exc_info=True)
             send_telegram(f"❌ MomentumRadar retrain falhou: {e}")
 
-    scheduler.add_job(
-        _run_momentum_monthly,
-        CronTrigger(day=1, hour=8, minute=0, timezone=LISBON_TZ),
-        id="momentum_retrain", name="Monthly Retrain (MomentumRadar)",
-    )
+    # Momentum retrain cron REMOVED (2026-07-02): the trainer is a RETIRED
+    # stub (anti-predictive, CV IC = -0.0042) — the cron fired monthly, hit
+    # the stub's RuntimeError and spammed the traceback to Telegram.
+    # _run_momentum_monthly stays defined for the admin command path, which
+    # surfaces the retirement message deliberately when invoked by hand.
 
     # ── CoreRadar Retrain — dia 1, 07h00 Lisboa (entre DIP e Momentum) ────────
     # Previously missing! Core stayed with whatever model was trained manually
@@ -4050,11 +4050,10 @@ def main() -> None:
             logging.error(f"[core_retrain] {e}", exc_info=True)
             send_telegram(f"❌ Core retrain falhou: {e}")
 
-    scheduler.add_job(
-        _run_core_monthly,
-        CronTrigger(day=1, hour=7, minute=0, timezone=LISBON_TZ),
-        id="core_retrain", name="Monthly Retrain (CoreRadar)",
-    )
+    # Core retrain cron REMOVED (2026-07-02): CoreRadar runs rule-based in
+    # watchlist mode; the ML bundle it retrained is gated off by default
+    # (DIPRADAR_USE_ML_SCORE=0). _run_core_monthly stays defined for manual
+    # invocation if the ML path is ever revalidated.
 
     # ── Paper Trading: update diário de posições abertas (22:50 Lisboa) ───────
     # Fecha posições que atingiram o target ou esgotaram o hold_days.
