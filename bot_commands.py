@@ -928,8 +928,14 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
             by_bucket.setdefault(bucket, []).append((sym, pos))
             total_cost += pos.get("total_cost", 0)
 
+        # total_cost is USD (shares × USD avg_price) — convert for honest
+        # EUR display. Bucket % is a ratio, unit-free.
+        from data.market_client import get_usdeur as _get_usdeur
+        _fx_sync = _get_usdeur()
+
         lines = [
-            f"💼 *Carteira* — {len(positions)} posições, cost basis €{total_cost:.2f}",
+            f"💼 *Carteira* — {len(positions)} posições, "
+            f"cost basis €{total_cost * _fx_sync:.2f} (≈${total_cost:.0f} @ {_fx_sync:.4f})",
             "",
         ]
         for bucket in ("CORE", "ROTATION", "MOMENTUM", "DIP", "UNCATEGORIZED"):
@@ -938,11 +944,11 @@ def _handle_sync_portfolio(parts: list[str]) -> None:
             entries_b = by_bucket[bucket]
             bucket_cost = sum(p.get("total_cost", 0) for _, p in entries_b)
             bucket_pct = (bucket_cost / total_cost * 100) if total_cost > 0 else 0.0
-            lines.append(f"*{bucket}* — €{bucket_cost:.2f} ({bucket_pct:.1f}%)")
+            lines.append(f"*{bucket}* — €{bucket_cost * _fx_sync:.2f} ({bucket_pct:.1f}%)")
             for sym, pos in entries_b:
                 lines.append(
                     f"  • `{sym}`: {pos.get('shares', 0):g} @ ${pos.get('avg_price', 0):.2f}"
-                    f" (cost €{pos.get('total_cost', 0):.2f})"
+                    f" (cost ${pos.get('total_cost', 0):.2f})"
                 )
             lines.append("")
 
@@ -6303,13 +6309,25 @@ def _handle_command(text: str) -> None:
                 total_pnl   = total_value - total_cost
                 total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0.0
 
+                # Values above are USD (prices × shares, cost = USD basis).
+                # Convert for honest EUR display; ratios (pnl_pct, bucket %)
+                # are unit-free and stay as computed.
+                from data.market_client import get_usdeur as _get_usdeur
+                _fx = _get_usdeur()
+                total_value_eur = total_value * _fx
+                total_cost_eur  = total_cost * _fx
+                total_pnl_eur   = total_pnl * _fx
+
                 # ── Build output ──────────────────────────────────────
                 lines: list[str] = []
                 lines.append(f"📊 *Monthly Portfolio Check* — {_dt.utcnow().strftime('%Y-%m-%d')}")
                 lines.append("")
-                lines.append(f"💼 *Total*: €{total_value:.2f} (cost €{total_cost:.2f})")
                 lines.append(
-                    f"   PnL: €{total_pnl:+.2f} ({total_pnl_pct:+.2f}%)"
+                    f"💼 *Total*: €{total_value_eur:.2f} (cost €{total_cost_eur:.2f}, "
+                    f"≈${total_value:.0f} @ {_fx:.4f})"
+                )
+                lines.append(
+                    f"   PnL: €{total_pnl_eur:+.2f} ({total_pnl_pct:+.2f}%)"
                 )
                 lines.append("")
 
@@ -6320,7 +6338,7 @@ def _handle_command(text: str) -> None:
                     pct = (v / total_value * 100) if total_value > 0 else 0.0
                     n = len(portfolio_by_bucket[b])
                     if n > 0:
-                        lines.append(f"   {b}: €{v:.2f} ({pct:.1f}%) — {n} posições")
+                        lines.append(f"   {b}: €{v * _fx:.2f} ({pct:.1f}%) — {n} posições")
                 lines.append("")
 
                 # Per-bucket position details with state
@@ -6361,7 +6379,7 @@ def _handle_command(text: str) -> None:
                             conc_marker = " ⚠️"
                         lines.append(
                             f"  {state_emoji} `{s['ticker']:<5}` "
-                            f"€{s['value_now']:>7.0f} ({pnl_str}) "
+                            f"€{s['value_now'] * _fx:>7.0f} ({pnl_str}) "
                             f"{conc_pct:>4.1f}%{conc_marker} {days_str}"
                         )
                         # Reason on a separate line if non-HOLD
@@ -6617,26 +6635,30 @@ def _handle_command(text: str) -> None:
 
                 CONCENTRATION_HARD = 0.30
 
-                # Portfolio state. /sync_portfolio populates `total_cost`
-                # (USD: shares × avg_price), NOT value_eur/cost_eur — those
-                # come from a different (older) code path. For concentration
-                # cap math the unit doesn't matter (it's a ratio), so we
-                # use total_cost directly. Falls back to value_eur/cost_eur
-                # if total_cost missing (older position records).
+                # Portfolio state. /sync_portfolio populates `total_cost` in
+                # USD (shares × USD avg_price). The budget (cash_amount) is
+                # EUR, so BOTH display and cap math need the portfolio in
+                # EUR — `new_total = portfolio_value + remaining` mixing USD
+                # with EUR was a real unit bug, not just a label problem.
+                # get_usdeur() has a built-in 0.92 fallback + warning log on
+                # FX fetch failure, so this never raises.
+                from data.market_client import get_usdeur
+                _usdeur = get_usdeur()
                 positions = get_positions() or {}
-                portfolio_value = sum(
+                _portfolio_value_usd = sum(
                     float(p.get("total_cost") or p.get("value_eur") or p.get("cost_eur") or 0)
                     for p in positions.values()
                 )
+                portfolio_value = _portfolio_value_usd * _usdeur  # EUR
                 ticker_current_value = {}
                 for sym, pos in positions.items():
-                    val = float(
+                    val_usd = float(
                         pos.get("total_cost")
                         or pos.get("value_eur")
                         or pos.get("cost_eur")
                         or 0
                     )
-                    ticker_current_value[sym.upper()] = val
+                    ticker_current_value[sym.upper()] = val_usd * _usdeur  # EUR
 
                 # Regime context for cash buffer guidance
                 try:
@@ -6654,7 +6676,10 @@ def _handle_command(text: str) -> None:
 
                 lines = ["💰 *Allocation Proposal — Watchlist mode*"]
                 lines.append("")
-                lines.append(f"📊 Portfolio: live €{portfolio_value:,.0f} | {len(positions)} positions")
+                lines.append(
+                    f"📊 Portfolio: €{portfolio_value:,.0f} "
+                    f"(≈${_portfolio_value_usd:,.0f} @ {_usdeur:.4f}) | {len(positions)} positions"
+                )
                 lines.append(f"💵 Cash inflow: €{cash_amount:,.2f}")
                 lines.append(f"{_badge} Regime: *{_r_label}* ({_r_score:.0f}/100) | cash target {_r_target}%")
                 lines.append("")
@@ -6900,6 +6925,14 @@ def _handle_command(text: str) -> None:
                     return 0.0
 
                 # ── State current portfolio (cost basis + live value) ──────
+                # NOTE (unit audit 2026-07-02): portfolio_value here is USD
+                # (live USD prices × shares) but is later mixed with EUR
+                # budgets and rendered with € labels. This LEGACY Kelly path
+                # only runs when DIPRADAR_SCORING_MODE is composite or
+                # dislocation (watchlist has its own FX-correct branch). Not
+                # fixed here to avoid touching gated legacy semantics — if
+                # this path is ever revived, apply get_usdeur() conversion
+                # like _run_allocation_watchlist does.
                 positions = get_positions()
                 portfolio_by_bucket: dict = {
                     "CORE": [], "ROTATION": [], "MOMENTUM": [], "DIP": [],
@@ -9708,12 +9741,16 @@ def _handle_command(text: str) -> None:
                 r_target = regime.get("cash_target_pct", 20)
                 qdd = regime.get("components", {}).get("quality_dd", {})
 
-                # Portfolio cash position estimate
+                # Portfolio cash position estimate. total_cost is USD
+                # (shares × USD avg_price) — the fields value_eur/cost_eur
+                # don't exist on /sync_portfolio records, which made this
+                # sum silently 0. Use total_cost + FX conversion.
+                from data.market_client import get_usdeur as _get_usdeur
                 positions = get_positions()
                 portfolio_value = sum(
-                    float(p.get("value_eur") or p.get("cost_eur") or 0)
+                    float(p.get("total_cost") or p.get("value_eur") or p.get("cost_eur") or 0)
                     for p in positions.values()
-                )
+                ) * _get_usdeur()
 
                 badge = {"FROTHY": "🟦", "NEUTRAL": "🟨", "PANIC": "🟥"}.get(r_label, "⚪")
                 lines = [

@@ -538,7 +538,30 @@ def run_daily_digest(clear_after: bool = True, label: str = "Digest") -> int:
         "",
     ]
 
-    if top_3:
+    # Digest format is mode-scoped: in watchlist mode we do NOT show
+    # "α esperado" / win_prob — those come from the ML layer that failed
+    # the F.5 validation gate ("the numbers you learned not to trust").
+    # In composite/dislocation legacy modes the OLD format is UNCHANGED.
+    try:
+        from core.scoring_dispatch import get_active_scorer
+        _watchlist_mode = get_active_scorer() == "watchlist"
+    except Exception:
+        _watchlist_mode = True  # safe default: honest format
+
+    if top_3 and _watchlist_mode:
+        lines.append("🏆 *Top 3 por score*:")
+        for i, e in enumerate(top_3, 1):
+            ticker = e.get("ticker", "?")
+            score  = e.get("score")
+            score_s = f"score {score:.0f}" if score is not None else "score n/d"
+            atype  = e.get("alert_type", "?")
+            tag    = " 📦" if e.get("in_portfolio") else ""
+            lines.append(f"  {i}. *{ticker}*{tag} [{atype}] {score_s}")
+            if e.get("summary"):
+                lines.append(f"     _{e['summary']}_")
+        lines.append("")
+    elif top_3:
+        # LEGACY modes (composite/dislocation): old α-ranked format as-is
         lines.append("🏆 *Top 3 ranked por α esperado*:")
         for i, e in enumerate(top_3, 1):
             ticker = e.get("ticker", "?")
@@ -563,8 +586,11 @@ def run_daily_digest(clear_after: bool = True, label: str = "Digest") -> int:
         lines.append("")
 
     if liquidity is not None:
-        lines.append(f"💰 Liquidez actual: *€{liquidity:.2f}*")
-        lines.append(f"   Próximo passo: `/cash {liquidity:.0f}` para o ranking ROI completo.")
+        if liquidity > 0:
+            lines.append(f"💰 Liquidez actual: *€{liquidity:.2f}*")
+            lines.append(f"   Próximo passo: `/cash {liquidity:.0f}` para proposta de allocation.")
+        else:
+            lines.append("💰 Sem liquidez — lista informativa apenas (sem sizing).")
         lines.append("")
 
     lines.append(
@@ -667,21 +693,28 @@ def send_heartbeat() -> None:
     # math to /cash, which has all the live inputs.
 
     if total > 0:
+        # Generic 10-step monitoring ladder (user decision 2026-07-02:
+        # "de 10 em 10 — 30, 20 e 10"). Replaces the old per-ticker
+        # hardcodes (NVO >= 28, ADBE "limite é 10-12%") with one policy
+        # applied uniformly. NOTE: this ladder governs MONITORING alerts
+        # on existing positions; the separate 25% soft / 30% hard caps
+        # govern BUY eligibility in /cash + watchlist triage. Two scales,
+        # two purposes — both deliberate.
         concentration_warnings = []
         for pos in snapshot["positions"]:
             weight = pos["value_eur"] / total * 100
             sym = pos["symbol"]
-            if sym == "NVO" and weight >= 28:
+            if weight >= 30:
                 concentration_warnings.append(
-                    f"  ⚠️ *NVO*: {weight:.1f}% do portfólio — limite é 30%"
+                    f"  🔴 *{sym}*: {weight:.1f}% — acima do hard cap 30%, não reforçar"
                 )
-            elif sym == "ADBE" and weight >= 11:
+            elif weight >= 20:
                 concentration_warnings.append(
-                    f"  ⚠️ *ADBE*: {weight:.1f}% — limite é 10–12%, não reforçar"
+                    f"  🟠 *{sym}*: {weight:.1f}% — concentração elevada (≥20%)"
                 )
-            elif weight >= 20 and sym not in ("NVO",):
+            elif weight >= 10:
                 concentration_warnings.append(
-                    f"  ⚠️ *{sym}*: {weight:.1f}% — posição pesada, monitorizar"
+                    f"  🟡 *{sym}*: {weight:.1f}% — posição relevante (≥10%), monitorizar"
                 )
         # 'Core (EUNL+PPR)' warning removed (2026-06-12). The 35% minimum
         # was hardcoded against an old asset allocation model. The user's
@@ -1429,14 +1462,45 @@ def build_flip_ranking(ranked_entries: list[dict], spy_change: float | None, exc
         _, strategy   = calculate_flip_target(f, s, earnings, catalyst, spy_change, category=category)
         badge         = score_badge(s)
         tier_badge    = {1: "🔴T1", 2: "🟡T2", 3: "🔵T3"}.get(tier, "")
-        _, sizing_str = suggest_position_size(
-            score=s, beta=beta, earnings_days=earnings_days, spy_change=spy_change,
-        )
+        # Sizing line is mode-scoped + liquidity-gated (per user report:
+        # "€42 (40% do orçamento)" was rendered with €0 liquidity because
+        # suggest_position_size never reads liquidity — it derives from
+        # FLIP_FUND_EUR × score multipliers).
+        #   watchlist mode: show sizing ONLY when there is actual liquidity;
+        #                   otherwise an honest "sem liquidez" note.
+        #   legacy modes (composite/dislocation): old behavior unchanged.
+        sizing_line = None
+        try:
+            from core.scoring_dispatch import get_active_scorer as _gas
+            _wl_mode = _gas() == "watchlist"
+        except Exception:
+            _wl_mode = True
+        if _wl_mode:
+            try:
+                from portfolio.portfolio import get_liquidity as _get_liq
+                _liq = _get_liq()
+            except Exception:
+                _liq = 0.0
+            if _liq and _liq > 0:
+                _, sizing_str = suggest_position_size(
+                    score=s, beta=beta, earnings_days=earnings_days, spy_change=spy_change,
+                )
+                if sizing_str:
+                    sizing_line = f"   💶 *Sizing:* {sizing_str}"
+            else:
+                sizing_line = "   💶 _Sem liquidez — sizing via /cash quando houver._"
+        else:
+            _, sizing_str = suggest_position_size(
+                score=s, beta=beta, earnings_days=earnings_days, spy_change=spy_change,
+            )
+            if sizing_str:
+                sizing_line = f"   💶 *Sizing:* {sizing_str}"
+
         lines.append(f"*{i}. {sym}*{in_portfolio} {tier_badge} | Score {s:.0f}/100 {badge} | {category}")
         lines.append(f"   💰 ${price} | 🏦 ${mc_b:.1f}B")
         lines.append(f"   {strategy}")
-        if sizing_str:
-            lines.append(f"   💶 *Sizing:* {sizing_str}")
+        if sizing_line:
+            lines.append(sizing_line)
         lines.append("")
     return "\n".join(lines)
 
@@ -1738,7 +1802,21 @@ def build_alert(
         f"\n*Estratégia:* {strategy}"
         f"{macro_ctx}"
     )
-    if no_liquidity:
+    # In watchlist mode the sizing gate consults the REAL liquidity ledger
+    # (portfolio.get_liquidity), not the monthly-budget arithmetic that
+    # `no_liquidity` was derived from — the budget resets on day 1 and made
+    # sizing "€42 (40% do orçamento)" render with €0 actual cash (user
+    # report 2026-07-02). Legacy modes keep the old no_liquidity semantics.
+    _real_liq_ok = True
+    try:
+        from core.scoring_dispatch import get_active_scorer as _gas_alert
+        if _gas_alert() == "watchlist":
+            from portfolio.portfolio import get_liquidity as _gl_alert
+            _real_liq_ok = (_gl_alert() or 0) > 0
+    except Exception:
+        pass
+
+    if no_liquidity or not _real_liq_ok:
         body += "\n⚠️ _Sem liquidez disponível — alerta para referência e monitorização. Sem compra executada._"
     elif sizing_str and verdict not in ("EVITAR", "REJEITAR"):
         # Suppress sizing when the verdict is reject — showing "💶 Sizing: €20"
@@ -1953,19 +2031,23 @@ def _build_allocation_appendix(symbol: str) -> str:
             positions = get_positions() or {}
         except Exception:
             positions = {}
-        # /sync_portfolio stores `total_cost` (USD = shares × avg_price);
-        # value_eur/cost_eur are legacy/alternate fields. Try total_cost first.
+        # /sync_portfolio stores `total_cost` in USD (shares × USD avg_price);
+        # value_eur/cost_eur are legacy/alternate fields. Convert to EUR so
+        # display labels are honest and headroom math doesn't mix currencies
+        # with EUR budgets. get_usdeur() has a built-in 0.92 fallback.
+        from data.market_client import get_usdeur
+        _usdeur = get_usdeur()
         portfolio_value = sum(
             float(p.get("total_cost") or p.get("value_eur") or p.get("cost_eur") or 0)
             for p in positions.values()
-        )
+        ) * _usdeur
         ticker_pos = positions.get(symbol, {}) if isinstance(positions, dict) else {}
         current_pos_eur = float(
             ticker_pos.get("total_cost")
             or ticker_pos.get("value_eur")
             or ticker_pos.get("cost_eur")
             or 0
-        )
+        ) * _usdeur
         current_pct = (current_pos_eur / portfolio_value) if portfolio_value > 0 else 0.0
         cap_eur = portfolio_value * 0.30 if portfolio_value > 0 else 0.0
         headroom = max(0.0, cap_eur - current_pos_eur) if portfolio_value > 0 else float("inf")
@@ -2063,7 +2145,7 @@ def _build_allocation_appendix(symbol: str) -> str:
                 concentration_cap_pct=0.30,
                 portfolio_value_eur=portfolio_value,
                 current_positions_eur={
-                    t: float((p.get("value_eur") or p.get("cost_eur") or 0))
+                    t: float((p.get("total_cost") or p.get("value_eur") or p.get("cost_eur") or 0)) * _usdeur
                     for t, p in positions.items() if isinstance(p, dict)
                 },
             )

@@ -960,6 +960,22 @@ def format_core_alert(opp: dict) -> str:
     yield_line = f"\n  Yield: *{ann_yield:.1f}%/ano*" if ann_yield >= 1 else ""
     note_line  = f"\n  _{note}_" if note else ""
 
+    # Sizing line is mode-scoped. In watchlist mode /cash is the single
+    # source of truth for sizing — the per-alert "Alocação sugerida €X"
+    # came from _suggest_core_allocation (monthly-budget remaining), which
+    # jumped €50 → €425 on the day-1 budget reset regardless of the user's
+    # actual liquidity. Legacy modes keep the old suggestion.
+    try:
+        from core.scoring_dispatch import get_active_scorer as _gas_core
+        _wl_mode = _gas_core() == "watchlist"
+    except Exception:
+        _wl_mode = True
+    sizing_line = (
+        "  Sizing: corre `/cash` (fonte única de alocação)\n"
+        if _wl_mode else
+        f"  Alocação sugerida: *€{eur:.0f}*\n"
+    )
+
     return (
         f"💎 *CoreRadar — {ticker}*  `score {score:.0f}/100`\n\n"
         + (f"{ma200w_line}\n" if ma200w_line else "")
@@ -969,8 +985,8 @@ def format_core_alert(opp: dict) -> str:
         + (f"{vol_line}\n" if vol_line else "")
         + (f"{fund_line}\n" if fund_line else "")
         + f"{yield_line}{note_line}\n\n"
-        f"  Alocação sugerida: *€{eur:.0f}*\n"
-        f"  _Posição CORE — hold de longo prazo, sem auto-close_"
+        + sizing_line
+        + "  _Posição CORE — hold de longo prazo, sem auto-close_"
     )
 
 
