@@ -373,6 +373,12 @@ def _no_headlines(ticker, max_results=8):
     return []
 
 
+def _no_llm(*args, **kwargs):
+    """classify_fn stub: LLM unavailable → triage must use keyword fallback.
+    Also shields tests from a real ANTHROPIC_API_KEY in the dev env."""
+    return None
+
+
 class TestTriage:
     """Automates the manual review of the 2026-06-29 /cash proposal:
     NVO at 30.3% (cap), HOOD +34pp (outperformer), MKC merger (event),
@@ -419,7 +425,8 @@ class TestTriage:
         def fetch(t, max_results=8):
             return [_FakeHeadline(headline)]
         ctx = {"position_pct": {}, "sector_cost_pct": {}}
-        hw.triage_watchlist([e], ctx, fetch_headlines_fn=fetch)
+        hw.triage_watchlist([e], ctx, fetch_headlines_fn=fetch,
+                            classify_fn=_no_llm)
         assert e.triage_tier == "BORDERLINE"
         event_reasons = [r for r in e.triage_reasons if "event risk" in r]
         assert event_reasons, f"no event-risk reason: {e.triage_reasons}"
@@ -444,7 +451,8 @@ class TestTriage:
             return [_FakeHeadline("Salesforce in talks for $20B acquisition of rival")]
         ctx = {"position_pct": {},
                "sector_cost_pct": {"Technology": 0.45}}
-        hw.triage_watchlist([e], ctx, fetch_headlines_fn=fetch)
+        hw.triage_watchlist([e], ctx, fetch_headlines_fn=fetch,
+                            classify_fn=_no_llm)
         assert e.triage_tier == "BORDERLINE"
         assert any("$20B acquisition" in r for r in e.triage_reasons), \
             "snippet must survive when multiple reasons accumulate"
@@ -522,3 +530,174 @@ class TestTriage:
         stats = hw.get_last_run_stats()
         assert stats.get("n_excluded") == 1
         assert stats.get("n_clean") == 0
+
+
+# ── LLM drop-attribution classifier ──────────────────────────────────
+
+from core.llm_attribution import DropAttribution  # noqa: E402 — pure dataclass, no SDK import
+import core.llm_attribution as la  # noqa: E402
+
+
+def _llm(category, explanation="", key_headline="", confidence="high"):
+    """Build a classify_fn stub returning a fixed attribution."""
+    def fn(ticker, headlines, **kwargs):
+        return DropAttribution(category=category, explanation=explanation,
+                               key_headline=key_headline, confidence=confidence)
+    return fn
+
+
+def _llm_must_not_be_called(ticker, headlines, **kwargs):
+    raise AssertionError("classifier must not be called")
+
+
+class TestLLMTriage:
+    """LLM drop-attribution inside triage_watchlist: corporate_event and
+    deterioration flag BORDERLINE with explanation + evidence; the other
+    categories affirmatively clear the name (no keyword noise); any LLM
+    failure falls back to the keyword scan unchanged."""
+
+    _CTX = {"position_pct": {}, "sector_cost_pct": {}}
+
+    def test_corporate_event_borderline_with_explanation_and_snippet(self):
+        """MKC case via LLM: BORDERLINE, reason carries the PT explanation
+        AND the decisive headline as evidence."""
+        e = _mk_entry("MKC", sector="Consumer Defensive")
+        headline = "McCormick announces $44.8B merger with Unilever food business"
+        def fetch(t, max_results=8):
+            return [_FakeHeadline(headline)]
+        hw.triage_watchlist(
+            [e], dict(self._CTX), fetch_headlines_fn=fetch,
+            classify_fn=_llm("corporate_event",
+                             explanation="MKC anunciou fusão de $44.8B com a Unilever",
+                             key_headline=headline),
+        )
+        assert e.triage_tier == "BORDERLINE"
+        ev = [r for r in e.triage_reasons if "evento corporativo" in r]
+        assert ev, f"no corporate-event reason: {e.triage_reasons}"
+        assert "fusão de $44.8B" in ev[0], "reason must carry the explanation"
+        assert "$44.8B merger" in ev[0], "reason must carry the headline snippet"
+        assert e.drop_attribution["category"] == "corporate_event"
+
+    def test_deterioration_borderline(self):
+        e = _mk_entry("XYZ")
+        headline = "XYZ slashes full-year guidance on customer churn"
+        def fetch(t, max_results=8):
+            return [_FakeHeadline(headline)]
+        hw.triage_watchlist(
+            [e], dict(self._CTX), fetch_headlines_fn=fetch,
+            classify_fn=_llm("deterioration",
+                             explanation="Corte de guidance anual por churn de clientes",
+                             key_headline=headline),
+        )
+        assert e.triage_tier == "BORDERLINE"
+        assert any("deterioração" in r for r in e.triage_reasons)
+
+    def test_specific_fear_stays_clean_and_kills_keyword_noise(self):
+        """ESTC case: headline contains 'cut' (keyword would flag) but the
+        LLM judged specific_fear -> CLEAN, no event reason, attribution
+        stored for display."""
+        e = _mk_entry("ESTC")
+        def fetch(t, max_results=8):
+            # 'cut' would keyword-match; it's about ANOTHER company
+            return [_FakeHeadline("Datadog price target cut by Morgan Stanley")]
+        hw.triage_watchlist(
+            [e], dict(self._CTX), fetch_headlines_fn=fetch,
+            classify_fn=_llm("specific_fear",
+                             explanation="Queda parece medo específico; headline é sobre a Datadog"),
+        )
+        assert e.triage_tier == "CLEAN"
+        assert not any("event risk" in r for r in e.triage_reasons), \
+            "keyword scan must NOT run when the LLM affirmatively classified"
+        assert e.drop_attribution["category"] == "specific_fear"
+
+    def test_llm_failure_falls_back_to_keywords(self):
+        """classify_fn returns None (API down / disabled) -> keyword scan
+        fires exactly as pre-LLM."""
+        e = _mk_entry("MKC")
+        def fetch(t, max_results=8):
+            return [_FakeHeadline("McCormick announces $44.8B merger with Unilever")]
+        hw.triage_watchlist([e], dict(self._CTX), fetch_headlines_fn=fetch,
+                            classify_fn=_no_llm)
+        assert e.triage_tier == "BORDERLINE"
+        assert any("matched: merger" in r for r in e.triage_reasons)
+
+    def test_llm_exception_falls_back_to_keywords(self):
+        """classify_fn raising must not break triage — keyword fallback."""
+        e = _mk_entry("MKC")
+        def fetch(t, max_results=8):
+            return [_FakeHeadline("McCormick announces $44.8B merger with Unilever")]
+        def boom(*a, **k):
+            raise RuntimeError("API down")
+        hw.triage_watchlist([e], dict(self._CTX), fetch_headlines_fn=fetch,
+                            classify_fn=boom)
+        assert e.triage_tier == "BORDERLINE"
+        assert any("matched: merger" in r for r in e.triage_reasons)
+
+    def test_llm_never_touches_excluded(self):
+        """EXCLUDED names skip headline fetch AND the classifier — the LLM
+        can never override the quantitative exclusion rules."""
+        e = _mk_entry("NVO")
+        ctx = {"position_pct": {"NVO": 0.35}, "sector_cost_pct": {}}
+        hw.triage_watchlist([e], ctx, fetch_headlines_fn=_no_headlines,
+                            classify_fn=_llm_must_not_be_called)
+        assert e.triage_tier == "EXCLUDED"
+
+    def test_llm_not_called_without_headlines(self):
+        e = _mk_entry("SPGI", sector_rel=-0.12)
+        hw.triage_watchlist([e], dict(self._CTX),
+                            fetch_headlines_fn=_no_headlines,
+                            classify_fn=_llm_must_not_be_called)
+        assert e.triage_tier == "CLEAN"
+
+    def test_flag_without_key_headline_still_reasons(self):
+        """Attribution without key_headline: reason is label + explanation,
+        no dangling quotes."""
+        e = _mk_entry("XYZ")
+        def fetch(t, max_results=8):
+            return [_FakeHeadline("Some headline")]
+        hw.triage_watchlist(
+            [e], dict(self._CTX), fetch_headlines_fn=fetch,
+            classify_fn=_llm("deterioration", explanation="Guidance cortado"),
+        )
+        assert e.triage_tier == "BORDERLINE"
+        r = [x for x in e.triage_reasons if "deterioração" in x][0]
+        assert "Guidance cortado" in r
+        assert '"' not in r  # no empty-snippet quotes
+
+
+class TestLLMAttributionParsing:
+    """_parse_response is the defensive boundary between the API and
+    triage — anything unparseable must become None (keyword fallback)."""
+
+    def test_valid_json(self):
+        raw = ('{"category": "corporate_event", "explanation": "Fusão anunciada",'
+               ' "key_headline": "X to merge with Y", "confidence": "high"}')
+        r = la._parse_response(raw)
+        assert r is not None
+        assert r.category == "corporate_event"
+        assert r.explanation == "Fusão anunciada"
+        assert r.key_headline == "X to merge with Y"
+        assert r.confidence == "high"
+
+    def test_invalid_category_returns_none(self):
+        raw = '{"category": "banana", "explanation": "", "key_headline": "", "confidence": "low"}'
+        assert la._parse_response(raw) is None
+
+    def test_malformed_json_returns_none(self):
+        assert la._parse_response("not json at all {") is None
+
+    def test_empty_returns_none(self):
+        assert la._parse_response("") is None
+        assert la._parse_response("   ") is None
+
+    def test_non_dict_json_returns_none(self):
+        assert la._parse_response('["corporate_event"]') is None
+
+    def test_missing_fields_tolerated(self):
+        """Schema guarantees the fields, but the parser must survive a
+        degraded response (e.g. older SDK without output_config)."""
+        r = la._parse_response('{"category": "unclear"}')
+        assert r is not None
+        assert r.category == "unclear"
+        assert r.explanation == ""
+        assert r.confidence == "low"

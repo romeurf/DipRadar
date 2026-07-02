@@ -120,8 +120,13 @@ def get_last_run_stats() -> dict:
 # to the human, with reasons shown ("mais free nas borderlines para que
 # possa ser um humano a tomar a decisão final").
 
-# Event-risk keywords for headline scan. merger/acquisition family is
-# NOT in dislocation_score._BAD_NEWS_KW (that set targets deterioration
+# Event-risk keywords for headline scan — FALLBACK path. The preferred
+# path is core/llm_attribution.classify_drop (LLM reads the headlines
+# and classifies WHY the stock fell, with explanation + evidence); the
+# keyword scan runs when the classifier is disabled (no ANTHROPIC_API_KEY),
+# errors out, or returns unparseable output — byte-identical to the
+# pre-LLM behavior. merger/acquisition family is NOT in
+# dislocation_score._BAD_NEWS_KW (that set targets deterioration
 # signals); "cut"/"lowered" overlap deliberately — a guidance cut is
 # both bad news AND an event that changes the thesis.
 _EVENT_RISK_KW = frozenset({
@@ -139,6 +144,7 @@ def triage_watchlist(
     portfolio_context: Optional[dict] = None,
     *,
     fetch_headlines_fn=None,
+    classify_fn=None,
 ) -> "list[WatchlistEntry]":
     """Classify each qualifying entry into CLEAN / BORDERLINE / EXCLUDED.
 
@@ -161,18 +167,38 @@ def triage_watchlist(
         market-wide selloff most names legitimately sit here and WILL
         flood borderline — correct behavior, not a bug: they aren't
         specific dislocations and the human sees them flagged as such.
-      - event-risk keyword in recent headlines — reason carries the
-        HEADLINE SNIPPET, not just the keyword (an MKC flag is only
+      - event risk in recent headlines — preferred: LLM drop-attribution
+        (corporate_event/deterioration flag, with explanation + evidence);
+        fallback: keyword scan. Either way the reason carries the
+        HEADLINE SNIPPET, not just a keyword (an MKC flag is only
         useful if it shows "$44.8B merger...", never just "merger")
       - candidate sector > 35% of portfolio cost basis — adensa check
     CLEAN: everything else (fell alone < -5pp strictly, no flags).
 
+    The LLM classifier can only move CLEAN → BORDERLINE — never EXCLUDE,
+    never promote past the quantitative rules above. `classify_fn` is a
+    test injection point: pass a fake to simulate classifications, or
+    `lambda *a, **k: None` to force the keyword fallback deterministically.
+
     With portfolio_context=None all entries stay CLEAN with an explicit
     "triage skipped" reason — legacy callers see no behavior change.
-    Headline fetch is SKIPPED for names already EXCLUDED (saves 1-2s each).
+    Headline fetch is SKIPPED for names already EXCLUDED (saves 1-2s each,
+    and EXCLUDED names never reach the LLM).
     """
     if fetch_headlines_fn is None:
         from utils.news_headlines import fetch_headlines as fetch_headlines_fn
+
+    # Resolve the production LLM classifier once per run. Disabled (no
+    # ANTHROPIC_API_KEY / DIPRADAR_LLM_TRIAGE=0 / SDK missing / breaker
+    # tripped) → classify_fn stays None → keyword fallback below.
+    if classify_fn is None:
+        try:
+            from core.llm_attribution import classify_drop as _cd, is_enabled as _llm_on
+            if _llm_on():
+                classify_fn = _cd
+                log.info("[triage] LLM drop-attribution ativo")
+        except Exception:
+            classify_fn = None
 
     if portfolio_context is None:
         for e in entries:
@@ -223,21 +249,64 @@ def triage_watchlist(
                 f"vs sector {sr*100:+.0f}pp — caiu COM o mercado, não é dislocation específica"
             )
 
-        # Event risk in recent headlines — reason must carry the snippet
+        # ── Event risk in recent headlines ─────────────────────────────
+        # Preferred: LLM drop-attribution — classifies WHY it fell, with
+        # explanation + evidence, and kills keyword false-positives (a
+        # Datadog "price target cut" headline in the ESTC feed no longer
+        # flags ESTC). Fallback: keyword scan, unchanged pre-LLM behavior.
         try:
             headlines = fetch_headlines_fn(e.ticker, max_results=8)
         except Exception as ex:
             log.debug(f"[triage] headlines {e.ticker}: {ex}")
             headlines = []
-        for h in headlines or []:
-            title = getattr(h, "title", "") or ""
-            title_lower = title.lower()
-            matched = next((kw for kw in _EVENT_RISK_KW if kw in title_lower), None)
-            if matched:
+
+        attribution = None
+        if headlines and classify_fn is not None:
+            try:
+                attribution = classify_fn(
+                    e.ticker, headlines,
+                    dd_pct=e.dd_from_52w_high,
+                    sector_rel_pp=e.sector_relative_60d,
+                    sector=e.sector,
+                )
+            except Exception as ex:
+                log.warning(f"[triage] LLM attribution {e.ticker} falhou: {ex}")
+                attribution = None
+
+        if attribution is not None:
+            e.drop_attribution = {
+                "category":     attribution.category,
+                "explanation":  attribution.explanation,
+                "key_headline": attribution.key_headline,
+                "confidence":   attribution.confidence,
+            }
+            if attribution.category in ("corporate_event", "deterioration"):
                 tier = "BORDERLINE"
-                snippet = title[:90] + ("…" if len(title) > 90 else "")
-                reasons.append(f'event risk: "{snippet}" (matched: {matched})')
-                break  # one event flag is enough
+                label = ("evento corporativo"
+                         if attribution.category == "corporate_event"
+                         else "deterioração")
+                reason = (f"{label}: {attribution.explanation}"
+                          if attribution.explanation else label)
+                kh = attribution.key_headline
+                if kh:
+                    snippet = kh[:90] + ("…" if len(kh) > 90 else "")
+                    reason += f' — "{snippet}"'
+                reasons.append(reason)
+            # specific_fear / sector_or_market / unclear: NO flag, and the
+            # keyword scan is deliberately NOT run — the classifier
+            # affirmatively judged there is no thesis-changing event.
+            # That's the upgrade over substring matching.
+        else:
+            # Keyword fallback — reason must carry the snippet
+            for h in headlines or []:
+                title = getattr(h, "title", "") or ""
+                title_lower = title.lower()
+                matched = next((kw for kw in _EVENT_RISK_KW if kw in title_lower), None)
+                if matched:
+                    tier = "BORDERLINE"
+                    snippet = title[:90] + ("…" if len(title) > 90 else "")
+                    reasons.append(f'event risk: "{snippet}" (matched: {matched})')
+                    break  # one event flag is enough
 
         # Cluster concentration — the "adensa vs diversifica" check
         cand_sector = e.sector or ""
@@ -280,6 +349,11 @@ class WatchlistEntry:
     # Triage (set by triage_watchlist; defaults keep legacy callers intact)
     triage_tier:          str = "CLEAN"     # CLEAN | BORDERLINE | EXCLUDED
     triage_reasons:       list = field(default_factory=list)
+    # LLM drop-attribution (set by triage when the classifier ran):
+    # {"category", "explanation", "key_headline", "confidence"} — stored
+    # for ALL classified names (incl. CLEAN) so display paths can show
+    # "porquê caiu" later; only corporate_event/deterioration flag tier.
+    drop_attribution:     Optional[dict] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
