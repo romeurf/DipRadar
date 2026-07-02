@@ -89,6 +89,11 @@ _disabled_until: float = 0.0
 _client = None            # lazy anthropic.Anthropic singleton
 _logged_provider = False  # one INFO line per process for Railway logs
 
+# Envelope metadata from the last API call (finishReason etc.) — included
+# in "resposta não parseável" warnings so failures self-diagnose in the
+# Railway logs instead of needing a debug redeploy.
+_last_response_debug = ""
+
 
 @dataclass
 class DropAttribution:
@@ -257,7 +262,10 @@ def classify_drop(
 
     result = _parse_response(raw)
     if result is None:
-        log.warning(f"[llm-attribution] {ticker}: resposta não parseável — keyword fallback")
+        log.warning(
+            f"[llm-attribution] {ticker}: resposta não parseável — keyword "
+            f"fallback | raw[:200]={raw[:200]!r} | {_last_response_debug}"
+        )
         return None
     _result_cache[cache_key] = (time.time(), result)
     log.info(
@@ -314,7 +322,10 @@ def _call_gemini(ticker, headlines, dd_pct, sector_rel_pp, sector) -> str:
         "generationConfig": {
             "responseMimeType": "application/json",
             "responseSchema": _GEMINI_SCHEMA,
-            "maxOutputTokens": 1024,
+            # Generous: free-tier tokens are free, and if a model snapshot
+            # ignores thinkingBudget=0 the thoughts bill against this cap —
+            # 1024 produced truncated/empty JSON ("resposta não parseável").
+            "maxOutputTokens": 8192,
             "temperature": 0.0,
             # 2.5-flash "thinks" by default and thoughts bill against
             # maxOutputTokens — an unbounded think can eat the whole
@@ -335,7 +346,24 @@ def _call_gemini(ticker, headlines, dd_pct, sector_rel_pp, sector) -> str:
     )
     if resp.status_code != 200:
         raise RuntimeError(f"Gemini HTTP {resp.status_code}: {resp.text[:200]}")
-    return _extract_gemini_text(resp.json())
+    data = resp.json()
+    text = _extract_gemini_text(data)
+
+    # Capture envelope metadata for the not-parseable warning: an empty
+    # text usually means finishReason=MAX_TOKENS (thoughts ate the budget)
+    # or SAFETY — visible here without a debug redeploy.
+    global _last_response_debug
+    try:
+        cand0 = (data.get("candidates") or [{}])[0]
+        _last_response_debug = (
+            f"finishReason={cand0.get('finishReason')} "
+            f"usage={data.get('usageMetadata')}"
+        )
+        if not text:
+            _last_response_debug += f" body[:300]={json.dumps(data)[:300]}"
+    except Exception:
+        _last_response_debug = "envelope inspection failed"
+    return text
 
 
 def _extract_gemini_text(payload) -> str:
@@ -386,13 +414,12 @@ def _call_anthropic(ticker, headlines, dd_pct, sector_rel_pp, sector) -> str:
 
 def _parse_response(raw: str) -> Optional[DropAttribution]:
     """Defensive parse: both backends enforce a schema server-side, but
-    refusals/safety blocks/max_tokens/HTTP oddities can produce anything."""
+    refusals/safety blocks/max_tokens/HTTP oddities can produce anything.
+    Tolerates markdown fences and prose-wrapped JSON (seen when a model
+    ignores responseMimeType) by slicing the outermost {...} block."""
     if not raw or not raw.strip():
         return None
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        return None
+    data = _loads_lenient(raw)
     if not isinstance(data, dict):
         return None
     cat = data.get("category")
@@ -404,3 +431,30 @@ def _parse_response(raw: str) -> Optional[DropAttribution]:
         key_headline=str(data.get("key_headline") or "").strip(),
         confidence=str(data.get("confidence") or "low").strip(),
     )
+
+
+def _loads_lenient(raw: str):
+    """json.loads with two fallbacks: strip ```json fences, then slice
+    the outermost {...} span. Returns the parsed object or None."""
+    raw = raw.strip()
+    try:
+        return json.loads(raw)
+    except ValueError:
+        pass
+    # ```json ... ``` fences
+    if raw.startswith("```"):
+        stripped = raw.strip("`")
+        if stripped.lower().startswith("json"):
+            stripped = stripped[4:]
+        try:
+            return json.loads(stripped.strip())
+        except ValueError:
+            pass
+    # Prose-wrapped: take the outermost { ... } span
+    start, end = raw.find("{"), raw.rfind("}")
+    if 0 <= start < end:
+        try:
+            return json.loads(raw[start:end + 1])
+        except ValueError:
+            pass
+    return None

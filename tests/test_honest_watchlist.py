@@ -702,6 +702,27 @@ class TestLLMAttributionParsing:
         assert r.explanation == ""
         assert r.confidence == "low"
 
+    def test_markdown_fenced_json_parses(self):
+        """Model ignoring responseMimeType wraps JSON in ```json fences —
+        the 2026-07-02 'resposta não parseável' production case."""
+        raw = '```json\n{"category": "specific_fear", "explanation": "x", "key_headline": "", "confidence": "low"}\n```'
+        r = la._parse_response(raw)
+        assert r is not None
+        assert r.category == "specific_fear"
+
+    def test_prose_wrapped_json_parses(self):
+        raw = ('Aqui está a classificação:\n'
+               '{"category": "sector_or_market", "explanation": "caiu com o sector",'
+               ' "key_headline": "", "confidence": "medium"}\n'
+               'Espero que ajude.')
+        r = la._parse_response(raw)
+        assert r is not None
+        assert r.category == "sector_or_market"
+
+    def test_truncated_json_returns_none(self):
+        """MAX_TOKENS mid-JSON must fail cleanly to keyword fallback."""
+        assert la._parse_response('{"category": "corporate_event", "expl') is None
+
 
 class TestLLMProviders:
     """Provider auto-detection: free-first (Gemini preferred), forced
