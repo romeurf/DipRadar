@@ -388,10 +388,15 @@ def _fetch_sector_for(ticker: str) -> str:
 
 
 def _fetch_catalyst_days(ticker: str) -> Optional[int]:
-    """Days to next earnings. None if not available within yfinance's window."""
+    """Days to next earnings. None if not available within 120d.
+
+    120d window (vs the legacy 45d default) so the display can honestly
+    say "catalyst far (70d)" instead of pretending the date is unknown —
+    catalyst is a SIGNAL not a filter, so far dates are information too.
+    """
     try:
         from data.market_client import get_earnings_days
-        return get_earnings_days(ticker)
+        return get_earnings_days(ticker, max_days=120)
     except Exception as e:
         log.debug(f"[watchlist] catalyst fetch {ticker}: {e}")
         return None

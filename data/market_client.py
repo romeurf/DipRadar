@@ -561,7 +561,14 @@ def get_fundamentals(symbol: str, region: str = "", min_market_cap: int = 2_000_
     return result
 
 
-def get_earnings_days(symbol: str) -> int | None:
+def get_earnings_days(symbol: str, max_days: int = 45) -> int | None:
+    """Days until the next scheduled earnings, or None if unknown/too far.
+
+    max_days: upper visibility window. Default 45 preserves the legacy
+    semantics every existing caller relies on ("earnings near"). The
+    watchlist passes 120 so it can honestly render "catalyst far (70d)"
+    instead of pretending the date doesn't exist.
+    """
     try:
         time.sleep(3)
         cal = yf.Ticker(symbol).calendar
@@ -583,16 +590,27 @@ def get_earnings_days(symbol: str) -> int | None:
                 # earnings (recent IPO, special situation). Treat as "unknown".
                 return None
             earnings_raw = earnings_raw[0]
+        # yfinance schema drift (observed 2026-07): "Earnings Date" now
+        # holds plain datetime.date objects. The old branches only knew
+        # unix timestamps and pandas Timestamps (.to_pydatetime), so every
+        # ticker fell through to None → "catalyst —" across the board.
+        # Order matters below: datetime is a subclass of date, so check
+        # datetime BEFORE date.
         if isinstance(earnings_raw, (int, float)):
             dt = datetime.fromtimestamp(earnings_raw, tz=timezone.utc)
         elif hasattr(earnings_raw, "to_pydatetime"):
             dt = earnings_raw.to_pydatetime()
+        elif isinstance(earnings_raw, datetime):
+            dt = earnings_raw
+        elif isinstance(earnings_raw, date):
+            dt = datetime(earnings_raw.year, earnings_raw.month,
+                          earnings_raw.day, tzinfo=timezone.utc)
         else:
             return None
         if not dt.tzinfo:
             dt = dt.replace(tzinfo=timezone.utc)
         days = (dt - datetime.now(tz=timezone.utc)).days
-        return days if 0 <= days <= 45 else None
+        return days if 0 <= days <= max_days else None
     except Exception as e:
         logging.warning(f"Earnings days {symbol}: {e}")
         return None
