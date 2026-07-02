@@ -195,6 +195,21 @@ def is_enabled() -> bool:
     return _active_provider() is not None
 
 
+def status() -> str:
+    """One-line human status for logs — answers "why is the classifier
+    (not) running?" without SSH-ing into Railway env vars."""
+    if (os.getenv("DIPRADAR_LLM_TRIAGE") or "").strip() == "0":
+        return "desativado (DIPRADAR_LLM_TRIAGE=0) — keyword fallback"
+    if time.time() < _disabled_until:
+        return (f"breaker ativo (+{int(_disabled_until - time.time())}s "
+                f"após falha de API) — keyword fallback")
+    prov = _active_provider()
+    if prov is None:
+        return ("sem API key utilizável (define GEMINI_API_KEY no Railway) "
+                "— keyword fallback")
+    return f"ativo: provider={prov} model={_model_for(prov)}"
+
+
 def classify_drop(
     ticker: str,
     headlines: list,

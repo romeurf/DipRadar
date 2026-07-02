@@ -189,15 +189,18 @@ def triage_watchlist(
         from utils.news_headlines import fetch_headlines as fetch_headlines_fn
 
     # Resolve the production LLM classifier once per run. Disabled (no
-    # ANTHROPIC_API_KEY / DIPRADAR_LLM_TRIAGE=0 / SDK missing / breaker
-    # tripped) → classify_fn stays None → keyword fallback below.
+    # API key / DIPRADAR_LLM_TRIAGE=0 / breaker tripped) → classify_fn
+    # stays None → keyword fallback below. The status line logs EVERY
+    # scan so "porque não há logs de llm-attribution?" is answerable
+    # from Railway logs alone.
     if classify_fn is None:
         try:
-            from core.llm_attribution import classify_drop as _cd, is_enabled as _llm_on
-            if _llm_on():
-                classify_fn = _cd
-                log.info("[triage] LLM drop-attribution ativo")
-        except Exception:
+            from core import llm_attribution as _la
+            if _la.is_enabled():
+                classify_fn = _la.classify_drop
+            log.info(f"[triage] LLM drop-attribution: {_la.status()}")
+        except Exception as _la_err:
+            log.warning(f"[triage] LLM drop-attribution indisponível: {_la_err}")
             classify_fn = None
 
     if portfolio_context is None:

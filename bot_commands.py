@@ -9915,7 +9915,10 @@ def _handle_command(text: str) -> None:
                         _r_score = 50.0
                     _badge = {"FROTHY": "🟦", "NEUTRAL": "🟨", "PANIC": "🟥"}.get(_r_label, "⚪")
 
-                    _ts_now = _dt.now().strftime("%Y-%m-%d %H:%M")
+                    # Railway roda em UTC — hora naive dava 1h a menos
+                    # em Lisboa (verão). Render explícito em Europe/Lisbon.
+                    from zoneinfo import ZoneInfo as _ZI
+                    _ts_now = _dt.now(_ZI("Europe/Lisbon")).strftime("%Y-%m-%d %H:%M")
                     header_lines = [
                         f"📋 *Honest Watchlist* — `{_ts_now}`",
                         f"{_badge} Regime: *{_r_label}* ({_r_score:.0f}/100)",
@@ -9995,7 +9998,8 @@ def _handle_command(text: str) -> None:
                     _r_score = 50.0
                 _badge = {"FROTHY": "🟦", "NEUTRAL": "🟨", "PANIC": "🟥"}.get(_r_label, "⚪")
 
-                _ts_now = _dt.now().strftime("%Y-%m-%d %H:%M")
+                from zoneinfo import ZoneInfo as _ZI
+                _ts_now = _dt.now(_ZI("Europe/Lisbon")).strftime("%Y-%m-%d %H:%M")
                 _engine_tag = {
                     "watchlist":   "📋 watchlist",
                     "dislocation": "🧠 dislocation_z (experimental)",

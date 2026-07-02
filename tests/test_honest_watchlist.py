@@ -766,6 +766,16 @@ class TestLLMProviders:
         monkeypatch.setattr(la, "_disabled_until", la.time.time() + 60)
         assert la.is_enabled() is False
 
+    def test_status_names_the_missing_key(self, monkeypatch):
+        """status() must say WHY the classifier is off — the Railway-logs
+        diagnosis line."""
+        self._reset(monkeypatch)
+        assert "GEMINI_API_KEY" in la.status()
+        monkeypatch.setenv("GEMINI_API_KEY", "g")
+        assert la.status() == "ativo: provider=gemini model=gemini-2.5-flash"
+        monkeypatch.setenv("DIPRADAR_LLM_TRIAGE", "0")
+        assert "DIPRADAR_LLM_TRIAGE=0" in la.status()
+
     def test_model_override_applies_to_active_provider(self, monkeypatch):
         self._reset(monkeypatch)
         monkeypatch.setenv("DIPRADAR_LLM_MODEL", "gemini-2.5-flash-lite")
