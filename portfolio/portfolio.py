@@ -563,6 +563,56 @@ def get_position_pct(symbol: str, usd_eur: float = 0.92) -> float:
     return max(0.0, min(pos_cost / total_eur, 1.0))
 
 
+def build_portfolio_context(usd_eur: float = 0.92) -> dict:
+    """Portfolio snapshot for the watchlist triage layer.
+
+    Returns:
+        {"position_pct":    {SYM: float},     # position % of total wealth, 0..1
+         "sector_cost_pct": {sector: float}}  # sector share of cost basis, 0..1
+
+    position_pct reuses get_position_pct (cost-basis, FX-aware) — the
+    verified-correct signal for the triage EXCLUDED rule (>= 30% cap).
+    NOTE: triage uses this cost-basis pct while /cash's internal headroom
+    trim converts total_cost separately. Slight duplication by design —
+    triage is the authoritative gate, headroom is belt-and-braces. See
+    plan A4 design risks.
+
+    sector_cost_pct resolves each holding's sector via the shared
+    utils/sector_cache (same source the watchlist candidates use, so
+    cluster comparisons are like-for-like strings). Holdings whose
+    sector can't resolve (UCITS ETFs etc.) are grouped under "" and
+    never matched by candidates (candidates with empty sector skip the
+    cluster check).
+    """
+    fx = max(0.5, min(float(usd_eur or 0.92), 2.0))
+    positions = get_positions()
+
+    position_pct: dict[str, float] = {}
+    for sym in positions.keys():
+        position_pct[sym.upper()] = get_position_pct(sym, usd_eur=fx)
+
+    # Sector cost shares (cost basis in EUR)
+    sector_cost: dict[str, float] = {}
+    total_cost_eur = 0.0
+    try:
+        from utils.sector_cache import get_sector
+    except Exception:
+        get_sector = lambda t: ""  # noqa: E731 — degrade to no cluster info
+    for sym, p in positions.items():
+        cost = float(p.get("total_cost", 0) or 0)
+        if _is_usd_ticker(sym):
+            cost *= fx
+        sector = get_sector(sym) or ""
+        sector_cost[sector] = sector_cost.get(sector, 0.0) + cost
+        total_cost_eur += cost
+
+    sector_cost_pct = (
+        {s: c / total_cost_eur for s, c in sector_cost.items()}
+        if total_cost_eur > 0 else {}
+    )
+    return {"position_pct": position_pct, "sector_cost_pct": sector_cost_pct}
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # /buy
 # ─────────────────────────────────────────────────────────────────────────

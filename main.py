@@ -2273,21 +2273,32 @@ def run_watchdog_scan() -> None:
         # ── Watchlist mode (default after F.5 REVERT) ─────────────────
         # Direct path through honest_watchlist for clarity. No z-based
         # ranking. "New qualifier" = ticker in current watchlist AND
-        # not in notified set AND not already deployed.
+        # not in notified set AND not already deployed AND triage tier
+        # CLEAN or BORDERLINE (user decision 2026-07-02: borderlines
+        # notify too — they exist FOR the human — tier-tagged so both
+        # are distinguishable at a glance; EXCLUDED never notifies).
         if session.scorer == "watchlist":
             from core.honest_watchlist import get_watchlist
-            entries = get_watchlist()
+            try:
+                from portfolio.portfolio import build_portfolio_context
+                from data.market_client import get_usdeur as _gu_wd
+                _pf_ctx = build_portfolio_context(usd_eur=_gu_wd())
+            except Exception as _ctx_err:
+                logging.warning(f"[watchdog] portfolio_context failed: {_ctx_err}")
+                _pf_ctx = None
+            entries = get_watchlist(portfolio_context=_pf_ctx)
             previously_notified = set(notified_map.keys())
             new_qualifiers_wl = [
                 e for e in entries
                 if e.ticker not in deployed_tickers
                 and e.ticker not in previously_notified
+                and e.triage_tier in ("CLEAN", "BORDERLINE")
             ]
             if not new_qualifiers_wl:
                 logging.info(
                     f"[watchdog] watchlist: 0 new qualifiers "
                     f"(held_cash €{held_cash:.0f}, total qualifiers={len(entries)}, "
-                    f"already notified or deployed)"
+                    f"already notified/deployed/excluded)"
                 )
                 return
 
@@ -2302,7 +2313,11 @@ def run_watchdog_scan() -> None:
                 "",
             ]
             for e in top3:
-                lines.append(f"`{e.summary_line}`")
+                _tier_tag = "✅ CLEAN" if e.triage_tier == "CLEAN" else "🟡 BORDERLINE"
+                lines.append(f"{_tier_tag}  `{e.summary_line}`")
+                if e.triage_tier == "BORDERLINE":
+                    for r in e.triage_reasons:
+                        lines.append(f"    · _{r}_")
                 hl = fetch_headlines(e.ticker, max_results=2)
                 if hl:
                     lines.append(format_headlines_for_telegram(hl, max_results=2, indent="  "))

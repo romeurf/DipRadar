@@ -342,3 +342,183 @@ class TestSummaryLineFormat:
         assert "catalyst 24d" in s
         assert "ROE 71%" in s
         assert "GM 84%" in s
+
+
+# ── Triage layer (CLEAN / BORDERLINE / EXCLUDED) ─────────────────────
+
+class _FakeHeadline:
+    def __init__(self, title):
+        self.title = title
+        self.publisher = "Test"
+        self.published_at = "2026-07-01T10:00:00"
+        self.url = ""
+
+
+def _mk_entry(ticker="XYZ", sector="Technology", sector_rel=-0.12,
+              dd=-0.40, catalyst=20):
+    """Minimal qualifying WatchlistEntry for triage tests."""
+    return hw.WatchlistEntry(
+        ticker=ticker, qualifies=True,
+        dd_from_52w_high=dd,
+        sector=sector, sector_relative_60d=sector_rel,
+        days_to_catalyst=catalyst, catalyst_source="earnings_calendar",
+        quality_passes=True, quality_reason="",
+        roe=0.30, gross_margin=0.60, revenue_growth=0.10, fcf_yield=0.03,
+        current_price=100.0, core_score=80.0,
+        summary_line=f"{ticker} test line",
+    )
+
+
+def _no_headlines(ticker, max_results=8):
+    return []
+
+
+class TestTriage:
+    """Automates the manual review of the 2026-06-29 /cash proposal:
+    NVO at 30.3% (cap), HOOD +34pp (outperformer), MKC merger (event),
+    software-AI cluster. Machine excludes clear-cut only; borderlines
+    are generous and human-reviewed."""
+
+    def test_excluded_at_cap(self):
+        """NVO case: position >= 30% -> EXCLUDED, headroom zero."""
+        e = _mk_entry("NVO")
+        ctx = {"position_pct": {"NVO": 0.31}, "sector_cost_pct": {}}
+        hw.triage_watchlist([e], ctx, fetch_headlines_fn=_no_headlines)
+        assert e.triage_tier == "EXCLUDED"
+        assert any("hard cap" in r for r in e.triage_reasons)
+
+    def test_excluded_sector_outperform(self):
+        """HOOD case: vs sector +34pp -> not a dislocation -> EXCLUDED."""
+        e = _mk_entry("HOOD", sector_rel=+0.34)
+        ctx = {"position_pct": {}, "sector_cost_pct": {}}
+        hw.triage_watchlist([e], ctx, fetch_headlines_fn=_no_headlines)
+        assert e.triage_tier == "EXCLUDED"
+        assert any("OUTPERFORMOU" in r for r in e.triage_reasons)
+
+    def test_borderline_near_cap(self):
+        """27% position: between soft (25%) and hard (30%) -> BORDERLINE."""
+        e = _mk_entry("ADBE")
+        ctx = {"position_pct": {"ADBE": 0.27}, "sector_cost_pct": {}}
+        hw.triage_watchlist([e], ctx, fetch_headlines_fn=_no_headlines)
+        assert e.triage_tier == "BORDERLINE"
+        assert any("perto do cap" in r for r in e.triage_reasons)
+
+    def test_borderline_fell_with_market(self):
+        """vs sector -2pp: fell WITH market, not specific -> BORDERLINE."""
+        e = _mk_entry("META", sector_rel=-0.02)
+        ctx = {"position_pct": {}, "sector_cost_pct": {}}
+        hw.triage_watchlist([e], ctx, fetch_headlines_fn=_no_headlines)
+        assert e.triage_tier == "BORDERLINE"
+        assert any("COM o mercado" in r for r in e.triage_reasons)
+
+    def test_borderline_event_risk_carries_snippet(self):
+        """MKC case: merger headline -> BORDERLINE, and the reason MUST
+        carry the headline snippet, never just the keyword."""
+        e = _mk_entry("MKC", sector="Consumer Defensive")
+        headline = "McCormick announces $44.8B merger with Unilever food business"
+        def fetch(t, max_results=8):
+            return [_FakeHeadline(headline)]
+        ctx = {"position_pct": {}, "sector_cost_pct": {}}
+        hw.triage_watchlist([e], ctx, fetch_headlines_fn=fetch)
+        assert e.triage_tier == "BORDERLINE"
+        event_reasons = [r for r in e.triage_reasons if "event risk" in r]
+        assert event_reasons, f"no event-risk reason: {e.triage_reasons}"
+        assert "$44.8B merger" in event_reasons[0], \
+            "reason must carry the headline SNIPPET, not just the keyword"
+        assert "matched: merger" in event_reasons[0]
+
+    def test_borderline_cluster(self):
+        """Candidate sector already 40% of portfolio -> adensa flag."""
+        e = _mk_entry("PAYC", sector="Technology")
+        ctx = {"position_pct": {},
+               "sector_cost_pct": {"Technology": 0.40}}
+        hw.triage_watchlist([e], ctx, fetch_headlines_fn=_no_headlines)
+        assert e.triage_tier == "BORDERLINE"
+        assert any("adensa cluster" in r for r in e.triage_reasons)
+
+    def test_borderline_event_and_cluster_both_reasons(self):
+        """Event-risk AND cluster simultaneously -> BOTH reasons appear,
+        headline snippet still present alongside the cluster reason."""
+        e = _mk_entry("CRM", sector="Technology")
+        def fetch(t, max_results=8):
+            return [_FakeHeadline("Salesforce in talks for $20B acquisition of rival")]
+        ctx = {"position_pct": {},
+               "sector_cost_pct": {"Technology": 0.45}}
+        hw.triage_watchlist([e], ctx, fetch_headlines_fn=fetch)
+        assert e.triage_tier == "BORDERLINE"
+        assert any("$20B acquisition" in r for r in e.triage_reasons), \
+            "snippet must survive when multiple reasons accumulate"
+        assert any("adensa cluster" in r for r in e.triage_reasons)
+        assert len(e.triage_reasons) >= 2
+
+    def test_clean_deep_dislocation(self):
+        """Deep DD, fell alone (-12pp), no flags, diversifies -> CLEAN."""
+        e = _mk_entry("SPGI", sector="Financial Services", sector_rel=-0.12)
+        ctx = {"position_pct": {},
+               "sector_cost_pct": {"Technology": 0.50}}  # different sector
+        hw.triage_watchlist([e], ctx, fetch_headlines_fn=_no_headlines)
+        assert e.triage_tier == "CLEAN"
+        assert e.triage_reasons == []
+
+    def test_multiple_reasons_accumulate(self):
+        """Near-cap + fell-with-market together -> both reasons listed."""
+        e = _mk_entry("MSFT", sector_rel=-0.03)
+        ctx = {"position_pct": {"MSFT": 0.26}, "sector_cost_pct": {}}
+        hw.triage_watchlist([e], ctx, fetch_headlines_fn=_no_headlines)
+        assert e.triage_tier == "BORDERLINE"
+        assert len(e.triage_reasons) == 2
+
+    def test_no_context_all_clean(self):
+        """portfolio_context=None -> all CLEAN with explicit skip reason
+        (legacy callers see no behavior change)."""
+        e = _mk_entry("XYZ", sector_rel=+0.50)  # would be EXCLUDED with ctx
+        hw.triage_watchlist([e], None, fetch_headlines_fn=_no_headlines)
+        assert e.triage_tier == "CLEAN"
+        assert e.triage_reasons == ["triage skipped (sem contexto de portfólio)"]
+
+    def test_sector_relative_none_does_not_vote(self):
+        """sector_rel=None abstains: neither excludes (outperform rule)
+        nor flags (fell-with-market rule)."""
+        e = _mk_entry("UNK", sector_rel=None)
+        ctx = {"position_pct": {}, "sector_cost_pct": {}}
+        hw.triage_watchlist([e], ctx, fetch_headlines_fn=_no_headlines)
+        assert e.triage_tier == "CLEAN"
+
+    def test_excluded_skips_headline_fetch(self):
+        """EXCLUDED names must not incur the headline fetch (1-2s each)."""
+        calls = []
+        def fetch(t, max_results=8):
+            calls.append(t)
+            return []
+        e = _mk_entry("NVO")
+        ctx = {"position_pct": {"NVO": 0.35}, "sector_cost_pct": {}}
+        hw.triage_watchlist([e], ctx, fetch_headlines_fn=fetch)
+        assert e.triage_tier == "EXCLUDED"
+        assert calls == [], "headline fetch must be skipped for EXCLUDED"
+
+    def test_get_watchlist_applies_triage(self, monkeypatch):
+        """Integration: get_watchlist(portfolio_context=...) triages and
+        records tier counts in _last_run_stats."""
+        opps = [{
+            "ticker": "NVO", "score": 80.0, "current_price": 48.0,
+            "roe": 0.71, "gross_margin": 0.83, "revenue_growth": 0.12,
+            "fcf_yield_fund": 0.05, "dd_from_52w_high": -0.30,
+        }]
+        monkeypatch.setattr("core.core_radar.scan_core_universe",
+                            lambda min_score=0.0: opps)
+        monkeypatch.setattr(hw, "_fetch_sector_for", lambda t: "Healthcare")
+        monkeypatch.setattr(hw, "_fetch_sector_relative_60d", lambda t, s: -0.12)
+        monkeypatch.setattr(hw, "_fetch_catalyst_days", lambda t: 24)
+        # Route triage through the real function but with no-network headlines
+        _real_triage = hw.triage_watchlist
+        def _triage_no_net(entries, ctx, **kw):
+            return _real_triage(entries, ctx, fetch_headlines_fn=_no_headlines)
+        monkeypatch.setattr(hw, "triage_watchlist", _triage_no_net)
+
+        ctx = {"position_pct": {"NVO": 0.31}, "sector_cost_pct": {}}
+        entries = hw.get_watchlist(source="core", portfolio_context=ctx)
+        assert len(entries) == 1
+        assert entries[0].triage_tier == "EXCLUDED"
+        stats = hw.get_last_run_stats()
+        assert stats.get("n_excluded") == 1
+        assert stats.get("n_clean") == 0

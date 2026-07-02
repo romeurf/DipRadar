@@ -36,7 +36,7 @@ dispatcher when DIPRADAR_SCORING_MODE=watchlist, which is the default).
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Optional
 
 log = logging.getLogger("watchlist")
@@ -109,6 +109,151 @@ def get_last_run_stats() -> dict:
     return dict(_last_run_stats)
 
 
+# ── Triage layer (CLEAN / BORDERLINE / EXCLUDED) ─────────────────────
+#
+# Automates the manual judgment the user applied to the first watchlist
+# /cash proposal (2026-06-29): NVO at 30.3% got +€84 proposed despite
+# being over the 30% cap; HOOD at vs_sector +34pp was listed despite
+# outperforming its sector (not a dislocation); MKC score 100 hid a
+# $44.8B merger; the whole list clustered in software-AI. The machine
+# excludes only the clear-cut cases; borderlines are generous and left
+# to the human, with reasons shown ("mais free nas borderlines para que
+# possa ser um humano a tomar a decisão final").
+
+# Event-risk keywords for headline scan. merger/acquisition family is
+# NOT in dislocation_score._BAD_NEWS_KW (that set targets deterioration
+# signals); "cut"/"lowered" overlap deliberately — a guidance cut is
+# both bad news AND an event that changes the thesis.
+_EVENT_RISK_KW = frozenset({
+    "merger", "acquisition", "acquires", "takeover", "buyout",
+    "spin-off", "spinoff", "divestiture", "cut", "lowered",
+})
+
+# Cluster threshold: candidate's sector already above this share of
+# portfolio cost basis → BORDERLINE "adensa" flag.
+_CLUSTER_PCT_THRESHOLD = 0.35
+
+
+def triage_watchlist(
+    entries: "list[WatchlistEntry]",
+    portfolio_context: Optional[dict] = None,
+    *,
+    fetch_headlines_fn=None,
+) -> "list[WatchlistEntry]":
+    """Classify each qualifying entry into CLEAN / BORDERLINE / EXCLUDED.
+
+    Mutates entries in place (sets triage_tier + triage_reasons) and
+    returns the same list. Reasons accumulate — an entry can be
+    BORDERLINE for near-cap AND event-risk AND cluster simultaneously,
+    and the human sees all three.
+
+    portfolio_context schema:
+        {"position_pct":   {SYM: float},    # live position % of wealth, 0..1
+         "sector_cost_pct": {sector: float}} # sector share of cost basis, 0..1
+
+    EXCLUDED (machine-safe, clear-cut only):
+      - position_pct >= 30%  — at/over hard cap, headroom €0 (NVO case)
+      - sector_relative_60d >= +10pp — outperformed sector; definitionally
+        not a dislocation (HOOD case, +34pp)
+    BORDERLINE (human decides):
+      - position_pct in [25%, 30%) — near cap
+      - sector_relative_60d in [-5pp, +10pp) — "fell with market". In a
+        market-wide selloff most names legitimately sit here and WILL
+        flood borderline — correct behavior, not a bug: they aren't
+        specific dislocations and the human sees them flagged as such.
+      - event-risk keyword in recent headlines — reason carries the
+        HEADLINE SNIPPET, not just the keyword (an MKC flag is only
+        useful if it shows "$44.8B merger...", never just "merger")
+      - candidate sector > 35% of portfolio cost basis — adensa check
+    CLEAN: everything else (fell alone < -5pp strictly, no flags).
+
+    With portfolio_context=None all entries stay CLEAN with an explicit
+    "triage skipped" reason — legacy callers see no behavior change.
+    Headline fetch is SKIPPED for names already EXCLUDED (saves 1-2s each).
+    """
+    if fetch_headlines_fn is None:
+        from utils.news_headlines import fetch_headlines as fetch_headlines_fn
+
+    if portfolio_context is None:
+        for e in entries:
+            e.triage_tier = "CLEAN"
+            e.triage_reasons = ["triage skipped (sem contexto de portfólio)"]
+        return entries
+
+    position_pct    = portfolio_context.get("position_pct") or {}
+    sector_cost_pct = portfolio_context.get("sector_cost_pct") or {}
+
+    for e in entries:
+        reasons: list[str] = []
+        tier = "CLEAN"
+
+        # ── EXCLUDED rules (checked first; skip expensive work after) ──
+        pos_pct = position_pct.get(e.ticker.upper())
+        if pos_pct is not None and pos_pct >= 0.30:
+            tier = "EXCLUDED"
+            reasons.append(
+                f"posição em {pos_pct*100:.1f}% — no/acima do hard cap 30%, headroom €0"
+            )
+
+        sr = e.sector_relative_60d
+        # sector_relative None does NOT vote: without sector resolution we
+        # can't assert it's a dislocation NOR that it isn't — abstaining
+        # is the only honest position (not merely "missing data").
+        if sr is not None and sr >= 0.10:
+            tier = "EXCLUDED"
+            reasons.append(
+                f"vs sector {sr*100:+.0f}pp — OUTPERFORMOU o sector; não é dislocation"
+            )
+
+        if tier == "EXCLUDED":
+            e.triage_tier = tier
+            e.triage_reasons = reasons
+            continue  # skip headline fetch — already out
+
+        # ── BORDERLINE rules (accumulate) ──────────────────────────────
+        if pos_pct is not None and 0.25 <= pos_pct < 0.30:
+            tier = "BORDERLINE"
+            reasons.append(
+                f"perto do cap: posição em {pos_pct*100:.1f}% (soft cap 25%)"
+            )
+
+        if sr is not None and -0.05 <= sr < 0.10:
+            tier = "BORDERLINE"
+            reasons.append(
+                f"vs sector {sr*100:+.0f}pp — caiu COM o mercado, não é dislocation específica"
+            )
+
+        # Event risk in recent headlines — reason must carry the snippet
+        try:
+            headlines = fetch_headlines_fn(e.ticker, max_results=8)
+        except Exception as ex:
+            log.debug(f"[triage] headlines {e.ticker}: {ex}")
+            headlines = []
+        for h in headlines or []:
+            title = getattr(h, "title", "") or ""
+            title_lower = title.lower()
+            matched = next((kw for kw in _EVENT_RISK_KW if kw in title_lower), None)
+            if matched:
+                tier = "BORDERLINE"
+                snippet = title[:90] + ("…" if len(title) > 90 else "")
+                reasons.append(f'event risk: "{snippet}" (matched: {matched})')
+                break  # one event flag is enough
+
+        # Cluster concentration — the "adensa vs diversifica" check
+        cand_sector = e.sector or ""
+        if cand_sector:
+            cluster_pct = sector_cost_pct.get(cand_sector)
+            if cluster_pct is not None and cluster_pct > _CLUSTER_PCT_THRESHOLD:
+                tier = "BORDERLINE"
+                reasons.append(
+                    f"adensa cluster: {cand_sector} já é {cluster_pct*100:.0f}% do portfólio"
+                )
+
+        e.triage_tier = tier
+        e.triage_reasons = reasons
+    return entries
+
+
 @dataclass
 class WatchlistEntry:
     ticker:               str
@@ -132,6 +277,9 @@ class WatchlistEntry:
     current_price:        Optional[float]
     core_score:           Optional[float]   # CoreRadar score (NOT used for ranking; for cross-reference)
     summary_line:         str               # pre-rendered display line
+    # Triage (set by triage_watchlist; defaults keep legacy callers intact)
+    triage_tier:          str = "CLEAN"     # CLEAN | BORDERLINE | EXCLUDED
+    triage_reasons:       list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -225,11 +373,15 @@ def compute_quality_thresholds(opps: list[dict]) -> dict:
 
 
 def _fetch_sector_for(ticker: str) -> str:
-    """Lazy yfinance.info sector lookup. Returns '' on failure."""
+    """Sector lookup via the shared persistent cache (utils/sector_cache).
+
+    The cache guarantees candidates AND portfolio holdings resolve
+    sectors through the same source, so triage cluster math compares
+    like-for-like strings. 90-day TTL — sectors virtually never change.
+    """
     try:
-        import yfinance as yf
-        info = yf.Ticker(ticker).info or {}
-        return info.get("sector", "") or ""
+        from utils.sector_cache import get_sector
+        return get_sector(ticker)
     except Exception as e:
         log.debug(f"[watchlist] sector fetch {ticker}: {e}")
         return ""
@@ -368,6 +520,7 @@ def get_watchlist(
     catalyst_min_days: int = DEFAULT_CATALYST_MIN_DAYS,
     source: str = "default",
     dip_lookback_days: int = 14,
+    portfolio_context: Optional[dict] = None,
 ) -> list[WatchlistEntry]:
     """Walk the chosen universe, evaluate each, return qualifying entries.
 
@@ -504,6 +657,19 @@ def get_watchlist(
         f"({n_with_catalyst} with near catalyst, {len(entries) - n_with_catalyst} without)"
     )
 
+    # Triage layer: classify qualifiers into CLEAN / BORDERLINE / EXCLUDED
+    # against the caller-supplied portfolio context. None → all CLEAN with
+    # explicit "triage skipped" reason (legacy callers unchanged).
+    entries = triage_watchlist(entries, portfolio_context)
+    n_clean      = sum(1 for e in entries if e.triage_tier == "CLEAN")
+    n_borderline = sum(1 for e in entries if e.triage_tier == "BORDERLINE")
+    n_excluded   = sum(1 for e in entries if e.triage_tier == "EXCLUDED")
+    if portfolio_context is not None:
+        log.info(
+            f"[watchlist] triage: {n_clean} CLEAN, {n_borderline} BORDERLINE, "
+            f"{n_excluded} EXCLUDED"
+        )
+
     # Persist run stats + the data-driven thresholds for callers to
     # render in /cash and /scan_now output (transparency: user sees
     # WHICH median ROE/GM/rev_growth was used to cut).
@@ -515,6 +681,9 @@ def get_watchlist(
         "n_quality_fail":       n_quality_fail,
         "n_qualified":          len(entries),
         "n_with_near_catalyst": n_with_catalyst,
+        "n_clean":              n_clean,
+        "n_borderline":         n_borderline,
+        "n_excluded":           n_excluded,
         "quality_thresholds":   quality_thresholds,
         "fetched_at_iso":       _dt.now().isoformat(timespec="seconds"),
     }
@@ -560,12 +729,45 @@ def format_watchlist_telegram(
     lines = [
         header,
         "",
-        f"_Quality compounders, DD >= 25% from 52w, catalyst <= 30d._",
+        f"_Quality compounders, DD >= 25% from 52w. Catalyst é sinal, não filtro._",
         f"_NÃO ranked by predicted return — apenas listed, ordered by DD depth._",
         "",
     ]
-    for e in entries:
-        lines.append(f"`{e.summary_line}`")
+
+    # Group by triage tier when triage ran (any entry with a tier other
+    # than the untriaged default set). Untriaged lists render flat.
+    _triaged = any(
+        e.triage_reasons and e.triage_reasons != ["triage skipped (sem contexto de portfólio)"]
+        for e in entries
+    ) or any(e.triage_tier != "CLEAN" for e in entries)
+
+    if _triaged:
+        _clean      = [e for e in entries if e.triage_tier == "CLEAN"]
+        _borderline = [e for e in entries if e.triage_tier == "BORDERLINE"]
+        _excluded   = [e for e in entries if e.triage_tier == "EXCLUDED"]
+
+        if _clean:
+            lines.append(f"*✅ CLEAN ({len(_clean)}):*")
+            for e in _clean:
+                lines.append(f"`{e.summary_line}`")
+            lines.append("")
+        if _borderline:
+            lines.append(f"*🟡 BORDERLINE — decide tu ({len(_borderline)}):*")
+            for e in _borderline:
+                lines.append(f"`{e.summary_line}`")
+                for r in e.triage_reasons:
+                    lines.append(f"    · _{r}_")
+            lines.append("")
+        if _excluded:
+            lines.append(f"*⛔ EXCLUÍDOS ({len(_excluded)}):*")
+            for e in _excluded:
+                _r0 = e.triage_reasons[0] if e.triage_reasons else "?"
+                lines.append(f"  ⛔ `{e.ticker}` — _{_r0}_")
+            lines.append("")
+    else:
+        for e in entries:
+            lines.append(f"`{e.summary_line}`")
+
     if include_disclaimer:
         lines.append("")
         lines.append("_Decide tu se há story para cada um._")

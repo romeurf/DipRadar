@@ -6671,8 +6671,17 @@ def _handle_command(text: str) -> None:
                     _r_label, _r_score, _r_target = "?", 50.0, 20
                 _badge = {"FROTHY": "🟦", "NEUTRAL": "🟨", "PANIC": "🟥"}.get(_r_label, "⚪")
 
-                # Watchlist candidates
-                entries = get_watchlist()
+                # Watchlist candidates WITH triage. The portfolio context
+                # feeds the CLEAN/BORDERLINE/EXCLUDED classifier — the
+                # machine excludes only clear-cut cases (at-cap, sector
+                # outperformers); borderlines are flagged for the human.
+                try:
+                    from portfolio.portfolio import build_portfolio_context
+                    _pf_ctx = build_portfolio_context(usd_eur=_usdeur)
+                except Exception as _ctx_err:
+                    logging.warning(f"[cash/watchlist] portfolio_context failed: {_ctx_err}")
+                    _pf_ctx = None
+                entries = get_watchlist(portfolio_context=_pf_ctx)
 
                 lines = ["💰 *Allocation Proposal — Watchlist mode*"]
                 lines.append("")
@@ -6716,28 +6725,44 @@ def _handle_command(text: str) -> None:
                         f"GM >= {_qt.get('gross_margin',0)*100:.0f}%, "
                         f"rev_growth >= {_qt.get('revenue_growth',0)*100:+.0f}%_"
                     )
+                # Split by triage tier. Only CLEAN names receive equal-weight
+                # allocation; BORDERLINE names are listed with per-name
+                # reasons for the human to decide; EXCLUDED are collapsed
+                # one-liners with the machine's reason.
+                _clean      = [e for e in entries if e.triage_tier == "CLEAN"]
+                _borderline = [e for e in entries if e.triage_tier == "BORDERLINE"]
+                _excluded   = [e for e in entries if e.triage_tier == "EXCLUDED"]
+
+                lines.append(
+                    f"🔎 Triage: *{len(_clean)} CLEAN* · "
+                    f"🟡 {len(_borderline)} borderline · ⛔ {len(_excluded)} excluídos"
+                )
                 lines.append(f"💸 Cash buffer (regime): €{_cash_buffer:,.0f}")
                 lines.append(f"💸 Deployable: €{_deployable:,.0f}")
-                _per_name = _deployable / max(1, len(entries))
-                lines.append(f"💵 Equal-weight per name: *€{_per_name:.0f}* ({len(entries)} positions)")
+                if _clean:
+                    _per_name = _deployable / len(_clean)
+                    lines.append(f"💵 Equal-weight per CLEAN name: *€{_per_name:.0f}* ({len(_clean)} positions)")
                 lines.append("")
 
-                # Equal-weight across ALL qualifiers, respecting concentration cap.
+                # Equal-weight across CLEAN qualifiers only, with the existing
+                # headroom trim as belt-and-braces for near-cap CLEAN names.
+                # NOTE: triage uses live/cost get_position_pct() upstream;
+                # this internal headroom uses total_cost (converted EUR).
+                # Slight inconsistency by design — triage is the
+                # authoritative gate for the EXCLUDED rule. See plan A4.
                 allocations = {}
                 remaining = _deployable
                 _cap_skipped_lines = []
 
-                if entries and remaining > 0:
-                    base_share = remaining / len(entries)
-                    for e in entries:
+                if _clean and remaining > 0:
+                    base_share = remaining / len(_clean)
+                    for e in _clean:
                         if portfolio_value > 0:
                             current = ticker_current_value.get(e.ticker.upper(), 0.0)
                             new_total = portfolio_value + remaining
                             max_held_eur = new_total * CONCENTRATION_HARD
                             headroom = max(0.0, max_held_eur - current)
                             alloc = min(base_share, headroom)
-                            # Concentration cap can produce zero alloc if
-                            # already at 30%; honest skip with reason
                             if alloc <= 0:
                                 _cap_skipped_lines.append(
                                     f"  ⏭️ `{e.ticker}` — já em 30% concentration cap (€{current:.0f} held)"
@@ -6750,15 +6775,37 @@ def _handle_command(text: str) -> None:
                 _deployed = sum(allocations.values())
                 _final_cash = cash_amount - _deployed
 
-                # Render ALL qualifiers with their allocation
-                lines.append("*BUYs propostos (equal-weight, all qualifiers):*")
-                for e in entries:
-                    eur = allocations.get(e.ticker)
-                    if eur:
-                        lines.append(f"`{e.summary_line}`  →  *€{eur:.0f}*")
-                    else:
-                        lines.append(f"`{e.summary_line}`  →  _skipped (cap)_")
-                lines.append("")
+                # ── CLEAN: allocated ──────────────────────────────────
+                if _clean:
+                    lines.append("*✅ CLEAN — BUYs propostos (equal-weight):*")
+                    for e in _clean:
+                        eur = allocations.get(e.ticker)
+                        if eur:
+                            lines.append(f"`{e.summary_line}`  →  *€{eur:.0f}*")
+                        else:
+                            lines.append(f"`{e.summary_line}`  →  _skipped (cap)_")
+                    lines.append("")
+                else:
+                    lines.append("⚪ *Nenhum nome CLEAN hoje* — nada alocado automaticamente.")
+                    lines.append("_Vê os borderlines abaixo: a decisão é tua._")
+                    lines.append("")
+
+                # ── BORDERLINE: human decides, reasons shown ──────────
+                if _borderline:
+                    lines.append(f"*🟡 Borderline — decide tu ({len(_borderline)}):*")
+                    for e in _borderline:
+                        lines.append(f"`{e.summary_line}`")
+                        for r in e.triage_reasons:
+                            lines.append(f"    · _{r}_")
+                    lines.append("")
+
+                # ── EXCLUDED: collapsed with machine reason ───────────
+                if _excluded:
+                    lines.append(f"*⛔ Excluídos ({len(_excluded)}):*")
+                    for e in _excluded:
+                        _reason0 = e.triage_reasons[0] if e.triage_reasons else "?"
+                        lines.append(f"  ⛔ `{e.ticker}` — _{_reason0}_")
+                    lines.append("")
 
                 if _cap_skipped_lines:
                     lines.append("_Skipped por concentration cap (já tens posição cheia):_")
@@ -9847,7 +9894,16 @@ def _handle_command(text: str) -> None:
                     _source = "full" if "--full" in parts else "default"
                     if _source == "full":
                         _reply("⏳ _Scan full universe (1518 tickers) — pode demorar 30-60min._")
-                    entries = get_watchlist(source=_source)
+                    # Portfolio context feeds the triage layer (same one
+                    # /cash and the watchdog use — one switch, one logic)
+                    try:
+                        from portfolio.portfolio import build_portfolio_context
+                        from data.market_client import get_usdeur as _gu
+                        _pf_ctx = build_portfolio_context(usd_eur=_gu())
+                    except Exception as _ctx_err:
+                        logging.warning(f"[scan_now] portfolio_context failed: {_ctx_err}")
+                        _pf_ctx = None
+                    entries = get_watchlist(source=_source, portfolio_context=_pf_ctx)
 
                     try:
                         from core.market_regime import compute_regime
