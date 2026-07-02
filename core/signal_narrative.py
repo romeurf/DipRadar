@@ -102,7 +102,16 @@ def generate_signal_narrative(
             )
 
     # ── 2. Sinal principal ML ─────────────────────────────────────────────────
-    if _is_valid(pred_alpha_90d) and _is_valid(win_prob):
+    # Mode-scoped: in watchlist mode the ML narrative ("O modelo prevê
+    # X% de alpha", "O Shield não recomenda") is suppressed entirely —
+    # those alpha predictions and win_probs come from the layer that
+    # failed the F.5 validation gate. Legacy modes keep the narrative.
+    try:
+        from core.scoring_dispatch import get_active_scorer as _gas_narr
+        _ml_narrative_on = _gas_narr() != "watchlist"
+    except Exception:
+        _ml_narrative_on = False
+    if _ml_narrative_on and _is_valid(pred_alpha_90d) and _is_valid(win_prob):
         alpha_pct = float(pred_alpha_90d) * 100
         prob      = float(win_prob)
 

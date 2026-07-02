@@ -1580,6 +1580,21 @@ def _build_plain_summary(
         else:
             frase2 = "Sem suporte suficiente para entrada agora."
 
+    # Mode-scoped: in watchlist mode, phrases that attribute the verdict
+    # to "o modelo" are replaced with model-free wording — the ML layer
+    # failed the F.5 gate and its voice shouldn't carry authority here.
+    try:
+        from core.scoring_dispatch import get_active_scorer as _gas_sum
+        if _gas_sum() == "watchlist" and "modelo" in frase2:
+            frase2 = {
+                "Na watchlist — modelo optimista mas aguardar confirmacao.":
+                    "Na watchlist — aguardar confirmacao.",
+                "O modelo nao ve vantagem clara neste momento.":
+                    "Sem suporte suficiente para entrada agora.",
+            }.get(frase2, frase2)
+    except Exception:
+        pass
+
     return f"{frase1}\n{frase2}"
 
 
@@ -1740,10 +1755,19 @@ def build_alert(
         spy_change=spy_change,
     )
 
-    # ML badge (Chunk 6)
+    # ML badge (Chunk 6). Mode-scoped: in watchlist mode the ML voice
+    # ("🤖 Modelo: NÃO RECOMENDA — X% de probabilidade de bater o
+    # mercado") is suppressed — those probabilities come from the layer
+    # that failed the F.5 validation gate. Legacy modes keep the badge.
     ml_line = ""
     if ml_result is not None:
-        ml_line = f"\n{ml_badge(ml_result)}"
+        try:
+            from core.scoring_dispatch import get_active_scorer as _gas_badge
+            _show_ml = _gas_badge() != "watchlist"
+        except Exception:
+            _show_ml = False
+        if _show_ml:
+            ml_line = f"\n{ml_badge(ml_result)}"
 
     # Narrativa de sinais (Chunk 6b) — explica o PORQUÊ em linguagem natural
     signal_narrative_text = ""
